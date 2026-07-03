@@ -96,6 +96,7 @@ export class MockExecutor implements AgentExecutor {
     const delayMatch = prompt.match(/^MOCK:delay (\d+)\s*([\s\S]*)$/);
     if (delayMatch) {
       await sleep(Number(delayMatch[1]), undefined, { signal }).catch(() => {});
+      if (signal.aborted) return { ok: false, error: 'aborted' };
       return this.interpret(delayMatch[2] ?? '', spec, signal);
     }
 

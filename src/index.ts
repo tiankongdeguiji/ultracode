@@ -1,5 +1,5 @@
 // Public API surface. Filled in milestone by milestone.
-export const VERSION = '0.1.0';
+export { VERSION } from './version.js';
 
 export { parseWorkflowScript, MAX_SCRIPT_BYTES } from './engine/meta.js';
 export type { WorkflowMeta, ParsedWorkflow } from './engine/meta.js';
