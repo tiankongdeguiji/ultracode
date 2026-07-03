@@ -75,6 +75,8 @@ export interface AgentOutcome {
   sessionId?: string;
   toolCalls: number;
   attempts: number;
+  /** loud-but-nonfatal conditions (e.g. silent no-op: actions auto-rejected) */
+  warnings?: string[];
 }
 
 export interface AgentExecutor {
@@ -111,7 +113,7 @@ export type AgentEvent =
   | { kind: 'session'; sessionId: string }
   /** assistant text; consumers keep the LAST one (codex #19816) */
   | { kind: 'message'; text: string }
-  | { kind: 'tool'; name: string; status: 'started' | 'completed' | 'failed' }
+  | { kind: 'tool'; name: string; status: 'started' | 'completed' | 'failed' | 'declined' }
   | { kind: 'usage'; usage: Partial<NormalizedUsage> }
   | {
       kind: 'result';

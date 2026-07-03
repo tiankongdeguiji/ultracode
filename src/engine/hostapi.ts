@@ -307,6 +307,11 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       }
 
       bumpPhase(spec.phase);
+      for (const warning of outcome.warnings ?? []) {
+        const msg = `agent[${seq}] ${spec.label} warning: ${warning}`;
+        state.failures.push(msg);
+        pushLog(msg);
+      }
       onEvent({
         type: 'agent_completed',
         seq,
