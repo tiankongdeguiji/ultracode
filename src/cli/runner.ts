@@ -82,6 +82,14 @@ export async function runnerMain(dir: string): Promise<number> {
     abort.abort(new Error('stopped by user'));
   });
 
+  // Wall-clock cap (default 60 minutes) — a loud stop, never a silent one.
+  const wallClockMs = config.wallClockMs ?? 60 * 60_000;
+  const wallTimer = setTimeout(() => {
+    events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms exceeded — stopping run` });
+    abort.abort(new Error(`wall-clock cap ${wallClockMs}ms exceeded`));
+  }, wallClockMs);
+  wallTimer.unref();
+
   // Parse up-front to seed the journal chain (executeWorkflow re-parses; cheap).
   const parsed = parseWorkflowScript(source);
   const chain = new KeyChain(seedKey(parsed.scriptHash, args), config.cwd);
@@ -170,6 +178,7 @@ export async function runnerMain(dir: string): Promise<number> {
   });
 
   clearInterval(heartbeat);
+  clearTimeout(wallTimer);
   writeFileSync(join(dir, 'output.json'), JSON.stringify(output, null, 2), 'utf8');
 
   const stopped = abort.signal.aborted;

@@ -182,11 +182,13 @@ export class CodexAdapter implements BackendAdapter {
               const status =
                 obj.type === 'item.started'
                   ? 'started'
-                  : item.status === 'failed' || item.status === 'declined'
-                    ? 'failed'
-                    : obj.type === 'item.completed'
-                      ? 'completed'
-                      : 'started';
+                  : item.status === 'declined'
+                    ? 'declined'
+                    : item.status === 'failed'
+                      ? 'failed'
+                      : obj.type === 'item.completed'
+                        ? 'completed'
+                        : 'started';
               const name =
                 item.type === 'command_execution'
                   ? `bash:${(item.command ?? '').slice(0, 40)}`

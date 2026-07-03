@@ -24,6 +24,8 @@ export function renderEvent(ev: TimestampedEvent): string | null {
       return `   agent[${ev.seq}] ${ev.label} ${ev.ok ? `done (${ev.totalTokens} tok)` : `FAILED: ${ev.error ?? ''}`}`;
     case 'workflow_log':
       return `   log: ${ev.message}`;
+    case 'budget_tick':
+      return `   spent: ${ev.spent} tok`;
     case 'stop_requested':
       return `■ stop requested`;
     case 'run_completed':

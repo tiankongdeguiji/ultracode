@@ -22,6 +22,43 @@ export interface MockStats {
   maxConcurrent: number;
 }
 
+/** Minimal valid instance for a JSON Schema (dry-run stubs). */
+export function stubFromSchema(schema: Record<string, unknown>): unknown {
+  if (schema.const !== undefined) return schema.const;
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0];
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+    return stubFromSchema(schema.anyOf[0] as Record<string, unknown>);
+  }
+  const type = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+  switch (type) {
+    case 'object': {
+      const out: Record<string, unknown> = {};
+      const props = (schema.properties ?? {}) as Record<string, Record<string, unknown>>;
+      const required = new Set((schema.required as string[]) ?? Object.keys(props));
+      for (const [key, sub] of Object.entries(props)) {
+        if (required.has(key)) out[key] = stubFromSchema(sub);
+      }
+      return out;
+    }
+    case 'array': {
+      const minItems = typeof schema.minItems === 'number' ? schema.minItems : 1;
+      const item = schema.items ? stubFromSchema(schema.items as Record<string, unknown>) : 'mock';
+      return Array.from({ length: Math.max(1, minItems) }, () => item);
+    }
+    case 'integer':
+    case 'number':
+      return typeof schema.minimum === 'number' ? schema.minimum : 0;
+    case 'boolean':
+      return true;
+    case 'string': {
+      const min = typeof schema.minLength === 'number' ? schema.minLength : 0;
+      return 'mock'.padEnd(min, 'x');
+    }
+    default:
+      return null;
+  }
+}
+
 function usageFor(spec: AgentSpec): NormalizedUsage {
   const inputTokens = Math.ceil(spec.prompt.length / 4);
   const outputTokens = 20;
@@ -134,6 +171,9 @@ export class MockExecutor implements AgentExecutor {
     const okDirective = prompt.match(/^MOCK:ok\s*([\s\S]*)$/);
     if (okDirective) return this.parseValue(okDirective[1] ?? '', spec);
 
+    // Default (no directive): schema-aware stub so dry-runs of typed
+    // workflows rehearse cleanly. Explicit directives stay strict.
+    if (spec.schema) return { ok: true, value: stubFromSchema(spec.schema) };
     return { ok: true, value: `mock response: ${prompt.slice(0, 60)}` };
   }
 

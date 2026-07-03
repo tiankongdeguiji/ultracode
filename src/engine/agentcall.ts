@@ -38,7 +38,7 @@ export interface AgentCallOptions {
   permission?: AgentRequest['permission'];
   /** per-attempt hard timeout (default 20 minutes) */
   attemptTimeoutMs?: number;
-  onToolEvent?: (spec: AgentSpec, name: string, status: 'started' | 'completed' | 'failed') => void;
+  onToolEvent?: (spec: AgentSpec, name: string, status: 'started' | 'completed' | 'failed' | 'declined') => void;
 }
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 20 * 60_000;
@@ -139,6 +139,7 @@ export class AgentCallExecutor implements AgentExecutor {
             sessionId: current.sessionId ?? first.sessionId,
             toolCalls: usages.reduce((n, a) => n + a.toolCalls, 0),
             attempts: attemptsUsed,
+            warnings: this.warningsFor(usages),
           };
         }
         lastErrors = validation.errors;
@@ -183,6 +184,15 @@ export class AgentCallExecutor implements AgentExecutor {
       toolCalls: usages.reduce((n, a) => n + a.toolCalls, 0),
       attempts: attemptsUsed + SCHEMA_REPAIR_LIMIT,
     };
+  }
+
+  /** Silent no-op detector: codex exec auto-rejects approvals yet exits 0. */
+  private warningsFor(attempts: AttemptResult[]): string[] | undefined {
+    const declined = attempts.reduce((n, a) => n + a.declinedActions, 0);
+    if (declined === 0) return undefined;
+    return [
+      `${declined} action(s) auto-rejected by the backend (headless approvals unavailable) — wrong sandbox/permission mode? The agent may have silently done nothing.`,
+    ];
   }
 
   private mergedUsage(spec: AgentSpec, attempts: AttemptResult[]) {
@@ -273,7 +283,7 @@ export class AgentCallExecutor implements AgentExecutor {
             break;
           case 'tool':
             if (ev.status === 'started') toolCalls++;
-            if (ev.status === 'failed') declinedActions++;
+            if (ev.status === 'declined') declinedActions++;
             this.opts.onToolEvent?.(spec, ev.name, ev.status);
             break;
           default:
@@ -291,12 +301,27 @@ export class AgentCallExecutor implements AgentExecutor {
 
       const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
       let timedOut = false;
+      let stalled = false;
       const timer = setTimeout(() => {
         timedOut = true;
         proc.killTree('SIGTERM');
         setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref();
       }, timeoutMs);
       timer.unref();
+
+      // Stall watchdog: no stream activity within stallMs → kill and retry.
+      let lastActivityAt = Date.now();
+      let stallTimer: ReturnType<typeof setInterval> | undefined;
+      if (spec.stallMs && spec.stallMs > 0) {
+        stallTimer = setInterval(() => {
+          if (Date.now() - lastActivityAt > spec.stallMs!) {
+            stalled = true;
+            proc.killTree('SIGTERM');
+            setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref();
+          }
+        }, Math.max(50, Math.min(1_000, spec.stallMs / 2)));
+        stallTimer.unref();
+      }
       const onAbort = () => {
         proc.killTree('SIGTERM');
         setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref();
@@ -306,18 +331,23 @@ export class AgentCallExecutor implements AgentExecutor {
       proc.child.stdout?.setEncoding('utf8');
       proc.child.stderr?.setEncoding('utf8');
       proc.child.stdout?.on('data', (chunk: string) => {
+        lastActivityAt = Date.now();
         for (const line of splitter.push(chunk)) {
           if (transcriptFile) appendFileSync(transcriptFile, line + '\n');
           consume(parser.push(line));
         }
       });
-      proc.child.stderr?.on('data', (chunk: string) => stderrTail.push(chunk));
+      proc.child.stderr?.on('data', (chunk: string) => {
+        lastActivityAt = Date.now();
+        stderrTail.push(chunk);
+      });
 
       const [code, sig] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
         proc.child.on('error', reject);
         proc.child.on('close', (c, s) => resolve([c, s]));
       });
       clearTimeout(timer);
+      if (stallTimer) clearInterval(stallTimer);
       signal.removeEventListener('abort', onAbort);
 
       for (const line of splitter.end()) {
@@ -333,6 +363,13 @@ export class AgentCallExecutor implements AgentExecutor {
       let exit = this.adapter.classifyExit(code, sig, events, stderrTail.text);
       if (timedOut) {
         exit = { ok: false, errorKind: 'stalled', retryable: true, message: `attempt timed out after ${timeoutMs}ms` };
+      } else if (stalled) {
+        exit = {
+          ok: false,
+          errorKind: 'stalled',
+          retryable: true,
+          message: `no stream activity for ${spec.stallMs}ms (stall watchdog)`,
+        };
       } else if (signal.aborted) {
         exit = { ok: false, errorKind: 'interrupted', retryable: false, message: 'aborted' };
       }
@@ -395,6 +432,7 @@ export class AgentCallExecutor implements AgentExecutor {
       sessionId: last.sessionId,
       toolCalls,
       attempts,
+      warnings: this.warningsFor(usages.length > 0 ? usages : [last]),
     };
   }
 }

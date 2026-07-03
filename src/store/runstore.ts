@@ -24,6 +24,7 @@ export interface RunConfig {
   budgetTotal?: number | null;
   logCap?: number;
   permission?: 'safe' | 'auto' | 'danger';
+  wallClockMs?: number;
   resumeFromRunId?: string;
 }
 
