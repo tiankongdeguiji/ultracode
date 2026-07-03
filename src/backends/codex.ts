@@ -30,6 +30,8 @@ import type {
 } from './types.js';
 import { parseJsonLine } from './ndjson.js';
 import { usageFromEvents } from './usage.js';
+import { checkCodexStrictSchema } from './schema-strict.js';
+import type { JsonSchema } from './types.js';
 import { execFile } from 'node:child_process';
 
 const PERMISSION_TO_SANDBOX: Record<AgentRequest['permission'], string> = {
@@ -70,6 +72,11 @@ export class CodexAdapter implements BackendAdapter {
         resolve({ available: true, version: stdout.trim(), warnings });
       });
     });
+  }
+
+  /** Strict-subset pre-validation: incompatible schemas 400 deterministically — reject before any spawn. */
+  checkSchema(schema: JsonSchema): { ok: true; wireSchema: JsonSchema } | { ok: false; reason: string } {
+    return checkCodexStrictSchema(schema);
   }
 
   buildSpawn(req: AgentRequest): SpawnPlan {
