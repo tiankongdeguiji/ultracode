@@ -14,12 +14,36 @@ import { readManifest, writeManifest, HEARTBEAT_INTERVAL_MS, type RunManifest } 
 import { readRunArgs, readRunConfig } from '../store/runstore.js';
 import { agentDirName } from '../store/layout.js';
 import { MockExecutor } from '../backends/mock.js';
+import { createExecutorForBackend } from '../engine/agentcall.js';
 import { VERSION } from '../version.js';
-import type { AgentExecutor } from '../backends/types.js';
+import type { AgentExecutor, AgentSpec } from '../backends/types.js';
 
-function resolveExecutor(backend: string): AgentExecutor {
-  if (backend === 'mock') return new MockExecutor();
-  throw new Error(`backend '${backend}' is not implemented yet`);
+/**
+ * Routes each agent to its backend's executor (per-call `backend:` override
+ * in agent() options; run config supplies the default).
+ */
+function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): AgentExecutor {
+  const cache = new Map<string, AgentExecutor>();
+  const artifactDir = (spec: AgentSpec) => join(dir, 'agents', agentDirName(spec.seq, spec.label));
+  const resolve = (backend: string): AgentExecutor => {
+    let ex = cache.get(backend);
+    if (!ex) {
+      ex =
+        backend === 'mock'
+          ? new MockExecutor()
+          : (createExecutorForBackend(backend, { artifactDir, permission }) ??
+            (() => {
+              throw new Error(`backend '${backend}' is not implemented yet`);
+            })());
+      cache.set(backend, ex);
+    }
+    return ex;
+  };
+  return {
+    execute(spec, signal) {
+      return resolve(spec.backend).execute(spec, signal);
+    },
+  };
 }
 
 export async function runnerMain(dir: string): Promise<number> {
@@ -72,7 +96,7 @@ export async function runnerMain(dir: string): Promise<number> {
 
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
-    executor: resolveExecutor(config.backend),
+    executor: makeExecutorMux(dir, config.permission ?? 'auto'),
     args,
     budgetTotal: config.budgetTotal ?? null,
     maxAgents: config.maxAgents,
