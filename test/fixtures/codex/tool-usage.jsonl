@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"019f0000-0000-7000-8000-000000000005"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"grep -r auth src/","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"grep -r auth src/","aggregated_output":"src/auth.ts: ...\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_1","type":"web_search","query":"jwt best practices","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"web_search","query":"jwt best practices","status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"ctx","tool":"lookup","status":"failed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":2000,"cached_input_tokens":1000,"output_tokens":40,"reasoning_output_tokens":8}}
