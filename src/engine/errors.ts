@@ -1,5 +1,18 @@
 /** Error taxonomy for the ultracode engine. */
 
+/**
+ * Cross-realm-safe error message extraction: errors thrown inside the vm
+ * context are instances of the CONTEXT's Error, so `instanceof Error` fails
+ * on the host side.
+ */
+export function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (e !== null && typeof e === 'object' && typeof (e as { message?: unknown }).message === 'string') {
+    return (e as { message: string }).message;
+  }
+  return String(e);
+}
+
 export class UltracodeError extends Error {
   constructor(
     message: string,
