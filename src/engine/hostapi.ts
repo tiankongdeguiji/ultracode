@@ -70,6 +70,10 @@ export interface AgentSettledRecord {
   error?: string;
   usage: { totalTokens: number; estimated: boolean };
   sessionId?: string;
+  /** hash-chain key assigned at dispatch (when a keyChain is configured) */
+  cacheKey?: string;
+  /** true when resolved from a prior run's journal (prefix replay) */
+  cached?: boolean;
 }
 
 export interface HostApiOptions {
@@ -85,10 +89,12 @@ export interface HostApiOptions {
   maxAgents?: number;
   logCap?: number;
   onEvent?: (ev: RunEvent) => void;
-  /** journal hook — invoked exactly once per settled (non-cache) agent, in dispatch order */
+  /** journal hook — invoked exactly once per settled agent (cache hits included) */
   onAgentSettled?: (record: AgentSettledRecord) => void;
+  /** sequential cache-key chain; next() invoked synchronously at dispatch in seq order */
+  keyChain?: { next(spec: AgentSpec): string };
   /** prefix-replay cache lookup (M8); returns {hit, value} */
-  cacheLookup?: (spec: AgentSpec) => { hit: boolean; value?: unknown } | undefined;
+  cacheLookup?: (spec: AgentSpec, cacheKey: string | undefined) => { hit: boolean; value?: unknown } | undefined;
   /** one-level nested workflow runner (M13) */
   runChild?: (ref: unknown, childArgs: unknown) => Promise<unknown>;
 }
@@ -236,6 +242,9 @@ export function createHostApi(opts: HostApiOptions): HostApi {
 
     const seq = state.agentCount++;
     const spec = normalizeAgentArgs(promptOrOpts, maybeOpts, seq);
+    // Chain key must advance for every dispatched agent — including skips —
+    // in seq order, synchronously (no await between seq assignment and here).
+    const cacheKey = opts.keyChain?.next(spec);
 
     if (spec.skip) {
       onEvent({ type: 'agent_completed', seq, label: spec.label, ok: true, skipped: true, totalTokens: 0 });
@@ -244,14 +253,23 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         status: 'skip',
         error: spec.skipReason,
         usage: { totalTokens: 0, estimated: false },
+        cacheKey,
       });
       return null;
     }
 
-    const cached = cacheLookup?.(spec);
+    const cached = cacheLookup?.(spec, cacheKey);
     if (cached?.hit) {
       bumpPhase(spec.phase);
       onEvent({ type: 'agent_completed', seq, label: spec.label, ok: true, totalTokens: 0 });
+      onAgentSettled?.({
+        spec,
+        status: 'ok',
+        value: cached.value,
+        usage: { totalTokens: 0, estimated: false },
+        cacheKey,
+        cached: true,
+      });
       return roundTrip(cached.value);
     }
 
@@ -261,6 +279,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       if (signal.aborted) throw new UltracodeError('Workflow stopped', 'aborted');
       onEvent({ type: 'agent_started', seq, label: spec.label, phase: spec.phase, backend: spec.backend });
       const outcome = await executor.execute(spec, signal);
+      if (signal.aborted) throw new UltracodeError('Workflow stopped', 'aborted');
       budget.add(outcome.usage.totalTokens, outcome.usage.estimated);
       onEvent({ type: 'budget_tick', spent: budget.spent() });
       state.totalToolCalls += outcome.toolCalls;
@@ -282,6 +301,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
           error: outcome.error,
           usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
           sessionId: outcome.sessionId,
+          cacheKey,
         });
         throw new WorkflowAgentError(failure, seq, spec.label);
       }
@@ -300,6 +320,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         value: outcome.value,
         usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
         sessionId: outcome.sessionId,
+        cacheKey,
       });
       return roundTrip(outcome.value);
     } finally {

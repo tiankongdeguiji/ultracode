@@ -39,8 +39,11 @@ export interface ExecuteOptions {
   syncTimeoutMs?: number;
   onEvent?: (ev: RunEvent) => void;
   onAgentSettled?: (record: AgentSettledRecord) => void;
-  cacheLookup?: (spec: AgentSpec) => { hit: boolean; value?: unknown } | undefined;
+  keyChain?: { next(spec: AgentSpec): string };
+  cacheLookup?: (spec: AgentSpec, cacheKey: string | undefined) => { hit: boolean; value?: unknown } | undefined;
   runChild?: (ref: unknown, childArgs: unknown) => Promise<unknown>;
+  /** invoked with the parsed script before execution (runner uses it to seed the journal) */
+  onParsed?: (parsed: ParsedWorkflow) => void;
 }
 
 export function validateArgsAgainstInputSchema(parsed: ParsedWorkflow, args: unknown): void {
@@ -59,6 +62,7 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
   const started = Date.now();
   const parsed = parseWorkflowScript(source);
   validateArgsAgainstInputSchema(parsed, opts.args ?? undefined);
+  opts.onParsed?.(parsed);
 
   const abort = new AbortController();
   const outerSignal = opts.signal;
@@ -83,6 +87,7 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
     logCap: opts.logCap,
     onEvent,
     onAgentSettled: opts.onAgentSettled,
+    keyChain: opts.keyChain,
     cacheLookup: opts.cacheLookup,
     runChild: opts.runChild,
   });
