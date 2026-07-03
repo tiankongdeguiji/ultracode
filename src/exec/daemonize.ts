@@ -6,7 +6,8 @@
  */
 import { openSync, closeSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readManifest } from '../store/manifest.js';
@@ -19,7 +20,9 @@ export function resolveRunnerEntry(): string[] {
   const here = fileURLToPath(import.meta.url); // .../src/exec/daemonize.ts or .../dist/exec/daemonize.js
   if (here.endsWith('.ts')) {
     // Absolute loader URL so the child resolves tsx regardless of its cwd.
-    const tsxLoader = import.meta.resolve('tsx');
+    // createRequire (not import.meta.resolve): vitest's SSR transform does
+    // not implement the latter.
+    const tsxLoader = pathToFileURL(createRequire(here).resolve('tsx')).href;
     return [process.execPath, '--import', tsxLoader, join(dirname(here), '../cli/main.ts')];
   }
   return [process.execPath, join(dirname(here), '../cli/main.js')];
