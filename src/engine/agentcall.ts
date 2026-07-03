@@ -9,7 +9,15 @@ import { mkdirSync, writeFileSync, appendFileSync, mkdtempSync, rmSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../backends/ndjson.js';
-import { estimateUsage } from '../backends/usage.js';
+import { estimateUsage, finalizeUsage } from '../backends/usage.js';
+import {
+  SCHEMA_REPAIR_LIMIT,
+  extractJsonCandidate,
+  freshRepairPrompt,
+  resumeRepairPrompt,
+  schemaPromptSuffix,
+} from '../backends/structured.js';
+import { validateWithSchema } from './ajv.js';
 import { spawnAgentProcess, TailBuffer } from '../exec/spawn.js';
 import type {
   AgentEvent,
@@ -53,22 +61,150 @@ export class AgentCallExecutor implements AgentExecutor {
   ) {}
 
   async execute(spec: AgentSpec, signal: AbortSignal): Promise<AgentOutcome> {
+    // Structured-output setup. Native adapters pre-validate the schema —
+    // incompatible schemas fail deterministically server-side, so reject
+    // with ZERO spawns. Emulated adapters get a prompt-contract suffix.
+    let req = this.toRequest(spec);
+    if (spec.schema) {
+      if (this.adapter.structuredOutput === 'native' && this.adapter.checkSchema) {
+        const check = this.adapter.checkSchema(spec.schema);
+        if (!check.ok) {
+          return {
+            ok: false,
+            error: `schema rejected: ${check.reason}`,
+            errorKind: 'schema-rejected',
+            usage: finalizeUsage({}),
+            toolCalls: 0,
+            attempts: 0,
+          };
+        }
+        req = { ...req, schema: check.wireSchema };
+      } else if (this.adapter.structuredOutput === 'emulated') {
+        req = { ...req, prompt: req.prompt + schemaPromptSuffix(spec.schema), schema: undefined };
+      }
+    }
+
     const maxAttempts = spec.retries + 1;
     let last: AttemptResult | undefined;
+    let attemptsUsed = 0;
+    const usages: AttemptResult[] = [];
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (signal.aborted) {
-        return this.toOutcome(spec, last, attempt - 1, 'aborted');
+        return this.toOutcome(spec, last, usages, attemptsUsed, 'aborted');
       }
-      const req = this.toRequest(spec);
       const plan = this.adapter.buildSpawn(req);
       last = await this.runAttempt(spec, plan, signal, attempt);
+      attemptsUsed = attempt;
+      usages.push(last);
       if (last.exit.ok) {
-        return this.toOutcome(spec, last, attempt);
+        if (!spec.schema) return this.toOutcome(spec, last, usages, attemptsUsed);
+        // Schema repair budget is independent of task retries; a schema
+        // failure after repairs is terminal (no task-retry loop).
+        return this.enforceSchema(spec, req, last, usages, signal, attemptsUsed);
       }
       if (!last.exit.retryable) break;
     }
-    return this.toOutcome(spec, last, Math.min(maxAttempts, (last ? 1 : 0) + spec.retries));
+    return this.toOutcome(spec, last, usages, attemptsUsed);
+  }
+
+  /** Extract → validate against the ORIGINAL schema → ≤2 repair turns (resume preferred). */
+  private async enforceSchema(
+    spec: AgentSpec,
+    req: AgentRequest,
+    first: AttemptResult,
+    usages: AttemptResult[],
+    signal: AbortSignal,
+    attemptsUsed: number,
+  ): Promise<AgentOutcome> {
+    const schema = spec.schema!;
+    let current = first;
+    let lastErrors: string[] = [];
+    let lastRaw: string | undefined;
+
+    for (let round = 0; round <= SCHEMA_REPAIR_LIMIT; round++) {
+      const candidate =
+        current.structured !== undefined
+          ? { value: current.structured, raw: JSON.stringify(current.structured) }
+          : current.finalText !== undefined
+            ? extractJsonCandidate(current.finalText)
+            : null;
+      if (candidate) {
+        const validation = validateWithSchema(schema, candidate.value);
+        if (validation.ok) {
+          return {
+            ok: true,
+            value: candidate.value,
+            usage: this.mergedUsage(spec, usages),
+            sessionId: current.sessionId ?? first.sessionId,
+            toolCalls: usages.reduce((n, a) => n + a.toolCalls, 0),
+            attempts: attemptsUsed,
+          };
+        }
+        lastErrors = validation.errors;
+        lastRaw = candidate.raw;
+      } else {
+        lastErrors = ['output was not parseable as JSON'];
+        lastRaw = current.finalText;
+      }
+
+      if (round === SCHEMA_REPAIR_LIMIT || signal.aborted) break;
+
+      const sessionId = current.sessionId ?? first.sessionId;
+      const resumePlan =
+        sessionId !== undefined ? this.adapter.buildResume(sessionId, resumeRepairPrompt(lastErrors, schema), req) : null;
+      const plan =
+        resumePlan ??
+        this.adapter.buildSpawn({
+          ...req,
+          prompt: freshRepairPrompt(spec.prompt, lastRaw, lastErrors, schema),
+        });
+      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1);
+      usages.push(current);
+      if (!current.exit.ok) {
+        return {
+          ok: false,
+          error: `schema repair attempt failed: ${current.exit.message}`,
+          errorKind: current.exit.errorKind ?? 'structured-output-retries',
+          usage: this.mergedUsage(spec, usages),
+          sessionId,
+          toolCalls: usages.reduce((n, a) => n + a.toolCalls, 0),
+          attempts: attemptsUsed + round + 1,
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      error: `structured output failed validation after ${SCHEMA_REPAIR_LIMIT} repair attempts: ${lastErrors.slice(0, 5).join('; ')}`,
+      errorKind: 'structured-output-retries',
+      usage: this.mergedUsage(spec, usages),
+      sessionId: current.sessionId ?? first.sessionId,
+      toolCalls: usages.reduce((n, a) => n + a.toolCalls, 0),
+      attempts: attemptsUsed + SCHEMA_REPAIR_LIMIT,
+    };
+  }
+
+  private mergedUsage(spec: AgentSpec, attempts: AttemptResult[]) {
+    let input = 0;
+    let output = 0;
+    let cached = 0;
+    let reasoning = 0;
+    let any = false;
+    let outputChars = 0;
+    for (const a of attempts) {
+      const u = this.adapter.extractUsage(a.events);
+      outputChars += a.outputChars;
+      if (u.totalTokens > 0) {
+        any = true;
+        input += u.inputTokens;
+        output += u.outputTokens;
+        cached += u.cachedInputTokens;
+        reasoning += u.reasoningTokens;
+      }
+    }
+    if (!any) return estimateUsage(spec.prompt.length * Math.max(1, attempts.length), outputChars);
+    return finalizeUsage({ inputTokens: input, outputTokens: output, cachedInputTokens: cached, reasoningTokens: reasoning });
   }
 
   toRequest(spec: AgentSpec): AgentRequest {
@@ -225,6 +361,7 @@ export class AgentCallExecutor implements AgentExecutor {
   private toOutcome(
     spec: AgentSpec,
     last: AttemptResult | undefined,
+    usages: AttemptResult[],
     attempts: number,
     overrideError?: string,
   ): AgentOutcome {
@@ -238,10 +375,8 @@ export class AgentCallExecutor implements AgentExecutor {
         attempts,
       };
     }
-    let usage = this.adapter.extractUsage(last.events);
-    if (usage.totalTokens === 0) {
-      usage = estimateUsage(spec.prompt.length, last.outputChars);
-    }
+    const usage = this.mergedUsage(spec, usages.length > 0 ? usages : [last]);
+    const toolCalls = (usages.length > 0 ? usages : [last]).reduce((n, a) => n + a.toolCalls, 0);
     if (!last.exit.ok) {
       return {
         ok: false,
@@ -249,7 +384,7 @@ export class AgentCallExecutor implements AgentExecutor {
         errorKind: last.exit.errorKind ?? 'unknown',
         usage,
         sessionId: last.sessionId,
-        toolCalls: last.toolCalls,
+        toolCalls,
         attempts,
       };
     }
@@ -258,7 +393,7 @@ export class AgentCallExecutor implements AgentExecutor {
       value: last.structured !== undefined ? last.structured : (last.finalText ?? ''),
       usage,
       sessionId: last.sessionId,
-      toolCalls: last.toolCalls,
+      toolCalls,
       attempts,
     };
   }

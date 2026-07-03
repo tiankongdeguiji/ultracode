@@ -3,10 +3,8 @@
  * sandbox + hostapi wiring, output shaping. Persistence and detachment live
  * in store/ and exec/ (M4); this module is pure engine.
  */
-import ajvModule from 'ajv/dist/2020.js';
-// ajv ships CJS; under NodeNext the class is on .default (or .Ajv2020).
-const Ajv2020 = (ajvModule as unknown as { default?: typeof ajvModule.Ajv2020 }).default ?? ajvModule.Ajv2020;
 import { parseWorkflowScript, type ParsedWorkflow } from './meta.js';
+import { validateWithSchema } from './ajv.js';
 import { createSandbox } from './sandbox.js';
 import { createHostApi, type AgentSettledRecord, type RunEvent } from './hostapi.js';
 import { defaultConcurrency } from './semaphore.js';
@@ -48,13 +46,11 @@ export interface ExecuteOptions {
 
 export function validateArgsAgainstInputSchema(parsed: ParsedWorkflow, args: unknown): void {
   if (!parsed.meta.inputSchema) return;
-  const ajv = new Ajv2020({ allErrors: true, strict: false });
-  const validate = ajv.compile(parsed.meta.inputSchema);
-  if (!validate(args)) {
-    const details = (validate.errors ?? [])
-      .map((e: { instancePath?: string; message?: string }) => `${e.instancePath || '/'} ${e.message ?? ''}`.trim())
-      .join('; ');
-    throw new MetaValidationError(`Workflow args do not match ${parsed.meta.name} meta.inputSchema: ${details}`);
+  const validation = validateWithSchema(parsed.meta.inputSchema, args);
+  if (!validation.ok) {
+    throw new MetaValidationError(
+      `Workflow args do not match ${parsed.meta.name} meta.inputSchema: ${validation.errors.join('; ')}`,
+    );
   }
 }
 

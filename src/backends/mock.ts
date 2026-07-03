@@ -13,6 +13,7 @@
  *   anything else              → succeed with "mock response: <prompt head>"
  */
 import { setTimeout as sleep } from 'node:timers/promises';
+import { validateWithSchema } from '../engine/ajv.js';
 import type { AgentExecutor, AgentOutcome, AgentSpec, NormalizedUsage } from './types.js';
 
 export interface MockStats {
@@ -55,7 +56,22 @@ export class MockExecutor implements AgentExecutor {
           return this.outcome(spec, { ok: false, error: 'aborted', errorKind: 'interrupted', attempts: attempt });
         }
         const res = await this.attempt(spec, signal);
-        if (res.ok) return this.outcome(spec, { ...res, attempts: attempt });
+        if (res.ok) {
+          // agent({schema}) contract holds on mock too (dry-run rehearsal):
+          // validate against the ORIGINAL schema, fail as the real pipeline would.
+          if (spec.schema) {
+            const validation = validateWithSchema(spec.schema, res.value);
+            if (!validation.ok) {
+              return this.outcome(spec, {
+                ok: false,
+                error: `structured output failed validation: ${validation.errors.slice(0, 5).join('; ')}`,
+                errorKind: 'structured-output-retries',
+                attempts: attempt,
+              });
+            }
+          }
+          return this.outcome(spec, { ...res, attempts: attempt });
+        }
         lastError = res.error ?? lastError;
       }
       return this.outcome(spec, { ok: false, error: lastError, errorKind: 'unknown', attempts: maxAttempts });
