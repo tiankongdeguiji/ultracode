@@ -96,6 +96,27 @@ program
   });
 
 program
+  .command('install')
+  .argument('<host>', 'codex | generic')
+  .description('install the ultracode skill + AGENTS.md trigger snippet for a host')
+  .option('--project', 'install into the current project instead of the user scope')
+  .option('--dry-run', 'show what would change without writing')
+  .action(async (host: string, opts: { project?: boolean; dryRun?: boolean }) => {
+    const { installCommand } = await import('./install.js');
+    process.exit(await installCommand(host, opts));
+  });
+
+program
+  .command('mode')
+  .argument('[value]', 'on | off (omit to print)')
+  .description('read or set the standing ultracode-mode marker (.ultracode/mode)')
+  .option('--home <dir>')
+  .action(async (value: string | undefined, opts: { home?: string }) => {
+    const { modeCommand } = await import('./mode.js');
+    process.exit(modeCommand(value, opts));
+  });
+
+program
   .command('doctor')
   .description('probe backends: availability, versions, auth topology, parallel-safety')
   .option('--json')
