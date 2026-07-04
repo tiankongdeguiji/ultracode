@@ -51,13 +51,17 @@ export async function collectDoctorRows(): Promise<DoctorRow[]> {
   ] as const) {
     const probe = await probeBin(bin);
     const auth = authEnv && process.env[authEnv] ? `${authEnv} set` : authEnv ? `${authEnv} unset` : 'cli-managed';
-    rows.push({
-      backend,
-      available: probe.ok,
-      version: probe.version,
-      auth,
-      warnings: probe.ok ? [] : ['not installed (adapter will refuse)'],
-    });
+    const warnings: string[] = probe.ok ? [] : ['not installed (adapter will refuse)'];
+    if (backend === 'qoder' && probe.ok) {
+      // The native Workflow tool sits behind a remote feature gate that can
+      // only be probed from a live session ("Workflow feature gate is
+      // disabled."). Fallback when off: the ultracode MCP triad.
+      warnings.push('native Workflow tool gate is remote — probe in a live session; MCP triad is the fallback');
+      if (!process.env.QODER_PERSONAL_ACCESS_TOKEN) {
+        warnings.push('a stored /login credential silently overrides env PATs — verify which account headless runs use');
+      }
+    }
+    rows.push({ backend, available: probe.ok, version: probe.version, auth, warnings });
   }
   return rows;
 }

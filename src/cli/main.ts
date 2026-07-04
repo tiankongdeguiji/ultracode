@@ -97,7 +97,7 @@ program
 
 program
   .command('install')
-  .argument('<host>', 'codex | generic')
+  .argument('<host>', 'codex | qoder | generic')
   .description('install the ultracode skill + AGENTS.md trigger snippet for a host')
   .option('--project', 'install into the current project instead of the user scope')
   .option('--dry-run', 'show what would change without writing')
@@ -132,6 +132,26 @@ program
   .option('--json', 'machine-readable output')
   .action((script: string, opts: { json?: boolean }) => {
     process.exit(runValidateCommand(script, opts));
+  });
+
+program
+  .command('sync')
+  .description('sync canonical .ultracode/workflows into .claude/workflows and .qoder/workflows (stamped copies)')
+  .option('--check', 'report drift without writing; exit 1 on drift')
+  .option('--adopt <hostFile>', 'reclaim a hand-edited host copy back into the canonical dir')
+  .action(async (opts: { check?: boolean; adopt?: string }) => {
+    const { syncCommand } = await import('./sync.js');
+    process.exit(syncCommand(opts));
+  });
+
+program
+  .command('lint')
+  .argument('<script>', 'workflow script file')
+  .description('check a workflow for cross-engine portability (Claude Code / Qoder native / ultracode)')
+  .option('--json')
+  .action(async (script: string, opts: { json?: boolean }) => {
+    const { lintCommand } = await import('./lint.js');
+    process.exit(lintCommand(script, opts));
   });
 
 program

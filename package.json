@@ -15,7 +15,8 @@
   "files": [
     "dist",
     "skill",
-    "workflows"
+    "workflows",
+    "hostpacks"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
