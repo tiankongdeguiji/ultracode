@@ -36,7 +36,7 @@ export interface StartRunResult {
   warnings: string[];
 }
 
-export const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex']);
+export const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex', 'qoder', 'claude', 'gemini']);
 
 export async function startDetachedRun(input: StartRunInput): Promise<StartRunResult> {
   const cwd = input.cwd ?? process.cwd();

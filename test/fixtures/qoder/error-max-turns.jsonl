@@ -1,0 +1,2 @@
+{"type": "system", "subtype": "init", "session_id": "qoder-sess-2"}
+{"type": "result", "subtype": "error_max_turns", "is_error": true, "errors": ["reached max turns"], "result": "", "session_id": "qoder-sess-2", "usage": {"input_tokens": 500, "output_tokens": 40}}

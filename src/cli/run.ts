@@ -28,7 +28,7 @@ export interface RunCliOptions {
   home?: string;
 }
 
-const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex']);
+const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex', 'qoder', 'claude', 'gemini']);
 
 /**
  * Execution ALWAYS happens in a detached runner process; the CLI attaches in

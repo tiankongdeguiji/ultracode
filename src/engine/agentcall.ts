@@ -30,6 +30,9 @@ import type {
   SpawnPlan,
 } from '../backends/types.js';
 import { CodexAdapter } from '../backends/codex.js';
+import { QoderAdapter } from '../backends/qoder.js';
+import { ClaudeAdapter } from '../backends/claude.js';
+import { GeminiAdapter } from '../backends/gemini.js';
 
 export interface AgentCallOptions {
   /** where to stream transcript.jsonl / stderr.log for a given spec (optional) */
@@ -442,6 +445,12 @@ export function createExecutorForBackend(backend: string, opts: AgentCallOptions
   switch (backend) {
     case 'codex':
       return new AgentCallExecutor(new CodexAdapter(), opts);
+    case 'qoder':
+      return new AgentCallExecutor(new QoderAdapter(), opts);
+    case 'claude':
+      return new AgentCallExecutor(new ClaudeAdapter(), opts);
+    case 'gemini':
+      return new AgentCallExecutor(new GeminiAdapter(), opts);
     default:
       return null;
   }

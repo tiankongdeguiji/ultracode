@@ -1,0 +1,3 @@
+{"type": "system", "subtype": "init", "session_id": "qoder-sess-1", "qodercli_version": "1.0.37", "cwd": "/w", "model": "auto", "tools": []}
+{"type": "assistant", "session_id": "qoder-sess-1", "message": {"role": "assistant", "content": [{"type": "text", "text": "{\"count\": 5}"}]}}
+{"type": "result", "subtype": "success", "is_error": false, "duration_ms": 900, "num_turns": 1, "result": "{\"count\": 5}", "structured_output": {"count": 5}, "session_id": "qoder-sess-1", "total_cost_usd": 0.002, "usage": {"input_tokens": 800, "output_tokens": 12, "cache_read_input_tokens": 100}, "modelUsage": {"auto": {"inputTokens": 800, "outputTokens": 12, "costUSD": 0.002}}}
