@@ -6,8 +6,8 @@
 import { parseWorkflowScript, type ParsedWorkflow } from './meta.js';
 import { validateWithSchema } from './ajv.js';
 import { createSandbox } from './sandbox.js';
-import { createHostApi, type AgentSettledRecord, type RunEvent } from './hostapi.js';
-import { defaultConcurrency } from './semaphore.js';
+import { createHostApi, type AgentSettledRecord, type RunEvent, type SharedRunState } from './hostapi.js';
+import { defaultConcurrency, Semaphore } from './semaphore.js';
 import { MetaValidationError, errorMessage } from './errors.js';
 import { BudgetAccount } from '../budget/account.js';
 import type { AgentExecutor, AgentSpec } from '../backends/types.js';
@@ -21,6 +21,8 @@ export interface RunOutput {
   totalTokens: number;
   totalToolCalls: number;
   durationMs: number;
+  /** kept worktree paths (parallel-mutation agents that left changes) */
+  workspaces?: string[];
   error?: string;
 }
 
@@ -28,6 +30,8 @@ export interface ExecuteOptions {
   executor: AgentExecutor;
   args?: unknown;
   budgetTotal?: number | null;
+  /** pre-built budget account (nested workflows share the parent's) */
+  budgetAccount?: BudgetAccount;
   maxConcurrency?: number;
   maxAgents?: number;
   logCap?: number;
@@ -40,8 +44,14 @@ export interface ExecuteOptions {
   keyChain?: { next(spec: AgentSpec): string };
   cacheLookup?: (spec: AgentSpec, cacheKey: string | undefined) => { hit: boolean; value?: unknown } | undefined;
   runChild?: (ref: unknown, childArgs: unknown) => Promise<unknown>;
+  /** resolve a child workflow name/scriptPath → source (enables workflow()) */
+  resolveChild?: (nameOrPath: string) => string;
   /** invoked with the parsed script before execution (runner uses it to seed the journal) */
   onParsed?: (parsed: ParsedWorkflow) => void;
+  /** shared execution state (nested workflows); created fresh if absent */
+  shared?: SharedRunState;
+  /** when true, workflow() throws (child workflows cannot nest further) */
+  noNesting?: boolean;
 }
 
 export function validateArgsAgainstInputSchema(parsed: ParsedWorkflow, args: unknown): void {
@@ -67,8 +77,38 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
     else outerSignal.addEventListener('abort', () => abort.abort(outerSignal.reason), { once: true });
   }
 
-  const budget = new BudgetAccount(opts.budgetTotal ?? null);
+  const budget = opts.budgetAccount ?? new BudgetAccount(opts.budgetTotal ?? null);
   const onEvent = opts.onEvent ?? (() => {});
+
+  const shared: SharedRunState = opts.shared ?? {
+    semaphore: new Semaphore(opts.maxConcurrency ?? defaultConcurrency()),
+    counter: { count: 0 },
+  };
+
+  // Build the nested-workflow runner from OUR internal shared primitives so
+  // children share this run's semaphore/counter/budget/signal/keyChain.
+  let runChild = opts.runChild;
+  if (!runChild && !opts.noNesting && opts.resolveChild) {
+    const resolver = opts.resolveChild;
+    runChild = async (ref, childArgs) => {
+      const { makeChildRunner } = await import('./child.js');
+      return makeChildRunner({
+        shared,
+        budget,
+        signal: abort.signal,
+        keyChain: opts.keyChain as never,
+        base: {
+          executor: opts.executor,
+          defaultBackend: opts.defaultBackend ?? 'mock',
+          cwd: opts.cwd ?? process.cwd(),
+          onEvent,
+          onAgentSettled: opts.onAgentSettled,
+          cacheLookup: opts.cacheLookup,
+        },
+        resolveName: resolver,
+      })(ref, childArgs);
+    };
+  }
 
   const host = createHostApi({
     executor: opts.executor,
@@ -85,7 +125,12 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
     onAgentSettled: opts.onAgentSettled,
     keyChain: opts.keyChain,
     cacheLookup: opts.cacheLookup,
-    runChild: opts.runChild,
+    runChild: opts.noNesting
+      ? () => {
+          throw new MetaValidationError('workflow() cannot nest more than one level');
+        }
+      : runChild,
+    shared,
   });
 
   onEvent({ type: 'run_started', name: parsed.meta.name });
@@ -116,6 +161,7 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
     totalTokens: budget.spent(),
     totalToolCalls: host.state.totalToolCalls,
     durationMs: Date.now() - started,
+    ...(host.state.workspaces.length > 0 ? { workspaces: host.state.workspaces } : {}),
     ...(error !== undefined ? { error } : {}),
   };
 }
