@@ -1,0 +1,120 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { ClaudeAdapter } from '../../src/backends/claude.js';
+import { QoderAdapter } from '../../src/backends/qoder.js';
+import { GeminiAdapter } from '../../src/backends/gemini.js';
+import type { AgentEvent, AgentRequest, BackendAdapter } from '../../src/backends/types.js';
+
+const FIX = join(__dirname, '../fixtures');
+
+function replay(adapter: BackendAdapter, fixture: string): AgentEvent[] {
+  const parser = adapter.createParser();
+  const events: AgentEvent[] = [];
+  for (const line of readFileSync(join(FIX, fixture), 'utf8').split('\n')) {
+    if (line.trim()) events.push(...parser.push(line));
+  }
+  events.push(...parser.end());
+  return events;
+}
+
+function req(o: Partial<AgentRequest> = {}): AgentRequest {
+  return { prompt: 'p', cwd: '/w', permission: 'auto', env: {}, ...o };
+}
+
+describe('ClaudeAdapter', () => {
+  const a = new ClaudeAdapter();
+
+  it('parses the live success-hello fixture: session, message, usage, ok', () => {
+    const events = replay(a, 'claude/success-hello.jsonl');
+    expect(events.find((e) => e.kind === 'session')).toMatchObject({ sessionId: 'be150d68-39d3-429d-851b-f15f48fbdf10' });
+    expect(events.filter((e) => e.kind === 'message').at(-1)).toMatchObject({ text: 'hello' });
+    const usage = a.extractUsage(events);
+    expect(usage.inputTokens).toBe(3454);
+    expect(usage.outputTokens).toBe(4);
+    expect(usage.cachedInputTokens).toBe(15084);
+    expect(usage.costUSD).toBeCloseTo(0.046255, 5);
+    expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: true });
+  });
+
+  it('builds --json-schema and stdin prompt; resume targets the session', () => {
+    const plan = a.buildSpawn(req({ schema: { type: 'object' }, model: 'sonnet' }));
+    expect(plan.argv).toContain('--json-schema');
+    expect(plan.argv).toContain('{"type":"object"}');
+    expect(plan.argv).toContain('stream-json');
+    expect(plan.stdinData).toBe('p');
+    expect(a.buildResume('sid', 'fix it', req())!.argv).toContain('sid');
+  });
+
+  it('permission maps to permission-mode', () => {
+    expect(a.buildSpawn(req({ permission: 'safe' })).argv).toContain('default');
+    expect(a.buildSpawn(req({ permission: 'danger' })).argv).toContain('bypassPermissions');
+  });
+});
+
+describe('QoderAdapter', () => {
+  const a = new QoderAdapter();
+
+  it('parses structured_output from the terminal result line', () => {
+    const events = replay(a, 'qoder/success-structured.jsonl');
+    const result = events.find((e) => e.kind === 'result');
+    expect(result).toMatchObject({ isError: false, structured: { count: 5 } });
+    expect(a.extractUsage(events)).toMatchObject({ inputTokens: 800, outputTokens: 12, cachedInputTokens: 100 });
+    expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: true });
+  });
+
+  it('maps error_max_turns and exit 41 auth', () => {
+    const events = replay(a, 'qoder/error-max-turns.jsonl');
+    expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: false, errorKind: 'max-turns' });
+    expect(a.classifyExit(41, null, [], 'auth failed')).toMatchObject({ ok: false, errorKind: 'auth', retryable: false });
+  });
+
+  it('builds --print --json-schema, agent routing, and -w cwd', () => {
+    const plan = a.buildSpawn(req({ schema: { type: 'object' }, agentType: 'uc-xhigh' }));
+    expect(plan.argv).toContain('--print');
+    expect(plan.argv).toContain('--json-schema');
+    expect(plan.argv).toEqual(expect.arrayContaining(['--agent', 'uc-xhigh', '-w', '/w']));
+  });
+});
+
+describe('GeminiAdapter (emulated)', () => {
+  const a = new GeminiAdapter();
+
+  it('is an emulated backend with no resume', () => {
+    expect(a.structuredOutput).toBe('emulated');
+    expect(a.buildResume()).toBeNull();
+  });
+
+  it('parses response text, tool lifecycle, and stats usage', () => {
+    const events = replay(a, 'gemini/success-json.jsonl');
+    const result = events.find((e) => e.kind === 'result');
+    expect(result).toMatchObject({ isError: false, text: 'Here is the JSON: {"count": 7}' });
+    const tools = events.filter((e) => e.kind === 'tool');
+    expect(tools.map((t) => t.kind === 'tool' && t.status)).toEqual(['started', 'completed']);
+    expect(a.extractUsage(events)).toMatchObject({ inputTokens: 1200, outputTokens: 30 });
+  });
+
+  it('puts the prompt in argv (no stdin) and adds --yolo unless safe', () => {
+    const plan = a.buildSpawn(req({ prompt: 'do X' }));
+    expect(plan.argv).toEqual(expect.arrayContaining(['-p', 'do X', '--output-format', 'stream-json', '--yolo']));
+    expect(plan.stdinData).toBeUndefined();
+    expect(a.buildSpawn(req({ permission: 'safe' })).argv).not.toContain('--yolo');
+  });
+
+  it('exit codes: 42 → schema-rejected, 53 → max-turns, other → retryable infra', () => {
+    expect(a.classifyExit(42, null, [], 'bad input')).toMatchObject({ errorKind: 'schema-rejected', retryable: false });
+    expect(a.classifyExit(53, null, [], '')).toMatchObject({ errorKind: 'max-turns', retryable: false });
+    expect(a.classifyExit(1, null, [], 'oops')).toMatchObject({ errorKind: 'infra', retryable: true });
+    expect(a.classifyExit(0, null, [], '')).toMatchObject({ ok: true });
+  });
+});
+
+describe('backend factory', () => {
+  it('creates an executor for every implemented backend', async () => {
+    const { createExecutorForBackend } = await import('../../src/engine/agentcall.js');
+    for (const b of ['codex', 'qoder', 'claude', 'gemini']) {
+      expect(createExecutorForBackend(b)).not.toBeNull();
+    }
+    expect(createExecutorForBackend('nonesuch')).toBeNull();
+  });
+});
