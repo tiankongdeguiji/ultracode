@@ -27,6 +27,30 @@ export function skillSourceDir(): string {
   return join(here, '../../skill/ultracode');
 }
 
+export function packagedDir(rel: string): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return join(here, '../..', rel);
+}
+
+/**
+ * Qoder rides its NATIVE Workflow tool (a faithful port of the same dialect) —
+ * this rule provides the standing-mode trigger Qoder lacks.
+ */
+export const QODER_RULE = `---
+trigger: always_on
+---
+
+# ultracode mode
+
+When the user writes "ultracode" anywhere in a message, includes a token budget like "+500k",
+or asks to orchestrate / use a workflow / fan out agents: read the \`ultracode\` skill and route
+the task through the NATIVE Workflow tool (dynamic workflows). Treat "ultracode" as a STANDING
+mode for the rest of the session until the user says "ultracode off": every substantive task gets
+a workflow; only trivial or conversational turns are handled solo. Budget directives are hard
+ceilings — the native \`budget\` global is stubbed, so pass them via args.budgetTokens and gate
+inside the script. Saved templates: uc-review, uc-research (in .qoder/workflows or ~/.qoder/workflows).
+`;
+
 export interface InstallAction {
   kind: 'copy-skill' | 'upsert-snippet';
   path: string;
@@ -125,6 +149,10 @@ export interface InstallOptions {
 export interface HostInstallPlan {
   skillDirs: string[];
   agentsFiles: string[];
+  /** files written verbatim (marker-free, fully managed by us) */
+  managedFiles?: { path: string; content: string; label: string }[];
+  /** packaged dirs copied file-by-file (workflow templates, agent defs) */
+  copyDirs?: { src: string; dest: string; label: string }[];
 }
 
 export function planFor(host: string, opts: InstallOptions): HostInstallPlan {
@@ -137,6 +165,23 @@ export function planFor(host: string, opts: InstallOptions): HostInstallPlan {
       return opts.project
         ? { skillDirs: [join(project, '.agents/skills/ultracode')], agentsFiles: [join(project, 'AGENTS.md')] }
         : { skillDirs: [join(home, '.agents/skills/ultracode')], agentsFiles: [join(home, '.codex/AGENTS.md')] };
+    case 'qoder': {
+      // Rides the NATIVE Workflow tool: skill + always_on rule (project) or
+      // AGENTS.md snippet (user) + uc-* templates + effort-routing agent defs.
+      const base = opts.project ? join(project, '.qoder') : join(home, '.qoder');
+      const plan: HostInstallPlan = {
+        skillDirs: [join(base, 'skills/ultracode')],
+        agentsFiles: opts.project ? [] : [join(home, '.qoder/AGENTS.md')],
+        copyDirs: [
+          { src: packagedDir('workflows'), dest: join(base, 'workflows'), label: 'uc-* workflow templates' },
+          { src: packagedDir('hostpacks/qoder/agents'), dest: join(base, 'agents'), label: 'uc-* agent definitions' },
+        ],
+      };
+      if (opts.project) {
+        plan.managedFiles = [{ path: join(base, 'rules/ultracode-mode.md'), content: QODER_RULE, label: 'always_on rule' }];
+      }
+      return plan;
+    }
     case 'generic':
       // .agents/skills is the cross-host de-facto path (gemini/cursor/amp/
       // crush/opencode/windsurf all scan it); AGENTS.md is near-universal.
@@ -144,15 +189,31 @@ export function planFor(host: string, opts: InstallOptions): HostInstallPlan {
         ? { skillDirs: [join(project, '.agents/skills/ultracode')], agentsFiles: [join(project, 'AGENTS.md')] }
         : { skillDirs: [join(home, '.agents/skills/ultracode')], agentsFiles: [] };
     default:
-      throw new Error(`unknown install host '${host}' (available: codex, generic)`);
+      throw new Error(`unknown install host '${host}' (available: codex, qoder, generic)`);
   }
 }
 
 export function installForHost(host: string, opts: InstallOptions): InstallAction[] {
   const plan = planFor(host, opts);
+  const dryRun = opts.dryRun ?? false;
   const actions: InstallAction[] = [];
-  for (const dir of plan.skillDirs) actions.push(copySkill(dir, opts.dryRun ?? false));
-  for (const file of plan.agentsFiles) actions.push(upsertMarkerBlock(file, AGENTS_SNIPPET, opts.dryRun ?? false));
+  for (const dir of plan.skillDirs) actions.push(copySkill(dir, dryRun));
+  for (const file of plan.agentsFiles) actions.push(upsertMarkerBlock(file, AGENTS_SNIPPET, dryRun));
+  for (const mf of plan.managedFiles ?? []) {
+    const same = existsSync(mf.path) && readFileSync(mf.path, 'utf8') === mf.content;
+    if (!same && !dryRun) {
+      mkdirSync(dirname(mf.path), { recursive: true });
+      writeFileSync(mf.path, mf.content, 'utf8');
+    }
+    actions.push({ kind: 'upsert-snippet', path: mf.path, changed: !same, detail: same ? `${mf.label} already current` : `${mf.label} written` });
+  }
+  for (const cd of plan.copyDirs ?? []) {
+    if (!dryRun) {
+      mkdirSync(cd.dest, { recursive: true });
+      cpSync(cd.src, cd.dest, { recursive: true, force: true });
+    }
+    actions.push({ kind: 'copy-skill', path: cd.dest, changed: true, detail: `${cd.label} installed` });
+  }
 
   // MCP registration (codex, user scope only — project .codex/config.toml
   // needs a trusted project; keep the user-scope path deterministic).
