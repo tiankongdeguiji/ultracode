@@ -15,8 +15,13 @@ import { readRunArgs, readRunConfig } from '../store/runstore.js';
 import { agentDirName } from '../store/layout.js';
 import { MockExecutor } from '../backends/mock.js';
 import { createExecutorForBackend } from '../engine/agentcall.js';
+import { Semaphore, defaultConcurrency } from '../engine/semaphore.js';
+import { BudgetAccount } from '../budget/account.js';
+import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
+import { resolveWorkflowSource } from '../installer/registry.js';
 import { VERSION } from '../version.js';
 import type { AgentExecutor, AgentSpec } from '../backends/types.js';
+import type { SharedRunState } from '../engine/hostapi.js';
 
 /**
  * Routes each agent to its backend's executor (per-call `backend:` override
@@ -110,12 +115,25 @@ export async function runnerMain(dir: string): Promise<number> {
     events.write({ type: 'workflow_log', message: `resuming from ${config.resumeFromRunId} (prefix replay)` });
   }
 
+  // Shared execution state so nested workflow() children share caps/budget.
+  const budgetAccount = new BudgetAccount(config.budgetTotal ?? null);
+  const shared: SharedRunState = {
+    semaphore: new Semaphore(config.maxConcurrency ?? defaultConcurrency()),
+    counter: { count: 0 },
+    runId: manifest.runId,
+  };
+  // Worktree isolation only inside a git repo.
+  const repoRoot = repoRootSync(config.cwd);
+  if (repoRoot) shared.worktrees = createWorktreeManager(repoRoot, worktreesRootFor(dir));
+
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
     executor: makeExecutorMux(dir, config.permission ?? 'auto'),
     cacheLookup: replay?.lookup,
     args,
-    budgetTotal: config.budgetTotal ?? null,
+    budgetAccount,
+    shared,
+    resolveChild: (nameOrPath) => resolveWorkflowSource(nameOrPath, config.cwd),
     maxAgents: config.maxAgents,
     maxConcurrency: config.maxConcurrency,
     logCap: config.logCap,

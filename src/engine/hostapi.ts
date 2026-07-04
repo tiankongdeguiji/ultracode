@@ -24,6 +24,20 @@ import { Semaphore } from './semaphore.js';
 import type { AgentExecutor, AgentSpec, JsonSchema } from '../backends/types.js';
 import type { BudgetAccount } from '../budget/account.js';
 import type { WorkflowMeta } from './meta.js';
+import type { WorktreeManager } from '../exec/worktree.js';
+
+/**
+ * State shared across a parent workflow and its one level of nested
+ * workflow() children: the concurrency semaphore, the lifetime agent
+ * counter (also the seq source), and the worktree manager. The budget and
+ * abort signal are shared by being passed identically to each hostapi.
+ */
+export interface SharedRunState {
+  semaphore: Semaphore;
+  counter: { count: number };
+  worktrees?: WorktreeManager;
+  runId?: string;
+}
 
 export const HARD_AGENT_CAP = 1000;
 export const MAX_ITEMS_PER_CALL = 4096;
@@ -61,6 +75,8 @@ export interface HostState {
   agentCount: number;
   totalToolCalls: number;
   phases: PhaseState[];
+  /** kept worktree paths (agents that left changes to merge) */
+  workspaces: string[];
 }
 
 export interface AgentSettledRecord {
@@ -97,6 +113,8 @@ export interface HostApiOptions {
   cacheLookup?: (spec: AgentSpec, cacheKey: string | undefined) => { hit: boolean; value?: unknown } | undefined;
   /** one-level nested workflow runner (M13) */
   runChild?: (ref: unknown, childArgs: unknown) => Promise<unknown>;
+  /** shared execution state for nested workflows; created fresh if absent */
+  shared?: SharedRunState;
 }
 
 export interface HostApi {
@@ -147,7 +165,8 @@ export function createHostApi(opts: HostApiOptions): HostApi {
   } = opts;
   const softCap = Math.min(opts.maxAgents ?? DEFAULT_SOFT_AGENT_CAP, HARD_AGENT_CAP);
   const logCap = opts.logCap ?? DEFAULT_LOG_CAP;
-  const semaphore = new Semaphore(opts.maxConcurrency);
+  const shared: SharedRunState = opts.shared ?? { semaphore: new Semaphore(opts.maxConcurrency), counter: { count: 0 } };
+  const semaphore = shared.semaphore;
 
   const state: HostState = {
     logs: [],
@@ -156,6 +175,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     agentCount: 0,
     totalToolCalls: 0,
     phases: (meta.phases ?? []).map((p) => ({ title: p.title, agentsDone: 0 })),
+    workspaces: [],
   };
 
   let currentPhase: string | undefined = undefined;
@@ -236,11 +256,14 @@ export function createHostApi(opts: HostApiOptions): HostApi {
 
   async function agentFn(promptOrOpts: unknown, maybeOpts?: unknown): Promise<unknown> {
     if (signal.aborted) throw new UltracodeError('Workflow stopped', 'aborted');
-    if (state.agentCount >= HARD_AGENT_CAP) throw new WorkflowAgentCapError(HARD_AGENT_CAP);
-    if (state.agentCount >= softCap) throw new WorkflowAgentCapError(softCap);
+    // Caps use the SHARED counter so a parent + its nested workflow() share
+    // the 1000 lifetime ceiling and the soft cap.
+    if (shared.counter.count >= HARD_AGENT_CAP) throw new WorkflowAgentCapError(HARD_AGENT_CAP);
+    if (shared.counter.count >= softCap) throw new WorkflowAgentCapError(softCap);
     if (budget.remaining() <= 0) throw new WorkflowBudgetError();
 
-    const seq = state.agentCount++;
+    const seq = shared.counter.count++;
+    state.agentCount++;
     const spec = normalizeAgentArgs(promptOrOpts, maybeOpts, seq);
     // Chain key must advance for every dispatched agent — including skips —
     // in seq order, synchronously (no await between seq assignment and here).
@@ -275,8 +298,15 @@ export function createHostApi(opts: HostApiOptions): HostApi {
 
     onEvent({ type: 'agent_queued', seq, label: spec.label, phase: spec.phase });
     const release = await semaphore.acquire();
+    let worktree: Awaited<ReturnType<WorktreeManager['create']>> | undefined;
     try {
       if (signal.aborted) throw new UltracodeError('Workflow stopped', 'aborted');
+      // Worktree isolation: fresh git worktree, only when explicitly asked
+      // and a manager is configured (the runner supplies it inside a repo).
+      if (spec.isolation === 'worktree' && shared.worktrees) {
+        worktree = await shared.worktrees.create(shared.runId ?? 'run', seq, spec.label);
+        spec.cwd = worktree.path;
+      }
       onEvent({ type: 'agent_started', seq, label: spec.label, phase: spec.phase, backend: spec.backend });
       const outcome = await executor.execute(spec, signal);
       if (signal.aborted) throw new UltracodeError('Workflow stopped', 'aborted');
@@ -330,6 +360,18 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       return roundTrip(outcome.value);
     } finally {
       release();
+      if (worktree) {
+        try {
+          const fin = await worktree.finalize();
+          if (!fin.removed) {
+            const msg = `agent[${seq}] ${spec.label} left changes in worktree ${fin.path} (branch kept for merge)`;
+            state.workspaces.push(fin.path);
+            pushLog(msg);
+          }
+        } catch (e) {
+          pushLog(`agent[${seq}] worktree cleanup failed: ${errMsg(e)}`);
+        }
+      }
     }
   }
 
