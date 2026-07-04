@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { parseWorkflowScript } from '../engine/meta.js';
+import { resolveWorkflowSource } from '../installer/registry.js';
 import { executeWorkflow } from '../engine/run.js';
 import { defaultConcurrency } from '../engine/semaphore.js';
 import { MockExecutor } from '../backends/mock.js';
@@ -46,9 +47,14 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
 
   let source: string;
   try {
-    source = readFileSync(file, 'utf8');
+    // Accept a file path or a registry name (.ultracode/workflows, packaged).
+    if (existsSync(file)) {
+      source = readFileSync(file, 'utf8');
+    } else {
+      source = resolveWorkflowSource(file, process.cwd());
+    }
   } catch (err) {
-    process.stderr.write(`ultracode: cannot read ${file}: ${(err as Error).message}\n`);
+    process.stderr.write(`ultracode: cannot resolve workflow '${file}': ${(err as Error).message}\n`);
     return 1;
   }
 

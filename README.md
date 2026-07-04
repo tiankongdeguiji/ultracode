@@ -32,6 +32,36 @@ Workflow scripts are **model-authored and user-reviewed before running** (`ultra
 
 Fan-out auth: Codex ChatGPT-plan OAuth is unsafe to fan out (single-use rotating refresh tokens) — `ultracode doctor` enforces concurrency 1 (`--force-oauth-fanout` caps at 3). Use `CODEX_API_KEY` for real parallelism. Qoder: `QODER_PERSONAL_ACCESS_TOKEN` is stateless and parallel-safe.
 
-## Status
+## Quick start
 
-Under construction — see `docs/design/judge.md` for the architecture and milestone plan, `docs/research/` for the underlying research (Claude Code ultracode mechanism, Codex/Qoder internals, MCP long-running-tool constraints, parallel-safety analysis).
+```bash
+npm install && npm run build      # or: npm link  for a global `ultracode`
+ultracode doctor                  # which backends are available + auth safety
+ultracode install codex           # skill + AGENTS.md trigger + MCP registration
+# then in Codex:  "ultracode: review this repo for auth bugs +500k"
+
+# or drive it directly:
+ultracode validate my.workflow.js
+ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
+ultracode run my.workflow.js --backend codex --budget 500k
+ultracode status <runId> --watch                # long runs: add --detach above
+ultracode resume <runId> [--script edited.js]   # completed agents replay free
+```
+
+## Commands
+
+`run` · `status` · `logs` · `stop` · `list` · `resume` · `validate` · `lint` · `doctor` · `mode` · `install <codex|qoder|generic>` · `sync` · `mcp`
+
+## What's proven
+
+End-to-end on real backends: the `uc-review` workflow (3 dimension finders → per-finding adversarial verification → synthesis) run on **Codex** against `examples/sample-repo` found both planted auth bugs — with constructed exploit inputs as evidence — plus a real unplanted one (`examples/parity-demo-output.json`, 12 agents). A typed-schema workflow verified on **Claude**. Codex drove the full `workflow_start → status → result` MCP loop. 187 offline tests (mock backend + golden fixtures) cover the dialect contract, sandbox bans, journal determinism, resume, structured-output, safety rails, all five adapters, worktree isolation, and nested workflows.
+
+## Design & research
+
+- `docs/design/judge.md` — the synthesized architecture + milestone plan (3 architects + judge).
+- `docs/research/` — the underlying research: the Claude Code ultracode mechanism, Codex/Qoder CLI internals (Qoder's native Workflow tool decompiled), MCP long-running-tool constraints across hosts, parallel-safety analysis, cross-host survey, JS-sandbox tradeoffs.
+- `SUPPORTED_VERSIONS.md` — pinned CLI versions, platform notes, live-test gate.
+
+## v1 scope
+
+In: engine (sandbox, dialect, journal/resume, budget, watchdogs), 5 backends (mock/codex/qoder/claude/gemini), CLI, MCP triad, codex+qoder+generic installers, worktree isolation, one-level nested workflows. Deferred: Windows, cursor/copilot/opencode/amp adapters, npm publish + marketplace repos (internal-first), MCP Tasks (unsupported by target hosts).

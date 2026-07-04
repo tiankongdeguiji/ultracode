@@ -1,0 +1,8 @@
+{
+  "name": "ultracode",
+  "version": "0.1.0",
+  "description": "ultracode mode for Qoder: rides the native Workflow tool with doctrine skill, always_on rule, uc-* templates, and effort-routing agents",
+  "author": "ultracode",
+  "license": "MIT",
+  "keywords": ["workflow", "orchestration", "ultracode", "quest"]
+}
