@@ -31,7 +31,7 @@ describe('stableStringify', () => {
 
 describe('KeyChain', () => {
   it('is deterministic: same specs → same chain', () => {
-    const seed = seedKey('hash', { q: 1 });
+    const seed = seedKey({ q: 1 });
     const a = new KeyChain(seed, ROOT);
     const b = new KeyChain(seed, ROOT);
     const specs = [spec({ prompt: 'one' }), spec({ prompt: 'two', model: 'fast' })];
@@ -39,7 +39,7 @@ describe('KeyChain', () => {
   });
 
   it('prefix property: change at n diverges keys from n onward only', () => {
-    const seed = seedKey('hash', null);
+    const seed = seedKey(null);
     const a = new KeyChain(seed, ROOT);
     const b = new KeyChain(seed, ROOT);
     const k1a = a.next(spec({ prompt: 'same' }));
@@ -54,7 +54,7 @@ describe('KeyChain', () => {
   });
 
   it('backend, model, effort, schema, agentType all affect the key', () => {
-    const seed = seedKey('h', null);
+    const seed = seedKey(null);
     const base = spec({ prompt: 'x' });
     const variants: Partial<AgentSpec>[] = [
       {},
@@ -69,7 +69,7 @@ describe('KeyChain', () => {
   });
 
   it('cwd equal to the run root is omitted from the hash', () => {
-    const seed = seedKey('h', null);
+    const seed = seedKey(null);
     const atRoot = new KeyChain(seed, ROOT).next(spec({ cwd: ROOT }));
     const alsoRoot = new KeyChain(seed, ROOT).next(spec({ cwd: ROOT }));
     const elsewhere = new KeyChain(seed, ROOT).next(spec({ cwd: '/other' }));
@@ -77,10 +77,10 @@ describe('KeyChain', () => {
     expect(atRoot).not.toBe(elsewhere);
   });
 
-  it('seed depends on script hash and args', () => {
-    expect(seedKey('a', { x: 1 })).not.toBe(seedKey('a', { x: 2 }));
-    expect(seedKey('a', { x: 1 })).not.toBe(seedKey('b', { x: 1 }));
-    expect(seedKey('a', { x: 1 })).toBe(seedKey('a', { x: 1 }));
+  it('seed depends on args only — script edits must preserve the prefix', () => {
+    expect(seedKey({ x: 1 })).not.toBe(seedKey({ x: 2 }));
+    expect(seedKey({ x: 1 })).toBe(seedKey({ x: 1 }));
+    expect(seedKey(null)).toBe(seedKey(null));
   });
 });
 
@@ -93,7 +93,7 @@ return [a, b]`;
 
   async function runOnce() {
     const records: { key?: string; seq: number; status: string }[] = [];
-    const chain = new KeyChain(seedKey('fixed-hash', null), process.cwd());
+    const chain = new KeyChain(seedKey(null), process.cwd());
     await executeWorkflow(SRC, {
       executor: new MockExecutor(),
       keyChain: chain,

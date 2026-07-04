@@ -5,10 +5,10 @@
  * SIGTERM aborts the run gracefully; partial output is preserved.
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { executeWorkflow } from '../engine/run.js';
 import { parseWorkflowScript } from '../engine/meta.js';
-import { JournalWriter, KeyChain, argsHash, seedKey } from '../engine/journal.js';
+import { JournalWriter, KeyChain, PrefixReplayCache, argsHash, readJournal, seedKey } from '../engine/journal.js';
 import { EventWriter } from '../store/events.js';
 import { readManifest, writeManifest, HEARTBEAT_INTERVAL_MS, type RunManifest } from '../store/manifest.js';
 import { readRunArgs, readRunConfig } from '../store/runstore.js';
@@ -92,19 +92,28 @@ export async function runnerMain(dir: string): Promise<number> {
 
   // Parse up-front to seed the journal chain (executeWorkflow re-parses; cheap).
   const parsed = parseWorkflowScript(source);
-  const chain = new KeyChain(seedKey(parsed.scriptHash, args), config.cwd);
+  const chain = new KeyChain(seedKey(args), config.cwd);
   journal.append({
     t: 'started',
     runId: manifest.runId,
     engineVersion: VERSION,
     scriptHash: parsed.scriptHash,
     argsHash: argsHash(args),
-    seedKey: seedKey(parsed.scriptHash, args),
+    seedKey: seedKey(args),
   });
+
+  // Prefix-replay cache from the prior run's journal (resume path).
+  let replay: PrefixReplayCache | undefined;
+  if (config.resumeFromRunId) {
+    const priorDir = join(dirname(dir), config.resumeFromRunId);
+    replay = new PrefixReplayCache(readJournal(join(priorDir, 'journal.jsonl')), priorDir);
+    events.write({ type: 'workflow_log', message: `resuming from ${config.resumeFromRunId} (prefix replay)` });
+  }
 
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
     executor: makeExecutorMux(dir, config.permission ?? 'auto'),
+    cacheLookup: replay?.lookup,
     args,
     budgetTotal: config.budgetTotal ?? null,
     maxAgents: config.maxAgents,
@@ -179,6 +188,12 @@ export async function runnerMain(dir: string): Promise<number> {
 
   clearInterval(heartbeat);
   clearTimeout(wallTimer);
+  if (replay) {
+    events.write({
+      type: 'workflow_log',
+      message: `prefix replay: ${replay.stats.hits} agent(s) from cache, ${replay.stats.hits === 0 ? 'no prefix matched' : `first live call after position ${replay.stats.hits}`}`,
+    });
+  }
   writeFileSync(join(dir, 'output.json'), JSON.stringify(output, null, 2), 'utf8');
 
   const stopped = abort.signal.aborted;

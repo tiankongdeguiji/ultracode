@@ -2,9 +2,14 @@
  * Journal: append-only journal.jsonl with hash-chained cache keys enabling
  * longest-unchanged-prefix replay on resume.
  *
- *   key_0 = "u1:" + sha256(scriptHash + "\0" + stableStringify(args))
+ *   key_0 = "u1:" + sha256("ultracode-seed\0" + stableStringify(args))
  *   key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0" +
  *           stableStringify({agentType, isolation, model, effort, schema, backend, cwd?}))
+ *
+ * The seed deliberately EXCLUDES the script hash: editing the script and
+ * resuming must replay the unchanged prefix of agent() calls (the calls
+ * themselves are what the chain hashes). Changing args changes the seed →
+ * full re-run.
  *
  * Keys are assigned at DISPATCH time (agent() prologue runs synchronously in
  * seq order), never at completion time — concurrent completions settle in
@@ -16,6 +21,7 @@
  */
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { AgentSpec } from '../backends/types.js';
 
 export const KEY_PREFIX = 'u1:';
@@ -33,8 +39,8 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-export function seedKey(scriptHash: string, args: unknown): string {
-  return KEY_PREFIX + sha256(`${scriptHash}\0${stableStringify(args ?? null)}`);
+export function seedKey(args: unknown): string {
+  return KEY_PREFIX + sha256(`ultracode-seed\0${stableStringify(args ?? null)}`);
 }
 
 export function argsHash(args: unknown): string {
@@ -96,6 +102,55 @@ export class JournalWriter {
   append(record: JournalRecord): void {
     appendFileSync(this.file, JSON.stringify(record) + '\n', 'utf8');
   }
+}
+
+type AgentRecord = Extract<JournalRecord, { t: 'agent' }>;
+
+/**
+ * Longest-unchanged-prefix replay over a prior run's journal.
+ *
+ * lookup() compares the NEXT prior agent record's chain key with the new
+ * dispatch's key, sequentially. A hit resolves instantly from the prior
+ * run's result.json. The FIRST miss disables all later hits — beyond an
+ * edit point everything runs live (hash chaining makes any earlier
+ * divergence change all subsequent keys anyway).
+ *
+ * Skip records are advanced over: skipped agents in the new run return
+ * null without consulting the cache, but they occupy journal positions.
+ * Error records are misses by design — failed agents re-run on resume.
+ */
+export class PrefixReplayCache {
+  private readonly queue: AgentRecord[];
+  private idx = 0;
+  private prefixMissed = false;
+  readonly stats = { hits: 0, misses: 0 };
+
+  constructor(records: JournalRecord[], private readonly priorRunDir: string) {
+    this.queue = records.filter((r): r is AgentRecord => r.t === 'agent');
+  }
+
+  readonly lookup = (_spec: AgentSpec, cacheKey: string | undefined): { hit: boolean; value?: unknown } | undefined => {
+    if (this.prefixMissed || !cacheKey) return undefined;
+    while (this.idx < this.queue.length && this.queue[this.idx]!.status === 'skip') this.idx++;
+    const head = this.queue[this.idx];
+    if (!head || head.key !== cacheKey || head.status !== 'ok' || !head.resultRef) {
+      this.prefixMissed = true;
+      this.stats.misses++;
+      return undefined;
+    }
+    try {
+      const result = JSON.parse(readFileSync(join(this.priorRunDir, head.resultRef), 'utf8')) as {
+        value?: unknown;
+      };
+      this.idx++;
+      this.stats.hits++;
+      return { hit: true, value: result.value ?? null };
+    } catch {
+      this.prefixMissed = true;
+      this.stats.misses++;
+      return undefined;
+    }
+  };
 }
 
 export function readJournal(file: string): JournalRecord[] {
