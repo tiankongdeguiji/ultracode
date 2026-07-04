@@ -60,6 +60,20 @@ program
   });
 
 program
+  .command('resume')
+  .argument('<runId>', 'terminal run to resume from')
+  .description('resume: completed agents replay from the journal, the rest run live')
+  .option('--script <file>', 'edited script (unchanged prefix still replays)')
+  .option('--args <json>', 'override args (changes the seed → full re-run)')
+  .option('--detach')
+  .option('--json')
+  .option('--home <dir>')
+  .action(async (runId: string, opts: Record<string, string | boolean>) => {
+    const { resumeCommand } = await import('./resume.js');
+    process.exit(await resumeCommand(runId, opts as never));
+  });
+
+program
   .command('stop')
   .argument('<runId>')
   .description('stop a running workflow (SIGTERM → 7s → SIGKILL)')
