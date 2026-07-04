@@ -34,19 +34,24 @@ export interface InstallAction {
   detail: string;
 }
 
-export function upsertMarkerBlock(file: string, snippet: string, dryRun: boolean): InstallAction {
+export function upsertMarkerBlock(
+  file: string,
+  snippet: string,
+  dryRun: boolean,
+  markers: { begin: string; end: string } = { begin: MARKER_BEGIN, end: MARKER_END },
+): InstallAction {
   const existing = existsSync(file) ? readFileSync(file, 'utf8') : '';
-  const begin = existing.indexOf(MARKER_BEGIN);
+  const begin = existing.indexOf(markers.begin);
   let next: string;
   if (begin === -1) {
     next = existing.length === 0 ? snippet + '\n' : existing.replace(/\n*$/, '\n\n') + snippet + '\n';
   } else {
-    const end = existing.indexOf(MARKER_END, begin);
+    const end = existing.indexOf(markers.end, begin);
     if (end === -1) {
       // corrupted block: replace from begin to EOF
       next = existing.slice(0, begin) + snippet + '\n';
     } else {
-      next = existing.slice(0, begin) + snippet + existing.slice(end + MARKER_END.length);
+      next = existing.slice(0, begin) + snippet + existing.slice(end + markers.end.length);
     }
   }
   const changed = next !== existing;
@@ -60,6 +65,33 @@ export function upsertMarkerBlock(file: string, snippet: string, dryRun: boolean
     changed,
     detail: begin === -1 ? 'snippet appended' : changed ? 'snippet updated' : 'snippet already current',
   };
+}
+
+export const TOML_MARKER_BEGIN = '# ultracode:begin (managed by `ultracode install`; edits inside will be overwritten)';
+export const TOML_MARKER_END = '# ultracode:end';
+
+/**
+ * codex MCP registration: appended as a marker-guarded TOML block. Appending
+ * a table at EOF is a safe TOML operation; we never parse or rewrite the
+ * rest of the user's config.toml. tool_timeout_sec=90 gives comfortable
+ * headroom over the ≤50s long-poll.
+ */
+export function codexMcpToml(command: string[], schemaNote = ''): string {
+  const [bin, ...args] = command;
+  return [
+    TOML_MARKER_BEGIN,
+    schemaNote,
+    '[mcp_servers.ultracode]',
+    `command = ${JSON.stringify(bin)}`,
+    `args = ${JSON.stringify(args)}`,
+    'tool_timeout_sec = 90',
+    // Without pre-approval, headless codex exec auto-rejects every MCP call
+    // ("user cancelled MCP tool call") — live-verified on 0.142.4.
+    'default_tools_approval_mode = "approve"',
+    TOML_MARKER_END,
+  ]
+    .filter((l) => l.length > 0)
+    .join('\n');
 }
 
 export function copySkill(destDir: string, dryRun: boolean): InstallAction {
@@ -83,6 +115,8 @@ export function copySkill(destDir: string, dryRun: boolean): InstallAction {
 export interface InstallOptions {
   project?: boolean;
   dryRun?: boolean;
+  /** argv for launching `ultracode mcp` (resolved by the CLI; enables codex MCP registration) */
+  mcpCommand?: string[];
   /** test seams */
   userHome?: string;
   projectRoot?: string;
@@ -119,5 +153,18 @@ export function installForHost(host: string, opts: InstallOptions): InstallActio
   const actions: InstallAction[] = [];
   for (const dir of plan.skillDirs) actions.push(copySkill(dir, opts.dryRun ?? false));
   for (const file of plan.agentsFiles) actions.push(upsertMarkerBlock(file, AGENTS_SNIPPET, opts.dryRun ?? false));
+
+  // MCP registration (codex, user scope only — project .codex/config.toml
+  // needs a trusted project; keep the user-scope path deterministic).
+  if (host === 'codex' && !opts.project && opts.mcpCommand) {
+    const home = opts.userHome ?? homedir();
+    const action = upsertMarkerBlock(
+      join(home, '.codex/config.toml'),
+      codexMcpToml(opts.mcpCommand),
+      opts.dryRun ?? false,
+      { begin: TOML_MARKER_BEGIN, end: TOML_MARKER_END },
+    );
+    actions.push({ ...action, detail: `MCP registration ${action.detail.replace('snippet ', '')}` });
+  }
   return actions;
 }

@@ -135,6 +135,15 @@ program
   });
 
 program
+  .command('mcp')
+  .description('start the ultracode MCP server on stdio (workflow_start/status/result/stop/list)')
+  .action(async () => {
+    const { mcpMain } = await import('../mcp/server.js');
+    await mcpMain();
+    process.exit(0);
+  });
+
+program
   .command('__runner', { hidden: true })
   .requiredOption('--run-dir <dir>')
   .action(async (opts: { runDir: string }) => {
