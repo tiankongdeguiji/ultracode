@@ -150,8 +150,12 @@ export async function runnerMain(dir: string): Promise<number> {
       }
       if (ev.type === 'agent_completed') {
         manifest.agentCount++;
-        if (ev.ok) {
-          const p = manifest.phases.at(-1);
+        // Credit the agent's OWN phase (by title), not whatever phase is last —
+        // concurrent agents from an earlier phase and skipped agents would
+        // otherwise inflate the final phase. Mirrors hostapi's bumpPhase (skips
+        // don't count).
+        if (ev.ok && !ev.skipped && ev.phase) {
+          const p = manifest.phases.find((ph) => ph.title === ev.phase);
           if (p) p.agentsDone++;
         }
         flushManifest();

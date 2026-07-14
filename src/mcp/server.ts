@@ -61,7 +61,7 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Launch a workflow (fire-and-forget; returns runId in <1s). Provide script (inline dialect text) ' +
         'or scriptPath, or resumeFromRunId to resume a terminal run (completed agents replay free). ' +
-        'budget is a hard token ceiling like "500k". backend: mock|codex.',
+        'budget is a hard token ceiling like "500k". backend: mock|codex|qoder|claude|gemini.',
       inputSchema: {
         script: z.string().optional(),
         scriptPath: z.string().optional(),
@@ -75,6 +75,13 @@ export function createServer(baseCwd: string): McpServer {
       },
     },
     async (input) => {
+      // Recursion guard: an ultracode MCP server inherited by a spawned worker
+      // (which sets ULTRACODE_INSIDE_RUN) must not launch fresh detached runs —
+      // that would fan out past the parent's budget/caps. Use in-script
+      // workflow() for nested orchestration (it shares the parent's caps/budget).
+      if (process.env.ULTRACODE_INSIDE_RUN) {
+        return fail('workflow_start refused: already inside an ultracode run (recursion guard). Use in-script workflow() for nesting.');
+      }
       try {
         const result = await startDetachedRun({
           script: input.script,

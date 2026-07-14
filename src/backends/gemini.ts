@@ -38,7 +38,11 @@ export class GeminiAdapter implements BackendAdapter {
   buildSpawn(req: AgentRequest): SpawnPlan {
     const argv = ['-p', req.prompt, '--output-format', 'stream-json'];
     if (req.model) argv.push('-m', req.model);
-    if (req.permission !== 'safe') argv.push('--yolo');
+    // Least privilege per tier: safe = default (prompt), auto = edit-only
+    // auto-approval, danger = --yolo (approve everything, incl. shell). Never
+    // --yolo below the danger tier — --yolo also defeats worktree isolation.
+    if (req.permission === 'danger') argv.push('--yolo');
+    else if (req.permission === 'auto') argv.push('--approval-mode', 'auto_edit');
     return { bin: this.bin, argv, env: req.env };
   }
 

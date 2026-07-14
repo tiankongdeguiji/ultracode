@@ -94,11 +94,14 @@ describe('GeminiAdapter (emulated)', () => {
     expect(a.extractUsage(events)).toMatchObject({ inputTokens: 1200, outputTokens: 30 });
   });
 
-  it('puts the prompt in argv (no stdin) and adds --yolo unless safe', () => {
-    const plan = a.buildSpawn(req({ prompt: 'do X' }));
-    expect(plan.argv).toEqual(expect.arrayContaining(['-p', 'do X', '--output-format', 'stream-json', '--yolo']));
+  it('prompt in argv (no stdin); permission maps to least privilege (--yolo only at danger)', () => {
+    const plan = a.buildSpawn(req({ prompt: 'do X' })); // default permission = auto
+    expect(plan.argv).toEqual(expect.arrayContaining(['-p', 'do X', '--output-format', 'stream-json', '--approval-mode', 'auto_edit']));
+    expect(plan.argv).not.toContain('--yolo');
     expect(plan.stdinData).toBeUndefined();
     expect(a.buildSpawn(req({ permission: 'safe' })).argv).not.toContain('--yolo');
+    expect(a.buildSpawn(req({ permission: 'safe' })).argv).not.toContain('--approval-mode');
+    expect(a.buildSpawn(req({ permission: 'danger' })).argv).toContain('--yolo');
   });
 
   it('exit codes: 42 → schema-rejected, 53 → max-turns, other → retryable infra', () => {

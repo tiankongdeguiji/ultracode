@@ -36,8 +36,8 @@ describe('nested workflow()', () => {
     // parent: pa + (child: 3) + pb = 5 agents. maxAgents 4 → cap trips inside.
     const out = await executeWorkflow(PARENT, { executor, resolveChild, maxAgents: 4, maxConcurrency: 4 });
     expect(out.error).toMatch(/max agents \(4\)/);
-    expect(out.agentCount + out.agentCount).toBeGreaterThan(0); // parent counted pa
-    expect(executor.stats.calls).toBe(4); // pa + 3 child, then cap trips on pb
+    expect(out.agentCount).toBe(1); // parent counted its own dispatch (pa) before the child ran
+    expect(executor.stats.calls).toBe(4); // pa + 3 child (shared counter), then the cap trips on pb
   });
 
   it('shared budget: child spend counts against the parent ceiling', async () => {

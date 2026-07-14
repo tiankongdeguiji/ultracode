@@ -5,7 +5,7 @@
  * retries → outcome. Schema enforcement layers on in M6; watchdogs
  * (stallMs / timeout) tighten in M7.
  */
-import { mkdirSync, writeFileSync, appendFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, openSync, writeSync, closeSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../backends/ndjson.js';
@@ -295,17 +295,27 @@ export class AgentCallExecutor implements AgentExecutor {
       }
     };
 
+    let transcriptFd: number | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stallTimer: ReturnType<typeof setInterval> | undefined;
+    let onAbort: (() => void) | undefined;
     try {
+      // Open the transcript once and writeSync to a persistent fd — not
+      // appendFileSync (open+write+close) per NDJSON line, which serializes
+      // every concurrent agent's IO behind blocking syscalls on the hot path.
+      if (transcriptFile) transcriptFd = openSync(transcriptFile, 'a');
       const proc = spawnAgentProcess(plan.bin, argv, {
         cwd: spec.cwd,
-        env: { ...process.env, ...plan.env },
+        // ULTRACODE_INSIDE_RUN marks spawned workers so an ultracode MCP server
+        // inherited by a worker refuses workflow_start (recursion guard).
+        env: { ...process.env, ...plan.env, ULTRACODE_INSIDE_RUN: '1' },
         stdinData: plan.stdinData,
       });
 
       const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
       let timedOut = false;
       let stalled = false;
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         timedOut = true;
         proc.killTree('SIGTERM');
         setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref();
@@ -314,7 +324,6 @@ export class AgentCallExecutor implements AgentExecutor {
 
       // Stall watchdog: no stream activity within stallMs → kill and retry.
       let lastActivityAt = Date.now();
-      let stallTimer: ReturnType<typeof setInterval> | undefined;
       if (spec.stallMs && spec.stallMs > 0) {
         stallTimer = setInterval(() => {
           if (Date.now() - lastActivityAt > spec.stallMs!) {
@@ -325,7 +334,7 @@ export class AgentCallExecutor implements AgentExecutor {
         }, Math.max(50, Math.min(1_000, spec.stallMs / 2)));
         stallTimer.unref();
       }
-      const onAbort = () => {
+      onAbort = () => {
         proc.killTree('SIGTERM');
         setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref();
       };
@@ -336,7 +345,7 @@ export class AgentCallExecutor implements AgentExecutor {
       proc.child.stdout?.on('data', (chunk: string) => {
         lastActivityAt = Date.now();
         for (const line of splitter.push(chunk)) {
-          if (transcriptFile) appendFileSync(transcriptFile, line + '\n');
+          if (transcriptFd !== undefined) writeSync(transcriptFd, line + '\n');
           consume(parser.push(line));
         }
       });
@@ -349,12 +358,9 @@ export class AgentCallExecutor implements AgentExecutor {
         proc.child.on('error', reject);
         proc.child.on('close', (c, s) => resolve([c, s]));
       });
-      clearTimeout(timer);
-      if (stallTimer) clearInterval(stallTimer);
-      signal.removeEventListener('abort', onAbort);
 
       for (const line of splitter.end()) {
-        if (transcriptFile) appendFileSync(transcriptFile, line + '\n');
+        if (transcriptFd !== undefined) writeSync(transcriptFd, line + '\n');
         consume(parser.push(line));
       }
       consume(parser.end());
@@ -394,6 +400,13 @@ export class AgentCallExecutor implements AgentExecutor {
         outputChars,
       };
     } finally {
+      // Runs on both success and the spawn-error path — the error path is
+      // retryable, so leaking the interval/timer/abort-listener would compound
+      // across retries.
+      if (timer) clearTimeout(timer);
+      if (stallTimer) clearInterval(stallTimer);
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      if (transcriptFd !== undefined) closeSync(transcriptFd);
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }
   }

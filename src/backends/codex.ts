@@ -144,11 +144,18 @@ export class CodexAdapter implements BackendAdapter {
             return [];
           case 'turn.completed': {
             const u = obj.usage ?? {};
+            // OpenAI/codex report cached_input_tokens as a SUBSET of input_tokens
+            // and reasoning_output_tokens as a SUBSET of output_tokens. Subtract
+            // cached from input (it is re-added at the 0.1× discount in
+            // finalizeUsage) and drop reasoning (already in output) so neither is
+            // double-counted. (Anthropic keeps these separate — see streamjson.ts.)
+            const inputRaw = u.input_tokens ?? 0;
+            const cached = u.cached_input_tokens ?? 0;
             const usage: Partial<NormalizedUsage> = {
-              inputTokens: u.input_tokens ?? 0,
-              cachedInputTokens: u.cached_input_tokens ?? 0,
+              inputTokens: Math.max(0, inputRaw - cached),
+              cachedInputTokens: cached,
               outputTokens: u.output_tokens ?? 0,
-              reasoningTokens: u.reasoning_output_tokens ?? 0,
+              reasoningTokens: 0,
             };
             return [
               { kind: 'usage', usage },

@@ -77,4 +77,29 @@ describe('sandbox hardening', () => {
     expect(() => compileCheck(`const = broken`)).toThrow();
     expect(() => compileCheck(`return 1`)).not.toThrow();
   });
+
+  it('injected host globals cannot reach the host Function via .constructor', async () => {
+    // .constructor on a raw host function is the host realm Function, which
+    // ignores this context's codeGeneration:false → a classic node:vm escape.
+    // The bootstrap re-wraps host globals as vm-realm functions, so their
+    // .constructor is the vm's frozen Function and invoking it throws.
+    const r = await run(
+      `try { const f = agent.constructor('return 1'); return 'ESCAPED:' + f(); }
+       catch (e) { return 'blocked'; }`,
+      { agent: () => 'ok' },
+    );
+    expect(r).toBe('blocked');
+  });
+
+  it('wrapping host globals preserves their behavior (agent/console/budget still callable)', async () => {
+    const r = await run(
+      `console.log('hi'); const v = await agent('x'); return { v, spent: budget.spent(), total: budget.total }`,
+      {
+        agent: async (p: string) => `got:${p}`,
+        console: { log: () => {} },
+        budget: { total: 500, spent: () => 42, remaining: () => 458 },
+      },
+    );
+    expect(r).toEqual({ v: 'got:x', spent: 42, total: 500 });
+  });
 });

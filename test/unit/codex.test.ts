@@ -80,13 +80,16 @@ describe('CodexAdapter parser + classifyExit on golden fixtures', () => {
     expect(messages.at(-1)).toMatchObject({ text: 'hello' });
 
     const usage = adapter.extractUsage(events);
+    // codex reports cached ⊂ input and reasoning ⊂ output: the adapter emits
+    // uncached input (12090-9600) and drops reasoning (already in output) so
+    // finalizeUsage doesn't double-count.
     expect(usage).toMatchObject({
-      inputTokens: 12090,
+      inputTokens: 12090 - 9600,
       cachedInputTokens: 9600,
       outputTokens: 17,
-      reasoningTokens: 10,
+      reasoningTokens: 0,
     });
-    expect(usage.totalTokens).toBe(12090 + 17 + 10 + Math.round(0.1 * 9600));
+    expect(usage.totalTokens).toBe(12090 - 9600 + 17 + Math.round(0.1 * 9600));
 
     const exit = adapter.classifyExit(0, null, events, '');
     expect(exit).toMatchObject({ ok: true });

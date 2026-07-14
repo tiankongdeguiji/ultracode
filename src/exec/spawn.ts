@@ -25,6 +25,11 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
   });
 
   if (opts.stdinData !== undefined && child.stdin) {
+    // If the child dies before draining stdin, the write raises EPIPE on the
+    // Writable; without a listener Node throws it as uncaught and takes down
+    // the detached runner. Swallow it — the spawn 'error'/exit is handled by
+    // the caller as a clean agent failure.
+    child.stdin.on('error', () => {});
     child.stdin.write(opts.stdinData);
     child.stdin.end();
   }

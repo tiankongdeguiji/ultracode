@@ -72,9 +72,16 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
 
   const abort = new AbortController();
   const outerSignal = opts.signal;
+  // Captured so it can be detached on completion — a nested workflow() forwards
+  // the parent's long-lived signal here, and without removal each child leaks a
+  // listener on it (only auto-removed if abort actually fires).
+  let onOuterAbort: (() => void) | undefined;
   if (outerSignal) {
     if (outerSignal.aborted) abort.abort(outerSignal.reason);
-    else outerSignal.addEventListener('abort', () => abort.abort(outerSignal.reason), { once: true });
+    else {
+      onOuterAbort = () => abort.abort(outerSignal.reason);
+      outerSignal.addEventListener('abort', onOuterAbort, { once: true });
+    }
   }
 
   const budget = opts.budgetAccount ?? new BudgetAccount(opts.budgetTotal ?? null);
@@ -150,6 +157,7 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
     onEvent({ type: abort.signal.aborted ? 'run_stopped' : 'run_failed', error });
   } finally {
     host.dispose();
+    if (onOuterAbort && outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
   }
 
   return {

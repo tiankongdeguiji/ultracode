@@ -90,5 +90,27 @@ export const HARDENING_BOOTSTRAP = `
   Object.freeze(Math);
   Object.freeze(Reflect);
   Object.freeze(GuardedDate);
+
+  // Defense in depth: re-wrap injected host globals as vm-realm objects/functions
+  // so guest code cannot reach the host realm Function via .constructor (a host
+  // function's constructor is the host Function, which ignores this context's
+  // codeGeneration:false). The sandbox is a capability/determinism device, not a
+  // hostile-code boundary, but this closes the trivial escape.
+  const wrapFn = (fn) => function (...a) { return fn.apply(undefined, a); };
+  for (const k of ['agent', 'parallel', 'pipeline', 'phase', 'log', 'workflow', 'setTimeout', 'clearTimeout']) {
+    const orig = globalThis[k];
+    if (typeof orig === 'function') globalThis[k] = wrapFn(orig);
+  }
+  if (globalThis.console && typeof globalThis.console === 'object') {
+    const c = globalThis.console;
+    const wc = {};
+    for (const m of Object.keys(c)) wc[m] = typeof c[m] === 'function' ? wrapFn(c[m].bind(c)) : c[m];
+    globalThis.console = wc;
+  }
+  if (globalThis.budget && typeof globalThis.budget === 'object') {
+    const b = globalThis.budget;
+    globalThis.budget = { total: b.total, spent: wrapFn(b.spent.bind(b)), remaining: wrapFn(b.remaining.bind(b)) };
+  }
+  try { globalThis.args = JSON.parse(JSON.stringify(globalThis.args === undefined ? null : globalThis.args)); } catch (e) {}
 })();
 `;

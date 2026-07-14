@@ -30,7 +30,7 @@ return { audits: audits.filter(Boolean) }
 
 Workflow scripts are **model-authored and user-reviewed before running** (`ultracode run` prints the plan and asks; `--dry-run` rehearses on a mock backend). The sandbox — hardened `node:vm`, frozen intrinsics, no fs/net/shell/require — is a capability-scoping and determinism device, **not** a hostile-code boundary. The only side-effect channel a script has is `agent()`, and every agent is a subprocess governed by the host CLI's own sandbox and permission system. Spawned workers default to `workspace-write`; the engine never passes `--yolo` / `danger-full-access`. Do not run workflow scripts you haven't read.
 
-Fan-out auth: Codex ChatGPT-plan OAuth is unsafe to fan out (single-use rotating refresh tokens) — `ultracode doctor` enforces concurrency 1 (`--force-oauth-fanout` caps at 3). Use `CODEX_API_KEY` for real parallelism. Qoder: `QODER_PERSONAL_ACCESS_TOKEN` is stateless and parallel-safe.
+Fan-out auth: Codex ChatGPT-plan OAuth is unsafe to fan out (single-use rotating refresh tokens) — `run`/`workflow_start` cap concurrency at 1 (`--force-oauth-fanout` raises it to 3); `ultracode doctor` reports the auth mode and warns. Use `CODEX_API_KEY` for real parallelism. Qoder: `QODER_PERSONAL_ACCESS_TOKEN` is stateless and parallel-safe.
 
 ## Quick start
 

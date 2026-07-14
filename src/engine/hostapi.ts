@@ -54,6 +54,7 @@ export type RunEvent =
       type: 'agent_completed';
       seq: number;
       label: string;
+      phase?: string;
       ok: boolean;
       skipped?: boolean;
       totalTokens: number;
@@ -270,7 +271,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     const cacheKey = opts.keyChain?.next(spec);
 
     if (spec.skip) {
-      onEvent({ type: 'agent_completed', seq, label: spec.label, ok: true, skipped: true, totalTokens: 0 });
+      onEvent({ type: 'agent_completed', seq, label: spec.label, phase: spec.phase, ok: true, skipped: true, totalTokens: 0 });
       onAgentSettled?.({
         spec,
         status: 'skip',
@@ -284,7 +285,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     const cached = cacheLookup?.(spec, cacheKey);
     if (cached?.hit) {
       bumpPhase(spec.phase);
-      onEvent({ type: 'agent_completed', seq, label: spec.label, ok: true, totalTokens: 0 });
+      onEvent({ type: 'agent_completed', seq, label: spec.label, phase: spec.phase, ok: true, totalTokens: 0 });
       onAgentSettled?.({
         spec,
         status: 'ok',
@@ -301,6 +302,11 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     let worktree: Awaited<ReturnType<WorktreeManager['create']>> | undefined;
     try {
       if (signal.aborted) throw new UltracodeError('Workflow stopped', 'aborted');
+      // Real dispatch gate: re-check the budget AFTER acquiring the permit,
+      // just before dispatch. The pre-acquire check races a parallel()/pipeline()
+      // batch (all N pass at spent=0 before any completes and calls budget.add);
+      // this one bounds overshoot to the concurrency window. Released in finally.
+      if (budget.remaining() <= 0) throw new WorkflowBudgetError();
       // Worktree isolation: fresh git worktree, only when explicitly asked
       // and a manager is configured (the runner supplies it inside a repo).
       if (spec.isolation === 'worktree' && shared.worktrees) {
@@ -321,6 +327,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
           type: 'agent_completed',
           seq,
           label: spec.label,
+          phase: spec.phase,
           ok: false,
           totalTokens: outcome.usage.totalTokens,
           error: outcome.error,
@@ -346,6 +353,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         type: 'agent_completed',
         seq,
         label: spec.label,
+        phase: spec.phase,
         ok: true,
         totalTokens: outcome.usage.totalTokens,
       });
