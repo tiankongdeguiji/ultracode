@@ -18,7 +18,8 @@ When the user writes "ultracode" anywhere in a message, includes a token budget 
 or asks to orchestrate / use a workflow / fan out agents: read the \`ultracode\` skill and route
 the task through a multi-agent workflow. Treat "ultracode" as a STANDING mode for the rest of
 the session until the user says "ultracode off": every substantive task gets a workflow;
-only trivial or conversational turns are handled solo. Budget directives are hard ceilings.
+only trivial or conversational turns are handled solo. Never set a token budget the user did not
+ask for — default to uncapped; only a user directive like "+500k" sets a hard ceiling.
 ${MARKER_END}`;
 
 /** Locate the packaged skill dir (works from src/ under tsx and from dist/). */
@@ -46,9 +47,10 @@ When the user writes "ultracode" anywhere in a message, includes a token budget 
 or asks to orchestrate / use a workflow / fan out agents: read the \`ultracode\` skill and route
 the task through the NATIVE Workflow tool (dynamic workflows). Treat "ultracode" as a STANDING
 mode for the rest of the session until the user says "ultracode off": every substantive task gets
-a workflow; only trivial or conversational turns are handled solo. Budget directives are hard
-ceilings — the native \`budget\` global is stubbed, so pass them via args.budgetTokens and gate
-inside the script. Saved templates: uc-review, uc-research (in .qoder/workflows or ~/.qoder/workflows).
+a workflow; only trivial or conversational turns are handled solo. Never set a token budget the user
+did not ask for — default to uncapped; only a user directive like "+500k" sets a hard ceiling (the
+native \`budget\` global is stubbed, so pass a user-given budget via args.budgetTokens and gate in-script).
+Saved templates: uc-review, uc-research (in .qoder/workflows or ~/.qoder/workflows).
 `;
 
 export interface InstallAction {

@@ -12,7 +12,7 @@ You orchestrate a fleet of subagents through a small JavaScript workflow script 
 - The keyword **"ultracode"** in a message, a budget token like **"+500k"**, or an explicit ask ("use a workflow", "fan out agents") switches ultracode mode ON for the rest of the session.
 - While ON: route **every substantive task** through a workflow by default. Work solo only on conversational turns and trivial mechanical edits. Optimize for the most exhaustive, correct answer — not the cheapest.
 - The user says **"ultracode off"** → revert to normal single-agent behavior.
-- Budget directives ("+500k", "2m") are HARD ceilings — pass them to the engine (`--budget` / `budget` arg); never treat them as advisory.
+- Budgets are **opt-in by the user only.** With no explicit directive, run **uncapped** — do NOT pass `--budget` or a `budget` arg, and never invent a number "to be safe." Only when the user gives a directive ("+500k", "budget 2m") do you set one; it is then a HARD ceiling, passed verbatim to the engine (`--budget` / `budget` arg), never advisory. The engine default is unlimited; keep it that way unless told otherwise.
 
 ## When to orchestrate — and when not
 
@@ -62,7 +62,7 @@ Scale to the ask: "find bugs" → few finders, single vote; "thoroughly audit" �
 
 1. **Qoder with the native Workflow tool available** → use the native tool / save to `.qoder/workflows/`. (Budget is stubbed there: pass it via `args.budgetTokens` and gate manually.)
 2. **ultracode MCP tools available** (`workflow_start`/`workflow_status`/`workflow_result`) → `workflow_start` returns a runId in <1s; poll `workflow_status` (a timed-out poll is harmless — re-poll the same runId); fetch `workflow_result` when terminal.
-3. **Shell access** → `ultracode run script.workflow.js --backend codex --budget 500k --yes` (add `--detach` for long runs, then `ultracode status <runId> --watch`). Always `ultracode validate` + `--dry-run` first — the dry run is free and catches dialect errors.
+3. **Shell access** → `ultracode run script.workflow.js --backend codex --yes` (append `--budget <the user's number>` ONLY if the user gave one; `--detach` for long runs, then `ultracode status <runId> --watch`). Always `ultracode validate` + `--dry-run` first — the dry run is free and catches dialect errors.
 4. Resume after failure/edit: `ultracode resume <runId> [--script edited.js]` — completed agents replay free from the journal.
 
 ## Safety rails (engine-enforced; don't fight them)
