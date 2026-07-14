@@ -16,7 +16,9 @@ import { readRunArgs, readRunConfig } from '../store/runstore.js';
 import { agentDirName } from '../store/layout.js';
 import { MockExecutor } from '../backends/mock.js';
 import { createExecutorForBackend } from '../engine/agentcall.js';
+import { readProcStat } from '../exec/procinfo.js';
 import { Semaphore, defaultConcurrency } from '../engine/semaphore.js';
+import { WorkflowBudgetError } from '../engine/errors.js';
 import { BudgetAccount } from '../budget/account.js';
 import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
 import { resolveWorkflowSource } from '../installer/registry.js';
@@ -31,6 +33,7 @@ import type { SharedRunState } from '../engine/hostapi.js';
 function makeExecutorMux(
   dir: string,
   permission: 'safe' | 'auto' | 'danger',
+  budget: BudgetAccount,
   codexMaxConcurrency?: number,
 ): AgentExecutor {
   const cache = new Map<string, AgentExecutor>();
@@ -61,6 +64,11 @@ function makeExecutorMux(
       if (spec.backend === 'codex' && codexSem) {
         const release = await codexSem.acquire();
         try {
+          // Re-check the budget AFTER the codex queue wait. Many codex calls can
+          // clear the engine's dispatch gate at spent=0, then serialize here
+          // behind cap 1 while earlier calls exhaust the budget — without this
+          // they'd all still spawn sequentially past the ceiling.
+          if (budget.remaining() <= 0) throw new WorkflowBudgetError();
           return await ex.execute(spec, signal);
         } finally {
           release();
@@ -86,6 +94,7 @@ export async function runnerMain(dir: string): Promise<number> {
     ...base,
     status: 'running',
     pid: process.pid,
+    pidStart: readProcStat(process.pid)?.starttime,
     startedAt: new Date().toISOString(),
     heartbeatAt: new Date().toISOString(),
     engineVersion: VERSION,
@@ -99,12 +108,46 @@ export async function runnerMain(dir: string): Promise<number> {
   const heartbeat = setInterval(flushManifest, HEARTBEAT_INTERVAL_MS);
   heartbeat.unref();
 
+  // Hard-stop backstop: abort() only stops the run if executeWorkflow can
+  // observe the signal and unwind. A guest awaiting a never-settling promise
+  // never returns, so the terminal manifest/output are never written and this
+  // detached process leaks. Arm a grace timer on any abort that finalizes and
+  // force-exits. (A CPU-bound sync loop blocks this timer too — that case still
+  // needs an external `ultracode stop` SIGKILL, as documented.)
+  const HARD_STOP_GRACE_MS = 15_000;
+  let hardStopTimer: ReturnType<typeof setTimeout> | undefined;
+  const armHardStop = (reason: string) => {
+    if (hardStopTimer) return;
+    hardStopTimer = setTimeout(() => {
+      events.write({
+        type: 'workflow_log',
+        message: `hard stop: runner did not unwind ${HARD_STOP_GRACE_MS}ms after ${reason} — force-exiting`,
+      });
+      try {
+        writeManifest(dir, {
+          ...manifest,
+          status: 'stopped',
+          endedAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+          error: reason,
+        });
+      } catch {
+        /* best effort — the point is to not leave a live orphan */
+      }
+      events.close();
+      process.exit(1);
+    }, HARD_STOP_GRACE_MS);
+    hardStopTimer.unref();
+  };
+
   process.on('SIGTERM', () => {
     events.write({ type: 'stop_requested' });
     abort.abort(new Error('stopped by user'));
+    armHardStop('stop requested');
   });
   process.on('SIGINT', () => {
     abort.abort(new Error('stopped by user'));
+    armHardStop('interrupt');
   });
 
   // Wall-clock cap (default 60 minutes) — a loud stop, never a silent one.
@@ -112,6 +155,7 @@ export async function runnerMain(dir: string): Promise<number> {
   const wallTimer = setTimeout(() => {
     events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms exceeded — stopping run` });
     abort.abort(new Error(`wall-clock cap ${wallClockMs}ms exceeded`));
+    armHardStop('wall-clock cap');
   }, wallClockMs);
   wallTimer.unref();
 
@@ -148,7 +192,7 @@ export async function runnerMain(dir: string): Promise<number> {
 
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
-    executor: makeExecutorMux(dir, config.permission ?? 'auto', config.codexMaxConcurrency),
+    executor: makeExecutorMux(dir, config.permission ?? 'auto', budgetAccount, config.codexMaxConcurrency),
     cacheLookup: replay?.lookup,
     args,
     budgetAccount,
@@ -230,6 +274,7 @@ export async function runnerMain(dir: string): Promise<number> {
 
   clearInterval(heartbeat);
   clearTimeout(wallTimer);
+  if (hardStopTimer) clearTimeout(hardStopTimer); // workflow unwound on its own
   if (replay) {
     events.write({
       type: 'workflow_log',

@@ -311,18 +311,52 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       // permits × (retries + repairs) × per-attempt-tokens — larger than a single
       // concurrency window, but still bounded. Released in finally.
       if (budget.remaining() <= 0) throw new WorkflowBudgetError();
-      // Worktree isolation: fresh git worktree, only when explicitly asked
-      // and a manager is configured (the runner supplies it inside a repo).
-      if (spec.isolation === 'worktree' && shared.worktrees) {
+      // Worktree isolation: a fresh git worktree, when explicitly asked for.
+      // If the caller requested it but no manager exists (e.g. not inside a git
+      // repo), FAIL LOUD rather than silently running in the shared cwd —
+      // parallel mutating agents would otherwise collide despite asking to be
+      // isolated. The runner supplies the manager only inside a repo.
+      if (spec.isolation === 'worktree') {
+        if (!shared.worktrees) {
+          throw new UltracodeError(
+            `agent[${seq}] ${spec.label} requested worktree isolation, but it is unavailable (not inside a git repo) — refusing to run unisolated`,
+            'worktree-unavailable',
+          );
+        }
         worktree = await shared.worktrees.create(shared.runId ?? 'run', seq, spec.label);
         spec.cwd = worktree.path;
       }
       onEvent({ type: 'agent_started', seq, label: spec.label, phase: spec.phase, backend: spec.backend });
       const outcome = await executor.execute(spec, signal);
-      if (signal.aborted) throw new UltracodeError('Workflow stopped', 'aborted');
       budget.add(outcome.usage.totalTokens, outcome.usage.estimated);
       onEvent({ type: 'budget_tick', spent: budget.spent() });
       state.totalToolCalls += outcome.toolCalls;
+
+      // Stopped while this call was in flight: still record what it consumed and
+      // produced (budget above + the journal record here) BEFORE propagating the
+      // stop — otherwise stopped runs underreport tokens and drop the journal
+      // entry (which also lets a completed-then-stopped agent replay on resume).
+      if (signal.aborted) {
+        onEvent({
+          type: 'agent_completed',
+          seq,
+          label: spec.label,
+          phase: spec.phase,
+          ok: outcome.ok,
+          totalTokens: outcome.usage.totalTokens,
+          error: outcome.error,
+        });
+        onAgentSettled?.({
+          spec,
+          status: outcome.ok ? 'ok' : 'error',
+          value: outcome.ok ? outcome.value : undefined,
+          error: outcome.error,
+          usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
+          sessionId: outcome.sessionId,
+          cacheKey,
+        });
+        throw new UltracodeError('Workflow stopped', 'aborted');
+      }
 
       if (!outcome.ok) {
         const failure = `agent[${seq}] ${spec.label} failed: ${outcome.error ?? 'unknown error'}`;

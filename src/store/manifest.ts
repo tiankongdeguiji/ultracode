@@ -13,6 +13,9 @@ export interface RunManifest {
   title?: string;
   status: RunStatus;
   pid: number;
+  /** Kernel start-time of `pid` (Linux) — distinguishes the real runner from a
+   *  recycled PID when deciding orphaned-vs-alive and before signaling a stop. */
+  pidStart?: string;
   startedAt: string;
   endedAt?: string;
   heartbeatAt: string;

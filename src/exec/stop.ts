@@ -3,7 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isTerminal, readManifest } from '../store/manifest.js';
-import { getRun, isPidAlive, reapOrphans } from '../store/runstore.js';
+import { getRun, isRunnerAlive, reapOrphans } from '../store/runstore.js';
 import { readProcStat } from './procinfo.js';
 
 /** Kill recorded worker process groups — used when the runner was SIGKILL'd
@@ -27,11 +27,15 @@ export function killWorkerGroups(runDir: string): number {
     const [pidStr, recordedStart] = readFileSync(pgidFile, 'utf8').trim().split(/\s+/);
     const pid = Number(pidStr);
     if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
-    // Verify identity where /proc exists (Linux). Elsewhere `readProcStat` is
-    // undefined and we fall back to the pid>1 guard — best-effort, as the whole
-    // force-kill path already is.
+    // Verify identity where /proc exists (Linux). FAIL CLOSED: only kill when we
+    // can prove this is the process the runner spawned — a recorded start-time
+    // that still matches, and the target is its own group leader (our detached
+    // workers are). A worker that overwrites its pgid file with just a victim
+    // PID (no start-time) therefore never passes. Elsewhere (`readProcStat`
+    // undefined — no /proc) we fall back to the pid>1/self guards above,
+    // best-effort as the whole force-kill path is.
     const live = readProcStat(pid);
-    if (live && (live.pgrp !== pid || (recordedStart && live.starttime !== recordedStart))) continue;
+    if (live && (!recordedStart || live.starttime !== recordedStart || live.pgrp !== pid)) continue;
     try {
       process.kill(-pid, 'SIGKILL');
       killed++;
@@ -55,7 +59,10 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
     return { ok: true, status: run.effectiveStatus, message: `already ${run.effectiveStatus}` };
   }
   const pid = run.manifest.pid;
-  if (!isPidAlive(pid)) {
+  // isRunnerAlive (not isPidAlive): a live PID whose start-time no longer
+  // matches is a recycled PID, not our runner — signaling it would hit an
+  // unrelated process. Treat that as already-dead.
+  if (!isRunnerAlive(run.manifest)) {
     reapOrphans(root);
     return { ok: true, status: 'orphaned', message: 'runner already dead; marked orphaned' };
   }

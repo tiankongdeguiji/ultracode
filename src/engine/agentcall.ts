@@ -205,21 +205,36 @@ export class AgentCallExecutor implements AgentExecutor {
     let output = 0;
     let cached = 0;
     let reasoning = 0;
-    let any = false;
-    let outputChars = 0;
+    let realAny = false;
+    let estimatedAny = false;
     for (const a of attempts) {
       const u = this.adapter.extractUsage(a.events);
-      outputChars += a.outputChars;
       if (u.totalTokens > 0) {
-        any = true;
+        realAny = true;
         input += u.inputTokens;
         output += u.outputTokens;
         cached += u.cachedInputTokens;
         reasoning += u.reasoningTokens;
+      } else {
+        // This attempt reported no usage — estimate it (its prompt + its own
+        // output) rather than dropping it, so a failed attempt or schema-repair
+        // that died before emitting a usage event is still counted. (Previously
+        // any attempt with usage suppressed estimation for the ones without.)
+        const est = estimateUsage(spec.prompt.length, a.outputChars);
+        input += est.inputTokens;
+        output += est.outputTokens;
+        estimatedAny = true;
       }
     }
-    if (!any) return estimateUsage(spec.prompt.length * Math.max(1, attempts.length), outputChars);
-    return finalizeUsage({ inputTokens: input, outputTokens: output, cachedInputTokens: cached, reasoningTokens: reasoning });
+    if (!realAny && !estimatedAny) return estimateUsage(spec.prompt.length, 0);
+    const merged = finalizeUsage({
+      inputTokens: input,
+      outputTokens: output,
+      cachedInputTokens: cached,
+      reasoningTokens: reasoning,
+    });
+    merged.estimated = estimatedAny; // any estimated portion → flag the total
+    return merged;
   }
 
   toRequest(spec: AgentSpec): AgentRequest {

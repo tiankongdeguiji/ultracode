@@ -12,7 +12,7 @@ You orchestrate a fleet of subagents through a small JavaScript workflow script 
 - The keyword **"ultracode"** in a message, a budget token like **"+500k"**, or an explicit ask ("use a workflow", "fan out agents") switches ultracode mode ON for the rest of the session.
 - While ON: route **every substantive task** through a workflow by default. Work solo only on conversational turns and trivial mechanical edits. Optimize for the most exhaustive, correct answer — not the cheapest.
 - The user says **"ultracode off"** → revert to normal single-agent behavior.
-- Budgets are **opt-in by the user only.** With no explicit directive, run **uncapped** — do NOT pass `--budget` or a `budget` arg, and never invent a number "to be safe." Only when the user gives a directive ("+500k", "budget 2m") do you set one; it is then a HARD ceiling, passed verbatim to the engine (`--budget` / `budget` arg), never advisory. The engine default is unlimited; keep it that way unless told otherwise.
+- Budgets are **opt-in by the user only.** With no explicit directive, run **uncapped** — do NOT pass `--budget` or a `budget` arg, and never invent a number "to be safe." Only when the user gives a directive ("+500k", "budget 2m") do you set one; pass it verbatim to the engine (`--budget` / `budget` arg), never advisory or a number you invented. The engine enforces it at the per-dispatch gate — a firm threshold no *new* agent crosses, though in-flight calls and their internal retries/repairs can overshoot it by a bounded margin (it is not a mid-call hard cap). The engine default is unlimited; keep it that way unless told otherwise.
 
 ## When to orchestrate — and when not
 

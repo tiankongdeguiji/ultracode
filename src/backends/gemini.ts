@@ -92,8 +92,19 @@ export class GeminiAdapter implements BackendAdapter {
   classifyExit(code: number | null, signal: NodeJS.Signals | null, events: AgentEvent[], stderrTail: string): ExitClass {
     if (signal) return { ok: false, errorKind: 'interrupted', retryable: false, message: `killed by ${signal}` };
     switch (code) {
-      case 0:
+      case 0: {
+        // Exit 0 alone is not success: require a terminal, non-error result.
+        // A truncated stream (no result) or an in-band error (obj.error →
+        // isError) would otherwise resolve agent() with an empty value.
+        const result = events.filter((e): e is Extract<AgentEvent, { kind: 'result' }> => e.kind === 'result').pop();
+        if (!result) {
+          return { ok: false, errorKind: 'infra', retryable: true, message: 'gemini exited 0 without a terminal result (truncated stream?)' };
+        }
+        if (result.isError) {
+          return { ok: false, errorKind: 'infra', retryable: true, message: `gemini reported an in-band error: ${stderrTail.slice(-300)}` };
+        }
         return { ok: true, retryable: false, message: 'ok' };
+      }
       case 42:
         return { ok: false, errorKind: 'schema-rejected', retryable: false, message: `gemini input error (42): ${stderrTail.slice(-300)}` };
       case 53:

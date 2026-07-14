@@ -104,11 +104,16 @@ describe('GeminiAdapter (emulated)', () => {
     expect(a.buildSpawn(req({ permission: 'danger' })).argv).toContain('--yolo');
   });
 
-  it('exit codes: 42 → schema-rejected, 53 → max-turns, other → retryable infra', () => {
+  it('exit codes: 42 → schema-rejected, 53 → max-turns, other → retryable infra; exit 0 requires a terminal non-error result', () => {
     expect(a.classifyExit(42, null, [], 'bad input')).toMatchObject({ errorKind: 'schema-rejected', retryable: false });
     expect(a.classifyExit(53, null, [], '')).toMatchObject({ errorKind: 'max-turns', retryable: false });
     expect(a.classifyExit(1, null, [], 'oops')).toMatchObject({ errorKind: 'infra', retryable: true });
-    expect(a.classifyExit(0, null, [], '')).toMatchObject({ ok: true });
+    // Exit 0 alone is NOT success: a truncated stream (no result) is retryable infra.
+    expect(a.classifyExit(0, null, [], '')).toMatchObject({ ok: false, errorKind: 'infra', retryable: true });
+    // Exit 0 with a terminal non-error result → ok.
+    expect(a.classifyExit(0, null, [{ kind: 'result', isError: false, text: 'done' }], '')).toMatchObject({ ok: true });
+    // Exit 0 with an in-band error result → not ok.
+    expect(a.classifyExit(0, null, [{ kind: 'result', isError: true }], '')).toMatchObject({ ok: false });
   });
 });
 

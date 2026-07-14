@@ -115,6 +115,37 @@ describe('MCP triad', () => {
     expect(entry).toBeDefined();
   }, 60_000);
 
+  it('refuses workflow_start and workflow_stop from inside a run (recursion / confused-deputy guard)', async () => {
+    // A worker that inherited the MCP server has ULTRACODE_INSIDE_RUN set: it
+    // must not launch fresh runs, nor make this unsandboxed process signal an
+    // arbitrary PID via a forged run manifest.
+    const inside = new Client({ name: 'inside-client', version: '0.0.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', tsxLoader, mainTs, 'mcp'],
+      cwd: projectDir,
+      env: { ...(process.env as Record<string, string>), ULTRACODE_INSIDE_RUN: '1' },
+    });
+    await inside.connect(transport);
+    try {
+      const start = (await inside.callTool({
+        name: 'workflow_start',
+        arguments: { script: HELLO, backend: 'mock' },
+      })) as { isError?: boolean; content: { text: string }[] };
+      expect(start.isError).toBe(true);
+      expect(start.content[0]!.text).toContain('recursion guard');
+
+      const stop = (await inside.callTool({
+        name: 'workflow_stop',
+        arguments: { runId: 'wf_zzzzzzzzzzzz' },
+      })) as { isError?: boolean; content: { text: string }[] };
+      expect(stop.isError).toBe(true);
+      expect(stop.content[0]!.text).toContain('recursion guard');
+    } finally {
+      await inside.close();
+    }
+  }, 30_000);
+
   it('bad script errors cleanly through workflow_start', async () => {
     const start = (await client.callTool({
       name: 'workflow_start',

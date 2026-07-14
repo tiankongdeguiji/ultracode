@@ -130,6 +130,25 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
       process.kill(-pid, 'SIGKILL');
     }
   });
+
+  it('fails closed on an empty recorded start-time — a PID-only forged pgid is not killed (linux)', async () => {
+    if (process.platform !== 'linux') return;
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    const pid = child.pid!;
+    try {
+      // A worker overwrote its pgid file with just a live victim PID (no
+      // start-time). With /proc available we require a matching start-time, so
+      // this must NOT be killed.
+      expect(killWorkerGroups(mk({ forged: `${pid}` }))).toBe(0);
+      expect(readProcStat(pid)).toBeTruthy(); // still alive
+    } finally {
+      process.kill(-pid, 'SIGKILL');
+    }
+  });
 });
 
 describe('PrefixReplayCache resultRef confinement (resume reads a worker-writable journal)', () => {

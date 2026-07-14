@@ -8,13 +8,13 @@ import { join } from 'node:path';
 import { VERSION } from '../version.js';
 import { runDir, runsDir, RUN_ID_RE } from './layout.js';
 import {
-  HEARTBEAT_STALE_MS,
   isTerminal,
   readManifest,
   writeManifest,
   type RunManifest,
   type RunStatus,
 } from './manifest.js';
+import { readProcStat } from '../exec/procinfo.js';
 
 export interface RunConfig {
   backend: string;
@@ -82,12 +82,27 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
-/** Effective status: detects runners that died without finalizing. */
+/** True only if `pid` is the SAME process the runner recorded — a live PID whose
+ *  kernel start-time no longer matches (original runner died, PID recycled) is a
+ *  different process and must not be treated as the runner (nor signaled). */
+export function isRunnerAlive(manifest: RunManifest): boolean {
+  if (!isPidAlive(manifest.pid)) return false;
+  if (manifest.pidStart) {
+    const live = readProcStat(manifest.pid);
+    if (live && live.starttime !== manifest.pidStart) return false;
+  }
+  return true;
+}
+
+/** Effective status: detects runners that died without finalizing.
+ *  A stale heartbeat is NOT by itself terminal: a runner that is alive but wedged
+ *  (e.g. a synchronous sandbox loop) stops heartbeating yet still needs the
+ *  external SIGTERM→SIGKILL path. Only a genuinely dead/recycled runner is
+ *  `orphaned`; a stale-but-alive one stays `running` so `stop` will signal it. */
 export function liveStatus(manifest: RunManifest): RunStatus {
   if (isTerminal(manifest.status)) return manifest.status;
   if (manifest.status === 'created') return manifest.status;
-  const stale = Date.now() - Date.parse(manifest.heartbeatAt) > HEARTBEAT_STALE_MS;
-  if (!isPidAlive(manifest.pid) || stale) return 'orphaned';
+  if (!isRunnerAlive(manifest)) return 'orphaned';
   return manifest.status;
 }
 

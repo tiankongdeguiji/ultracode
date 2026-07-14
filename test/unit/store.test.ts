@@ -113,15 +113,23 @@ describe('runstore', () => {
     expect(existsSync(join(dir, 'agents'))).toBe(true);
   });
 
-  it('liveStatus detects dead pids and stale heartbeats as orphaned', () => {
+  it('liveStatus: dead/recycled pid → orphaned; a stale-but-alive runner stays running', () => {
     const m = baseManifest('wf_bbbbbbbbbbbb');
     expect(liveStatus(m)).toBe('running'); // our own live pid, fresh heartbeat
 
     const deadPid = { ...m, pid: 999999999 };
     expect(liveStatus(deadPid)).toBe('orphaned');
 
+    // Stale heartbeat but the runner PID is still alive → NOT terminal, so
+    // `stop` still signals it (the wedged-runner case that needs the SIGKILL
+    // backstop). Marking it orphaned here would make stop return early.
     const stale = { ...m, heartbeatAt: new Date(Date.now() - 60_000).toISOString() };
-    expect(liveStatus(stale)).toBe('orphaned');
+    expect(liveStatus(stale)).toBe('running');
+
+    // A live PID whose recorded start-time no longer matches is a recycled PID,
+    // not our runner → orphaned (Linux only; no /proc elsewhere → can't verify).
+    const recycled = { ...m, pidStart: 'not-our-starttime' };
+    expect(liveStatus(recycled)).toBe(process.platform === 'linux' ? 'orphaned' : 'running');
 
     expect(liveStatus({ ...m, status: 'completed' })).toBe('completed');
   });

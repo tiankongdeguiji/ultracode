@@ -61,7 +61,7 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Launch a workflow (fire-and-forget; returns runId in <1s). Provide script (inline dialect text) ' +
         'or scriptPath, or resumeFromRunId to resume a terminal run (completed agents replay free). ' +
-        'budget is a hard token ceiling like "500k". backend: mock|codex|qoder|claude|gemini.',
+        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend: mock|codex|qoder|claude|gemini.',
       inputSchema: {
         script: z.string().optional(),
         scriptPath: z.string().optional(),
@@ -211,6 +211,13 @@ export function createServer(baseCwd: string): McpServer {
       inputSchema: { runId: z.string(), cwd: z.string().optional() },
     },
     async (input) => {
+      // Same recursion/confused-deputy guard as workflow_start: a worker that
+      // inherited this MCP server could plant a fake run manifest carrying any
+      // same-user PID and call workflow_stop to make this (unsandboxed) process
+      // signal that PID. Refuse to signal from inside a run.
+      if (process.env.ULTRACODE_INSIDE_RUN) {
+        return fail('workflow_stop refused: cannot stop runs from inside an ultracode run (recursion guard).');
+      }
       const result = await stopRun(rootFor(input.cwd), input.runId);
       return result.ok ? ok({ runId: input.runId, status: result.status, message: result.message }) : fail(result.message);
     },
