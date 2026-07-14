@@ -56,15 +56,28 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   const run = getRun(root, runId);
   if (!run) return { ok: false, status: 'unknown', message: `no run ${runId} under ${root}` };
   if (isTerminal(run.effectiveStatus)) {
-    return { ok: true, status: run.effectiveStatus, message: `already ${run.effectiveStatus}` };
+    // A crashed/OOMed runner surfaces as terminal 'orphaned' (dead pid) without
+    // having cleaned up its detached workers — reap them here so they can't keep
+    // spending/mutating after every later stop returns "already orphaned".
+    const killed = run.effectiveStatus === 'orphaned' ? killWorkerGroups(run.dir) : 0;
+    return {
+      ok: true,
+      status: run.effectiveStatus,
+      message: `already ${run.effectiveStatus}${killed ? ` (+${killed} orphaned worker group(s))` : ''}`,
+    };
   }
   const pid = run.manifest.pid;
   // isRunnerAlive (not isPidAlive): a live PID whose start-time no longer
   // matches is a recycled PID, not our runner — signaling it would hit an
-  // unrelated process. Treat that as already-dead.
+  // unrelated process. Treat that as already-dead (and reap its workers).
   if (!isRunnerAlive(run.manifest)) {
+    const killed = killWorkerGroups(run.dir);
     reapOrphans(root);
-    return { ok: true, status: 'orphaned', message: 'runner already dead; marked orphaned' };
+    return {
+      ok: true,
+      status: 'orphaned',
+      message: `runner already dead; marked orphaned${killed ? ` (+${killed} worker group(s))` : ''}`,
+    };
   }
   try {
     process.kill(pid, 'SIGTERM');

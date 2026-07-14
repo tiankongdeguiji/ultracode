@@ -42,8 +42,8 @@ function normalizeRef(ref: unknown): { source?: string; name?: string; scriptPat
   throw new UltracodeError('workflow() expects a name string or { name | scriptPath | script }', 'bad-child-ref');
 }
 
-export function makeChildRunner(deps: ChildRunnerDeps): (ref: unknown, childArgs: unknown) => Promise<unknown> {
-  return async (ref: unknown, childArgs: unknown): Promise<unknown> => {
+export function makeChildRunner(deps: ChildRunnerDeps): (ref: unknown, childArgs: unknown) => Promise<RunOutput> {
+  return async (ref: unknown, childArgs: unknown): Promise<RunOutput> => {
     const { source, name, scriptPath } = normalizeRef(ref);
     let childSource = source;
     if (childSource === undefined) {
@@ -74,6 +74,9 @@ export function makeChildRunner(deps: ChildRunnerDeps): (ref: unknown, childArgs
     if (out.error) {
       throw new UltracodeError(`child workflow '${label}' failed: ${out.error}`, 'child-failed');
     }
-    return out.result;
+    // Return the full output so the parent's workflow() can merge the child's
+    // diagnostics (failures/logs/workspaces/counters) — the caller extracts
+    // .result for the script.
+    return out;
   };
 }

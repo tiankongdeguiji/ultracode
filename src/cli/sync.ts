@@ -6,8 +6,19 @@
  * then sync again).
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { writeFileNoFollow } from '../exec/safe-write.js';
+
+/** True if the path exists and is a symlink (repo-controlled symlinks are a
+ *  read-exfil / write-redirect vector in the sync/adopt paths). */
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
 
 const STAMP_RE = /^\/\/ ultracode:sync sha256=([0-9a-f]{64}) src=(\S+).*\n/;
 
@@ -33,14 +44,22 @@ export function syncProject(projectRoot: string, opts: { write: boolean }): Sync
   if (!existsSync(canonicalDir)) return entries;
 
   for (const file of readdirSync(canonicalDir).filter((f) => f.endsWith('.js'))) {
+    const canonical = join(canonicalDir, file);
+    // A symlinked canonical entry would copy an arbitrary user file into the host
+    // registries — refuse to follow it.
+    if (isSymlink(canonical)) continue;
     const rel = join('.ultracode/workflows', file);
-    const content = readFileSync(join(canonicalDir, file), 'utf8');
+    const content = readFileSync(canonical, 'utf8');
     const expected = stampedCopy(rel, content);
 
     for (const hostDir of HOST_WORKFLOW_DIRS) {
       const target = join(projectRoot, hostDir, file);
       let state: SyncEntry['state'];
-      if (!existsSync(target)) {
+      if (isSymlink(target)) {
+        // Never read through or write over a symlink at the host path — a
+        // dangling/outside-pointing link would exfiltrate or overwrite elsewhere.
+        state = 'foreign';
+      } else if (!existsSync(target)) {
         state = 'created';
       } else {
         const existing = readFileSync(target, 'utf8');
@@ -59,7 +78,7 @@ export function syncProject(projectRoot: string, opts: { write: boolean }): Sync
       }
       if (opts.write && (state === 'created' || state === 'updated')) {
         mkdirSync(join(projectRoot, hostDir), { recursive: true });
-        writeFileSync(target, expected, 'utf8');
+        writeFileNoFollow(target, expected);
       }
       entries.push({ file, target, state });
     }
@@ -73,7 +92,7 @@ export function adoptCopy(projectRoot: string, hostFile: string): string {
   const canonicalDir = join(projectRoot, '.ultracode/workflows');
   mkdirSync(canonicalDir, { recursive: true });
   const dest = join(canonicalDir, basename(hostFile));
-  writeFileSync(dest, content, 'utf8');
+  writeFileNoFollow(dest, content); // refuse a symlink planted at dest
   return dest;
 }
 

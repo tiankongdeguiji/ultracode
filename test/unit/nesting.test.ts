@@ -21,6 +21,28 @@ const resolveChild = (name) => {
 };
 
 describe('nested workflow()', () => {
+  it("merges a child's caught agent failures into the parent (not silently dropped)", async () => {
+    // The child catches an agent failure inside parallel() → no top-level child
+    // error, but the failure must still surface in the PARENT's failures[].
+    const CHILD_WITH_CAUGHT_FAILURE = `export const meta = { name: 'uc-child', description: 'c' }
+const r = await parallel([
+  () => agent('MOCK:fail boom-in-child', { label: 'bad' }),
+  () => agent('MOCK:ok fine', { label: 'good' }),
+])
+return r`;
+    const PARENT_ONE = `export const meta = { name: 'uc-parent', description: 'd' }
+await workflow('uc-child', {})
+return 'parent-done'`;
+    const out = await executeWorkflow(PARENT_ONE, {
+      executor: new MockExecutor(),
+      resolveChild: () => CHILD_WITH_CAUGHT_FAILURE,
+      maxConcurrency: 4,
+    });
+    expect(out.error).toBeUndefined(); // parent completed
+    expect(out.result).toBe('parent-done');
+    expect(out.failures.some((f) => f.includes('boom-in-child') || f.includes('bad'))).toBe(true);
+  });
+
   it('runs a child inline and returns its result', async () => {
     const executor = new MockExecutor();
     const out = await executeWorkflow(PARENT, { executor, resolveChild, maxConcurrency: 4 });
@@ -36,7 +58,7 @@ describe('nested workflow()', () => {
     // parent: pa + (child: 3) + pb = 5 agents. maxAgents 4 → cap trips inside.
     const out = await executeWorkflow(PARENT, { executor, resolveChild, maxAgents: 4, maxConcurrency: 4 });
     expect(out.error).toMatch(/max agents \(4\)/);
-    expect(out.agentCount).toBe(1); // parent counted its own dispatch (pa) before the child ran
+    expect(out.agentCount).toBe(4); // pa (1) + the child's 3 agents merged into the parent; cap trips on pb
     expect(executor.stats.calls).toBe(4); // pa + 3 child (shared counter), then the cap trips on pb
   });
 

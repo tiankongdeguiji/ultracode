@@ -43,7 +43,7 @@ export interface ExecuteOptions {
   onAgentSettled?: (record: AgentSettledRecord) => void;
   keyChain?: { next(spec: AgentSpec): string };
   cacheLookup?: (spec: AgentSpec, cacheKey: string | undefined) => { hit: boolean; value?: unknown } | undefined;
-  runChild?: (ref: unknown, childArgs: unknown) => Promise<unknown>;
+  runChild?: (ref: unknown, childArgs: unknown) => Promise<RunOutput>;
   /** resolve a child workflow name/scriptPath → source (enables workflow()) */
   resolveChild?: (nameOrPath: string) => string;
   /** invoked with the parsed script before execution (runner uses it to seed the journal) */

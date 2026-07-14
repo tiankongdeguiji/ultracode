@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseWorkflowScript } from '../engine/meta.js';
+import { validateArgsAgainstInputSchema } from '../engine/run.js';
 import { codexConcurrencyPolicy, detectCodexAuth } from '../backends/codex-auth.js';
 import { defaultConcurrency } from '../engine/semaphore.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
@@ -48,13 +49,14 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
     return 1;
   }
 
-  let name: string;
+  let parsed: ReturnType<typeof parseWorkflowScript>;
   try {
-    name = parseWorkflowScript(source).meta.name;
+    parsed = parseWorkflowScript(source);
   } catch (err) {
     process.stderr.write(`ultracode: invalid workflow: ${(err as Error).message}\n`);
     return 1;
   }
+  const name = parsed.meta.name;
 
   let args: unknown = readRunArgs(prior.dir);
   if (opts.args !== undefined) {
@@ -63,6 +65,15 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
     } catch {
       args = opts.args;
     }
+  }
+
+  // Validate args before createRunDir (same rationale as `run`) — avoid
+  // launching a runner that fails post-'running' and orphans the new run.
+  try {
+    validateArgsAgainstInputSchema(parsed, args ?? undefined);
+  } catch (err) {
+    process.stderr.write(`ultracode: ${(err as Error).message}\n`);
+    return 1;
   }
 
   const config = readRunConfig(prior.dir);

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { resolveWorkflowSource } from '../installer/registry.js';
-import { executeWorkflow } from '../engine/run.js';
+import { executeWorkflow, validateArgsAgainstInputSchema } from '../engine/run.js';
 import { defaultConcurrency } from '../engine/semaphore.js';
 import { MockExecutor } from '../backends/mock.js';
 import { codexConcurrencyPolicy, detectCodexAuth } from '../backends/codex-auth.js';
@@ -58,13 +58,14 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
   }
 
   // Fail fast on invalid scripts before creating any run state.
-  let name: string;
+  let parsed: ReturnType<typeof parseWorkflowScript>;
   try {
-    name = parseWorkflowScript(source).meta.name;
+    parsed = parseWorkflowScript(source);
   } catch (err) {
     process.stderr.write(`ultracode: invalid workflow: ${(err as Error).message}\n`);
     return 1;
   }
+  const name = parsed.meta.name;
 
   let args: unknown = null;
   if (opts.args !== undefined) {
@@ -73,6 +74,16 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
     } catch {
       args = opts.args; // plain string args are legal
     }
+  }
+
+  // Validate args against meta.inputSchema BEFORE creating any run dir — else a
+  // bad-args run creates the dir, launches, and the runner fails after marking
+  // the manifest 'running', leaving an orphan with no output.json.
+  try {
+    validateArgsAgainstInputSchema(parsed, args ?? undefined);
+  } catch (err) {
+    process.stderr.write(`ultracode: ${(err as Error).message}\n`);
+    return 1;
   }
 
   let budgetTotal: number | null = null;

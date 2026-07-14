@@ -4,7 +4,7 @@
 
 1. **Qoder native Workflow tool** (qodercli / Qoder IDE with the tool registered): invoke it directly, or install the script to `.qoder/workflows/<name>.js` and run by name. Native resume: `resumeFromRunId: "wf_..."`. Caveats: `budget` global is stubbed (`{total:null}`) — pass `args.budgetTokens` and gate manually; no per-call `effort` (define a subagent in `.qoder/agents/` with frontmatter `effort:` and use `agentType`); never name anything `Workflow`, `workflows`, or `deep-research`.
 2. **ultracode MCP tools** (`workflow_start` / `workflow_status` / `workflow_result` / `workflow_stop` / `workflow_list`):
-   - `workflow_start {script | scriptPath, args?, backend?, budget?, resumeFromRunId?}` → returns `{runId}` in <1s. Fire-and-forget: the run survives you.
+   - `workflow_start {script | scriptPath, backend, args?, budget?, resumeFromRunId?}` → returns `{runId}` in <1s. Fire-and-forget: the run survives you. **`backend` is required for a fresh start** (mock|codex|qoder|claude|gemini); `mock` returns fabricated stubs for rehearsal only, so always pass a real backend for real work. (Resume inherits the prior run's backend.)
    - Poll `workflow_status {runId, waitSeconds: 25, sinceEventOffset}` — long-poll; returns fresh log tail + `nextEventOffset`. **A timed-out poll is harmless: re-poll with the same runId.**
    - `workflow_result {runId}` when status is terminal → full output (result, failures, usage, artifact paths).
 3. **Shell CLI**:

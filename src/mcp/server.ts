@@ -61,7 +61,7 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Launch a workflow (fire-and-forget; returns runId in <1s). Provide script (inline dialect text) ' +
         'or scriptPath, or resumeFromRunId to resume a terminal run (completed agents replay free). ' +
-        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend: mock|codex|qoder|claude|gemini.',
+        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend (REQUIRED for a fresh start) is one of mock|codex|qoder|claude|gemini — mock returns fabricated stubs (rehearsal only), so pass a real backend for real work.',
       inputSchema: {
         script: z.string().optional(),
         scriptPath: z.string().optional(),
@@ -81,6 +81,16 @@ export function createServer(baseCwd: string): McpServer {
       // workflow() for nested orchestration (it shares the parent's caps/budget).
       if (process.env.ULTRACODE_INSIDE_RUN) {
         return fail('workflow_start refused: already inside an ultracode run (recursion guard). Use in-script workflow() for nesting.');
+      }
+      // Require an explicit backend for a fresh start. Defaulting to 'mock' would
+      // silently run real review/research work on the mock backend — which
+      // returns plausible fabricated stubs without touching the repo, so a fake
+      // run looks successful. (Resume inherits the prior run's backend.)
+      if (!input.resumeFromRunId && !input.backend) {
+        return fail(
+          'workflow_start requires an explicit backend (mock|codex|qoder|claude|gemini). ' +
+            '"mock" returns fabricated stub output — pass it only to rehearse the dialect, never for real work.',
+        );
       }
       try {
         const result = await startDetachedRun({

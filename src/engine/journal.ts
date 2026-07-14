@@ -40,8 +40,13 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-export function seedKey(args: unknown): string {
-  return KEY_PREFIX + sha256(`ultracode-seed\0${stableStringify(args ?? null)}`);
+export function seedKey(args: unknown, permission?: string): string {
+  // Permission is a run-level capability that changes what agents may do and
+  // therefore their observable output, and MCP resume can override it. Fold it
+  // into the seed so resuming under a different permission (safe↔danger)
+  // invalidates the whole prefix instead of replaying results produced under
+  // different capabilities.
+  return KEY_PREFIX + sha256(`ultracode-seed\0${stableStringify(args ?? null)}\0${permission ?? ''}`);
 }
 
 export function argsHash(args: unknown): string {

@@ -32,6 +32,8 @@ Workflow scripts are **trusted input** — model-authored and user-reviewed befo
 
 Fan-out auth: Codex ChatGPT-plan OAuth is unsafe to fan out (single-use rotating refresh tokens) — `run`/`workflow_start` cap concurrency at 1 (the `run` CLI's `--force-oauth-fanout` raises it to 3; MCP `workflow_start` has no such flag and stays pinned at 1); `ultracode doctor` reports the auth mode and warns. Use `CODEX_API_KEY` for real parallelism. Qoder: `QODER_PERSONAL_ACCESS_TOKEN` is stateless and parallel-safe.
 
+Worker-writable run store: the run store (`.ultracode/runs/**`) lives inside the workspace, so a prompt-injected agent that processes hostile repo content runs as the same user and *can* write there. Artifact writes are `O_NOFOLLOW` (no symlink redirect), other backends' credentials are scrubbed from each worker's env, and forced-stop kill targets are bound to the recorded process's kernel start-time (Linux) so a recycled/forged PID isn't signaled. These raise the bar but are **not** a boundary against a same-user attacker: PID start-times are public and unavailable off Linux (best-effort there), and **`resume` re-executes `script.js`/`config.json` from that worker-writable dir with no review gate** — so a poisoned prior run can influence a later resume (including its `permission`). Treat resuming an untrusted run as running its inputs. Two known replay caveats: a `pipeline()` whose later-stage dispatch order depends on completion timing can lose its cache prefix on resume, and fallback token estimates (no-usage backends) are approximate. Full isolation (control-plane outside the workspace, a separate-process sandbox, authenticated signaling) is future work.
+
 ## Quick start
 
 ```bash

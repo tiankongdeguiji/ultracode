@@ -25,6 +25,7 @@ import type { AgentExecutor, AgentSpec, JsonSchema } from '../backends/types.js'
 import type { BudgetAccount } from '../budget/account.js';
 import type { WorkflowMeta } from './meta.js';
 import type { WorktreeManager } from '../exec/worktree.js';
+import type { RunOutput } from './run.js';
 
 /**
  * State shared across a parent workflow and its one level of nested
@@ -116,8 +117,9 @@ export interface HostApiOptions {
   keyChain?: { next(spec: AgentSpec): string };
   /** prefix-replay cache lookup (M8); returns {hit, value} */
   cacheLookup?: (spec: AgentSpec, cacheKey: string | undefined) => { hit: boolean; value?: unknown } | undefined;
-  /** one-level nested workflow runner (M13) */
-  runChild?: (ref: unknown, childArgs: unknown) => Promise<unknown>;
+  /** one-level nested workflow runner (M13) — returns the child's full output so
+   *  the parent can merge its diagnostics (failures/logs/workspaces/counters) */
+  runChild?: (ref: unknown, childArgs: unknown) => Promise<RunOutput>;
   /** shared execution state for nested workflows; created fresh if absent */
   shared?: SharedRunState;
 }
@@ -503,7 +505,17 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     if (!opts.runChild) {
       throw new UltracodeError('workflow() is not available: no child workflow registry configured', 'no-child-registry');
     }
-    return roundTrip(await opts.runChild(ref, childArgs));
+    const childOut = await opts.runChild(ref, childArgs);
+    // Merge the child's diagnostics into the parent run — otherwise caught
+    // parallel()/pipeline() agent failures, warnings, kept workspaces, and
+    // counters vanish and the parent can report an empty failures[] despite
+    // failed child agents.
+    for (const f of childOut.failures) state.failures.push(f);
+    for (const l of childOut.logs) pushLog(l);
+    if (childOut.workspaces) for (const w of childOut.workspaces) state.workspaces.push(w);
+    state.agentCount += childOut.agentCount;
+    state.totalToolCalls += childOut.totalToolCalls;
+    return roundTrip(childOut.result);
   }
 
   // Timers: wrapped so everything is cleared on abort.

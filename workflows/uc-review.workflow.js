@@ -1,6 +1,8 @@
 // Portable across Claude Code (.claude/workflows), Qoder native (.qoder/workflows),
-// and the ultracode engine. Budget shim: Qoder's `budget` global is stubbed —
-// pass args.budgetTokens there.
+// and the ultracode engine. Budget note: the engine enforces budget.total at the
+// dispatch gate on codex/claude; on Qoder native `budget` is stubbed, so
+// args.budgetTokens is ADVISORY (logged, not enforced — the dialect can't observe
+// per-agent spend here).
 export const meta = {
   name: 'uc-review',
   description: 'Multi-perspective code review: parallel finders per dimension, adversarial verification per finding, synthesized report',
@@ -19,7 +21,11 @@ export const meta = {
 
 const target = args.target
 const focus = (args && args.focus) || 'correctness bugs, security issues, and broken edge cases'
-const budgetTokens = (budget && budget.total) || (args && args.budgetTokens) || null
+// On codex/claude the engine sets budget.total and ENFORCES it at the dispatch
+// gate. On Qoder native the `budget` global is stubbed, so args.budgetTokens is
+// ADVISORY only — this template can't observe per-agent spend to self-gate.
+const engineBudget = (budget && budget.total) || null
+const advisoryBudget = (args && args.budgetTokens) || null
 
 const FINDINGS = {
   type: 'object',
@@ -65,7 +71,8 @@ const found = await parallel(
 
 const findings = found.filter(Boolean).flatMap((r) => r.findings)
 log(`${findings.length} candidate finding(s) across ${dimensions.length} dimensions`)
-if (budgetTokens) log(`budget: ${budgetTokens} tokens`)
+if (engineBudget) log(`budget: ${engineBudget} tokens (engine-enforced)`)
+else if (advisoryBudget) log(`budget: ${advisoryBudget} tokens (ADVISORY — not enforced on this backend)`)
 
 phase('Verify')
 const verified = await pipeline(

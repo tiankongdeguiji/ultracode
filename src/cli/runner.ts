@@ -140,15 +140,18 @@ export async function runnerMain(dir: string): Promise<number> {
   wallTimer.unref();
 
   // Parse up-front to seed the journal chain (executeWorkflow re-parses; cheap).
+  // The seed folds in permission so a resume under a different permission does
+  // not replay results produced under different capabilities.
   const parsed = parseWorkflowScript(source);
-  const chain = new KeyChain(seedKey(args), config.cwd);
+  const seed = seedKey(args, config.permission);
+  const chain = new KeyChain(seed, config.cwd);
   journal.append({
     t: 'started',
     runId: manifest.runId,
     engineVersion: VERSION,
     scriptHash: parsed.scriptHash,
     argsHash: argsHash(args),
-    seedKey: seedKey(args),
+    seedKey: seed,
   });
 
   // Prefix-replay cache from the prior run's journal (resume path).

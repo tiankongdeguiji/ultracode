@@ -36,6 +36,29 @@ import { QoderAdapter } from '../backends/qoder.js';
 import { ClaudeAdapter } from '../backends/claude.js';
 import { GeminiAdapter } from '../backends/gemini.js';
 
+/** Known credential env vars per backend. A worker for one backend does not need
+ *  another backend's secrets — a prompt-injected worker reading hostile repo
+ *  content should not be able to exfiltrate them. (This scrubs cross-backend
+ *  credentials only; a full runtime allowlist covering unrelated host secrets
+ *  like GH_TOKEN/cloud creds is left to the caller's environment hygiene.) */
+const BACKEND_SECRET_ENV: Record<string, readonly string[]> = {
+  codex: ['CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'OPENAI_API_KEY', 'CODEX_HOME'],
+  qoder: ['QODER_PERSONAL_ACCESS_TOKEN'],
+  claude: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'],
+  gemini: ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_APPLICATION_CREDENTIALS'],
+};
+
+/** Copy of `env` with every OTHER backend's credential vars removed (the target
+ *  backend keeps its own). */
+export function scrubForeignBackendSecrets(env: NodeJS.ProcessEnv, backend: string): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const [b, vars] of Object.entries(BACKEND_SECRET_ENV)) {
+    if (b === backend) continue;
+    for (const v of vars) delete out[v];
+  }
+  return out;
+}
+
 export interface AgentCallOptions {
   /** where to stream transcript.jsonl / stderr.log for a given spec (optional) */
   artifactDir?: (spec: AgentSpec) => string;
@@ -327,9 +350,10 @@ export class AgentCallExecutor implements AgentExecutor {
       if (transcriptFile) transcriptFd = openWriteFdNoFollow(transcriptFile);
       const proc = spawnAgentProcess(plan.bin, argv, {
         cwd: spec.cwd,
-        // ULTRACODE_INSIDE_RUN marks spawned workers so an ultracode MCP server
-        // inherited by a worker refuses workflow_start (recursion guard).
-        env: { ...process.env, ...plan.env, ULTRACODE_INSIDE_RUN: '1' },
+        // Scrub OTHER backends' credentials so a prompt-injected worker can't
+        // exfiltrate them. ULTRACODE_INSIDE_RUN marks spawned workers so an
+        // ultracode MCP server inherited by a worker refuses workflow_start.
+        env: { ...scrubForeignBackendSecrets(process.env, spec.backend), ...plan.env, ULTRACODE_INSIDE_RUN: '1' },
         stdinData: plan.stdinData,
       });
       // Persist the worker's PGID so `ultracode stop` can kill the group if the

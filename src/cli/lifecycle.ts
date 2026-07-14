@@ -9,6 +9,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { readEventsFrom, type TimestampedEvent } from '../store/events.js';
 import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, isPidAlive, listRuns, reapOrphans } from '../store/runstore.js';
+import { stopRun } from '../exec/stop.js';
 import { ultracodeRoot } from '../store/layout.js';
 
 export function renderEvent(ev: TimestampedEvent): string | null {
@@ -166,42 +167,17 @@ export async function logsCommand(
 
 export async function stopCommand(runId: string, opts: { home?: string }): Promise<number> {
   const root = ultracodeRoot(process.cwd(), opts.home);
-  const run = getRun(root, runId);
-  if (!run) {
-    process.stderr.write(`ultracode: no run ${runId} under ${root}\n`);
+  // Route through the single hardened stop path (stopRun): PID-recycle-aware
+  // signaling (pidStart) + detached worker-group cleanup on the SIGKILL fallback
+  // and the dead-runner path. Previously this reimplemented an older, weaker
+  // path that ignored both.
+  const result = await stopRun(root, runId);
+  if (!result.ok) {
+    process.stderr.write(`ultracode: ${result.message}\n`);
     return 1;
   }
-  if (isTerminal(run.effectiveStatus)) {
-    process.stdout.write(`${runId} already ${run.effectiveStatus}\n`);
-    return 0;
-  }
-  const pid = run.manifest.pid;
-  if (!isPidAlive(pid)) {
-    reapOrphans(root);
-    process.stdout.write(`${runId} runner already dead; marked orphaned\n`);
-    return 0;
-  }
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch {
-    /* raced */
-  }
-  const deadline = Date.now() + 7_000;
-  while (Date.now() < deadline) {
-    const m = readManifest(run.dir);
-    if (m && isTerminal(m.status)) {
-      process.stdout.write(`${runId} ${m.status}\n`);
-      return 0;
-    }
-    await sleep(200);
-  }
-  try {
-    process.kill(pid, 'SIGKILL');
-  } catch {
-    /* gone */
-  }
-  reapOrphans(root);
-  process.stdout.write(`${runId} force-killed\n`);
+  const detail = result.message && result.message !== result.status ? ` (${result.message})` : '';
+  process.stdout.write(`${runId} ${result.status}${detail}\n`);
   return 0;
 }
 
