@@ -30,6 +30,6 @@
 ## Workflow lifecycle discipline
 
 - Always `validate` then `--dry-run` before spending tokens: dialect errors, cap misconfigurations, and schema mistakes surface for free.
-- Long runs: `--detach`, then poll `status`. The run store (`.ultracode/runs/<runId>/`) holds `output.json`, `journal.jsonl`, `events.jsonl`, and per-agent `agents/<seq>-<label>/{prompt.md, result.json, transcript.jsonl}` — cite these paths when reporting.
+- Long runs: `--detach`, then poll `status`. The run store (`.ultracode/runs/<runId>/`) holds `output.json`, `journal.jsonl`, `events.jsonl`, and per-agent `agents/<seq>-<label>/{prompt.md, result.json, transcript.jsonl}` — cite these paths when reporting. The dir name zero-pads seq to 4 and slugifies the label, e.g. `agents/0003-audit-src-foo-ts/`.
 - On failure: read `output.json` `failures[]` first (every cap trip, declined action, and agent error lands there), then `resume` — completed agents replay free.
 - Report faithfully: surface `failures[]` and warnings to the user even when the run "succeeded".

@@ -67,7 +67,10 @@ export class ClaudeAdapter implements BackendAdapter {
 
   classifyExit(code: number | null, signal: NodeJS.Signals | null, events: AgentEvent[], stderrTail: string): ExitClass {
     if (signal) return { ok: false, errorKind: 'interrupted', retryable: false, message: `killed by ${signal}` };
-    const result = events.find((e) => e.kind === 'result');
+    // The TERMINAL result is authoritative: an assistant message can emit an
+    // earlier result{isError:true} (from obj.error) before a successful terminal
+    // result, so `.find()` (first) would misclassify success as failure.
+    const result = events.filter((e): e is Extract<AgentEvent, { kind: 'result' }> => e.kind === 'result').pop();
     if (code === 0 && result && result.kind === 'result' && !result.isError) {
       return { ok: true, retryable: false, message: 'ok' };
     }

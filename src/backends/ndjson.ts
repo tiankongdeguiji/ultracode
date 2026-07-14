@@ -17,13 +17,18 @@ export class NdjsonSplitter {
   push(chunk: string): string[] {
     this.buffer += chunk;
     const lines: string[] = [];
+    // Scan with a moving offset and slice the buffer ONCE at the end, rather
+    // than re-slicing the whole (possibly large) buffer on every newline — the
+    // latter is O(n²) on bursty multi-line chunks.
+    let start = 0;
     for (;;) {
-      const nl = this.buffer.indexOf('\n');
+      const nl = this.buffer.indexOf('\n', start);
       if (nl === -1) break;
-      const line = this.buffer.slice(0, nl).replace(/\r$/, '');
-      this.buffer = this.buffer.slice(nl + 1);
+      const line = this.buffer.slice(start, nl).replace(/\r$/, '');
+      start = nl + 1;
       if (line.trim().length > 0) lines.push(line);
     }
+    if (start > 0) this.buffer = this.buffer.slice(start);
     // No newline in sight and the pending line already exceeds the cap → drop it
     // (surfacing a short raw notice, logged as noise) rather than buffering more.
     if (this.buffer.length > this.maxLineBytes) {

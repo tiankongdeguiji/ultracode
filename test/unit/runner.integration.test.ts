@@ -26,6 +26,15 @@ await agent('MOCK:delay 15000 MOCK:ok done', { label: 'sleeper' })
 return 'finished'
 `;
 
+// Keeps the event loop alive (a long timer) while awaiting a never-settling
+// promise, and never touches the abort signal. The wall-clock abort can't unwind
+// it, so the hard-stop backstop is the only thing that ends the run.
+const HANG = `export const meta = { name: 'hang', description: 'd' }
+setTimeout(() => {}, 600000)
+await new Promise(() => {})
+return 'unreachable'
+`;
+
 async function waitTerminal(dir: string, timeoutMs = 15_000): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -121,6 +130,25 @@ describe('detached runner', () => {
     await sleep(200);
     expect(isPidAlive(pid)).toBe(false);
   }, 30_000);
+
+  it('hard-stop backstop force-exits a run whose script never unwinds after the wall-clock cap', async () => {
+    // The script awaits a never-settling promise: the wall-clock cap fires
+    // abort(), but executeWorkflow never returns, so only the hard-stop backstop
+    // can end the detached process (otherwise it leaks with no terminal manifest).
+    const prev = process.env.ULTRACODE_HARD_STOP_GRACE_MS;
+    process.env.ULTRACODE_HARD_STOP_GRACE_MS = '1500';
+    try {
+      const { dir } = makeRun(HANG, { wallClockMs: 500 });
+      const { pid } = await launchRunner(dir);
+      const status = await waitTerminal(dir, 12_000);
+      expect(status).toBe('stopped');
+      await sleep(300);
+      expect(isPidAlive(pid)).toBe(false); // the process actually exited
+    } finally {
+      if (prev === undefined) delete process.env.ULTRACODE_HARD_STOP_GRACE_MS;
+      else process.env.ULTRACODE_HARD_STOP_GRACE_MS = prev;
+    }
+  }, 20_000);
 
   it('run survives launcher death by construction (launcher already exited: we are polling from a different process)', async () => {
     // The launcher (this test) returns from launchRunner immediately after

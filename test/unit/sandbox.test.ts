@@ -24,6 +24,14 @@ describe('sandbox hardening', () => {
     expect(r).toEqual(['1970-01-01T00:00:00.000Z', 0, 0]);
   });
 
+  it('Date ban cannot be bypassed via Date.prototype.constructor', async () => {
+    // Date.prototype.constructor must be the guarded constructor, not the real
+    // Date — otherwise the determinism bans (which prefix-replay resume relies
+    // on) are trivially reachable.
+    await expect(run(`return Date.prototype.constructor.now()`)).rejects.toThrow(BAN_MESSAGES.dateNow);
+    await expect(run(`return new Date(0).constructor()`)).rejects.toThrow(BAN_MESSAGES.dateNoArgs);
+  });
+
   it('Math.random() throws the exact ban message', async () => {
     await expect(run(`return Math.random()`)).rejects.toThrow(BAN_MESSAGES.mathRandom);
   });

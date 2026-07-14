@@ -29,8 +29,9 @@ export class Semaphore {
       this.inUse++;
       return this.makeRelease();
     }
+    // Queue and wait to be HANDED a permit directly (see makeRelease) — we do
+    // NOT increment on wake-up, because the releaser kept the count reserved.
     await new Promise<void>((resolve) => this.queue.push(resolve));
-    this.inUse++;
     return this.makeRelease();
   }
 
@@ -39,9 +40,13 @@ export class Semaphore {
     return () => {
       if (released) return;
       released = true;
-      this.inUse--;
       const next = this.queue.shift();
+      // Hand the permit straight to the next waiter WITHOUT dropping the count.
+      // Decrement-then-reacquire would leave inUse momentarily below permits, so
+      // a fresh acquire() interleaving between the release and the woken waiter's
+      // continuation could over-subscribe (grab the permit the waiter was handed).
       if (next) next();
+      else this.inUse--;
     };
   }
 }

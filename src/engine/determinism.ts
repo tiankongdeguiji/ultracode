@@ -64,6 +64,15 @@ export const HARDENING_BOOTSTRAP = `
     throw new Error(${JSON.stringify(BAN_MESSAGES.dateNoArgs)});
   }
   GuardedDate.prototype = RealDate.prototype;
+  // Close the constructor back-door: RealDate.prototype.constructor still points
+  // at the un-guarded RealDate, so 'Date.prototype.constructor.now()' and
+  // 'new Date(0).constructor()' would bypass the bans. Re-point it at
+  // GuardedDate (non-writable/-configurable) so those routes hit the guards too.
+  Object.defineProperty(RealDate.prototype, 'constructor', {
+    value: GuardedDate,
+    writable: false,
+    configurable: false,
+  });
   GuardedDate.parse = RealDate.parse.bind(RealDate);
   GuardedDate.UTC = RealDate.UTC.bind(RealDate);
   GuardedDate.now = () => {

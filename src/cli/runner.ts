@@ -18,7 +18,6 @@ import { MockExecutor } from '../backends/mock.js';
 import { createExecutorForBackend } from '../engine/agentcall.js';
 import { readProcStat } from '../exec/procinfo.js';
 import { Semaphore, defaultConcurrency } from '../engine/semaphore.js';
-import { WorkflowBudgetError } from '../engine/errors.js';
 import { BudgetAccount } from '../budget/account.js';
 import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
 import { resolveWorkflowSource } from '../installer/registry.js';
@@ -30,20 +29,12 @@ import type { SharedRunState } from '../engine/hostapi.js';
  * Routes each agent to its backend's executor (per-call `backend:` override
  * in agent() options; run config supplies the default).
  */
-function makeExecutorMux(
-  dir: string,
-  permission: 'safe' | 'auto' | 'danger',
-  budget: BudgetAccount,
-  codexMaxConcurrency?: number,
-): AgentExecutor {
+function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): AgentExecutor {
   const cache = new Map<string, AgentExecutor>();
   const artifactDir = (spec: AgentSpec) => join(dir, 'agents', agentDirName(spec.seq, spec.label));
-  // Gate codex separately so per-call backend:'codex' honors the OAuth fan-out
-  // cap even in a non-codex-default run (where the run-level semaphore is wider).
-  const codexSem =
-    codexMaxConcurrency && codexMaxConcurrency >= 1 && codexMaxConcurrency !== Infinity
-      ? new Semaphore(codexMaxConcurrency)
-      : undefined;
+  // Codex OAuth fan-out is capped via shared.backendLimits in the ENGINE (before
+  // the general permit) rather than here — gating inside execute() would hold a
+  // general permit while parked and starve other backends (head-of-line block).
   const resolve = (backend: string): AgentExecutor => {
     let ex = cache.get(backend);
     if (!ex) {
@@ -59,22 +50,8 @@ function makeExecutorMux(
     return ex;
   };
   return {
-    async execute(spec, signal) {
-      const ex = resolve(spec.backend);
-      if (spec.backend === 'codex' && codexSem) {
-        const release = await codexSem.acquire();
-        try {
-          // Re-check the budget AFTER the codex queue wait. Many codex calls can
-          // clear the engine's dispatch gate at spent=0, then serialize here
-          // behind cap 1 while earlier calls exhaust the budget — without this
-          // they'd all still spawn sequentially past the ceiling.
-          if (budget.remaining() <= 0) throw new WorkflowBudgetError();
-          return await ex.execute(spec, signal);
-        } finally {
-          release();
-        }
-      }
-      return ex.execute(spec, signal);
+    execute(spec, signal) {
+      return resolve(spec.backend).execute(spec, signal);
     },
   };
 }
@@ -114,7 +91,7 @@ export async function runnerMain(dir: string): Promise<number> {
   // detached process leaks. Arm a grace timer on any abort that finalizes and
   // force-exits. (A CPU-bound sync loop blocks this timer too — that case still
   // needs an external `ultracode stop` SIGKILL, as documented.)
-  const HARD_STOP_GRACE_MS = 15_000;
+  const HARD_STOP_GRACE_MS = Number(process.env.ULTRACODE_HARD_STOP_GRACE_MS) || 15_000;
   let hardStopTimer: ReturnType<typeof setTimeout> | undefined;
   const armHardStop = (reason: string) => {
     if (hardStopTimer) return;
@@ -137,7 +114,10 @@ export async function runnerMain(dir: string): Promise<number> {
       events.close();
       process.exit(1);
     }, HARD_STOP_GRACE_MS);
-    hardStopTimer.unref();
+    // Intentionally NOT unref'd: this is the last-resort guarantee. On abort the
+    // sandbox disposes the script's timers, so the loop can otherwise empty and
+    // the process exit code-0 with a stuck 'running' manifest before this fires.
+    // Keeping it ref'd holds the process alive just long enough to finalize.
   };
 
   process.on('SIGTERM', () => {
@@ -181,18 +161,26 @@ export async function runnerMain(dir: string): Promise<number> {
 
   // Shared execution state so nested workflow() children share caps/budget.
   const budgetAccount = new BudgetAccount(config.budgetTotal ?? null);
+  const maxConcurrency = config.maxConcurrency ?? defaultConcurrency();
   const shared: SharedRunState = {
-    semaphore: new Semaphore(config.maxConcurrency ?? defaultConcurrency()),
+    semaphore: new Semaphore(maxConcurrency),
     counter: { count: 0 },
     runId: manifest.runId,
   };
+  // Codex OAuth fan-out cap as a per-backend limiter, acquired before the
+  // general permit. Only when it actually constrains (tighter than the general
+  // cap) — in a codex-DEFAULT run the general semaphore already equals it.
+  const codexCap = config.codexMaxConcurrency;
+  if (codexCap && codexCap >= 1 && codexCap < maxConcurrency) {
+    shared.backendLimits = new Map([['codex', new Semaphore(codexCap)]]);
+  }
   // Worktree isolation only inside a git repo.
   const repoRoot = repoRootSync(config.cwd);
   if (repoRoot) shared.worktrees = createWorktreeManager(repoRoot, worktreesRootFor(dir));
 
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
-    executor: makeExecutorMux(dir, config.permission ?? 'auto', budgetAccount, config.codexMaxConcurrency),
+    executor: makeExecutorMux(dir, config.permission ?? 'auto'),
     cacheLookup: replay?.lookup,
     args,
     budgetAccount,

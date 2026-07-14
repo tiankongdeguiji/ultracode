@@ -83,7 +83,12 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
 function usageFromResult(obj: Record<string, any>): Partial<NormalizedUsage> {
   const u = obj.usage ?? {};
   return {
-    inputTokens: u.input_tokens ?? 0,
+    // cache_creation_input_tokens is prompt Anthropic reports separately from
+    // input_tokens (write-through, billed ~1.25×). Fold it into input — on
+    // cache-populating turns it's often the bulk, and dropping it lets real
+    // spend overshoot the budget dispatch gate. (cache_read stays discounted to
+    // 0.1× via cachedInputTokens.)
+    inputTokens: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
     outputTokens: u.output_tokens ?? 0,
     cachedInputTokens: u.cache_read_input_tokens ?? 0,
     reasoningTokens: 0,

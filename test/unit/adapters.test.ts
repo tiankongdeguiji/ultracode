@@ -30,7 +30,7 @@ describe('ClaudeAdapter', () => {
     expect(events.find((e) => e.kind === 'session')).toMatchObject({ sessionId: 'be150d68-39d3-429d-851b-f15f48fbdf10' });
     expect(events.filter((e) => e.kind === 'message').at(-1)).toMatchObject({ text: 'hello' });
     const usage = a.extractUsage(events);
-    expect(usage.inputTokens).toBe(3454);
+    expect(usage.inputTokens).toBe(5530); // 3454 input + 2076 cache_creation (write-through; previously dropped)
     expect(usage.outputTokens).toBe(4);
     expect(usage.cachedInputTokens).toBe(15084);
     expect(usage.costUSD).toBeCloseTo(0.046255, 5);
