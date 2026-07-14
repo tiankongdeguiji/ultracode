@@ -5,7 +5,8 @@
  * retries → outcome. Schema enforcement layers on in M6; watchdogs
  * (stallMs / timeout) tighten in M7.
  */
-import { mkdirSync, writeFileSync, openSync, writeSync, closeSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, writeSync, closeSync, mkdtempSync, rmSync } from 'node:fs';
+import { openWriteFdNoFollow, writeFileNoFollow } from '../exec/safe-write.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../backends/ndjson.js';
@@ -303,7 +304,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // Open the transcript once and writeSync to a persistent fd — not
       // appendFileSync (open+write+close) per NDJSON line, which serializes
       // every concurrent agent's IO behind blocking syscalls on the hot path.
-      if (transcriptFile) transcriptFd = openSync(transcriptFile, 'a');
+      if (transcriptFile) transcriptFd = openWriteFdNoFollow(transcriptFile);
       const proc = spawnAgentProcess(plan.bin, argv, {
         cwd: spec.cwd,
         // ULTRACODE_INSIDE_RUN marks spawned workers so an ultracode MCP server
@@ -311,6 +312,9 @@ export class AgentCallExecutor implements AgentExecutor {
         env: { ...process.env, ...plan.env, ULTRACODE_INSIDE_RUN: '1' },
         stdinData: plan.stdinData,
       });
+      // Persist the worker's PGID so `ultracode stop` can kill the group if the
+      // runner is unresponsive and gets SIGKILL'd (detached workers survive it).
+      if (artifactDir && proc.child.pid) writeFileNoFollow(join(artifactDir, 'pgid'), String(proc.child.pid));
 
       const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
       let timedOut = false;
@@ -366,7 +370,7 @@ export class AgentCallExecutor implements AgentExecutor {
       consume(parser.end());
 
       if (artifactDir) {
-        writeFileSync(join(artifactDir, `stderr.attempt${attempt}.log`), stderrTail.text, 'utf8');
+        writeFileNoFollow(join(artifactDir, `stderr.attempt${attempt}.log`), stderrTail.text);
       }
 
       let exit = this.adapter.classifyExit(code, sig, events, stderrTail.text);
@@ -407,6 +411,7 @@ export class AgentCallExecutor implements AgentExecutor {
       if (stallTimer) clearInterval(stallTimer);
       if (onAbort) signal.removeEventListener('abort', onAbort);
       if (transcriptFd !== undefined) closeSync(transcriptFd);
+      if (artifactDir) rmSync(join(artifactDir, 'pgid'), { force: true });
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }
   }

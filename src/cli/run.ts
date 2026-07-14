@@ -110,10 +110,10 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
 
   // Auth-aware concurrency policy: ChatGPT-OAuth fan-out is unsafe.
   let maxConcurrency = opts.maxConcurrency ? Number(opts.maxConcurrency) : defaultConcurrency();
+  const codexPolicy = codexConcurrencyPolicy(maxConcurrency, detectCodexAuth(), opts.forceOauthFanout === true);
   if (backend === 'codex') {
-    const policy = codexConcurrencyPolicy(maxConcurrency, detectCodexAuth(), opts.forceOauthFanout === true);
-    if (policy.warning) process.stderr.write(`⚠ ${policy.warning}\n`);
-    maxConcurrency = policy.maxConcurrency;
+    if (codexPolicy.warning) process.stderr.write(`⚠ ${codexPolicy.warning}\n`);
+    maxConcurrency = codexPolicy.maxConcurrency;
   }
 
   // Review before run: print the plan; require confirmation unless --yes.
@@ -156,6 +156,7 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
       cwd: process.cwd(),
       maxAgents: opts.maxAgents ? Number(opts.maxAgents) : undefined,
       maxConcurrency,
+      codexMaxConcurrency: codexPolicy.maxConcurrency,
       budgetTotal,
       permission,
       wallClockMs: opts.timeout ? Number(opts.timeout) * 60_000 : undefined,

@@ -3,8 +3,12 @@
  * node:vm context. The body is the export-stripped script (from meta.ts),
  * wrapped in an async IIFE so top-level await and top-level return both work.
  *
- * The `timeout` option only guards SYNCHRONOUS runaway execution; async
- * lifetime is governed by run-level wall-clock caps and per-agent watchdogs.
+ * The `timeout` option only guards the INITIAL synchronous segment of the IIFE.
+ * A synchronous loop that runs after an `await` (e.g. `await agent(); while(1){}`)
+ * blocks the event loop, so neither this timeout nor the runner's wall-clock
+ * timer/SIGTERM handler can fire — the backstop is external: `ultracode stop`
+ * SIGKILLs the runner process (node:vm cannot preempt guest code). Per-agent
+ * watchdogs bound the subprocess side.
  */
 import vm from 'node:vm';
 import { HARDENING_BOOTSTRAP } from './determinism.js';

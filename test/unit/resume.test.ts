@@ -145,6 +145,24 @@ return [a, b]`;
     expect(replay.executor.stats.calls).toBe(3);
     expect(replay.cache.stats.hits).toBe(0);
   });
+
+  it('a parallel batch that completes out of order still fully replays (journal seq-sorted)', async () => {
+    const src = `export const meta = { name: 'r', description: 'd' }
+const r = await parallel([
+  () => agent('MOCK:delay 80 MOCK:ok zero', { label: 'z' }),
+  () => agent('MOCK:ok one', { label: 'o' }),
+])
+return r`;
+    const prior = await runAndJournal(src);
+    expect(prior.output.result).toEqual(['zero', 'one']);
+    // seq 1 completes before seq 0, so the journal is appended out of dispatch order
+    expect(prior.records.filter((r) => r.t === 'agent').map((r) => (r as { seq: number }).seq)).toEqual([1, 0]);
+    // ...but resume sorts by seq, so the whole prefix still hits.
+    const replay = await replayRun(src, prior.dir, prior.records);
+    expect(replay.output.result).toEqual(['zero', 'one']);
+    expect(replay.cache.stats.hits).toBe(2);
+    expect(replay.executor.stats.calls).toBe(0);
+  });
 });
 
 describe('runner-level resume (detached processes)', () => {

@@ -126,7 +126,11 @@ export class PrefixReplayCache {
   readonly stats = { hits: 0, misses: 0 };
 
   constructor(records: JournalRecord[], private readonly priorRunDir: string) {
-    this.queue = records.filter((r): r is AgentRecord => r.t === 'agent');
+    // Records are appended in COMPLETION order (a parallel batch settles out of
+    // order), but the chain keys are assigned in DISPATCH (seq) order and the
+    // new run dispatches in seq order. Sort by seq so replay compares like with
+    // like — otherwise one out-of-order parallel agent breaks the whole prefix.
+    this.queue = records.filter((r): r is AgentRecord => r.t === 'agent').sort((a, b) => a.seq - b.seq);
   }
 
   readonly lookup = (_spec: AgentSpec, cacheKey: string | undefined): { hit: boolean; value?: unknown } | undefined => {

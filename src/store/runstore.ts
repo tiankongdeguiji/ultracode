@@ -25,6 +25,9 @@ export interface RunConfig {
   logCap?: number;
   permission?: 'safe' | 'auto' | 'danger';
   wallClockMs?: number;
+  /** codex-specific concurrency cap (OAuth fan-out safety), applied even when
+   *  codex is only used via a per-call backend override. */
+  codexMaxConcurrency?: number;
   resumeFromRunId?: string;
 }
 

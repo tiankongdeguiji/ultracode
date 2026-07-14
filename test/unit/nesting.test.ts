@@ -90,4 +90,18 @@ return workflow('nope', {})`, {
     expect(a).toHaveLength(5); // pa, c0, c1, c2, pb — all in one chain
     expect(new Set(a).size).toBe(5);
   });
+
+  it('a child honors the parent maxAgents cap (propagated, not the default 50)', async () => {
+    const parent = `export const meta = { name: 'uc-parent', description: 'd' }
+await agent('MOCK:ok pa', { label: 'pa' })
+await workflow('uc-child', { n: 10 })
+await agent('MOCK:ok pb', { label: 'pb' })
+return 'done'`;
+    const executor = new MockExecutor();
+    const out = await executeWorkflow(parent, { executor, resolveChild, maxAgents: 3, maxConcurrency: 4 });
+    expect(out.error).toMatch(/max agents \(3\)/);
+    // pa + 2 child dispatches hit the shared ceiling of 3; without cap propagation
+    // the child would run all 10 against its own default cap of 50.
+    expect(executor.stats.calls).toBe(3);
+  });
 });

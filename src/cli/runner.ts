@@ -4,7 +4,8 @@
  * 5s heartbeat), events.jsonl, journal.jsonl, agents/**, output.json.
  * SIGTERM aborts the run gracefully; partial output is preserved.
  */
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
+import { writeFileNoFollow } from '../exec/safe-write.js';
 import { dirname, join } from 'node:path';
 import { executeWorkflow } from '../engine/run.js';
 import { parseWorkflowScript } from '../engine/meta.js';
@@ -27,9 +28,19 @@ import type { SharedRunState } from '../engine/hostapi.js';
  * Routes each agent to its backend's executor (per-call `backend:` override
  * in agent() options; run config supplies the default).
  */
-function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): AgentExecutor {
+function makeExecutorMux(
+  dir: string,
+  permission: 'safe' | 'auto' | 'danger',
+  codexMaxConcurrency?: number,
+): AgentExecutor {
   const cache = new Map<string, AgentExecutor>();
   const artifactDir = (spec: AgentSpec) => join(dir, 'agents', agentDirName(spec.seq, spec.label));
+  // Gate codex separately so per-call backend:'codex' honors the OAuth fan-out
+  // cap even in a non-codex-default run (where the run-level semaphore is wider).
+  const codexSem =
+    codexMaxConcurrency && codexMaxConcurrency >= 1 && codexMaxConcurrency !== Infinity
+      ? new Semaphore(codexMaxConcurrency)
+      : undefined;
   const resolve = (backend: string): AgentExecutor => {
     let ex = cache.get(backend);
     if (!ex) {
@@ -45,8 +56,17 @@ function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): A
     return ex;
   };
   return {
-    execute(spec, signal) {
-      return resolve(spec.backend).execute(spec, signal);
+    async execute(spec, signal) {
+      const ex = resolve(spec.backend);
+      if (spec.backend === 'codex' && codexSem) {
+        const release = await codexSem.acquire();
+        try {
+          return await ex.execute(spec, signal);
+        } finally {
+          release();
+        }
+      }
+      return ex.execute(spec, signal);
     },
   };
 }
@@ -128,7 +148,7 @@ export async function runnerMain(dir: string): Promise<number> {
 
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
-    executor: makeExecutorMux(dir, config.permission ?? 'auto'),
+    executor: makeExecutorMux(dir, config.permission ?? 'auto', config.codexMaxConcurrency),
     cacheLookup: replay?.lookup,
     args,
     budgetAccount,
@@ -168,12 +188,13 @@ export async function runnerMain(dir: string): Promise<number> {
     onAgentSettled: (record) => {
       const agentDir = join(dir, 'agents', agentDirName(record.spec.seq, record.spec.label));
       mkdirSync(agentDir, { recursive: true });
-      writeFileSync(join(agentDir, 'prompt.md'), record.spec.prompt, 'utf8');
+      // Symlink-safe: a worker may have planted a symlink at these paths.
+      writeFileNoFollow(join(agentDir, 'prompt.md'), record.spec.prompt);
       if (record.spec.schema) {
-        writeFileSync(join(agentDir, 'schema.json'), JSON.stringify(record.spec.schema, null, 2), 'utf8');
+        writeFileNoFollow(join(agentDir, 'schema.json'), JSON.stringify(record.spec.schema, null, 2));
       }
       const resultRef = join('agents', agentDirName(record.spec.seq, record.spec.label), 'result.json');
-      writeFileSync(
+      writeFileNoFollow(
         join(dir, resultRef),
         JSON.stringify(
           {
@@ -189,7 +210,6 @@ export async function runnerMain(dir: string): Promise<number> {
           null,
           2,
         ),
-        'utf8',
       );
       journal.append({
         t: 'agent',
@@ -216,7 +236,7 @@ export async function runnerMain(dir: string): Promise<number> {
       message: `prefix replay: ${replay.stats.hits} agent(s) from cache, ${replay.stats.hits === 0 ? 'no prefix matched' : `first live call after position ${replay.stats.hits}`}`,
     });
   }
-  writeFileSync(join(dir, 'output.json'), JSON.stringify(output, null, 2), 'utf8');
+  writeFileNoFollow(join(dir, 'output.json'), JSON.stringify(output, null, 2));
 
   const stopped = abort.signal.aborted;
   manifest = {

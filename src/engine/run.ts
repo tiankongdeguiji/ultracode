@@ -111,6 +111,10 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
           onEvent,
           onAgentSettled: opts.onAgentSettled,
           cacheLookup: opts.cacheLookup,
+          // Propagate caps so a child honors the parent's agent ceiling (the
+          // lifetime counter is shared, but softCap is per-hostapi).
+          maxAgents: opts.maxAgents,
+          logCap: opts.logCap,
         },
         resolveName: resolver,
       })(ref, childArgs);

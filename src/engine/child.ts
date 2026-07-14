@@ -20,7 +20,10 @@ export interface ChildRunnerDeps {
   budget: BudgetAccount;
   signal: AbortSignal;
   keyChain?: { next(spec: never): string };
-  base: Pick<ExecuteOptions, 'executor' | 'defaultBackend' | 'cwd' | 'onEvent' | 'onAgentSettled' | 'cacheLookup'>;
+  base: Pick<
+    ExecuteOptions,
+    'executor' | 'defaultBackend' | 'cwd' | 'onEvent' | 'onAgentSettled' | 'cacheLookup' | 'maxAgents' | 'logCap'
+  >;
   /** resolve a child by name → source text (registry lookup lives in the runner/CLI) */
   resolveName?: (name: string) => string;
   /** journal boundary hooks */

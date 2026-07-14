@@ -91,11 +91,13 @@ export const HARDENING_BOOTSTRAP = `
   Object.freeze(Reflect);
   Object.freeze(GuardedDate);
 
-  // Defense in depth: re-wrap injected host globals as vm-realm objects/functions
-  // so guest code cannot reach the host realm Function via .constructor (a host
-  // function's constructor is the host Function, which ignores this context's
-  // codeGeneration:false). The sandbox is a capability/determinism device, not a
-  // hostile-code boundary, but this closes the trivial escape.
+  // Defense in depth (NOT a complete boundary): re-wrap injected host globals as
+  // vm-realm functions so guest code can't DIRECTLY reach the host Function via
+  // .constructor. This does NOT close every escape — values the host returns
+  // (Promises from agent(), the Timeout from setTimeout, JSON-parsed results)
+  // are host objects whose .constructor chain still reaches the host Function.
+  // node:vm is a capability/determinism device, not a hostile-code boundary;
+  // real isolation would need a separate OS process. Scripts are trusted input.
   const wrapFn = (fn) => function (...a) { return fn.apply(undefined, a); };
   for (const k of ['agent', 'parallel', 'pipeline', 'phase', 'log', 'workflow', 'setTimeout', 'clearTimeout']) {
     const orig = globalThis[k];

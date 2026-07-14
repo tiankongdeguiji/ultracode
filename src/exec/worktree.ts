@@ -40,6 +40,7 @@ export function createWorktreeManager(repoRoot: string, worktreesRoot: string): 
     async create(runId: string, seq: number, _label: string): Promise<Worktree> {
       const dir = join(worktreesRoot, runId, String(seq));
       const branch = `ultracode/${runId}/${seq}`;
+      const base = (await git(repoRoot, ['rev-parse', 'HEAD'])).stdout.trim();
       const add = await git(repoRoot, ['worktree', 'add', '--quiet', '-b', branch, dir, 'HEAD']);
       if (add.code !== 0) {
         throw new Error(`git worktree add failed: ${add.stderr.trim() || add.stdout.trim()}`);
@@ -49,8 +50,13 @@ export function createWorktreeManager(repoRoot: string, worktreesRoot: string): 
         branch,
         async finalize() {
           const status = await git(dir, ['status', '--porcelain']);
-          const dirty = status.stdout.trim().length > 0;
-          if (dirty) {
+          const head = (await git(dir, ['rev-parse', 'HEAD'])).stdout.trim();
+          // "Changed" = uncommitted work OR the branch advanced past its base.
+          // A prior version only checked porcelain, so an agent that COMMITTED
+          // its work left a clean tree → the worktree+branch were force-deleted,
+          // dropping the only ref to the committed changes.
+          const changed = status.stdout.trim().length > 0 || (head !== '' && head !== base);
+          if (changed) {
             // Keep the worktree + branch for the caller to inspect/merge.
             return { removed: false, path: dir, dirty: true };
           }
