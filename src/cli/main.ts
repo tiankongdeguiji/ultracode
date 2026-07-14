@@ -21,7 +21,7 @@ program
   .option('--args <json>', 'workflow args (JSON or plain string)')
   .option('--backend <id>', 'default backend for agents', 'mock')
   .option('--max-agents <n>', 'soft lifetime agent cap (hard ceiling 1000)')
-  .option('--max-concurrency <n>', 'concurrent agent cap (default min(16, cores-2))')
+  .option('--max-concurrency <n>', 'concurrent agent cap (default min(16, max(2, cores-2)))')
   .option('--budget <spec>', 'token budget: 500k, +500k, 2m (hard dispatch-gate ceiling)')
   .option('--permission <mode>', 'worker sandbox: safe|auto|danger (read-only/workspace-write/full)', 'auto')
   .option('--timeout <minutes>', 'wall-clock cap in minutes (default 60)')

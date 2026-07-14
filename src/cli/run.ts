@@ -10,6 +10,7 @@ import { parseBudget } from '../budget/parse.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
+import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
 import { attachForeground, printOutput } from './lifecycle.js';
 import { validateScript } from './validate.js';
 
@@ -28,8 +29,6 @@ export interface RunCliOptions {
   json?: boolean;
   home?: string;
 }
-
-const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex', 'qoder', 'claude', 'gemini']);
 
 /**
  * Execution ALWAYS happens in a detached runner process; the CLI attaches in

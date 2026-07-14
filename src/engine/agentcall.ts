@@ -7,6 +7,7 @@
  */
 import { mkdirSync, writeFileSync, writeSync, closeSync, mkdtempSync, rmSync } from 'node:fs';
 import { openWriteFdNoFollow, writeFileNoFollow } from '../exec/safe-write.js';
+import { readProcStat } from '../exec/procinfo.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../backends/ndjson.js';
@@ -300,6 +301,10 @@ export class AgentCallExecutor implements AgentExecutor {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     let onAbort: (() => void) | undefined;
+    // Delayed SIGKILL escalations scheduled after a SIGTERM. Tracked so `finally`
+    // can cancel any still pending — otherwise a kill stays armed 5s out against
+    // a pid that has already closed and may be recycled (→ kill the wrong group).
+    const escalationTimers: ReturnType<typeof setTimeout>[] = [];
     try {
       // Open the transcript once and writeSync to a persistent fd — not
       // appendFileSync (open+write+close) per NDJSON line, which serializes
@@ -314,15 +319,27 @@ export class AgentCallExecutor implements AgentExecutor {
       });
       // Persist the worker's PGID so `ultracode stop` can kill the group if the
       // runner is unresponsive and gets SIGKILL'd (detached workers survive it).
-      if (artifactDir && proc.child.pid) writeFileNoFollow(join(artifactDir, 'pgid'), String(proc.child.pid));
+      // Record `<pid> <starttime>`: the kernel start-time binds the pgid to this
+      // exact process instance so a later forced stop can't be redirected to a
+      // recycled — or worker-forged — PID (see stop.ts killWorkerGroups).
+      if (artifactDir && proc.child.pid) {
+        const stat = readProcStat(proc.child.pid);
+        writeFileNoFollow(join(artifactDir, 'pgid'), `${proc.child.pid} ${stat?.starttime ?? ''}`);
+      }
+
+      // SIGTERM the tree, then escalate to SIGKILL if it survives — but track the
+      // escalation so `finally` can cancel it if the child closes first.
+      const killWithEscalation = () => {
+        proc.killTree('SIGTERM');
+        escalationTimers.push(setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref());
+      };
 
       const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
       let timedOut = false;
       let stalled = false;
       timer = setTimeout(() => {
         timedOut = true;
-        proc.killTree('SIGTERM');
-        setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref();
+        killWithEscalation();
       }, timeoutMs);
       timer.unref();
 
@@ -332,16 +349,12 @@ export class AgentCallExecutor implements AgentExecutor {
         stallTimer = setInterval(() => {
           if (Date.now() - lastActivityAt > spec.stallMs!) {
             stalled = true;
-            proc.killTree('SIGTERM');
-            setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref();
+            killWithEscalation();
           }
         }, Math.max(50, Math.min(1_000, spec.stallMs / 2)));
         stallTimer.unref();
       }
-      onAbort = () => {
-        proc.killTree('SIGTERM');
-        setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref();
-      };
+      onAbort = () => killWithEscalation();
       signal.addEventListener('abort', onAbort, { once: true });
 
       proc.child.stdout?.setEncoding('utf8');
@@ -409,6 +422,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // across retries.
       if (timer) clearTimeout(timer);
       if (stallTimer) clearInterval(stallTimer);
+      for (const t of escalationTimers) clearTimeout(t);
       if (onAbort) signal.removeEventListener('abort', onAbort);
       if (transcriptFd !== undefined) closeSync(transcriptFd);
       if (artifactDir) rmSync(join(artifactDir, 'pgid'), { force: true });

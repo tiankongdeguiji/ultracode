@@ -20,8 +20,9 @@
  * silently replay results produced under different conditions.
  */
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, writeSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
+import { openAppendFdNoFollow } from '../exec/safe-write.js';
 import type { AgentSpec } from '../backends/types.js';
 
 export const KEY_PREFIX = 'u1:';
@@ -97,10 +98,15 @@ export type JournalRecord =
   | { t: 'child-exit'; name: string };
 
 export class JournalWriter {
+  private fd: number | undefined;
   constructor(private readonly file: string) {}
 
   append(record: JournalRecord): void {
-    appendFileSync(this.file, JSON.stringify(record) + '\n', 'utf8');
+    // Held append fd opened O_NOFOLLOW: the run store is worker-writable, so
+    // refuse to follow a symlink planted at the journal path (consistent with
+    // the artifact writers). Process-lifetime fd — released on runner exit.
+    if (this.fd === undefined) this.fd = openAppendFdNoFollow(this.file);
+    writeSync(this.fd, JSON.stringify(record) + '\n');
   }
 }
 
@@ -142,8 +148,19 @@ export class PrefixReplayCache {
       this.stats.misses++;
       return undefined;
     }
+    // resultRef comes from the prior run's journal, which lives in the
+    // worker-writable run dir — untrusted. Confine the read to priorRunDir so a
+    // rewritten `../../..`-escaping ref can't turn resume into an arbitrary-file
+    // read gadget (the parsed .value flows back into the host agent's context).
+    const base = resolve(this.priorRunDir);
+    const target = resolve(base, head.resultRef);
+    if (target !== base && !target.startsWith(base + sep)) {
+      this.prefixMissed = true;
+      this.stats.misses++;
+      return undefined;
+    }
     try {
-      const result = JSON.parse(readFileSync(join(this.priorRunDir, head.resultRef), 'utf8')) as {
+      const result = JSON.parse(readFileSync(target, 'utf8')) as {
         value?: unknown;
       };
       this.idx++;

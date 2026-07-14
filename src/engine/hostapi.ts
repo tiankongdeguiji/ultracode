@@ -304,8 +304,12 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       if (signal.aborted) throw new UltracodeError('Workflow stopped', 'aborted');
       // Real dispatch gate: re-check the budget AFTER acquiring the permit,
       // just before dispatch. The pre-acquire check races a parallel()/pipeline()
-      // batch (all N pass at spent=0 before any completes and calls budget.add);
-      // this one bounds overshoot to the concurrency window. Released in finally.
+      // batch (all N pass at spent=0 before any completes and calls budget.add).
+      // This gate is per-dispatch, not per-attempt: executor.execute() may run
+      // several internal attempts (retries + schema repairs) before it returns
+      // and budget.add runs once, so worst-case overshoot is
+      // permits × (retries + repairs) × per-attempt-tokens — larger than a single
+      // concurrency window, but still bounded. Released in finally.
       if (budget.remaining() <= 0) throw new WorkflowBudgetError();
       // Worktree isolation: fresh git worktree, only when explicitly asked
       // and a manager is configured (the runner supplies it inside a repo).
