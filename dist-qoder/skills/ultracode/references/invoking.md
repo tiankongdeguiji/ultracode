@@ -11,7 +11,7 @@
    ```bash
    ultracode validate my.workflow.js          # meta + dialect + compile check
    ultracode run my.workflow.js --dry-run     # free rehearsal on the mock backend
-   ultracode run my.workflow.js --backend codex --budget 500k --yes [--detach]
+   ultracode run my.workflow.js --backend codex --yes [--budget <ONLY if the user specified one>] [--detach]
    ultracode status <runId> --watch | logs <runId> --follow | stop <runId>
    ultracode resume <runId> [--script edited.js]
    ultracode doctor                           # backend availability + auth safety table
