@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readEventsFrom, type TimestampedEvent } from '../store/events.js';
 import { isTerminal, readManifest } from '../store/manifest.js';
-import { getRun, isPidAlive, listRuns, reapOrphans } from '../store/runstore.js';
+import { getRun, listRuns, reapOrphans } from '../store/runstore.js';
 import { stopRun } from '../exec/stop.js';
 import { ultracodeRoot } from '../store/layout.js';
 
@@ -57,66 +57,18 @@ export interface AttachResult {
 }
 
 /**
- * Foreground attach: tail events until the manifest is terminal, mirroring
- * the run status in the exit code. First Ctrl-C sends SIGTERM to the runner
- * (explicit stop); the run store keeps everything if we die instead.
+ * Foreground attach: the live panel (or line stream) until the manifest is
+ * terminal, mirroring the run status in the exit code. First Ctrl-C sends
+ * SIGTERM to the runner (explicit stop); the run store keeps everything if we
+ * die instead. Thin delegation to panelLoop — dynamic import because watch.ts
+ * imports renderEvent from this module.
  */
 export async function attachForeground(
   dir: string,
-  opts: { quiet?: boolean; onSigint?: () => void } = {},
+  opts: { quiet?: boolean; plain?: boolean; noColor?: boolean } = {},
 ): Promise<AttachResult> {
-  const eventsFile = join(dir, 'events.jsonl');
-  let offset = 0;
-  let sigints = 0;
-
-  const sigintHandler = () => {
-    sigints++;
-    const manifest = readManifest(dir);
-    if (sigints === 1 && manifest && manifest.pid > 0 && isPidAlive(manifest.pid)) {
-      process.stderr.write('\n■ stopping run (Ctrl-C again to detach immediately)…\n');
-      try {
-        process.kill(manifest.pid, 'SIGTERM');
-      } catch {
-        /* already gone */
-      }
-    } else {
-      process.stderr.write('\n■ detached; run may still be finalizing. Re-attach: ultracode status --watch\n');
-      process.exit(130);
-    }
-  };
-  process.on('SIGINT', sigintHandler);
-
-  try {
-    for (;;) {
-      const page = readEventsFrom(eventsFile, offset);
-      offset = page.nextOffset;
-      if (!opts.quiet) {
-        for (const ev of page.events) {
-          const line = renderEvent(ev);
-          if (line) process.stderr.write(line + '\n');
-        }
-      }
-      const manifest = readManifest(dir);
-      if (manifest && isTerminal(manifest.status)) {
-        // drain remaining events
-        const rest = readEventsFrom(eventsFile, offset);
-        if (!opts.quiet) {
-          for (const ev of rest.events) {
-            const line = renderEvent(ev);
-            if (line) process.stderr.write(line + '\n');
-          }
-        }
-        return { exitCode: manifest.status === 'completed' ? 0 : 1 };
-      }
-      if (manifest && manifest.status === 'running' && !isPidAlive(manifest.pid)) {
-        process.stderr.write('✗ runner died without finalizing (orphaned). See runner.log\n');
-        return { exitCode: 1 };
-      }
-      await sleep(150);
-    }
-  } finally {
-    process.removeListener('SIGINT', sigintHandler);
-  }
+  const { panelLoop } = await import('./watch.js');
+  return panelLoop(dir, { mode: 'attach', quiet: opts.quiet, plain: opts.plain, noColor: opts.noColor });
 }
 
 export function statusCommand(runId: string, opts: { watch?: boolean; json?: boolean; home?: string }): Promise<number> {

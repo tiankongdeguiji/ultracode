@@ -16,6 +16,8 @@ export interface ResumeCliOptions {
   yes?: boolean;
   detach?: boolean;
   json?: boolean;
+  plain?: boolean;
+  noColor?: boolean;
   home?: string;
 }
 
@@ -101,11 +103,11 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
 
   if (opts.detach) {
     process.stdout.write(`${newId}\n`);
-    process.stderr.write(`resumed from ${runId}; monitor: ultracode status ${newId} --watch\n`);
+    process.stderr.write(`resumed from ${runId}; monitor: ultracode watch ${newId}\n`);
     return 0;
   }
   process.stderr.write(`▶ ${newId} (resumed from ${runId})\n`);
-  const { exitCode } = await attachForeground(dir, { quiet: opts.json });
+  const { exitCode } = await attachForeground(dir, { quiet: opts.json, plain: opts.plain, noColor: opts.noColor });
   if (opts.json) printOutput(dir);
   return exitCode;
 }

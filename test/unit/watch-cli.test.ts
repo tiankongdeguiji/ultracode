@@ -135,6 +135,33 @@ describe('watch CLI', () => {
     expect(out).toContain('completed');
   }, 20_000);
 
+  it('attach mode follows an externally-stopped run to exit 1 and shows the stop', async () => {
+    const SLOW = `export const meta = { name: 'slow', description: 'd' }
+await agent('MOCK:delay 15000 MOCK:ok done', { label: 'sleeper' })
+return 'finished'
+`;
+    const { dir } = makeRun(SLOW);
+    const { pid } = await launchRunner(dir);
+    const stream = fakeTty();
+    const loop = panelLoop(dir, { mode: 'attach', stream });
+    await sleep(400); // let the panel paint the running sleeper
+    process.kill(pid, 'SIGTERM');
+    const { exitCode } = await loop;
+    const out = stream.chunks.join('');
+    expect(exitCode).toBe(1);
+    expect(out).toContain('sleeper');
+    expect(out).toContain('stopped');
+  }, 20_000);
+
+  it('quiet mode emits nothing but still mirrors the exit code', async () => {
+    const { dir } = makeRun(HELLO);
+    await launchRunner(dir);
+    const stream = fakeTty();
+    const { exitCode } = await panelLoop(dir, { mode: 'attach', quiet: true, stream });
+    expect(exitCode).toBe(0);
+    expect(stream.chunks).toEqual([]);
+  }, 20_000);
+
   it('unknown runId fails fast with a message', async () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-watch-'));
     const { chunks, restore } = captureStderr();

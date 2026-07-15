@@ -26,6 +26,8 @@ export interface RunCliOptions {
   dryRun?: boolean;
   yes?: boolean;
   json?: boolean;
+  plain?: boolean;
+  noColor?: boolean;
   home?: string;
 }
 
@@ -181,12 +183,12 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
 
   if (opts.detach) {
     process.stdout.write(`${runId}\n`);
-    process.stderr.write(`run dir: ${dir}\nmonitor: ultracode status ${runId} --watch\n`);
+    process.stderr.write(`run dir: ${dir}\nmonitor: ultracode watch ${runId}\n`);
     return 0;
   }
 
   process.stderr.write(`▶ ${runId} (${dir})\n`);
-  const { exitCode } = await attachForeground(dir, { quiet: opts.json });
+  const { exitCode } = await attachForeground(dir, { quiet: opts.json, plain: opts.plain, noColor: opts.noColor });
   if (opts.json) printOutput(dir);
   return exitCode;
 }

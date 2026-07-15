@@ -127,7 +127,7 @@ key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0"
 
 ### 1.5 Progress events
 
-The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens}, workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `status --watch`, `logs --follow`, and MCP long-poll all tail this file by byte offset; the MCP long-poll wakes only on *renderable* lines, so usage ticks never spin it.
+The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens}, workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `status --watch`, `logs --follow`, and MCP long-poll all tail this file by byte offset; the MCP long-poll wakes only on *renderable* lines, so usage ticks never spin it.
 
 ---
 
@@ -270,6 +270,7 @@ ultracode run <script.js | name> [--args '<json>'] [--backend id] [--model m] [-
               [--budget 500k|+500k] [--max-concurrency N] [--permission safe|auto|danger]
               [--cwd dir] [--foreground] [--timeout 2h] [--json]
    # default: detach, print runId + paths; --foreground tails events until terminal, exit 0/1 mirrors run status
+ultracode watch  <runId> [--plain] [--no-color] # live panel: phases, per-agent tokens/elapsed, budget; Ctrl-C detaches
 ultracode status <runId> [--watch] [--json]     # phases, agent table, budget, heartbeat
 ultracode logs   <runId> [--follow] [--agent seq]
 ultracode resume <runId> [--script f] [--args j]

@@ -29,10 +29,13 @@ program
   .option('--yes', 'skip the review-before-run confirmation')
   .option('--detach', 'print runId and return immediately')
   .option('--json', 'suppress progress; print output.json at the end')
+  .option('--plain', 'line-per-event progress instead of the live panel')
+  .option('--no-color', 'live panel without colors')
   .option('--home <dir>', 'run-store root (default <cwd>/.ultracode or $ULTRACODE_HOME)')
   .action(async (script: string, opts: Record<string, string | boolean>) => {
     const { runCommand } = await import('./run.js');
-    process.exit(await runCommand(script, opts as never));
+    // commander's --no-color negates a `color` option (true by default)
+    process.exit(await runCommand(script, { ...opts, noColor: opts.color === false } as never));
   });
 
 program
@@ -80,10 +83,12 @@ program
   .option('--max-concurrency <n>', 'override the stored concurrency for this resume')
   .option('--detach')
   .option('--json')
+  .option('--plain', 'line-per-event progress instead of the live panel')
+  .option('--no-color', 'live panel without colors')
   .option('--home <dir>')
   .action(async (runId: string, opts: Record<string, string | boolean>) => {
     const { resumeCommand } = await import('./resume.js');
-    process.exit(await resumeCommand(runId, opts as never));
+    process.exit(await resumeCommand(runId, { ...opts, noColor: opts.color === false } as never));
   });
 
 program
