@@ -7,7 +7,8 @@ import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Optional argv root override exists for tests; default is the repo root.
+// Optional argv override of the root used for BOTH reading canonical sources
+// and writing the dist-* outputs (exists for tests); default is the repo root.
 const root = process.argv[2] ? resolve(process.argv[2]) : join(dirname(fileURLToPath(import.meta.url)), '..');
 const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 // A falsy version would be silently dropped by JSON.stringify, and a malformed

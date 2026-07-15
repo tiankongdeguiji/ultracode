@@ -18,7 +18,7 @@ Bundled MCP registration is deferred with marketplace distribution, so today
 the installer writes these directly into your Codex config:
 
 - An **AGENTS.md** trigger snippet — standing "ultracode mode" on the keyword / a budget directive.
-- An **MCP server** registration (`.mcp.json` / config.toml block) pointing at `ultracode mcp`
+- An **MCP server** registration (`~/.codex/config.toml` `[mcp_servers.ultracode]` block) pointing at `ultracode mcp`
   (`tool_timeout_sec = 90`, `default_tools_approval_mode = "approve"` — headless Codex auto-rejects
   MCP calls otherwise).
 

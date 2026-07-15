@@ -63,6 +63,8 @@ describe('plugin bundles', () => {
     // could green-pass with the guard deleted.
     const badVersions = [
       {},
+      { version: '' },
+      { version: null },
       { version: '1.2.3junk' },
       { version: ['1.2.3'] },
       { version: '01.2.3' },
@@ -78,6 +80,22 @@ describe('plugin bundles', () => {
         stderr = String((e as { stderr?: unknown }).stderr ?? '');
       }
       expect(stderr, JSON.stringify(bad)).toMatch(/version missing or invalid/);
+    }
+  });
+
+  it('build-plugins accepts prerelease and build-metadata versions', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-goodver-'));
+    for (const version of ['10.20.30', '1.2.3-alpha.1', '1.2.3-alpha.1+build.9']) {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ version }));
+      let stderr = '';
+      try {
+        execFileSync('node', [join(root, 'scripts/build-plugins.mjs'), dir], { stdio: 'pipe' });
+      } catch (e) {
+        stderr = String((e as { stderr?: unknown }).stderr ?? '');
+      }
+      // The bare temp root later fails at the copy step (ENOENT); all that
+      // matters here is that an over-strict guard did not reject the version.
+      expect(stderr, version).not.toMatch(/version missing or invalid/);
     }
   });
 
