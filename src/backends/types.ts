@@ -79,8 +79,19 @@ export interface AgentOutcome {
   warnings?: string[];
 }
 
+/**
+ * Mid-execution progress surfaced by an executor. Display-only: final
+ * accounting always comes from AgentOutcome.usage (a usage tick may lag or
+ * slightly overshoot the authoritative total). `usage` is cumulative across
+ * the executor's internal attempts/repairs, never per-attempt deltas.
+ */
+export type AgentProgress =
+  | { type: 'usage'; usage: NormalizedUsage }
+  | { type: 'retry'; attempt: number; maxAttempts: number; kind: 'task' | 'schema-repair'; reason?: string }
+  | { type: 'model'; model: string };
+
 export interface AgentExecutor {
-  execute(spec: AgentSpec, signal: AbortSignal): Promise<AgentOutcome>;
+  execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (p: AgentProgress) => void): Promise<AgentOutcome>;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,11 +121,13 @@ export interface SpawnPlan {
 }
 
 export type AgentEvent =
-  | { kind: 'session'; sessionId: string }
+  /** model is the backend-resolved id when the stream reports one (init lines) */
+  | { kind: 'session'; sessionId: string; model?: string }
   /** assistant text; consumers keep the LAST one (codex #19816) */
   | { kind: 'message'; text: string }
   | { kind: 'tool'; name: string; status: 'started' | 'completed' | 'failed' | 'declined' }
-  | { kind: 'usage'; usage: Partial<NormalizedUsage> }
+  /** interim: a mid-run snapshot (per API call) — excluded from usage accounting */
+  | { kind: 'usage'; usage: Partial<NormalizedUsage>; interim?: boolean }
   | {
       kind: 'result';
       text?: string;

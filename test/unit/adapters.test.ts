@@ -27,14 +27,32 @@ describe('ClaudeAdapter', () => {
 
   it('parses the live success-hello fixture: session, message, usage, ok', () => {
     const events = replay(a, 'claude/success-hello.jsonl');
-    expect(events.find((e) => e.kind === 'session')).toMatchObject({ sessionId: 'be150d68-39d3-429d-851b-f15f48fbdf10' });
+    expect(events.find((e) => e.kind === 'session')).toMatchObject({ sessionId: 'be150d68-39d3-429d-851b-f15f48fbdf10', model: 'claude-opus-4-8[1m]' });
     expect(events.filter((e) => e.kind === 'message').at(-1)).toMatchObject({ text: 'hello' });
+    // The assistant line's per-API-call usage surfaces as one interim tick…
+    const interim = events.filter((e) => e.kind === 'usage' && e.interim);
+    expect(interim).toHaveLength(1);
+    expect(interim[0]).toMatchObject({ usage: { inputTokens: 5530, outputTokens: 1, cachedInputTokens: 15084 } });
+    // …and stays out of accounting: extractUsage totals are unchanged.
     const usage = a.extractUsage(events);
     expect(usage.inputTokens).toBe(5530); // 3454 input + 2076 cache_creation (write-through; previously dropped)
     expect(usage.outputTokens).toBe(4);
     expect(usage.cachedInputTokens).toBe(15084);
     expect(usage.costUSD).toBeCloseTo(0.046255, 5);
     expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: true });
+  });
+
+  it('emits an interim usage tick per assistant message; accounting stays terminal-only', () => {
+    const events = replay(a, 'claude/streaming-usage.jsonl');
+    const interim = events.filter((e): e is Extract<AgentEvent, { kind: 'usage' }> => e.kind === 'usage' && e.interim === true);
+    expect(interim.map((e) => e.usage)).toEqual([
+      expect.objectContaining({ inputTokens: 150, outputTokens: 20, cachedInputTokens: 1000 }), // 100 + 50 cache_creation
+      expect.objectContaining({ inputTokens: 200, outputTokens: 40, cachedInputTokens: 1200 }),
+    ]);
+    expect(interim.every((e) => e.usage.costUSD === undefined)).toBe(true); // cost only exists on the result line
+    const usage = a.extractUsage(events);
+    expect(usage).toMatchObject({ inputTokens: 350, outputTokens: 60, cachedInputTokens: 2200, totalTokens: 630 });
+    expect(usage.costUSD).toBeCloseTo(0.0123, 5);
   });
 
   it('builds --json-schema and stdin prompt; resume targets the session', () => {
@@ -60,6 +78,8 @@ describe('QoderAdapter', () => {
     const result = events.find((e) => e.kind === 'result');
     expect(result).toMatchObject({ isError: false, structured: { count: 5 } });
     expect(a.extractUsage(events)).toMatchObject({ inputTokens: 800, outputTokens: 12, cachedInputTokens: 100 });
+    // qoder's assistant lines omit usage → no interim ticks (graceful degradation)
+    expect(events.some((e) => e.kind === 'usage' && e.interim)).toBe(false);
     expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: true });
   });
 
@@ -87,6 +107,7 @@ describe('GeminiAdapter (emulated)', () => {
 
   it('parses response text, tool lifecycle, and stats usage', () => {
     const events = replay(a, 'gemini/success-json.jsonl');
+    expect(events.find((e) => e.kind === 'session')).toMatchObject({ sessionId: 'gem-1', model: 'gemini' });
     const result = events.find((e) => e.kind === 'result');
     expect(result).toMatchObject({ isError: false, text: 'Here is the JSON: {"count": 7}' });
     const tools = events.filter((e) => e.kind === 'tool');

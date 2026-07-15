@@ -57,6 +57,12 @@ export class GeminiAdapter implements BackendAdapter {
         const obj = parseJsonLine(line) as Record<string, any> | undefined;
         if (!obj || typeof obj.type !== 'string') return [];
         switch (obj.type) {
+          case 'init':
+            // No headless resume, so the sessionId itself goes unused — the
+            // event exists to carry the resolved model to progress consumers.
+            return typeof obj.session_id === 'string'
+              ? [{ kind: 'session', sessionId: obj.session_id, model: typeof obj.model === 'string' ? obj.model : undefined }]
+              : [];
           case 'message':
             return typeof obj.content === 'string'
               ? [{ kind: 'message', text: obj.content }]

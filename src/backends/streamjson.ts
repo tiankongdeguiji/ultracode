@@ -36,7 +36,9 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
 
       switch (obj.type) {
         case 'system':
-          if (typeof obj.session_id === 'string') out.push({ kind: 'session', sessionId: obj.session_id });
+          if (typeof obj.session_id === 'string') {
+            out.push({ kind: 'session', sessionId: obj.session_id, model: typeof obj.model === 'string' ? obj.model : undefined });
+          }
           break;
         case 'assistant': {
           if (typeof obj.session_id === 'string') out.push({ kind: 'session', sessionId: obj.session_id });
@@ -46,6 +48,11 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
               if (block?.type === 'text' && typeof block.text === 'string') out.push({ kind: 'message', text: block.text });
               if (block?.type === 'tool_use') out.push({ kind: 'tool', name: `tool:${block.name ?? ''}`, status: 'started' });
             }
+          }
+          // Assistant lines carry per-API-call usage (qoder omits it) —
+          // surfaced as interim ticks for live progress, never for accounting.
+          if (obj.message?.usage && typeof obj.message.usage === 'object') {
+            out.push({ kind: 'usage', usage: usageFromResult({ usage: obj.message.usage }), interim: true });
           }
           if (typeof obj.error === 'string') {
             out.push({ kind: 'result', isError: true, errorKind: ASSISTANT_ERROR_KIND[obj.error] ?? 'infra', text: obj.error, raw: obj });
