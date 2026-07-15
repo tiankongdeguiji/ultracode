@@ -55,6 +55,17 @@ describe('ClaudeAdapter', () => {
     expect(usage.costUSD).toBeCloseTo(0.0123, 5);
   });
 
+  it('dedupes interim usage across per-content-block assistant lines of one API call', () => {
+    const events = replay(a, 'claude/multiblock-usage.jsonl');
+    const interim = events.filter((e): e is Extract<AgentEvent, { kind: 'usage' }> => e.kind === 'usage' && e.interim === true);
+    // msg_01 spans two lines (text + tool_use, identical usage) → ONE tick; msg_02 → one more.
+    expect(interim.map((e) => e.usage)).toEqual([
+      expect.objectContaining({ inputTokens: 100, outputTokens: 30, cachedInputTokens: 500 }),
+      expect.objectContaining({ inputTokens: 180, outputTokens: 55, cachedInputTokens: 700 }),
+    ]);
+    expect(a.extractUsage(events)).toMatchObject({ inputTokens: 280, outputTokens: 85, cachedInputTokens: 1200 });
+  });
+
   it('builds --json-schema and stdin prompt; resume targets the session', () => {
     const plan = a.buildSpawn(req({ schema: { type: 'object' }, model: 'sonnet' }));
     expect(plan.argv).toContain('--json-schema');

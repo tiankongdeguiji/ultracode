@@ -12,6 +12,9 @@ issue trackers, SDK message envelopes, decompiled Qoder internals — plus docs/
 - claude/streaming-usage.jsonl — multi-assistant-message transcript in the
   claude/success-hello.jsonl envelope (per-API-call `message.usage` on assistant
   lines); exercises interim usage ticks vs terminal-only accounting
+- claude/multiblock-usage.jsonl — one API call split across multiple assistant
+  lines (same message.id, identical usage per content block — verified against
+  a live claude 2.1.x capture); exercises interim-usage dedup by message id
 
 Re-record live fixtures when a backend's CLI version changes; verify synthetic
 fixtures against a live capture before trusting a new parser path.

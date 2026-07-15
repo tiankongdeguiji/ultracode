@@ -28,6 +28,10 @@ const ASSISTANT_ERROR_KIND: Record<string, ErrorKind> = {
 };
 
 export function createStreamJsonParser(): { push(line: string): AgentEvent[]; end(): AgentEvent[] } {
+  // The CLI emits one assistant line PER CONTENT BLOCK of an API call (same
+  // message.id, byte-identical usage repeated) — deduped here or a text+tool_use
+  // turn would count its usage twice in interim accumulation.
+  let lastUsageMessageId: string | undefined;
   return {
     push(line: string): AgentEvent[] {
       const obj = parseJsonLine(line) as Record<string, any> | undefined;
@@ -52,7 +56,11 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
           // Assistant lines carry per-API-call usage (qoder omits it) —
           // surfaced as interim ticks for live progress, never for accounting.
           if (obj.message?.usage && typeof obj.message.usage === 'object') {
-            out.push({ kind: 'usage', usage: usageFromResult({ usage: obj.message.usage }), interim: true });
+            const messageId = typeof obj.message.id === 'string' ? obj.message.id : undefined;
+            if (messageId === undefined || messageId !== lastUsageMessageId) {
+              lastUsageMessageId = messageId;
+              out.push({ kind: 'usage', usage: usageFromResult({ usage: obj.message.usage }), interim: true });
+            }
           }
           if (typeof obj.error === 'string') {
             out.push({ kind: 'result', isError: true, errorKind: ASSISTANT_ERROR_KIND[obj.error] ?? 'infra', text: obj.error, raw: obj });
