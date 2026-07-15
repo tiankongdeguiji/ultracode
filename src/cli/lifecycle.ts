@@ -19,10 +19,22 @@ export function renderEvent(ev: TimestampedEvent): string | null {
     case 'phase_started':
       return `── phase: ${ev.title}`;
     case 'agent_started':
-      return `   agent[${ev.seq}] ${ev.label} started (${ev.backend})`;
+      return `   agent[${ev.seq}] ${ev.label} started (${ev.backend}${ev.model ? ` · ${ev.model}` : ''})`;
+    case 'agent_retry':
+      return `   agent[${ev.seq}] ${ev.label} retry ${ev.attempt}/${ev.maxAttempts}${ev.reason ? `: ${ev.reason}` : ''}`;
     case 'agent_completed':
       if (ev.skipped) return `   agent[${ev.seq}] ${ev.label} skipped`;
+      if (ev.cached) return `   agent[${ev.seq}] ${ev.label} done (cached)`;
       return `   agent[${ev.seq}] ${ev.label} ${ev.ok ? `done (${ev.totalTokens} tok)` : `FAILED: ${ev.error ?? ''}`}`;
+    case 'agent_usage':
+    case 'agent_model':
+      // Live-tick noise for folding panels only: line consumers (logs
+      // --follow, MCP logTail) would emit ~1 line/s per running agent.
+      return null;
+    case 'child_started':
+      return `▸ child workflow: ${ev.name}`;
+    case 'child_completed':
+      return `▸ child workflow ${ev.name} ${ev.ok ? 'done' : `FAILED: ${ev.error ?? ''}`}`;
     case 'workflow_log':
       return `   log: ${ev.message}`;
     case 'budget_tick':

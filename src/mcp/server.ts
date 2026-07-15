@@ -136,7 +136,7 @@ export function createServer(baseCwd: string): McpServer {
       const root = rootFor(input.cwd);
       const wait = Math.min(input.waitSeconds ?? DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS) * 1000;
       const deadline = Date.now() + wait;
-      const offset = input.sinceEventOffset ?? 0;
+      let offset = input.sinceEventOffset ?? 0;
       const progressToken = (extra as { _meta?: { progressToken?: string | number } })._meta?.progressToken;
       let ticks = 0;
 
@@ -145,9 +145,16 @@ export function createServer(baseCwd: string): McpServer {
         if (!run) return fail(`no run ${input.runId} under ${root}`);
         const eventsFile = join(run.dir, 'events.jsonl');
         const page = readEventsFrom(eventsFile, offset);
+        offset = page.nextOffset; // consume even null-rendered pages so ticks are never re-read
         const terminal = isTerminal(run.effectiveStatus);
+        // Wake on RENDERABLE lines, not raw events: agent_usage ticks arrive
+        // ~1/s per running agent and render null — waking on them would return
+        // empty logTails in a tight loop, burning the polling host's tokens.
+        const logTail = page.events
+          .map((e: TimestampedEvent) => renderEvent(e))
+          .filter((l): l is string => l !== null);
 
-        if (page.events.length > 0 || terminal || Date.now() >= deadline) {
+        if (logTail.length > 0 || terminal || Date.now() >= deadline) {
           const m = run.manifest;
           return ok({
             runId: input.runId,
@@ -155,11 +162,8 @@ export function createServer(baseCwd: string): McpServer {
             phases: m.phases,
             agentCount: m.agentCount,
             budget: m.budget,
-            logTail: page.events
-              .map((e: TimestampedEvent) => renderEvent(e))
-              .filter((l): l is string => l !== null)
-              .slice(-40),
-            nextEventOffset: page.nextOffset,
+            logTail: logTail.slice(-40),
+            nextEventOffset: offset,
             terminal,
             ...(terminal ? { next: `call workflow_result with runId=${input.runId}` } : {}),
           });

@@ -3,13 +3,14 @@
  * launches real detached runners on the mock backend. No network.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { readProcStat } from '../../src/exec/procinfo.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const mainTs = join(here, '../../src/cli/main.ts');
@@ -88,6 +89,49 @@ describe('MCP triad', () => {
     expect(result.structuredContent!.logs).toEqual(['done']);
     expect(result.structuredContent!.artifacts.runDir).toContain(runId);
   }, 60_000);
+
+  it('long-poll is not woken by agent_usage ticks (renderable lines only)', async () => {
+    // Fabricated live run: manifest points at THIS (alive) process so
+    // liveStatus stays 'running'; events.jsonl holds only null-rendered ticks.
+    const runId = 'wf_ticksonly001';
+    const dir = join(projectDir, '.ultracode', 'runs', runId);
+    mkdirSync(dir, { recursive: true });
+    const now = new Date().toISOString();
+    writeFileSync(
+      join(dir, 'manifest.json'),
+      JSON.stringify({
+        runId,
+        name: 'ticks',
+        status: 'running',
+        pid: process.pid,
+        pidStart: readProcStat(process.pid)?.starttime,
+        startedAt: now,
+        heartbeatAt: now,
+        phases: [],
+        agentCount: 0,
+        budget: { total: null, spent: 0 },
+        backendDefault: 'mock',
+        engineVersion: '0.0.0',
+      }),
+    );
+    writeFileSync(
+      join(dir, 'events.jsonl'),
+      '{"ts":1,"type":"agent_usage","seq":0,"totalTokens":100,"estimated":false}\n' +
+        '{"ts":2,"type":"agent_usage","seq":0,"totalTokens":200,"estimated":false}\n',
+    );
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const elapsed = Date.now() - t0;
+    const status = s.structuredContent!;
+    expect(status.terminal).toBe(false);
+    expect(status.logTail).toEqual([]);
+    expect(status.nextEventOffset).toBeGreaterThan(0); // ticks consumed, never re-served
+    expect(elapsed).toBeGreaterThanOrEqual(900); // waited to deadline instead of waking on ticks
+  }, 20_000);
 
   it('workflow_result on a running workflow errors with guidance; stop terminates it', async () => {
     const start = (await client.callTool({

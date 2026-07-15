@@ -108,7 +108,7 @@ interface AgentOptions {
 - **`phase(title)`**: creates/reuses named phase index (seeded from `meta.phases`); subsequent agents group under it. `opts.phase` on agent() sets the group directly (documented for use inside parallel/pipeline stages to avoid races on the global phase pointer — we implement it, closing Qoder's doc-ahead-of-code gap).
 - **`log(msg)`**: appends `workflow_log` event; cap 1000 entries then drop+count.
 - **`budget`**: `{ total: number|null, spent(): number, remaining(): number }` — real, wired (see §5).
-- **`workflow(nameOrRef | {name|scriptPath, args?}, args?)`**: runs a child workflow **inline, one nesting level max** (child attempting `workflow()` throws). Child shares parent's semaphore, agent counter, AbortSignal, and BudgetAccount; child journal entries interleave into the parent chain with a `child-enter(name, argsHash)` boundary record so prefix replay stays coherent. Child phases surface as `kind:'child'`.
+- **`workflow(nameOrRef | {name|scriptPath, args?}, args?)`**: runs a child workflow **inline, one nesting level max** (child attempting `workflow()` throws). Child shares parent's semaphore, agent counter, AbortSignal, and BudgetAccount; child journal entries interleave into the parent chain with a `child-enter(name, argsHash)` boundary record so prefix replay stays coherent. Child events surface tagged `childId`/`childName`, bounded by `child_started`/`child_completed` (see §1.5).
 - **Run result**: `{ result, logs, failures, agentCount, totalTokens, totalToolCalls, durationMs, error? }` → `output.json`.
 
 ### 1.4 Journal + resume (`journal.ts`) — hash-chain prefix replay
@@ -121,13 +121,13 @@ key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0"
         + stableStringify({ agentType, isolation, model, effort, schema, backend, cwd }))
 ```
 
-(`stableStringify` = sorted-key deterministic JSON; absent fields omitted.) Records: `{t:'started', runId, engineVersion, scriptHash, argsHash}`, `{t:'agent', seq, key, status:'ok'|'error'|'skip', label, phase, backend, sessionId?, usage, resultRef, error?}`, `{t:'child-enter'|'child-exit', name}`.
+(`stableStringify` = sorted-key deterministic JSON; absent fields omitted.) Records: `{t:'started', runId, engineVersion, scriptHash, argsHash}`, `{t:'agent', seq, key, status:'ok'|'error'|'skip', label, phase, backend, model?, sessionId?, usage, resultRef, error?}`, `{t:'child-enter'|'child-exit', name}`.
 
 **Resume** (`resumeFromRunId`): prior run must be terminal (pid dead + manifest status ∉ running). New run gets fresh runId + fresh journal; the old journal is loaded as an ordered replay queue. `nextCachedResult(key)` compares sequentially; every hit resolves that `agent()` **instantly** from `resultRef` (re-read from the old run's `agents/` dir); the **first miss sets `prefixMissed = true` and disables all later hits** — exactly the longest-unchanged-prefix contract. Determinism holds because banned entropy sources + instant cached resolution make the microtask interleaving reproducible up to the first live call; beyond that everything runs live anyway. Same script + same args ⇒ full cache hit.
 
 ### 1.5 Progress events
 
-The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend}, agent_progress {seq, toolName, elapsedMs}, agent_completed {seq, usage, ok}, workflow_log, budget_tick {spent}, run_completed|run_failed|run_stopped`. CLI `status --watch`, `logs --follow`, and MCP long-poll all tail this file by byte offset.
+The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens}, workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `status --watch`, `logs --follow`, and MCP long-poll all tail this file by byte offset; the MCP long-poll wakes only on *renderable* lines, so usage ticks never spin it.
 
 ---
 
