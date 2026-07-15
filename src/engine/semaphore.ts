@@ -19,7 +19,7 @@ export class Semaphore {
   private readonly queue: Array<() => void> = [];
 
   constructor(readonly permits: number) {
-    if (!Number.isInteger(permits) || permits < 1) {
+    if (!isPositiveInt(permits)) {
       throw new TypeError(`Semaphore permits must be a positive integer, got ${permits}`);
     }
   }

@@ -11,7 +11,7 @@ import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
 import { attachForeground, printOutput } from './lifecycle.js';
-import { parseMaxConcurrency } from './options.js';
+import { readMaxConcurrencyOpt } from './options.js';
 import { validateScript } from './validate.js';
 
 export interface RunCliOptions {
@@ -104,15 +104,9 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
   // Fail fast on a bad cap BEFORE any run dir exists — a non-positive or
   // fractional value would crash the runner after the manifest says 'running',
   // orphaning the run (the MCP path gets this guard from zod; the CLI must match).
-  let maxConcurrencyOpt: number | undefined;
-  if (opts.maxConcurrency !== undefined) {
-    const n = parseMaxConcurrency(opts.maxConcurrency);
-    if (n === null) {
-      process.stderr.write(`ultracode: --max-concurrency must be a positive integer\n`);
-      return 1;
-    }
-    maxConcurrencyOpt = n;
-  }
+  const mcOpt = readMaxConcurrencyOpt(opts.maxConcurrency);
+  if (!mcOpt.ok) return 1;
+  const maxConcurrencyOpt = mcOpt.value;
 
   // Dry run: rehearse on the mock backend in-process — free, instant, and
   // exercises the identical dialect semantics (schema validation included).

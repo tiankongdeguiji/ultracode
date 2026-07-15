@@ -7,7 +7,7 @@ import { createRunDir, getRun, readRunArgs, readRunConfig, reapOrphans } from '.
 import { isTerminal } from '../store/manifest.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { attachForeground, printOutput } from './lifecycle.js';
-import { parseMaxConcurrency } from './options.js';
+import { readMaxConcurrencyOpt } from './options.js';
 
 export interface ResumeCliOptions {
   script?: string;
@@ -28,15 +28,9 @@ export interface ResumeCliOptions {
 export async function resumeCommand(runId: string, opts: ResumeCliOptions): Promise<number> {
   // Validate CLI input before touching the store — bad input fails fast even
   // when the run id is unknown.
-  let maxConcurrencyOverride: number | undefined;
-  if (opts.maxConcurrency !== undefined) {
-    const n = parseMaxConcurrency(opts.maxConcurrency);
-    if (n === null) {
-      process.stderr.write(`ultracode: --max-concurrency must be a positive integer\n`);
-      return 1;
-    }
-    maxConcurrencyOverride = n;
-  }
+  const mcOpt = readMaxConcurrencyOpt(opts.maxConcurrency);
+  if (!mcOpt.ok) return 1;
+  const maxConcurrencyOverride = mcOpt.value;
 
   const root = ultracodeRoot(process.cwd(), opts.home);
   let prior = getRun(root, runId);

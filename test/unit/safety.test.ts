@@ -203,9 +203,10 @@ describe('CLI --max-concurrency fail-fast', () => {
     const { chunks, spy } = captureStderr();
     try {
       for (const bad of BAD_VALUES) {
+        chunks.length = 0;
         expect(await runCommand(file, { yes: true, backend: 'mock', home, maxConcurrency: bad })).toBe(1);
+        expect(chunks.join('')).toContain('--max-concurrency must be a positive integer');
       }
-      expect(chunks.join('')).toContain('--max-concurrency must be a positive integer');
       expect(existsSync(home)).toBe(false); // no run store, no orphanable run dir
     } finally {
       spy.mockRestore();
@@ -244,6 +245,47 @@ describe('CLI --max-concurrency fail-fast', () => {
       errSpy.mockRestore();
     }
   }, 30_000);
+
+  it('ULTRACODE_MAX_CONCURRENCY seeds a fresh run config; an explicit flag beats the env', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const { readRunConfig } = await import('../../src/store/runstore.js');
+    const { readManifest, isTerminal } = await import('../../src/store/manifest.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-mcenv-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const prevEnv = process.env.ULTRACODE_MAX_CONCURRENCY;
+    const outs: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      outs.push(String(chunk));
+      return true;
+    });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const runAndReadMc = async (home: string, flag?: string) => {
+      outs.length = 0;
+      expect(
+        await runCommand(file, { yes: true, backend: 'mock', home, detach: true, maxConcurrency: flag }),
+      ).toBe(0);
+      const runDir = join(home, 'runs', outs.join('').trim().split('\n')[0]!);
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        const m = readManifest(runDir);
+        if (m && isTerminal(m.status)) break;
+        if (Date.now() > deadline) throw new Error(`run not terminal: ${m?.status}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return readRunConfig(runDir).maxConcurrency;
+    };
+    try {
+      process.env.ULTRACODE_MAX_CONCURRENCY = '7';
+      expect(await runAndReadMc(join(dir, 's1'))).toBe(7); // env seeds the frozen config
+      expect(await runAndReadMc(join(dir, 's2'), '4')).toBe(4); // explicit flag beats env
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+      if (prevEnv === undefined) delete process.env.ULTRACODE_MAX_CONCURRENCY;
+      else process.env.ULTRACODE_MAX_CONCURRENCY = prevEnv;
+    }
+  }, 40_000);
 
   it('resume validates --max-concurrency before touching the store', async () => {
     const { resumeCommand } = await import('../../src/cli/resume.js');
