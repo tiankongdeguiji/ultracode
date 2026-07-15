@@ -150,17 +150,22 @@ describe('detached runner', () => {
     }
   }, 20_000);
 
-  it('tolerates a non-positive maxConcurrency in an inherited config.json (falls back to default, no orphan)', async () => {
-    // Old-version or hand-edited run dirs can carry maxConcurrency: 0 — the
-    // runner must not throw in the Semaphore constructor after flipping the
-    // manifest to 'running' (that would orphan the run).
-    const { dir } = makeRun(HELLO, { maxConcurrency: 0 });
-    await launchRunner(dir);
-    const status = await waitTerminal(dir);
-    expect(status).toBe('completed');
-    const output = JSON.parse(readFileSync(join(dir, 'output.json'), 'utf8'));
-    expect(output.result).toEqual({ g: 'hi' });
-  }, 30_000);
+  it('tolerates a non-positive or fractional maxConcurrency in an inherited config.json (falls back to default, no orphan)', async () => {
+    // Old-version or hand-edited run dirs can carry maxConcurrency: 0 or 2.5 —
+    // the runner must not throw in the Semaphore constructor after flipping the
+    // manifest to 'running' (that would orphan the run). 2.5 pins the
+    // integer-ness half of the guard, 0 the positivity half.
+    const zero = makeRun(HELLO, { maxConcurrency: 0 });
+    const frac = makeRun(HELLO, { maxConcurrency: 2.5 });
+    await launchRunner(zero.dir);
+    await launchRunner(frac.dir);
+    for (const { dir } of [zero, frac]) {
+      const status = await waitTerminal(dir);
+      expect(status).toBe('completed');
+      const output = JSON.parse(readFileSync(join(dir, 'output.json'), 'utf8'));
+      expect(output.result).toEqual({ g: 'hi' });
+    }
+  }, 40_000);
 
   it('run survives launcher death by construction (launcher already exited: we are polling from a different process)', async () => {
     // The launcher (this test) returns from launchRunner immediately after
