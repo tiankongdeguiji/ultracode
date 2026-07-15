@@ -65,7 +65,7 @@ Progress grouping (seeded from `meta.phases`, matched by exact title) and narrat
 
 ## Caps (engine-enforced, loudly reported)
 
-Concurrency `min(16, max(2, cores−2))` (FIFO queue beyond it); lifetime 1000 agents hard / 50 soft default (`--max-agents`); 4096 items per parallel/pipeline call; per-attempt timeout 20m; run wall-clock 60m default.
+Concurrency default `min(10, max(2, cores−2))` — `--max-concurrency`, `ULTRACODE_MAX_CONCURRENCY`, or `workflow_start`'s `maxConcurrency` override it (FIFO queue beyond the cap; the env var seeds fresh runs only — resumes inherit the stored value unless explicitly overridden); lifetime 1000 agents hard / 50 soft default (`--max-agents`); 4096 items per parallel/pipeline call; per-attempt timeout 20m; run wall-clock 60m default.
 
 ## Failure-handling idioms
 

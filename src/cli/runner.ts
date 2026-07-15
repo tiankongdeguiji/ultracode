@@ -17,7 +17,7 @@ import { agentDirName } from '../store/layout.js';
 import { MockExecutor } from '../backends/mock.js';
 import { createExecutorForBackend } from '../engine/agentcall.js';
 import { readProcStat } from '../exec/procinfo.js';
-import { Semaphore, defaultConcurrency } from '../engine/semaphore.js';
+import { Semaphore, defaultConcurrency, isPositiveInt } from '../engine/semaphore.js';
 import { BudgetAccount } from '../budget/account.js';
 import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
 import { resolveWorkflowSource } from '../installer/registry.js';
@@ -32,9 +32,6 @@ import type { SharedRunState } from '../engine/hostapi.js';
 function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): AgentExecutor {
   const cache = new Map<string, AgentExecutor>();
   const artifactDir = (spec: AgentSpec) => join(dir, 'agents', agentDirName(spec.seq, spec.label));
-  // Codex OAuth fan-out is capped via shared.backendLimits in the ENGINE (before
-  // the general permit) rather than here — gating inside execute() would hold a
-  // general permit while parked and starve other backends (head-of-line block).
   const resolve = (backend: string): AgentExecutor => {
     let ex = cache.get(backend);
     if (!ex) {
@@ -164,19 +161,17 @@ export async function runnerMain(dir: string): Promise<number> {
 
   // Shared execution state so nested workflow() children share caps/budget.
   const budgetAccount = new BudgetAccount(config.budgetTotal ?? null);
-  const maxConcurrency = config.maxConcurrency ?? defaultConcurrency();
+  // Choke-point guard: config.json is worker-writable and version-inherited on
+  // resume — a non-positive-integer maxConcurrency (0, 2.5, hand-edited junk)
+  // would throw in the Semaphore constructor AFTER the manifest flipped to
+  // 'running', orphaning the run. Fall back to the default instead.
+  const storedMax = config.maxConcurrency ?? defaultConcurrency();
+  const maxConcurrency = isPositiveInt(storedMax) ? storedMax : defaultConcurrency();
   const shared: SharedRunState = {
     semaphore: new Semaphore(maxConcurrency),
     counter: { count: 0 },
     runId: manifest.runId,
   };
-  // Codex OAuth fan-out cap as a per-backend limiter, acquired before the
-  // general permit. Only when it actually constrains (tighter than the general
-  // cap) — in a codex-DEFAULT run the general semaphore already equals it.
-  const codexCap = config.codexMaxConcurrency;
-  if (codexCap && codexCap >= 1 && codexCap < maxConcurrency) {
-    shared.backendLimits = new Map([['codex', new Semaphore(codexCap)]]);
-  }
   // Worktree isolation only inside a git repo.
   const repoRoot = repoRootSync(config.cwd);
   if (repoRoot) shared.worktrees = createWorktreeManager(repoRoot, worktreesRootFor(dir));
@@ -190,7 +185,10 @@ export async function runnerMain(dir: string): Promise<number> {
     shared,
     resolveChild: (nameOrPath) => resolveWorkflowSource(nameOrPath, config.cwd),
     maxAgents: config.maxAgents,
-    maxConcurrency: config.maxConcurrency,
+    // The guarded local, NOT raw config.maxConcurrency: if a refactor ever
+    // stops threading `shared`, the engine's own Semaphore fallback must still
+    // receive a sanitized value (raw 2.5/0 would throw post-'running').
+    maxConcurrency,
     logCap: config.logCap,
     signal: abort.signal,
     defaultBackend: config.backend,

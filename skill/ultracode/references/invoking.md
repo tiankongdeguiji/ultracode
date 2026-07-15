@@ -4,7 +4,7 @@
 
 1. **Qoder native Workflow tool** (qodercli / Qoder IDE with the tool registered): invoke it directly, or install the script to `.qoder/workflows/<name>.js` and run by name. Native resume: `resumeFromRunId: "wf_..."`. Caveats: `budget` global is stubbed (`{total:null}`) — pass `args.budgetTokens` and gate manually; no per-call `effort` (define a subagent in `.qoder/agents/` with frontmatter `effort:` and use `agentType`); never name anything `Workflow`, `workflows`, or `deep-research`.
 2. **ultracode MCP tools** (`workflow_start` / `workflow_status` / `workflow_result` / `workflow_stop` / `workflow_list`):
-   - `workflow_start {script | scriptPath, backend, args?, budget?, resumeFromRunId?}` → returns `{runId}` in <1s. Fire-and-forget: the run survives you. **`backend` is required for a fresh start** (mock|codex|qoder|claude|gemini); `mock` returns fabricated stubs for rehearsal only, so always pass a real backend for real work. (Resume inherits the prior run's backend.)
+   - `workflow_start {script | scriptPath, backend, args?, budget?, maxConcurrency?, resumeFromRunId?}` → returns `{runId}` in <1s. Fire-and-forget: the run survives you. **`backend` is required for a fresh start** (mock|codex|qoder|claude|gemini); `mock` returns fabricated stubs for rehearsal only, so always pass a real backend for real work. (Resume inherits the prior run's backend.)
    - Poll `workflow_status {runId, waitSeconds: 25, sinceEventOffset}` — long-poll; returns fresh log tail + `nextEventOffset`. **A timed-out poll is harmless: re-poll with the same runId.**
    - `workflow_result {runId}` when status is terminal → full output (result, failures, usage, artifact paths).
 3. **Shell CLI**:
@@ -14,14 +14,14 @@
    ultracode run my.workflow.js --backend codex --yes [--budget <ONLY if the user specified one>] [--detach]
    ultracode status <runId> --watch | logs <runId> --follow | stop <runId>
    ultracode resume <runId> [--script edited.js]
-   ultracode doctor                           # backend availability + auth safety table
+   ultracode doctor                           # backend availability + auth mode table
    ```
 
 ## Backend notes (ultracode engine workers)
 
 | backend | worker CLI | structured output | parallel-safe auth |
 |---|---|---|---|
-| codex | `codex exec --json` | native `--output-schema` (strict subset) | `CODEX_API_KEY` (ChatGPT OAuth → concurrency 1) |
+| codex | `codex exec --json` | native `--output-schema` (strict subset) | `CODEX_API_KEY` |
 | qoder | `qodercli --print` | native `--json-schema` (+ engine revalidation) | `QODER_PERSONAL_ACCESS_TOKEN` (beware stored /login creds) |
 | claude | `claude -p` | native `--json-schema` | CLI-managed |
 | gemini | `gemini -p` | emulated (prompt contract + validate/retry) | `GEMINI_API_KEY` |

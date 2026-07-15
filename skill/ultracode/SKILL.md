@@ -69,5 +69,5 @@ Scale to the ask: "find bugs" → few finders, single vote; "thoroughly audit" �
 
 - Review-before-run is mandatory (`--yes` only after you've shown the user the plan or they pre-authorized).
 - Workers default to workspace-write sandbox; use `--permission safe` (read-only) for research/review workflows — prefer it whenever agents don't need to edit.
-- Codex on ChatGPT OAuth runs at concurrency 1 (fan-out unsafe); real parallelism needs `CODEX_API_KEY`.
+- Concurrency is user-controlled: default min(10, max(2, cores-2)); override via `--max-concurrency`, `ULTRACODE_MAX_CONCURRENCY`, or `workflow_start`'s `maxConcurrency`. The env var seeds fresh runs only — a resume inherits the stored value unless `resume --max-concurrency` / MCP `maxConcurrency` overrides it. For codex workers, `CODEX_API_KEY` is the parallel-safe auth.
 - Budget exhaustion stops dispatch loudly; check `failures[]` in the output — it lists every cap trip, declined action, and failed agent.

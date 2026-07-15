@@ -1,8 +1,16 @@
 import os from 'node:os';
 
-/** Engine default: min(16, max(2, cores - 2)) — matches the reference implementations. */
+/** The one validation rule for every concurrency surface (flag, env, stored config). */
+export function isPositiveInt(n: number): boolean {
+  return Number.isInteger(n) && n > 0;
+}
+
+/** Engine default: min(10, max(2, cores - 2)); ULTRACODE_MAX_CONCURRENCY (a strict
+ *  positive integer, same rule as --max-concurrency) overrides. Junk is ignored. */
 export function defaultConcurrency(): number {
-  return Math.min(16, Math.max(2, os.cpus().length - 2));
+  const fromEnv = Number(process.env.ULTRACODE_MAX_CONCURRENCY);
+  if (isPositiveInt(fromEnv)) return fromEnv;
+  return Math.min(10, Math.max(2, os.cpus().length - 2));
 }
 
 /** FIFO counting semaphore. acquire() resolves with a release function. */
@@ -11,7 +19,7 @@ export class Semaphore {
   private readonly queue: Array<() => void> = [];
 
   constructor(readonly permits: number) {
-    if (!Number.isInteger(permits) || permits < 1) {
+    if (!isPositiveInt(permits)) {
       throw new TypeError(`Semaphore permits must be a positive integer, got ${permits}`);
     }
   }

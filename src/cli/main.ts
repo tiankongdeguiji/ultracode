@@ -21,13 +21,12 @@ program
   .option('--args <json>', 'workflow args (JSON or plain string)')
   .option('--backend <id>', 'default backend for agents', 'mock')
   .option('--max-agents <n>', 'soft lifetime agent cap (hard ceiling 1000)')
-  .option('--max-concurrency <n>', 'concurrent agent cap (default min(16, max(2, cores-2)))')
+  .option('--max-concurrency <n>', 'concurrent agent cap (default min(10, max(2, cores-2)); env ULTRACODE_MAX_CONCURRENCY overrides the default)')
   .option('--budget <spec>', 'token budget: 500k, +500k, 2m (hard dispatch-gate ceiling)')
   .option('--permission <mode>', 'worker sandbox: safe|auto|danger (read-only/workspace-write/full)', 'auto')
   .option('--timeout <minutes>', 'wall-clock cap in minutes (default 60)')
   .option('--dry-run', 'rehearse on the mock backend: no tokens, no run dir')
   .option('--yes', 'skip the review-before-run confirmation')
-  .option('--force-oauth-fanout', 'allow codex ChatGPT-OAuth concurrency up to 3 (racy; prefer CODEX_API_KEY)')
   .option('--detach', 'print runId and return immediately')
   .option('--json', 'suppress progress; print output.json at the end')
   .option('--home <dir>', 'run-store root (default <cwd>/.ultracode or $ULTRACODE_HOME)')
@@ -65,6 +64,7 @@ program
   .description('resume: completed agents replay from the journal, the rest run live')
   .option('--script <file>', 'edited script (unchanged prefix still replays)')
   .option('--args <json>', 'override args (changes the seed → full re-run)')
+  .option('--max-concurrency <n>', 'override the stored concurrency for this resume')
   .option('--detach')
   .option('--json')
   .option('--home <dir>')
@@ -118,7 +118,7 @@ program
 
 program
   .command('doctor')
-  .description('probe backends: availability, versions, auth topology, parallel-safety')
+  .description('probe backends: availability, versions, auth topology')
   .option('--json')
   .action(async (opts: { json?: boolean }) => {
     const { doctorCommand } = await import('./doctor.js');

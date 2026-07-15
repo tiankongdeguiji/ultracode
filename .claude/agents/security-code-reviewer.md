@@ -19,7 +19,7 @@ You are a security reviewer for **ultracode**, a workflow engine that (a) execut
 
 **Credentials & auth (`src/backends/codex-auth.ts`, adapters):**
 - Never log or echo secrets (`CODEX_API_KEY`, `QODER_PERSONAL_ACCESS_TOKEN`, OAuth tokens); flag secrets passed on argv where an env var/file is safer.
-- OAuth fan-out safety must be enforced (ChatGPT-OAuth codex fan-out is unsafe → concurrency capped); flag regressions.
+- Concurrency is user-controlled by design (no auth-derived caps or warnings since 0.1.1); codex auth detection is informational only (`doctor`). Do NOT flag the absence of OAuth fan-out caps/warnings as a regression.
 - Never default to `--yolo` / `danger-full-access` / `bypassPermissions`; the default worker sandbox must be the least privilege the task needs.
 
 **Injection & untrusted input:**

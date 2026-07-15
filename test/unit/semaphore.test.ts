@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import os from 'node:os';
 import { Semaphore, defaultConcurrency } from '../../src/engine/semaphore.js';
 
 describe('Semaphore', () => {
@@ -84,9 +85,50 @@ describe('Semaphore', () => {
     expect(s.active).toBe(0);
   });
 
-  it('defaultConcurrency is within [2, 16]', () => {
-    const d = defaultConcurrency();
-    expect(d).toBeGreaterThanOrEqual(2);
-    expect(d).toBeLessThanOrEqual(16);
+  it('defaultConcurrency is within [2, 10]; ULTRACODE_MAX_CONCURRENCY overrides, junk is ignored', () => {
+    const prev = process.env.ULTRACODE_MAX_CONCURRENCY;
+    try {
+      delete process.env.ULTRACODE_MAX_CONCURRENCY;
+      const computed = defaultConcurrency();
+      expect(computed).toBeGreaterThanOrEqual(2);
+      expect(computed).toBeLessThanOrEqual(10);
+
+      process.env.ULTRACODE_MAX_CONCURRENCY = '24';
+      expect(defaultConcurrency()).toBe(24);
+      process.env.ULTRACODE_MAX_CONCURRENCY = '1';
+      expect(defaultConcurrency()).toBe(1);
+      // '2.5' and '24abc' pin the strict-integer rule: parseInt-style
+      // truncation (2.5→2, 24abc→24) must NOT be honored — same rule as
+      // the --max-concurrency flag.
+      for (const junk of ['0', '-3', 'abc', '', '2.5', '24abc']) {
+        process.env.ULTRACODE_MAX_CONCURRENCY = junk;
+        expect(defaultConcurrency()).toBe(computed);
+      }
+    } finally {
+      if (prev === undefined) delete process.env.ULTRACODE_MAX_CONCURRENCY;
+      else process.env.ULTRACODE_MAX_CONCURRENCY = prev;
+    }
+  });
+
+  it('defaultConcurrency formula: cap 10, floor 2 (mocked core counts)', () => {
+    const cpu = { model: 'x', speed: 0, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } };
+    const spy = vi.spyOn(os, 'cpus');
+    const prev = process.env.ULTRACODE_MAX_CONCURRENCY;
+    try {
+      delete process.env.ULTRACODE_MAX_CONCURRENCY;
+      for (const [cores, expected] of [
+        [32, 10], // cap
+        [12, 10], // 12-2 hits the cap exactly
+        [8, 6],
+        [3, 2], // floor
+      ] as const) {
+        spy.mockReturnValue(new Array(cores).fill(cpu));
+        expect(defaultConcurrency()).toBe(expected);
+      }
+    } finally {
+      spy.mockRestore();
+      if (prev === undefined) delete process.env.ULTRACODE_MAX_CONCURRENCY;
+      else process.env.ULTRACODE_MAX_CONCURRENCY = prev;
+    }
   });
 });

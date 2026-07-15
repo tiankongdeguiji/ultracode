@@ -7,7 +7,6 @@ import { join } from 'node:path';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { validateArgsAgainstInputSchema } from '../engine/run.js';
 import { defaultConcurrency } from '../engine/semaphore.js';
-import { codexConcurrencyPolicy, detectCodexAuth } from '../backends/codex-auth.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir, getRun } from '../store/runstore.js';
 import { isTerminal } from '../store/manifest.js';
@@ -26,14 +25,12 @@ export interface StartRunInput {
   resumeFromRunId?: string;
   cwd?: string;
   home?: string;
-  forceOauthFanout?: boolean;
 }
 
 export interface StartRunResult {
   runId: string;
   dir: string;
   name: string;
-  warnings: string[];
 }
 
 export const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex', 'qoder', 'claude', 'gemini']);
@@ -41,7 +38,6 @@ export const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex', 'qoder', 'claude',
 export async function startDetachedRun(input: StartRunInput): Promise<StartRunResult> {
   const cwd = input.cwd ?? process.cwd();
   const root = ultracodeRoot(cwd, input.home);
-  const warnings: string[] = [];
 
   let source = input.script;
   let args = input.args ?? null;
@@ -53,7 +49,6 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     budgetTotal: input.budgetTotal ?? null,
     permission: input.permission ?? 'auto',
     wallClockMs: input.wallClockMs,
-    codexMaxConcurrency: undefined as number | undefined,
     resumeFromRunId: undefined as string | undefined,
   };
 
@@ -98,17 +93,8 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
   const parsed = parseWorkflowScript(source);
   validateArgsAgainstInputSchema(parsed, args ?? undefined);
 
-  // Codex OAuth fan-out cap: apply to the run default AND record a codex-specific
-  // limit so per-call backend:'codex' in a non-codex-default run is also gated.
-  const codexPolicy = codexConcurrencyPolicy(config.maxConcurrency!, detectCodexAuth(), input.forceOauthFanout === true);
-  config.codexMaxConcurrency = codexPolicy.maxConcurrency;
-  if (config.backend === 'codex') {
-    if (codexPolicy.warning) warnings.push(codexPolicy.warning);
-    config.maxConcurrency = codexPolicy.maxConcurrency;
-  }
-
   const runId = newRunId();
   const dir = createRunDir(root, { runId, name: parsed.meta.name, source, args, config, resumedFrom });
   await launchRunner(dir);
-  return { runId, dir, name: parsed.meta.name, warnings };
+  return { runId, dir, name: parsed.meta.name };
 }

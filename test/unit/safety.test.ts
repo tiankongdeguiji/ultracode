@@ -1,16 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { parseBudget } from '../../src/budget/parse.js';
-import {
-  codexConcurrencyPolicy,
-  detectCodexAuth,
-  isFanoutSafe,
-  OAUTH_FANOUT_FORCED_CAP,
-} from '../../src/backends/codex-auth.js';
+import { detectCodexAuth } from '../../src/backends/codex-auth.js';
 import { AgentCallExecutor } from '../../src/engine/agentcall.js';
 import { usageFromEvents } from '../../src/backends/usage.js';
 import { parseJsonLine } from '../../src/backends/ndjson.js';
 import type { AgentEvent, AgentRequest, AgentSpec, BackendAdapter, ExitClass, SpawnPlan } from '../../src/backends/types.js';
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -32,7 +27,7 @@ describe('parseBudget', () => {
   });
 });
 
-describe('codex auth policy', () => {
+describe('codex auth detection', () => {
   it('detectCodexAuth prefers env keys', () => {
     const prev = process.env.CODEX_API_KEY;
     try {
@@ -53,18 +48,23 @@ describe('codex auth policy', () => {
     expect(detectCodexAuth(home)).toBe('chatgpt-oauth');
   });
 
-  it('caps OAuth fan-out at 1, or 3 when forced; api-key is uncapped', () => {
-    const oauth = codexConcurrencyPolicy(8, 'chatgpt-oauth', false);
-    expect(oauth.maxConcurrency).toBe(1);
-    expect(oauth.warning).toContain('capped at 1');
-
-    const forced = codexConcurrencyPolicy(8, 'chatgpt-oauth', true);
-    expect(forced.maxConcurrency).toBe(OAUTH_FANOUT_FORCED_CAP);
-
-    expect(codexConcurrencyPolicy(8, 'api-key-env', false)).toEqual({ maxConcurrency: 8 });
-    expect(codexConcurrencyPolicy(1, 'chatgpt-oauth', false)).toEqual({ maxConcurrency: 1 });
-    expect(isFanoutSafe('api-key-file')).toBe(true);
-    expect(isFanoutSafe('chatgpt-oauth')).toBe(false);
+  it('detects CODEX_ACCESS_TOKEN and tolerates malformed auth.json', () => {
+    const prevKey = process.env.CODEX_API_KEY;
+    const prevTok = process.env.CODEX_ACCESS_TOKEN;
+    try {
+      delete process.env.CODEX_API_KEY;
+      process.env.CODEX_ACCESS_TOKEN = 'tok';
+      expect(detectCodexAuth('/nonexistent')).toBe('access-token-env');
+      delete process.env.CODEX_ACCESS_TOKEN;
+      const home = mkdtempSync(join(tmpdir(), 'uc-codexhome-'));
+      writeFileSync(join(home, 'auth.json'), '{not json');
+      expect(detectCodexAuth(home)).toBe('none');
+    } finally {
+      if (prevKey === undefined) delete process.env.CODEX_API_KEY;
+      else process.env.CODEX_API_KEY = prevKey;
+      if (prevTok === undefined) delete process.env.CODEX_ACCESS_TOKEN;
+      else process.env.CODEX_ACCESS_TOKEN = prevTok;
+    }
   });
 });
 
@@ -178,6 +178,128 @@ describe('silent no-op detector', () => {
     expect(outcome.ok).toBe(true);
     expect(outcome.warnings).toHaveLength(1);
     expect(outcome.warnings![0]).toContain('2 action(s) auto-rejected');
+  });
+});
+
+describe('CLI --max-concurrency fail-fast', () => {
+  const SCRIPT = `export const meta = { name: 't', description: 'd' }\nreturn 1`;
+  const BAD_VALUES = ['0', '-1', '2.5', 'abc', ''];
+
+  function captureStderr() {
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      chunks.push(String(chunk));
+      return true;
+    });
+    return { chunks, spy };
+  }
+
+  it('run rejects non-positive-integer values before creating any run state', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-mcguard-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const { chunks, spy } = captureStderr();
+    try {
+      for (const bad of BAD_VALUES) {
+        chunks.length = 0;
+        expect(await runCommand(file, { yes: true, backend: 'mock', home, maxConcurrency: bad })).toBe(1);
+        expect(chunks.join('')).toContain('--max-concurrency must be a positive integer');
+      }
+      expect(existsSync(home)).toBe(false); // no run store, no orphanable run dir
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('run persists a valid --max-concurrency into the new run config', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const { readRunConfig } = await import('../../src/store/runstore.js');
+    const { readManifest, isTerminal } = await import('../../src/store/manifest.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-mcaccept-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const outs: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      outs.push(String(chunk));
+      return true;
+    });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(await runCommand(file, { yes: true, backend: 'mock', home, maxConcurrency: '4', detach: true })).toBe(0);
+      const runId = outs.join('').trim().split('\n')[0]!;
+      const runDir = join(home, 'runs', runId);
+      expect(readRunConfig(runDir).maxConcurrency).toBe(4);
+      // Let the detached runner reach terminal so it can't outlive the test.
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        const m = readManifest(runDir);
+        if (m && isTerminal(m.status)) break;
+        if (Date.now() > deadline) throw new Error(`run not terminal: ${m?.status}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  }, 30_000);
+
+  it('ULTRACODE_MAX_CONCURRENCY seeds a fresh run config; an explicit flag beats the env', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const { readRunConfig } = await import('../../src/store/runstore.js');
+    const { readManifest, isTerminal } = await import('../../src/store/manifest.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-mcenv-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const prevEnv = process.env.ULTRACODE_MAX_CONCURRENCY;
+    const outs: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      outs.push(String(chunk));
+      return true;
+    });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const runAndReadMc = async (home: string, flag?: string) => {
+      outs.length = 0;
+      expect(
+        await runCommand(file, { yes: true, backend: 'mock', home, detach: true, maxConcurrency: flag }),
+      ).toBe(0);
+      const runDir = join(home, 'runs', outs.join('').trim().split('\n')[0]!);
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        const m = readManifest(runDir);
+        if (m && isTerminal(m.status)) break;
+        if (Date.now() > deadline) throw new Error(`run not terminal: ${m?.status}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return readRunConfig(runDir).maxConcurrency;
+    };
+    try {
+      process.env.ULTRACODE_MAX_CONCURRENCY = '7';
+      expect(await runAndReadMc(join(dir, 's1'))).toBe(7); // env seeds the frozen config
+      expect(await runAndReadMc(join(dir, 's2'), '4')).toBe(4); // explicit flag beats env
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+      if (prevEnv === undefined) delete process.env.ULTRACODE_MAX_CONCURRENCY;
+      else process.env.ULTRACODE_MAX_CONCURRENCY = prevEnv;
+    }
+  }, 40_000);
+
+  it('resume validates --max-concurrency before touching the store', async () => {
+    const { resumeCommand } = await import('../../src/cli/resume.js');
+    const home = join(mkdtempSync(join(tmpdir(), 'uc-mcguard-')), 'store');
+    const { chunks, spy } = captureStderr();
+    try {
+      // Guard fires before the run lookup: the bad value — not the unknown
+      // runId — must be the reported error.
+      expect(await resumeCommand('wf_zzzzzzzzzzzz', { home, maxConcurrency: '2.5' })).toBe(1);
+      expect(chunks.join('')).toContain('--max-concurrency must be a positive integer');
+      expect(existsSync(home)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

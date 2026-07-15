@@ -5,13 +5,13 @@ import { resolveWorkflowSource } from '../installer/registry.js';
 import { executeWorkflow, validateArgsAgainstInputSchema } from '../engine/run.js';
 import { defaultConcurrency } from '../engine/semaphore.js';
 import { MockExecutor } from '../backends/mock.js';
-import { codexConcurrencyPolicy, detectCodexAuth } from '../backends/codex-auth.js';
 import { parseBudget } from '../budget/parse.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
 import { attachForeground, printOutput } from './lifecycle.js';
+import { readMaxConcurrencyOpt } from './options.js';
 import { validateScript } from './validate.js';
 
 export interface RunCliOptions {
@@ -25,7 +25,6 @@ export interface RunCliOptions {
   detach?: boolean;
   dryRun?: boolean;
   yes?: boolean;
-  forceOauthFanout?: boolean;
   json?: boolean;
   home?: string;
 }
@@ -102,6 +101,13 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
     return 1;
   }
 
+  // Fail fast on a bad cap BEFORE any run dir exists — a non-positive or
+  // fractional value would crash the runner after the manifest says 'running',
+  // orphaning the run (the MCP path gets this guard from zod; the CLI must match).
+  const mcOpt = readMaxConcurrencyOpt(opts.maxConcurrency);
+  if (!mcOpt.ok) return 1;
+  const maxConcurrencyOpt = mcOpt.value;
+
   // Dry run: rehearse on the mock backend in-process — free, instant, and
   // exercises the identical dialect semantics (schema validation included).
   if (opts.dryRun) {
@@ -112,19 +118,13 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
       budgetTotal,
       defaultBackend: 'mock',
       maxAgents: opts.maxAgents ? Number(opts.maxAgents) : undefined,
-      maxConcurrency: opts.maxConcurrency ? Number(opts.maxConcurrency) : undefined,
+      maxConcurrency: maxConcurrencyOpt,
     });
     process.stdout.write(JSON.stringify(output, null, 2) + '\n');
     return output.error ? 1 : 0;
   }
 
-  // Auth-aware concurrency policy: ChatGPT-OAuth fan-out is unsafe.
-  let maxConcurrency = opts.maxConcurrency ? Number(opts.maxConcurrency) : defaultConcurrency();
-  const codexPolicy = codexConcurrencyPolicy(maxConcurrency, detectCodexAuth(), opts.forceOauthFanout === true);
-  if (backend === 'codex') {
-    if (codexPolicy.warning) process.stderr.write(`⚠ ${codexPolicy.warning}\n`);
-    maxConcurrency = codexPolicy.maxConcurrency;
-  }
+  const maxConcurrency = maxConcurrencyOpt ?? defaultConcurrency();
 
   // Review before run: print the plan; require confirmation unless --yes.
   if (!opts.yes) {
@@ -166,7 +166,6 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
       cwd: process.cwd(),
       maxAgents: opts.maxAgents ? Number(opts.maxAgents) : undefined,
       maxConcurrency,
-      codexMaxConcurrency: codexPolicy.maxConcurrency,
       budgetTotal,
       permission,
       wallClockMs: opts.timeout ? Number(opts.timeout) * 60_000 : undefined,
