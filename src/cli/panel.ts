@@ -221,7 +221,8 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
     case 'agent_retry': {
       const row = state.agents.get(e.seq ?? -1);
       if (!row) return;
-      if (typeof e.attempt === 'number') row.attempt = e.attempt;
+      // max: a schema-repair notice must never roll a displayed attempt back
+      if (typeof e.attempt === 'number') row.attempt = Math.max(row.attempt, e.attempt);
       if (row.status === 'queued') row.status = 'running';
       return;
     }

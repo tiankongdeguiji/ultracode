@@ -259,7 +259,10 @@ export class AgentCallExecutor implements AgentExecutor {
 
       if (round === SCHEMA_REPAIR_LIMIT || signal.aborted) break;
 
-      tracker?.retry(round + 1, SCHEMA_REPAIR_LIMIT, 'schema-repair', lastErrors.slice(0, 3).join('; '));
+      // Overall attempt ordinal (not the repair round): task retries and
+      // schema repairs share one display sequence, so attempt is always >= 2
+      // whenever an extra spawn is running.
+      tracker?.retry(attemptsUsed + round + 1, attemptsUsed + SCHEMA_REPAIR_LIMIT, 'schema-repair', lastErrors.slice(0, 3).join('; '));
       const sessionId = current.sessionId ?? first.sessionId;
       const resumePlan =
         sessionId !== undefined ? this.adapter.buildResume(sessionId, resumeRepairPrompt(lastErrors, schema), req) : null;

@@ -161,7 +161,8 @@ describe('AgentCallExecutor progress', () => {
     expect(outcome.value).toEqual({ count: 7 });
     const retries = events.filter((p): p is Extract<AgentProgress, { type: 'retry' }> => p.type === 'retry');
     expect(retries).toHaveLength(1);
-    expect(retries[0]).toMatchObject({ kind: 'schema-repair', attempt: 1, maxAttempts: SCHEMA_REPAIR_LIMIT });
+    // Overall attempt ordinal: 1 task attempt + first repair spawn = attempt 2.
+    expect(retries[0]).toMatchObject({ kind: 'schema-repair', attempt: 2, maxAttempts: 1 + SCHEMA_REPAIR_LIMIT });
     expect(retries[0]!.reason).toContain('count');
   });
 
