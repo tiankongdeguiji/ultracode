@@ -164,10 +164,11 @@ return 'finished'
 
   it('watch of an orphaned run reports it and exits 1, in both plain and panel modes', async () => {
     const { root, runId, dir } = makeRun(HELLO);
-    // Fabricate an orphan without racing a real runner: 'running' manifest whose
-    // pidStart mismatches this live pid → isRunnerAlive false → liveStatus 'orphaned'.
+    // Fabricate an orphan without racing a real runner: 'running' manifest with a
+    // namespace-local pid (9 is either a kernel thread with a mismatched start
+    // time or absent → both paths give liveStatus 'orphaned' on any machine).
     const m = readManifest(dir)!;
-    writeManifest(dir, { ...m, status: 'running', pid: process.pid, pidStart: 'recycled-pid-start' });
+    writeManifest(dir, { ...m, status: 'running', pid: 9, pidStart: 'recycled-pid-start' });
 
     const { chunks, restore } = captureStderr();
     let code: number;
@@ -177,12 +178,16 @@ return 'finished'
       restore();
     }
     expect(code).toBe(1);
-    expect(chunks.join('')).toContain('orphaned');
+    const plainOut = chunks.join('');
+    expect(plainOut).toContain('orphaned');
+    expect(plainOut).toContain('looks namespace-local'); // sandbox-teardown hint
 
     const stream = fakeTty();
     const { exitCode } = await panelLoop(dir, { mode: 'observe', stream });
     expect(exitCode).toBe(1);
-    expect(stream.chunks.join('')).toContain('runner died without finalizing (orphaned)');
+    const panelOut = stream.chunks.join('');
+    expect(panelOut).toContain('runner died without finalizing (orphaned)');
+    expect(panelOut).toContain('looks namespace-local');
   });
 
   it('unknown runId fails fast with a message', async () => {

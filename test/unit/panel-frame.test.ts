@@ -133,6 +133,19 @@ describe('panel frame', () => {
     expect(renderFrame(s, FRAME_OPTS).split('\n')[0]).toContain('stopping…');
   });
 
+  it('terminal frames do not fake liveness: in-flight rows render interrupted, never spinning', () => {
+    const frame = renderFrame(richState(), { ...FRAME_OPTS, runStatus: 'orphaned' });
+    expect(frame).not.toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏↻]/); // no spinner or retry glyph anywhere
+    expect(frame).toContain('✗ review cli'); // was running → interrupted
+    expect(frame).toContain('interrupted');
+    expect(frame).toContain('⊘ review mcp'); // was queued → never started
+    expect(frame).toContain('never started');
+    expect(frame).toContain('agents 8/12 · 4 interrupted · 1 failed');
+    expect(frame).not.toContain('running'); // neither rows nor footer claim liveness
+    // last known live tokens still count toward the post-mortem total
+    expect(frame).toContain('| tokens 39k/500k |');
+  });
+
   it('never emits a line wider than cols, measured in display cells (CJK labels)', () => {
     const s = richState();
     foldEvent(

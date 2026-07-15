@@ -166,11 +166,20 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
         const rest = readEventsFrom(eventsFile, offset);
         offset = rest.nextOffset;
         for (const ev of rest.events) foldEvent(state, ev);
+        // A namespace-local pid (1-64) means the runner was born inside a fresh
+        // PID namespace — a transient sandbox (agent exec jail, one-shot
+        // container) that SIGKILLs everything in it when the launcher returns.
+        const sandboxHint =
+          status === 'orphaned' && manifest.pid > 0 && manifest.pid <= 64
+            ? `runner pid ${manifest.pid} looks namespace-local — the run was likely launched inside a transient sandbox (agent shell / one-shot container) that was torn down. Launch from a persistent shell, or keep the launching command attached until the run completes.`
+            : undefined;
         if (!opts.quiet) {
           if (mode.kind === 'plain') {
             writePlain([...page.events, ...rest.events]);
             if (status === 'orphaned') stream.write('✗ runner died without finalizing (orphaned). See runner.log\n');
+            if (sandboxHint) stream.write(`⚠ ${sandboxHint}\n`);
           } else {
+            if (sandboxHint) notices.push(`· ⚠ ${sandboxHint}`);
             // Freeze elapsed at the recorded end — the final frame stays in scrollback.
             paint(manifest, status, manifest.endedAt ? Date.parse(manifest.endedAt) : Date.now(), true);
           }

@@ -5,7 +5,7 @@
  * clock, geometry, and events, which keeps every path deterministic in tests.
  */
 import type { TimestampedEvent } from '../store/events.js';
-import type { RunStatus } from '../store/manifest.js';
+import { isTerminal, type RunStatus } from '../store/manifest.js';
 
 export type AgentRowStatus = 'queued' | 'running' | 'ok' | 'failed' | 'skipped' | 'cached';
 
@@ -412,9 +412,15 @@ function rowsOf(state: PanelState): AgentRow[] {
 }
 
 function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: Paint): string {
+  // A terminal frame must not fake liveness: rows the run left behind
+  // (runner died, run stopped) render as interrupted, never as spinning.
+  const lost = isTerminal(opts.runStatus) && (row.status === 'running' || row.status === 'queued');
   const spin = row.attempt >= 2 ? paint('33', '↻') : paint('36', spinnerFrame(opts.nowMs));
-  const glyph =
-    row.status === 'running'
+  const glyph = lost
+    ? row.status === 'running'
+      ? paint('33', '✗')
+      : paint('2', '⊘')
+    : row.status === 'running'
       ? spin
       : row.status === 'ok'
         ? paint('32', '✓')
@@ -428,7 +434,15 @@ function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: 
   const truncated = truncateToWidth(row.label, LABEL_WIDTH);
   const label = truncated + ' '.repeat(Math.max(0, LABEL_WIDTH - displayWidth(truncated)));
   const parts: string[] = [];
-  if (row.status === 'failed') {
+  if (lost) {
+    if (row.status === 'running') {
+      if (row.tokens > 0) parts.push(`${row.estimated ? '~' : ''}${formatTokens(row.tokens)} tok`);
+      if (row.startedTs !== undefined) parts.push(formatDuration((row.endedTs ?? opts.nowMs) - row.startedTs));
+      parts.push(paint('33', 'interrupted'));
+    } else {
+      parts.push(paint('2', 'never started'));
+    }
+  } else if (row.status === 'failed') {
     parts.push(paint('31', `failed: ${row.error ?? 'unknown error'}`));
   } else if (row.status === 'skipped') {
     parts.push(paint('2', 'skipped'));
@@ -463,7 +477,7 @@ function phaseLines(
   const members = sectionRows(state, childId, phase?.title);
   const lines: string[] = [];
   if (phase) {
-    const running = members.some((r) => r.status === 'running');
+    const running = !isTerminal(opts.runStatus) && members.some((r) => r.status === 'running');
     const glyph = running ? paint('36', spinnerFrame(opts.nowMs)) : phase.started ? '⏺' : paint('2', '⏺');
     const done = members.filter((r) => r.status === 'ok' || r.status === 'cached').length;
     const count = members.length > 0 ? ` (${done}/${members.length})` : '';
@@ -533,15 +547,23 @@ function childLines(state: PanelState, child: ChildGroup, opts: FrameOptions, pa
 }
 
 function footerLine(state: PanelState, opts: FrameOptions, paint: Paint): string {
+  const final = isTerminal(opts.runStatus);
   const rows = rowsOf(state);
   const settled = rows.filter((r) => SETTLED.has(r.status)).length;
   const running = rows.filter((r) => r.status === 'running');
   const queued = rows.filter((r) => r.status === 'queued').length;
   const failed = rows.filter((r) => r.status === 'failed').length;
+  // Last known ticks of in-flight rows still count toward the live figure —
+  // in a final frame that is the best estimate of what interrupted agents burned.
   const liveTokens = Math.max(state.spentTokens, opts.spentFloor ?? 0) + running.reduce((n, r) => n + r.tokens, 0);
   const parts = [`agents ${settled}/${rows.length}`];
-  if (running.length > 0) parts.push(`${running.length} running`);
-  if (queued > 0) parts.push(`${queued} queued`);
+  if (final) {
+    const interrupted = running.length + queued;
+    if (interrupted > 0) parts.push(paint('33', `${interrupted} interrupted`));
+  } else {
+    if (running.length > 0) parts.push(`${running.length} running`);
+    if (queued > 0) parts.push(`${queued} queued`);
+  }
   if (failed > 0) parts.push(paint('31', `${failed} failed`));
   const total = state.seed.budgetTotal;
   const tokens = `tokens ${formatTokens(liveTokens)}${total ? `/${formatTokens(total)}` : ''}`;
