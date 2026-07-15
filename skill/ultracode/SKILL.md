@@ -70,6 +70,6 @@ Scale to the ask: "find bugs" → few finders, single vote; "thoroughly audit" �
 ## Safety rails (engine-enforced; don't fight them)
 
 - Review-before-run is mandatory (`--yes` only after you've shown the user the plan or they pre-authorized).
-- Workers default to workspace-write sandbox; use `--permission safe` (read-only) for research/review workflows — prefer it whenever agents don't need to edit.
+- Workers default to workspace-write sandbox; use `--permission safe` (read-only) for research/review workflows — prefer it whenever agents don't need to edit. **Mind the backend asymmetry: codex `safe` is a read-only sandbox that can still RUN commands (sqlite3/grep/profilers work); claude/qoder `safe` is a headless default-permission mode that auto-rejects EVERY tool call — those workers can only read-and-reason.** If workers must execute read-only commands, either embed the evidence in the prompt or use `--permission auto` and constrain via prompts; watch for the engine's "actions auto-rejected" warning in `failures[]`.
 - Concurrency is user-controlled: default min(10, max(2, cores-2)); override via `--max-concurrency`, `ULTRACODE_MAX_CONCURRENCY`, or `workflow_start`'s `maxConcurrency`. The env var seeds fresh runs only — a resume inherits the stored value unless `resume --max-concurrency` / MCP `maxConcurrency` overrides it. For codex workers, `CODEX_API_KEY` is the parallel-safe auth.
 - Budget exhaustion stops dispatch loudly; check `failures[]` in the output — it lists every cap trip, declined action, and failed agent.
