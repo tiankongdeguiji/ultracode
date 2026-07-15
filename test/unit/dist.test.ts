@@ -56,13 +56,21 @@ describe('plugin bundles', () => {
     expect(existsSync(join(root, 'dist-qoder/STALE.txt'))).toBe(false);
   });
 
-  it('build-plugins rejects a non-SemVer package.json version', () => {
+  it('build-plugins rejects a missing or non-SemVer package.json version', () => {
     const dir = mkdtempSync(join(tmpdir(), 'uc-badver-'));
-    const run = () => execFileSync('node', [join(root, 'scripts/build-plugins.mjs'), dir], { stdio: 'pipe' });
-    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '1.2.3junk' }));
-    expect(run).toThrow();
-    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: ['1.2.3'] }));
-    expect(run).toThrow();
+    // Assert the guard's own message: the bare temp dir would make the script
+    // throw ENOENT at the copy step even without the guard, so toThrow() alone
+    // could green-pass with the guard deleted.
+    for (const bad of [{}, { version: '1.2.3junk' }, { version: ['1.2.3'] }]) {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify(bad));
+      let stderr = '';
+      try {
+        execFileSync('node', [join(root, 'scripts/build-plugins.mjs'), dir], { stdio: 'pipe' });
+      } catch (e) {
+        stderr = String((e as { stderr?: unknown }).stderr ?? '');
+      }
+      expect(stderr, JSON.stringify(bad)).toMatch(/version missing or invalid/);
+    }
   });
 
   it('bundled workflow copies are valid and portable', () => {
