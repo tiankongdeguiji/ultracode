@@ -11,8 +11,10 @@ import { fileURLToPath } from 'node:url';
 const root = process.argv[2] ? resolve(process.argv[2]) : join(dirname(fileURLToPath(import.meta.url)), '..');
 const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 // A falsy version would be silently dropped by JSON.stringify, and a malformed
-// one would ship in both manifests — require a complete SemVer string.
-const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+// one would ship in both manifests — require a valid SemVer 2.0.0 string
+// (official semver.org pattern: no leading zeros, no empty prerelease ids).
+const SEMVER =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
 if (typeof version !== 'string' || !SEMVER.test(version)) {
   throw new Error(`package.json version missing or invalid: ${JSON.stringify(version)}`);
 }

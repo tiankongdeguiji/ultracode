@@ -4,13 +4,19 @@ Brings dynamic multi-agent workflow orchestration ("ultracode") to OpenAI Codex 
 
 This plugin bundle is a **build output**: `npm run build:plugins` assembles it
 into `dist-codex/` from `skill/` and `hostpacks/codex/` — edit those sources,
-never the generated `dist-codex/` tree. `ultracode install codex` writes the
-same artifacts directly to your Codex config, so for local use you do not need
-this plugin. It exists for marketplace distribution (deferred; internal-first).
+never the generated `dist-codex/` tree. For local use you do not need this
+plugin — `ultracode install codex` sets everything up directly; the bundle
+exists for marketplace distribution (deferred; internal-first).
 
-## What it installs
+## What's in the bundle
 
 - The `ultracode` **skill** (`skills/ultracode/`) — teaches Codex when and how to orchestrate.
+
+## What `ultracode install codex` additionally writes
+
+Bundled MCP registration is deferred with marketplace distribution, so today
+the installer writes these directly into your Codex config:
+
 - An **AGENTS.md** trigger snippet — standing "ultracode mode" on the keyword / a budget directive.
 - An **MCP server** registration (`.mcp.json` / config.toml block) pointing at `ultracode mcp`
   (`tool_timeout_sec = 90`, `default_tools_approval_mode = "approve"` — headless Codex auto-rejects

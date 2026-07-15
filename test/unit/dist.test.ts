@@ -61,7 +61,15 @@ describe('plugin bundles', () => {
     // Assert the guard's own message: the bare temp dir would make the script
     // throw ENOENT at the copy step even without the guard, so toThrow() alone
     // could green-pass with the guard deleted.
-    for (const bad of [{}, { version: '1.2.3junk' }, { version: ['1.2.3'] }]) {
+    const badVersions = [
+      {},
+      { version: '1.2.3junk' },
+      { version: ['1.2.3'] },
+      { version: '01.2.3' },
+      { version: '1.2.3-01' },
+      { version: '1.2.3-alpha..1' },
+    ];
+    for (const bad of badVersions) {
       writeFileSync(join(dir, 'package.json'), JSON.stringify(bad));
       let stderr = '';
       try {
