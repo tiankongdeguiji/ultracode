@@ -5,8 +5,9 @@
  * journal keys so resume replays through the nesting boundary.
  */
 import { executeWorkflow, type ExecuteOptions, type RunOutput } from './run.js';
-import { UltracodeError } from './errors.js';
-import type { SharedRunState } from './hostapi.js';
+import { UltracodeError, errorMessage } from './errors.js';
+import { argsHash } from './journal.js';
+import type { RunEvent, SharedRunState } from './hostapi.js';
 import type { BudgetAccount } from '../budget/account.js';
 
 export interface ChildRef {
@@ -19,6 +20,8 @@ export interface ChildRunnerDeps {
   shared: SharedRunState;
   budget: BudgetAccount;
   signal: AbortSignal;
+  /** ordinal of this workflow() call within the parent run (tags child events) */
+  childId?: number;
   keyChain?: { next(spec: never): string };
   base: Pick<
     ExecuteOptions,
@@ -60,17 +63,45 @@ export function makeChildRunner(deps: ChildRunnerDeps): (ref: unknown, childArgs
     if (childSource === undefined) throw new UltracodeError('workflow() could not resolve a child script', 'unresolved-child');
 
     const label = name ?? scriptPath ?? '(inline)';
+    const childId = deps.childId ?? 0;
+    const emit = deps.base.onEvent ?? (() => {});
     deps.onChildEnter?.(label, childArgs);
-    const out = await executeWorkflow(childSource, {
-      ...deps.base,
-      args: childArgs,
-      signal: deps.signal,
-      budgetAccount: deps.budget,
-      shared: deps.shared,
-      keyChain: deps.keyChain as ExecuteOptions['keyChain'],
-      noNesting: true, // one level only
-    });
+    emit({ type: 'child_started', childId, name: label, argsHash: argsHash(childArgs) });
+    // Tag every event from inside the child (child agents share the parent's
+    // seq space and may interleave with concurrent parent agents — attribution
+    // must ride on each event) and drop the child's own run_* lifecycle so the
+    // parent stream contains exactly one run_started/run_completed.
+    const childOnEvent = (ev: RunEvent): void => {
+      switch (ev.type) {
+        case 'run_started':
+        case 'run_completed':
+        case 'run_failed':
+        case 'run_stopped':
+          return;
+        default:
+          emit({ ...ev, childId, childName: label });
+      }
+    };
+    let out: RunOutput;
+    try {
+      out = await executeWorkflow(childSource, {
+        ...deps.base,
+        onEvent: childOnEvent,
+        args: childArgs,
+        signal: deps.signal,
+        budgetAccount: deps.budget,
+        shared: deps.shared,
+        keyChain: deps.keyChain as ExecuteOptions['keyChain'],
+        noNesting: true, // one level only
+      });
+    } catch (e) {
+      // Pre-execution failures (e.g. a child script that does not parse) still
+      // close the boundary so event consumers never see a dangling child group.
+      emit({ type: 'child_completed', childId, name: label, ok: false, agentCount: 0, error: errorMessage(e) });
+      throw e;
+    }
     deps.onChildExit?.(label, out);
+    emit({ type: 'child_completed', childId, name: label, ok: !out.error, agentCount: out.agentCount, error: out.error });
     if (out.error) {
       throw new UltracodeError(`child workflow '${label}' failed: ${out.error}`, 'child-failed');
     }

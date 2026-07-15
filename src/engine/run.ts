@@ -97,12 +97,14 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
   let runChild = opts.runChild;
   if (!runChild && !opts.noNesting && opts.resolveChild) {
     const resolver = opts.resolveChild;
+    let childCount = 0;
     runChild = async (ref, childArgs) => {
       const { makeChildRunner } = await import('./child.js');
       return makeChildRunner({
         shared,
         budget,
         signal: abort.signal,
+        childId: childCount++,
         keyChain: opts.keyChain as never,
         base: {
           executor: opts.executor,

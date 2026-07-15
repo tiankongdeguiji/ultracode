@@ -19,7 +19,7 @@ export class EventWriter {
     this.fd = openSync(file, 'a');
   }
 
-  write(event: Record<string, unknown> & { type: string }): void {
+  write<T extends { type: string }>(event: T): void {
     const line = JSON.stringify({ ts: Date.now(), ...event }) + '\n';
     writeSync(this.fd, line);
   }

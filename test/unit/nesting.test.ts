@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { executeWorkflow } from '../../src/engine/run.js';
 import { MockExecutor } from '../../src/backends/mock.js';
 import { KeyChain, seedKey } from '../../src/engine/journal.js';
+import type { RunEvent } from '../../src/engine/hostapi.js';
 
 const PARENT = `export const meta = { name: 'uc-parent', description: 'nesting test' }
 const a = await agent('MOCK:ok parent-a', { label: 'pa' })
@@ -111,6 +112,80 @@ return workflow('nope', {})`, {
     expect(a).toEqual(b);
     expect(a).toHaveLength(5); // pa, c0, c1, c2, pb — all in one chain
     expect(new Set(a).size).toBe(5);
+  });
+
+  it('emits explicit child boundaries; child events tagged, exactly one untagged run lifecycle', async () => {
+    const events: RunEvent[] = [];
+    const out = await executeWorkflow(PARENT, {
+      executor: new MockExecutor(),
+      resolveChild,
+      maxConcurrency: 4,
+      onEvent: (e) => events.push(e),
+    });
+    expect(out.error).toBeUndefined();
+    // The child's own run_started/run_completed are dropped — one lifecycle only.
+    expect(events.filter((e) => e.type === 'run_started')).toEqual([{ type: 'run_started', name: 'uc-parent' }]);
+    expect(events.filter((e) => e.type === 'run_completed')).toHaveLength(1);
+    expect(events.filter((e) => e.type === 'child_started')).toEqual([
+      expect.objectContaining({ childId: 0, name: 'uc-child' }),
+    ]);
+    expect(events.filter((e) => e.type === 'child_completed')).toEqual([
+      expect.objectContaining({ childId: 0, name: 'uc-child', ok: true, agentCount: 3 }),
+    ]);
+    const completed = events.filter((e): e is Extract<RunEvent, { type: 'agent_completed' }> => e.type === 'agent_completed');
+    expect(completed.filter((e) => e.childId === 0 && e.childName === 'uc-child').map((e) => e.label).sort()).toEqual(['c0', 'c1', 'c2']);
+    expect(completed.filter((e) => e.childId === undefined).map((e) => e.label)).toEqual(['pa', 'pb']);
+  });
+
+  it('workflow() racing agent() in parallel(): attribution rides each event, not the boundary interval', async () => {
+    const script = `export const meta = { name: 'uc-parent', description: 'd' }
+return parallel([
+  () => workflow('uc-child', { n: 2 }),
+  () => agent('MOCK:delay 20 MOCK:ok parent-concurrent', { label: 'p-conc' }),
+])`;
+    const events: RunEvent[] = [];
+    const out = await executeWorkflow(script, {
+      executor: new MockExecutor(),
+      resolveChild,
+      maxConcurrency: 4,
+      onEvent: (e) => events.push(e),
+    });
+    expect(out.error).toBeUndefined();
+    const completed = events.filter((e): e is Extract<RunEvent, { type: 'agent_completed' }> => e.type === 'agent_completed');
+    expect(completed.find((e) => e.label === 'p-conc')?.childId).toBeUndefined();
+    expect(completed.filter((e) => e.childId === 0).map((e) => e.label).sort()).toEqual(['c0', 'c1']);
+  });
+
+  it("child log() lines appear once in the parent's logs and once on the event stream", async () => {
+    const CHILD_LOG = `export const meta = { name: 'uc-child', description: 'c' }
+log('hello-from-child')
+return 1`;
+    const events: RunEvent[] = [];
+    const out = await executeWorkflow(
+      `export const meta = { name: 'uc-p', description: 'd' }
+await workflow('uc-child', {})
+return 1`,
+      { executor: new MockExecutor(), resolveChild: () => CHILD_LOG, maxConcurrency: 2, onEvent: (e) => events.push(e) },
+    );
+    expect(out.error).toBeUndefined();
+    expect(out.logs.filter((l) => l === 'hello-from-child')).toHaveLength(1);
+    const logEvents = events.filter((e) => e.type === 'workflow_log' && e.message === 'hello-from-child');
+    expect(logEvents).toEqual([expect.objectContaining({ childId: 0, childName: 'uc-child' })]);
+  });
+
+  it('a failing child still closes its boundary with ok:false', async () => {
+    const FAIL_CHILD = `export const meta = { name: 'uc-child', description: 'c' }
+await agent('MOCK:fail child-boom', { label: 'cb' })`;
+    const events: RunEvent[] = [];
+    const out = await executeWorkflow(
+      `export const meta = { name: 'uc-p', description: 'd' }
+await workflow('uc-child', {})`,
+      { executor: new MockExecutor(), resolveChild: () => FAIL_CHILD, maxConcurrency: 2, onEvent: (e) => events.push(e) },
+    );
+    expect(out.error).toContain('child workflow');
+    expect(events.filter((e) => e.type === 'child_completed')).toEqual([
+      expect.objectContaining({ childId: 0, ok: false }),
+    ]);
   });
 
   it('a child honors the parent maxAgents cap (propagated, not the default 50)', async () => {

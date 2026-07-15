@@ -93,6 +93,7 @@ export type JournalRecord =
       label: string;
       phase?: string;
       backend: string;
+      model?: string;
       cached?: boolean;
       sessionId?: string;
       totalTokens: number;
