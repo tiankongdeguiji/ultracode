@@ -11,6 +11,7 @@ import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
 import { attachForeground, printOutput } from './lifecycle.js';
+import { parseMaxConcurrency } from './options.js';
 import { validateScript } from './validate.js';
 
 export interface RunCliOptions {
@@ -105,11 +106,12 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
   // orphaning the run (the MCP path gets this guard from zod; the CLI must match).
   let maxConcurrencyOpt: number | undefined;
   if (opts.maxConcurrency !== undefined) {
-    maxConcurrencyOpt = Number(opts.maxConcurrency);
-    if (!Number.isInteger(maxConcurrencyOpt) || maxConcurrencyOpt < 1) {
+    const n = parseMaxConcurrency(opts.maxConcurrency);
+    if (n === null) {
       process.stderr.write(`ultracode: --max-concurrency must be a positive integer\n`);
       return 1;
     }
+    maxConcurrencyOpt = n;
   }
 
   // Dry run: rehearse on the mock backend in-process — free, instant, and

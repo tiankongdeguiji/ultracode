@@ -7,6 +7,7 @@ import { createRunDir, getRun, readRunArgs, readRunConfig, reapOrphans } from '.
 import { isTerminal } from '../store/manifest.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { attachForeground, printOutput } from './lifecycle.js';
+import { parseMaxConcurrency } from './options.js';
 
 export interface ResumeCliOptions {
   script?: string;
@@ -25,6 +26,18 @@ export interface ResumeCliOptions {
  * processes and sessions by construction (plain files).
  */
 export async function resumeCommand(runId: string, opts: ResumeCliOptions): Promise<number> {
+  // Validate CLI input before touching the store — bad input fails fast even
+  // when the run id is unknown.
+  let maxConcurrencyOverride: number | undefined;
+  if (opts.maxConcurrency !== undefined) {
+    const n = parseMaxConcurrency(opts.maxConcurrency);
+    if (n === null) {
+      process.stderr.write(`ultracode: --max-concurrency must be a positive integer\n`);
+      return 1;
+    }
+    maxConcurrencyOverride = n;
+  }
+
   const root = ultracodeRoot(process.cwd(), opts.home);
   let prior = getRun(root, runId);
   if (!prior) {
@@ -80,14 +93,7 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
 
   // The stored maxConcurrency is frozen at run creation; this is the explicit
   // way to change it for a resume (ULTRACODE_MAX_CONCURRENCY only seeds new runs).
-  if (opts.maxConcurrency !== undefined) {
-    const n = Number(opts.maxConcurrency);
-    if (!Number.isInteger(n) || n < 1) {
-      process.stderr.write(`ultracode: --max-concurrency must be a positive integer\n`);
-      return 1;
-    }
-    config.maxConcurrency = n;
-  }
+  if (maxConcurrencyOverride !== undefined) config.maxConcurrency = maxConcurrencyOverride;
 
   const newId = newRunId();
   const dir = createRunDir(root, { runId: newId, name, source, args, config, resumedFrom: runId });

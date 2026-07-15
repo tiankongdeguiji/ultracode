@@ -161,7 +161,12 @@ export async function runnerMain(dir: string): Promise<number> {
 
   // Shared execution state so nested workflow() children share caps/budget.
   const budgetAccount = new BudgetAccount(config.budgetTotal ?? null);
-  const maxConcurrency = config.maxConcurrency ?? defaultConcurrency();
+  // Choke-point guard: config.json is worker-writable and version-inherited on
+  // resume — a non-positive-integer maxConcurrency (0, 2.5, hand-edited junk)
+  // would throw in the Semaphore constructor AFTER the manifest flipped to
+  // 'running', orphaning the run. Fall back to the default instead.
+  const storedMax = config.maxConcurrency ?? defaultConcurrency();
+  const maxConcurrency = Number.isInteger(storedMax) && storedMax > 0 ? storedMax : defaultConcurrency();
   const shared: SharedRunState = {
     semaphore: new Semaphore(maxConcurrency),
     counter: { count: 0 },

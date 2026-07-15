@@ -1,11 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { parseBudget } from '../../src/budget/parse.js';
 import { detectCodexAuth } from '../../src/backends/codex-auth.js';
 import { AgentCallExecutor } from '../../src/engine/agentcall.js';
 import { usageFromEvents } from '../../src/backends/usage.js';
 import { parseJsonLine } from '../../src/backends/ndjson.js';
 import type { AgentEvent, AgentRequest, AgentSpec, BackendAdapter, ExitClass, SpawnPlan } from '../../src/backends/types.js';
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -178,6 +178,53 @@ describe('silent no-op detector', () => {
     expect(outcome.ok).toBe(true);
     expect(outcome.warnings).toHaveLength(1);
     expect(outcome.warnings![0]).toContain('2 action(s) auto-rejected');
+  });
+});
+
+describe('CLI --max-concurrency fail-fast', () => {
+  const SCRIPT = `export const meta = { name: 't', description: 'd' }\nreturn 1`;
+  const BAD_VALUES = ['0', '-1', '2.5', 'abc', ''];
+
+  function captureStderr() {
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      chunks.push(String(chunk));
+      return true;
+    });
+    return { chunks, spy };
+  }
+
+  it('run rejects non-positive-integer values before creating any run state', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-mcguard-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const { chunks, spy } = captureStderr();
+    try {
+      for (const bad of BAD_VALUES) {
+        expect(await runCommand(file, { yes: true, backend: 'mock', home, maxConcurrency: bad })).toBe(1);
+      }
+      expect(chunks.join('')).toContain('--max-concurrency must be a positive integer');
+      expect(existsSync(home)).toBe(false); // no run store, no orphanable run dir
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('resume validates --max-concurrency before touching the store', async () => {
+    const { resumeCommand } = await import('../../src/cli/resume.js');
+    const home = join(mkdtempSync(join(tmpdir(), 'uc-mcguard-')), 'store');
+    const { chunks, spy } = captureStderr();
+    try {
+      // Guard fires before the run lookup: the bad value — not the unknown
+      // runId — must be the reported error.
+      expect(await resumeCommand('wf_zzzzzzzzzzzz', { home, maxConcurrency: '2.5' })).toBe(1);
+      expect(chunks.join('')).toContain('--max-concurrency must be a positive integer');
+      expect(existsSync(home)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

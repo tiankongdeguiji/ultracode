@@ -1,9 +1,10 @@
 import os from 'node:os';
 
-/** Engine default: min(10, max(2, cores - 2)); ULTRACODE_MAX_CONCURRENCY (any positive integer) overrides. */
+/** Engine default: min(10, max(2, cores - 2)); ULTRACODE_MAX_CONCURRENCY (a strict
+ *  positive integer, same rule as --max-concurrency) overrides. Junk is ignored. */
 export function defaultConcurrency(): number {
-  const fromEnv = parseInt(process.env.ULTRACODE_MAX_CONCURRENCY ?? '', 10);
-  if (fromEnv > 0) return fromEnv;
+  const fromEnv = Number(process.env.ULTRACODE_MAX_CONCURRENCY);
+  if (Number.isInteger(fromEnv) && fromEnv > 0) return fromEnv;
   return Math.min(10, Math.max(2, os.cpus().length - 2));
 }
 

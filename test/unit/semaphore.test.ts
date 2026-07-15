@@ -97,7 +97,10 @@ describe('Semaphore', () => {
       expect(defaultConcurrency()).toBe(24);
       process.env.ULTRACODE_MAX_CONCURRENCY = '1';
       expect(defaultConcurrency()).toBe(1);
-      for (const junk of ['0', '-3', 'abc', '']) {
+      // '2.5' and '24abc' pin the strict-integer rule: parseInt-style
+      // truncation (2.5→2, 24abc→24) must NOT be honored — same rule as
+      // the --max-concurrency flag.
+      for (const junk of ['0', '-3', 'abc', '', '2.5', '24abc']) {
         process.env.ULTRACODE_MAX_CONCURRENCY = junk;
         expect(defaultConcurrency()).toBe(computed);
       }
