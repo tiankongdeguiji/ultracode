@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateScript } from '../../src/cli/validate.js';
@@ -11,8 +11,13 @@ const root = join(__dirname, '../..');
 
 describe('plugin bundles', () => {
   // The bundles are gitignored build outputs — rebuild from the canonical
-  // sources so the assertions run against fresh, never stale, copies.
+  // sources so the assertions run against fresh, never stale, copies. The
+  // sentinels prove the rebuild wipes prior outputs rather than copying over them.
   beforeAll(() => {
+    for (const d of ['dist-codex', 'dist-qoder']) {
+      mkdirSync(join(root, d), { recursive: true });
+      writeFileSync(join(root, d, 'STALE.txt'), 'stale');
+    }
     execFileSync('node', [join(root, 'scripts/build-plugins.mjs')], { stdio: 'pipe' });
   });
 
@@ -44,6 +49,20 @@ describe('plugin bundles', () => {
 
   it('engine VERSION constant matches package.json', () => {
     expect(VERSION).toBe(pkg.version);
+  });
+
+  it('rebuild wipes stale files from prior outputs', () => {
+    expect(existsSync(join(root, 'dist-codex/STALE.txt'))).toBe(false);
+    expect(existsSync(join(root, 'dist-qoder/STALE.txt'))).toBe(false);
+  });
+
+  it('build-plugins rejects a non-SemVer package.json version', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-badver-'));
+    const run = () => execFileSync('node', [join(root, 'scripts/build-plugins.mjs'), dir], { stdio: 'pipe' });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '1.2.3junk' }));
+    expect(run).toThrow();
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: ['1.2.3'] }));
+    expect(run).toThrow();
   });
 
   it('bundled workflow copies are valid and portable', () => {

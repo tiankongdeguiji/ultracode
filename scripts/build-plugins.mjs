@@ -4,13 +4,18 @@
 // stamped from package.json. Marketplace distribution is deferred
 // (internal-first); `ultracode install` is the supported path.
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+// Optional argv root override exists for tests; default is the repo root.
+const root = process.argv[2] ? resolve(process.argv[2]) : join(dirname(fileURLToPath(import.meta.url)), '..');
 const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-// A falsy version would be silently dropped by JSON.stringify, shipping a version-less manifest.
-if (!/^\d+\.\d+\.\d+/.test(version ?? '')) throw new Error(`package.json version missing or invalid: ${version}`);
+// A falsy version would be silently dropped by JSON.stringify, and a malformed
+// one would ship in both manifests — require a complete SemVer string.
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+if (typeof version !== 'string' || !SEMVER.test(version)) {
+  throw new Error(`package.json version missing or invalid: ${JSON.stringify(version)}`);
+}
 const copy = (from, to) => {
   mkdirSync(dirname(to), { recursive: true });
   cpSync(join(root, from), to, { recursive: true, force: true });

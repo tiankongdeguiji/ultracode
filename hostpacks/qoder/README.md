@@ -5,8 +5,9 @@ tool** — a faithful port of the same dialect — so this pack does not rebuild
 engine. It supplies what Qoder lacks: the *doctrine* (when/how to orchestrate)
 and the standing-mode *trigger*.
 
-This directory is a **build output** assembled by `npm run build:plugins` from
-`skill/`, `workflows/`, and `hostpacks/qoder/` — do not edit it in place.
+This plugin bundle is a **build output**: `npm run build:plugins` assembles it
+into `dist-qoder/` from `skill/`, `workflows/`, and `hostpacks/qoder/` — edit
+those sources, never the generated `dist-qoder/` tree.
 
 ## What it installs
 
