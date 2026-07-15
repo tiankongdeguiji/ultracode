@@ -1,9 +1,9 @@
 /**
- * ultracode doctor: probe backends, detect auth topology, and surface
- * parallel-safety warnings before any tokens are spent.
+ * ultracode doctor: probe backends and report auth topology before any
+ * tokens are spent.
  */
 import { execFile } from 'node:child_process';
-import { detectCodexAuth, isFanoutSafe } from '../backends/codex-auth.js';
+import { detectCodexAuth } from '../backends/codex-auth.js';
 import { CodexAdapter } from '../backends/codex.js';
 
 interface DoctorRow {
@@ -32,9 +32,6 @@ export async function collectDoctorRows(): Promise<DoctorRow[]> {
     const probe = await new CodexAdapter().probe();
     const mode = detectCodexAuth();
     const warnings = [...(probe.warnings ?? [])];
-    if (probe.available && !isFanoutSafe(mode) && mode !== 'none') {
-      warnings.push('fan-out capped at 1 on this auth (see --force-oauth-fanout)');
-    }
     rows.push({
       backend: 'codex',
       available: probe.available,

@@ -7,7 +7,7 @@ tests before trusting a new parser path.
 
 | Backend | Verified CLI | Structured output | Notes |
 |---|---|---|---|
-| codex | codex-cli **0.142.4** | native `--output-schema` (strict subset) | LIVE-tested (parser + full parity demo). ChatGPT-OAuth fan-out capped at concurrency 1. |
+| codex | codex-cli **0.142.4** | native `--output-schema` (strict subset) | LIVE-tested (parser + full parity demo). `CODEX_API_KEY` is the parallel-safe auth. |
 | claude | Claude Code **2.1.200** | native `--json-schema` | LIVE-tested (parser + typed workflow). |
 | qoder | @qoder-ai/qodercli **1.0.37** (decompiled) | native `--json-schema` (undocumented) | fixture-verified only (no PAT at build time). Native Workflow tool is the primary Qoder path. |
 | gemini | Gemini CLI (docs) | emulated (prompt contract) | fixture-verified only. |

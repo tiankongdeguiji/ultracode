@@ -32,9 +32,6 @@ import type { SharedRunState } from '../engine/hostapi.js';
 function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): AgentExecutor {
   const cache = new Map<string, AgentExecutor>();
   const artifactDir = (spec: AgentSpec) => join(dir, 'agents', agentDirName(spec.seq, spec.label));
-  // Codex OAuth fan-out is capped via shared.backendLimits in the ENGINE (before
-  // the general permit) rather than here — gating inside execute() would hold a
-  // general permit while parked and starve other backends (head-of-line block).
   const resolve = (backend: string): AgentExecutor => {
     let ex = cache.get(backend);
     if (!ex) {
@@ -170,13 +167,6 @@ export async function runnerMain(dir: string): Promise<number> {
     counter: { count: 0 },
     runId: manifest.runId,
   };
-  // Codex OAuth fan-out cap as a per-backend limiter, acquired before the
-  // general permit. Only when it actually constrains (tighter than the general
-  // cap) — in a codex-DEFAULT run the general semaphore already equals it.
-  const codexCap = config.codexMaxConcurrency;
-  if (codexCap && codexCap >= 1 && codexCap < maxConcurrency) {
-    shared.backendLimits = new Map([['codex', new Semaphore(codexCap)]]);
-  }
   // Worktree isolation only inside a git repo.
   const repoRoot = repoRootSync(config.cwd);
   if (repoRoot) shared.worktrees = createWorktreeManager(repoRoot, worktreesRootFor(dir));

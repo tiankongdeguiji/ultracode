@@ -2,8 +2,6 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { validateArgsAgainstInputSchema } from '../engine/run.js';
-import { codexConcurrencyPolicy, detectCodexAuth } from '../backends/codex-auth.js';
-import { defaultConcurrency } from '../engine/semaphore.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir, getRun, readRunArgs, readRunConfig, reapOrphans } from '../store/runstore.js';
 import { isTerminal } from '../store/manifest.js';
@@ -13,6 +11,7 @@ import { attachForeground, printOutput } from './lifecycle.js';
 export interface ResumeCliOptions {
   script?: string;
   args?: string;
+  maxConcurrency?: string;
   yes?: boolean;
   detach?: boolean;
   json?: boolean;
@@ -79,20 +78,15 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
   const config = readRunConfig(prior.dir);
   config.resumeFromRunId = runId;
 
-  // Recompute the Codex OAuth fan-out cap against CURRENT auth (mirrors
-  // startDetachedRun). The stored value reflects the ORIGINAL run's auth:
-  // resuming an API-key run (uncapped) while now authenticated via ChatGPT OAuth
-  // must re-cap concurrency to 1, or the runner races the single-use rotating
-  // refresh token and corrupts the token family.
-  const codexPolicy = codexConcurrencyPolicy(
-    config.maxConcurrency ?? defaultConcurrency(),
-    detectCodexAuth(),
-    false,
-  );
-  config.codexMaxConcurrency = codexPolicy.maxConcurrency;
-  if (config.backend === 'codex') {
-    if (codexPolicy.warning) process.stderr.write(`⚠ ${codexPolicy.warning}\n`);
-    config.maxConcurrency = codexPolicy.maxConcurrency;
+  // The stored maxConcurrency is frozen at run creation; this is the explicit
+  // way to change it for a resume (ULTRACODE_MAX_CONCURRENCY only seeds new runs).
+  if (opts.maxConcurrency !== undefined) {
+    const n = Number(opts.maxConcurrency);
+    if (!Number.isInteger(n) || n < 1) {
+      process.stderr.write(`ultracode: --max-concurrency must be a positive integer\n`);
+      return 1;
+    }
+    config.maxConcurrency = n;
   }
 
   const newId = newRunId();

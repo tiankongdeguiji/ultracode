@@ -69,6 +69,7 @@ export function createServer(baseCwd: string): McpServer {
         backend: z.string().optional(),
         budget: z.string().optional(),
         maxAgents: z.number().int().positive().optional(),
+        maxConcurrency: z.number().int().positive().optional(),
         permission: z.enum(['safe', 'auto', 'danger']).optional(),
         resumeFromRunId: z.string().optional(),
         cwd: z.string().optional(),
@@ -100,6 +101,7 @@ export function createServer(baseCwd: string): McpServer {
           backend: input.backend,
           budgetTotal: input.budget ? parseBudget(input.budget) : null,
           maxAgents: input.maxAgents,
+          maxConcurrency: input.maxConcurrency,
           permission: input.permission,
           resumeFromRunId: input.resumeFromRunId,
           cwd: input.cwd ?? baseCwd,
@@ -108,7 +110,6 @@ export function createServer(baseCwd: string): McpServer {
           runId: result.runId,
           name: result.name,
           runDir: result.dir,
-          warnings: result.warnings,
           monitor: `call workflow_status with runId=${result.runId}; poll until terminal`,
         });
       } catch (err) {

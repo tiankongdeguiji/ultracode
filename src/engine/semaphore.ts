@@ -1,8 +1,10 @@
 import os from 'node:os';
 
-/** Engine default: min(16, max(2, cores - 2)) — matches the reference implementations. */
+/** Engine default: min(10, max(2, cores - 2)); ULTRACODE_MAX_CONCURRENCY (any positive integer) overrides. */
 export function defaultConcurrency(): number {
-  return Math.min(16, Math.max(2, os.cpus().length - 2));
+  const fromEnv = parseInt(process.env.ULTRACODE_MAX_CONCURRENCY ?? '', 10);
+  if (fromEnv > 0) return fromEnv;
+  return Math.min(10, Math.max(2, os.cpus().length - 2));
 }
 
 /** FIFO counting semaphore. acquire() resolves with a release function. */

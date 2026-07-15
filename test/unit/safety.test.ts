@@ -1,11 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseBudget } from '../../src/budget/parse.js';
-import {
-  codexConcurrencyPolicy,
-  detectCodexAuth,
-  isFanoutSafe,
-  OAUTH_FANOUT_FORCED_CAP,
-} from '../../src/backends/codex-auth.js';
+import { detectCodexAuth } from '../../src/backends/codex-auth.js';
 import { AgentCallExecutor } from '../../src/engine/agentcall.js';
 import { usageFromEvents } from '../../src/backends/usage.js';
 import { parseJsonLine } from '../../src/backends/ndjson.js';
@@ -32,7 +27,7 @@ describe('parseBudget', () => {
   });
 });
 
-describe('codex auth policy', () => {
+describe('codex auth detection', () => {
   it('detectCodexAuth prefers env keys', () => {
     const prev = process.env.CODEX_API_KEY;
     try {
@@ -53,18 +48,23 @@ describe('codex auth policy', () => {
     expect(detectCodexAuth(home)).toBe('chatgpt-oauth');
   });
 
-  it('caps OAuth fan-out at 1, or 3 when forced; api-key is uncapped', () => {
-    const oauth = codexConcurrencyPolicy(8, 'chatgpt-oauth', false);
-    expect(oauth.maxConcurrency).toBe(1);
-    expect(oauth.warning).toContain('capped at 1');
-
-    const forced = codexConcurrencyPolicy(8, 'chatgpt-oauth', true);
-    expect(forced.maxConcurrency).toBe(OAUTH_FANOUT_FORCED_CAP);
-
-    expect(codexConcurrencyPolicy(8, 'api-key-env', false)).toEqual({ maxConcurrency: 8 });
-    expect(codexConcurrencyPolicy(1, 'chatgpt-oauth', false)).toEqual({ maxConcurrency: 1 });
-    expect(isFanoutSafe('api-key-file')).toBe(true);
-    expect(isFanoutSafe('chatgpt-oauth')).toBe(false);
+  it('detects CODEX_ACCESS_TOKEN and tolerates malformed auth.json', () => {
+    const prevKey = process.env.CODEX_API_KEY;
+    const prevTok = process.env.CODEX_ACCESS_TOKEN;
+    try {
+      delete process.env.CODEX_API_KEY;
+      process.env.CODEX_ACCESS_TOKEN = 'tok';
+      expect(detectCodexAuth('/nonexistent')).toBe('access-token-env');
+      delete process.env.CODEX_ACCESS_TOKEN;
+      const home = mkdtempSync(join(tmpdir(), 'uc-codexhome-'));
+      writeFileSync(join(home, 'auth.json'), '{not json');
+      expect(detectCodexAuth(home)).toBe('none');
+    } finally {
+      if (prevKey === undefined) delete process.env.CODEX_API_KEY;
+      else process.env.CODEX_API_KEY = prevKey;
+      if (prevTok === undefined) delete process.env.CODEX_ACCESS_TOKEN;
+      else process.env.CODEX_ACCESS_TOKEN = prevTok;
+    }
   });
 });
 

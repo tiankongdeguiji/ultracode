@@ -63,13 +63,7 @@ export class CodexAdapter implements BackendAdapter {
           resolve({ available: false, authHint: `codex binary not found (${this.bin})` });
           return;
         }
-        const warnings: string[] = [];
-        if (!process.env.CODEX_API_KEY && !process.env.CODEX_ACCESS_TOKEN) {
-          warnings.push(
-            'no CODEX_API_KEY/CODEX_ACCESS_TOKEN: ChatGPT-OAuth fan-out is unsafe (single-use refresh tokens) — concurrency is capped',
-          );
-        }
-        resolve({ available: true, version: stdout.trim(), warnings });
+        resolve({ available: true, version: stdout.trim() });
       });
     });
   }

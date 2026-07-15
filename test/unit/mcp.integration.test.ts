@@ -3,7 +3,7 @@
  * launches real detached runners on the mock backend. No network.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -144,6 +144,32 @@ describe('MCP triad', () => {
     } finally {
       await inside.close();
     }
+  }, 30_000);
+
+  it('workflow_start accepts maxConcurrency and persists it into the run config', async () => {
+    const start = (await client.callTool({
+      name: 'workflow_start',
+      arguments: { script: HELLO, backend: 'mock', maxConcurrency: 4 },
+    })) as { structuredContent?: { runId?: string; runDir?: string }; isError?: boolean };
+    expect(start.isError).toBeFalsy();
+    const runDir = start.structuredContent!.runDir!;
+    const config = JSON.parse(readFileSync(join(runDir, 'config.json'), 'utf8')) as { maxConcurrency?: number };
+    expect(config.maxConcurrency).toBe(4);
+
+    // Non-positive values must be rejected at the zod gate (the CLI mirrors
+    // this with its own fail-fast check) — SDK surfaces it as either an
+    // isError result or a protocol-level rejection depending on version.
+    let rejected = false;
+    try {
+      const bad = (await client.callTool({
+        name: 'workflow_start',
+        arguments: { script: HELLO, backend: 'mock', maxConcurrency: 0 },
+      })) as { isError?: boolean };
+      rejected = bad.isError === true;
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
   }, 30_000);
 
   it('bad script errors cleanly through workflow_start', async () => {

@@ -35,10 +35,6 @@ import type { RunOutput } from './run.js';
  */
 export interface SharedRunState {
   semaphore: Semaphore;
-  /** Per-backend concurrency caps, acquired BEFORE the general permit so a
-   *  tightly-capped backend (e.g. codex OAuth fan-out = 1) can't hold general
-   *  permits while parked and starve other backends. Keyed by backend name. */
-  backendLimits?: Map<string, Semaphore>;
   counter: { count: number };
   worktrees?: WorktreeManager;
   runId?: string;
@@ -304,11 +300,6 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     }
 
     onEvent({ type: 'agent_queued', seq, label: spec.label, phase: spec.phase });
-    // Per-backend cap (e.g. codex OAuth fan-out) BEFORE the general permit: a
-    // capped backend parks here without holding a general permit, so it can't
-    // starve other backends. Non-capped backends skip straight to the permit.
-    const backendLimit = shared.backendLimits?.get(spec.backend);
-    const releaseBackend = backendLimit ? await backendLimit.acquire() : undefined;
     const release = await semaphore.acquire();
     let worktree: Awaited<ReturnType<WorktreeManager['create']>> | undefined;
     try {
@@ -417,7 +408,6 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       return roundTrip(outcome.value);
     } finally {
       release();
-      releaseBackend?.(); // release general permit first, then the backend cap
       if (worktree) {
         try {
           const fin = await worktree.finalize();
