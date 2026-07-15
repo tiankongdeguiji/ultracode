@@ -5,6 +5,9 @@ tool** — a faithful port of the same dialect — so this pack does not rebuild
 engine. It supplies what Qoder lacks: the *doctrine* (when/how to orchestrate)
 and the standing-mode *trigger*.
 
+This directory is a **build output** assembled by `npm run build:plugins` from
+`skill/`, `workflows/`, and `hostpacks/qoder/` — do not edit it in place.
+
 ## What it installs
 
 - The `ultracode` **skill** (`.qoder/skills/ultracode/`).
@@ -13,9 +16,6 @@ and the standing-mode *trigger*.
 - **Effort-routing agents** (`.qoder/agents/uc-xhigh.md`, `uc-verifier.md`) — Qoder's `budget`
   global is stubbed and per-call `effort` isn't portable, so budget rides `args.budgetTokens`
   and effort rides `agentType`.
-
-Only this README and `.qoder-plugin/plugin.json` are committed; regenerate the
-`skills/`, `workflows/`, and `agents/` subtrees with `npm run build:plugins`.
 
 ## Manual install (until marketplace)
 

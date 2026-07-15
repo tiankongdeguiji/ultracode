@@ -43,7 +43,7 @@ ultracode/                                # the git repo (this project) → npm 
 │   ├── uc-sweep.workflow.js              # multi-modal repo sweep (grep+semantic+test angles)
 │   ├── uc-judge-panel.workflow.js
 │   └── uc-fix-until-green.workflow.js    # loop-until-dry
-├── dist-codex/                           # BUILD OUTPUT (generated, gitignored; manifest+README committed) → marketplace repo mirror
+├── dist-codex/                           # BUILD OUTPUT (fully generated, gitignored) → marketplace repo mirror
 │   └── ...                               # §3 tree
 ├── dist-qoder/                           # BUILD OUTPUT → qoder marketplace mirror
 │   └── ...                               # §4 tree

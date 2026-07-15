@@ -9,23 +9,28 @@ import { lintWorkflowSource } from '../../src/cli/lint.js';
 const root = join(__dirname, '../..');
 
 describe('plugin bundles', () => {
-  // The copied subtrees are gitignored build outputs — rebuild from the
-  // canonical sources so the assertions run against fresh, never stale, copies.
+  // The bundles are gitignored build outputs — rebuild from the canonical
+  // sources so the assertions run against fresh, never stale, copies.
   beforeAll(() => {
     execFileSync('node', [join(root, 'scripts/build-plugins.mjs')], { stdio: 'pipe' });
   });
 
-  it('codex bundle: valid manifest + skill present', () => {
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+
+  it('codex bundle: valid manifest + README + skill present', () => {
     const manifest = JSON.parse(readFileSync(join(root, 'dist-codex/.codex-plugin/plugin.json'), 'utf8'));
     expect(manifest.name).toBe('ultracode');
-    expect(manifest.version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(manifest.version).toBe(pkg.version);
+    expect(existsSync(join(root, 'dist-codex/README.md'))).toBe(true);
     expect(existsSync(join(root, 'dist-codex/skills/ultracode/SKILL.md'))).toBe(true);
   });
 
-  it('qoder bundle: manifest + skill + templates + agent defs', () => {
+  it('qoder bundle: manifest + README + skill + templates + agent defs', () => {
     const manifest = JSON.parse(readFileSync(join(root, 'dist-qoder/.qoder-plugin/plugin.json'), 'utf8'));
     expect(manifest.name).toBe('ultracode');
+    expect(manifest.version).toBe(pkg.version);
     for (const f of [
+      'dist-qoder/README.md',
       'dist-qoder/skills/ultracode/SKILL.md',
       'dist-qoder/workflows/uc-review.workflow.js',
       'dist-qoder/workflows/uc-research.workflow.js',

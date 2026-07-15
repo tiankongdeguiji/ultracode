@@ -2,11 +2,10 @@
 
 Brings dynamic multi-agent workflow orchestration ("ultracode") to OpenAI Codex CLI.
 
-This directory is a **build output**: `ultracode install codex` writes the same
-artifacts directly to your Codex config, so for local use you do not need this
-plugin. It exists for marketplace distribution (deferred; internal-first).
-Only this README and `.codex-plugin/plugin.json` are committed; regenerate the
-`skills/` subtree with `npm run build:plugins`.
+This directory is a **build output** assembled by `npm run build:plugins` from
+`skill/` and `hostpacks/codex/` — do not edit it in place. `ultracode install codex`
+writes the same artifacts directly to your Codex config, so for local use you do
+not need this plugin. It exists for marketplace distribution (deferred; internal-first).
 
 ## What it installs
 
