@@ -1,8 +1,8 @@
 /**
  * codex exec adapter (pinned against codex-cli 0.142.x).
  *
- * Load-bearing quirks (source-verified, see docs/research/codex-cli.md and
- * followup-3.md):
+ * Load-bearing quirks (verified against codex-cli 0.142.x source and live
+ * exec/--output-schema behavior):
  *  - prompt via stdin ('-' positional): no argv length limits, no shell history.
  *  - NEVER -o/--output-last-message: the file is not written (nor truncated)
  *    on failure — a stale artifact from a prior run masquerades as output.

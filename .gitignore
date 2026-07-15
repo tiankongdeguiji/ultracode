@@ -4,3 +4,4 @@ dist/
 .ultracode/
 .DS_Store
 coverage/
+agent_space/

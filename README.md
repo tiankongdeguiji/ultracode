@@ -61,7 +61,7 @@ End-to-end on real backends: the `uc-review` workflow (3 dimension finders → p
 ## Design & research
 
 - `docs/design/judge.md` — the synthesized architecture + milestone plan (3 architects + judge).
-- `docs/research/` — the underlying research: the Claude Code ultracode mechanism, Codex/Qoder CLI internals (Qoder's native Workflow tool decompiled), MCP long-running-tool constraints across hosts, parallel-safety analysis, cross-host survey, JS-sandbox tradeoffs.
+- The design is grounded in source-level research: the Claude Code ultracode mechanism, Codex/Qoder CLI internals (Qoder's native Workflow tool decompiled), MCP long-running-tool constraints across hosts, parallel-safety analysis, a cross-host survey, and JS-sandbox tradeoffs.
 - `SUPPORTED_VERSIONS.md` — pinned CLI versions, platform notes, live-test gate.
 
 ## v1 scope
