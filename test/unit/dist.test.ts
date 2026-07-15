@@ -70,6 +70,9 @@ describe('plugin bundles', () => {
       { version: '01.2.3' },
       { version: '1.2.3-01' },
       { version: '1.2.3-alpha..1' },
+      // JS '$' without the m flag anchors to end-of-input (not before a final
+      // newline, unlike Perl/Python) — pinned here so that stays true.
+      { version: '1.2.3\n' },
     ];
     for (const bad of badVersions) {
       writeFileSync(join(dir, 'package.json'), JSON.stringify(bad));
