@@ -1,0 +1,5 @@
+{"type": "init", "session_id": "gem-1", "model": "gemini"}
+{"type": "tool_use", "name": "read_file"}
+{"type": "tool_result", "name": "read_file"}
+{"type": "message", "content": "Here is the JSON: {\"count\": 7}"}
+{"type": "result", "response": "Here is the JSON: {\"count\": 7}", "stats": {"models": {"gemini": {"tokens": {"prompt": 1200, "candidates": 30}}}}}

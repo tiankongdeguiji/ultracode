@@ -1,0 +1,2 @@
+{"type": "init", "session_id": "gem-2"}
+{"type": "result", "response": "a plain text answer", "stats": {"models": {"gemini": {"tokens": {"prompt": 300, "candidates": 8}}}}}

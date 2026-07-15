@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"019f0000-0000-7000-8000-000000000003"}
+{"type":"turn.started"}
+{"type":"error","message":"stream error: stream disconnected before completion; Reconnecting... 1/5"}
+{"type":"error","message":"stream error: stream disconnected before completion; Reconnecting... 2/5"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"recovered fine"}}
+{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}

@@ -1,0 +1,4 @@
+{"type": "thread.started", "thread_id": "019f0000-0000-7000-8000-000000000001"}
+{"type": "turn.started"}
+{"type": "error", "message": "unexpected status 400 Bad Request: {\"error\": {\"type\": \"invalid_request_error\", \"code\": \"invalid_json_schema\", \"message\": \"Invalid schema for response_format 'codex_output_schema': schema must be a JSON Schema of 'type: \\\"object\\\"', got 'type: \\\"array\\\"'.\", \"param\": \"text.format.schema\"}}"}
+{"type": "turn.failed", "error": {"message": "unexpected status 400 Bad Request: {\"error\": {\"type\": \"invalid_request_error\", \"code\": \"invalid_json_schema\", \"message\": \"Invalid schema for response_format 'codex_output_schema': schema must be a JSON Schema of 'type: \\\"object\\\"', got 'type: \\\"array\\\"'.\", \"param\": \"text.format.schema\"}}"}}

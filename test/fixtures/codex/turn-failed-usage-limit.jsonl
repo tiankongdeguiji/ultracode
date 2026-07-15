@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"019f0000-0000-7000-8000-000000000004"}
+{"type":"turn.started"}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. Your limit resets at 3:00 PM. To continue now, upgrade your plan or buy credits. (429 usage_limit_reached)"}}

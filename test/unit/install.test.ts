@@ -1,0 +1,119 @@
+import { describe, it, expect } from 'vitest';
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  AGENTS_SNIPPET,
+  MARKER_BEGIN,
+  MARKER_END,
+  installForHost,
+  planFor,
+  skillSourceDir,
+  upsertMarkerBlock,
+} from '../../src/installer/install.js';
+
+function tmp(): string {
+  return mkdtempSync(join(tmpdir(), 'uc-install-'));
+}
+
+describe('skill source', () => {
+  it('packaged skill exists with valid frontmatter and references', () => {
+    const src = skillSourceDir();
+    const skill = readFileSync(join(src, 'SKILL.md'), 'utf8');
+    expect(skill).toMatch(/^---\nname: ultracode\n/);
+    const description = skill.match(/description: (.*)\n/)?.[1] ?? '';
+    expect(description.length).toBeGreaterThan(0);
+    expect(description.length).toBeLessThanOrEqual(1024); // agentskills spec cap
+    for (const ref of ['dialect.md', 'patterns.md', 'invoking.md', 'portability.md']) {
+      expect(existsSync(join(src, 'references', ref))).toBe(true);
+    }
+    // progressive-disclosure budget: body should stay well under ~5k tokens
+    expect(skill.length).toBeLessThan(20_000);
+  });
+});
+
+describe('upsertMarkerBlock', () => {
+  it('appends to a fresh file, preserves existing content, and is idempotent', () => {
+    const dir = tmp();
+    const file = join(dir, 'AGENTS.md');
+    writeFileSync(file, '# My project\n\nExisting instructions.\n');
+
+    const first = upsertMarkerBlock(file, AGENTS_SNIPPET, false);
+    expect(first.changed).toBe(true);
+    const after = readFileSync(file, 'utf8');
+    expect(after).toContain('# My project');
+    expect(after).toContain('Existing instructions.');
+    expect(after).toContain(MARKER_BEGIN);
+    expect(after.split(MARKER_BEGIN)).toHaveLength(2); // exactly one block
+
+    const second = upsertMarkerBlock(file, AGENTS_SNIPPET, false);
+    expect(second.changed).toBe(false);
+    expect(readFileSync(file, 'utf8')).toBe(after);
+  });
+
+  it('replaces an outdated block in place', () => {
+    const dir = tmp();
+    const file = join(dir, 'AGENTS.md');
+    writeFileSync(file, `intro\n${MARKER_BEGIN}\nOLD CONTENT\n${MARKER_END}\ntrailing\n`);
+    upsertMarkerBlock(file, AGENTS_SNIPPET, false);
+    const after = readFileSync(file, 'utf8');
+    expect(after).toContain('intro');
+    expect(after).toContain('trailing');
+    expect(after).not.toContain('OLD CONTENT');
+    expect(after).toContain('STANDING mode');
+  });
+
+  it('creates the file (and parents) when missing; dry-run writes nothing', () => {
+    const dir = tmp();
+    const file = join(dir, 'nested/AGENTS.md');
+    const dry = upsertMarkerBlock(file, AGENTS_SNIPPET, true);
+    expect(dry.changed).toBe(true);
+    expect(existsSync(file)).toBe(false);
+    upsertMarkerBlock(file, AGENTS_SNIPPET, false);
+    expect(readFileSync(file, 'utf8')).toContain(MARKER_BEGIN);
+  });
+});
+
+describe('installForHost', () => {
+  it('codex user scope: skill → ~/.agents/skills, snippet → ~/.codex/AGENTS.md', () => {
+    const home = tmp();
+    const actions = installForHost('codex', { userHome: home });
+    expect(existsSync(join(home, '.agents/skills/ultracode/SKILL.md'))).toBe(true);
+    expect(existsSync(join(home, '.agents/skills/ultracode/references/patterns.md'))).toBe(true);
+    expect(readFileSync(join(home, '.codex/AGENTS.md'), 'utf8')).toContain('STANDING mode');
+    expect(actions.map((a) => a.kind)).toEqual(['copy-skill', 'upsert-snippet']);
+  });
+
+  it('codex project scope: skill → .agents/skills, snippet → project AGENTS.md (merged)', () => {
+    const project = tmp();
+    writeFileSync(join(project, 'AGENTS.md'), '# Project conventions\n');
+    installForHost('codex', { project: true, projectRoot: project });
+    expect(existsSync(join(project, '.agents/skills/ultracode/SKILL.md'))).toBe(true);
+    const agents = readFileSync(join(project, 'AGENTS.md'), 'utf8');
+    expect(agents).toContain('# Project conventions');
+    expect(agents).toContain(MARKER_BEGIN);
+  });
+
+  it('re-install refreshes the skill in place', () => {
+    const home = tmp();
+    installForHost('codex', { userHome: home });
+    const target = join(home, '.agents/skills/ultracode/SKILL.md');
+    writeFileSync(target, 'stale local edit');
+    installForHost('codex', { userHome: home });
+    expect(readFileSync(target, 'utf8')).toContain('name: ultracode');
+  });
+
+  it('generic host plan has no user AGENTS.md target; unknown hosts error', () => {
+    const home = tmp();
+    expect(planFor('generic', { userHome: home }).agentsFiles).toEqual([]);
+    expect(() => planFor('windsurf', {})).toThrow(/unknown install host/);
+  });
+
+  it('dry-run performs no writes', () => {
+    const home = tmp();
+    mkdirSync(join(home, '.agents'), { recursive: true });
+    installForHost('codex', { userHome: home, dryRun: true });
+    expect(existsSync(join(home, '.agents/skills'))).toBe(false);
+    expect(existsSync(join(home, '.codex'))).toBe(false);
+  });
+});
