@@ -1,0 +1,197 @@
+/**
+ * The live panel loop: tail events.jsonl + manifest.json and repaint a
+ * Claude-Code-style progress panel (phases, per-agent live tokens/elapsed,
+ * child groups, budget footer). Two entry points share it: `ultracode watch`
+ * (observe mode — Ctrl-C detaches, never signals the run) and the foreground
+ * attach of run/resume (attach mode — Ctrl-C owns the run). Falls back to the
+ * classic line-per-event stream for pipes, TERM=dumb, or --plain.
+ */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { readEventsFrom } from '../store/events.js';
+import { isTerminal, readManifest, type RunStatus } from '../store/manifest.js';
+import { getRun, isPidAlive, liveStatus } from '../store/runstore.js';
+import { ultracodeRoot } from '../store/layout.js';
+import { parseWorkflowScript } from '../engine/meta.js';
+import { LiveRegion } from './live-region.js';
+import { renderEvent } from './lifecycle.js';
+import {
+  createPanelState,
+  foldEvent,
+  renderFrame,
+  takeNarratorLines,
+  type PanelSeed,
+} from './panel.js';
+
+const PANEL_TICK_MS = 125; // 8fps spinner + sub-second elapsed
+const PLAIN_TICK_MS = 150; // the historical attach cadence
+const NARRATOR_BACKFILL = 50;
+
+export interface PanelStream {
+  write(chunk: string): boolean;
+  isTTY?: boolean;
+  columns?: number;
+  rows?: number;
+}
+
+export interface PanelLoopOptions {
+  /** attach: Ctrl-C owns the run (SIGTERM); observe: Ctrl-C detaches only */
+  mode: 'attach' | 'observe';
+  /** --json path: no progress output at all (exit code + signals still work) */
+  quiet?: boolean;
+  plain?: boolean;
+  noColor?: boolean;
+  /** default process.stderr — progress is never machine output */
+  stream?: PanelStream;
+}
+
+/** Gating precedence: --plain / not-a-TTY / TERM=dumb → line mode; NO_COLOR / --no-color strip SGR only. */
+export function resolveRenderMode(
+  stream: { isTTY?: boolean },
+  opts: { plain?: boolean; noColor?: boolean },
+  env: NodeJS.ProcessEnv = process.env,
+): { kind: 'panel' | 'plain'; color: boolean } {
+  if (opts.plain || !stream.isTTY || env.TERM === 'dumb') return { kind: 'plain', color: false };
+  const noColorEnv = env.NO_COLOR !== undefined && env.NO_COLOR !== '';
+  return { kind: 'panel', color: !opts.noColor && !noColorEnv };
+}
+
+function buildSeed(dir: string): PanelSeed {
+  const manifest = readManifest(dir);
+  const seed: PanelSeed = {
+    runName: manifest?.name ?? '(unknown)',
+    budgetTotal: manifest?.budget.total ?? null,
+    startedAtMs: manifest ? Date.parse(manifest.startedAt) : Date.now(),
+  };
+  try {
+    // meta.title and phase details never reach the manifest — best-effort
+    // re-parse of the run's own script.js fills them in.
+    const meta = parseWorkflowScript(readFileSync(join(dir, 'script.js'), 'utf8')).meta;
+    seed.title = meta.title;
+    seed.phases = meta.phases?.map((p) => ({ title: p.title, detail: p.detail }));
+  } catch {
+    seed.phases = manifest?.phases.map((p) => ({ title: p.title }));
+  }
+  return seed;
+}
+
+export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ exitCode: number }> {
+  const stream: PanelStream = opts.stream ?? process.stderr;
+  const mode = resolveRenderMode(stream, opts);
+  const eventsFile = join(dir, 'events.jsonl');
+  const state = createPanelState(buildSeed(dir));
+  const region = new LiveRegion(stream);
+  const notices: string[] = []; // SIGINT feedback, surfaced as narrator lines in panel mode
+  let offset = 0;
+  let sigints = 0;
+  let firstDrain = true;
+
+  const sigintHandler = (): void => {
+    sigints++;
+    if (opts.mode === 'observe') {
+      stream.write('\n■ detached (the run continues); stop it with: ultracode stop\n');
+      process.exit(130); // LiveRegion's exit hook restores the cursor
+    }
+    const manifest = readManifest(dir);
+    if (sigints === 1 && manifest && manifest.pid > 0 && isPidAlive(manifest.pid)) {
+      const msg = '■ stopping run (Ctrl-C again to detach immediately)…';
+      if (mode.kind === 'panel' && !opts.quiet) notices.push(`· ${msg}`);
+      else stream.write(`\n${msg}\n`);
+      try {
+        process.kill(manifest.pid, 'SIGTERM');
+      } catch {
+        /* already gone */
+      }
+    } else {
+      stream.write('\n■ detached; run may still be finalizing. Re-attach: ultracode watch\n');
+      process.exit(130);
+    }
+  };
+  process.on('SIGINT', sigintHandler);
+
+  const drainNarrator = (): string[] => {
+    let lines = [...notices.splice(0, notices.length), ...takeNarratorLines(state)];
+    if (firstDrain) {
+      firstDrain = false;
+      if (lines.length > NARRATOR_BACKFILL) {
+        lines = [`· … ${lines.length - NARRATOR_BACKFILL} earlier lines (see: ultracode logs)`, ...lines.slice(-NARRATOR_BACKFILL)];
+      }
+    }
+    return mode.color ? lines.map((l) => `\x1b[2m${l}\x1b[0m`) : lines;
+  };
+
+  const writePlain = (events: ReturnType<typeof readEventsFrom>['events']): void => {
+    for (const ev of events) {
+      const line = renderEvent(ev);
+      if (line) stream.write(line + '\n');
+    }
+  };
+
+  const paint = (status: RunStatus, nowMs: number, final: boolean): void => {
+    const manifest = readManifest(dir);
+    const frame = renderFrame(state, {
+      cols: stream.columns ?? 80,
+      rows: stream.rows ?? 24,
+      nowMs,
+      color: mode.color,
+      runStatus: status,
+      spentFloor: manifest?.budget.spent,
+    });
+    if (final) region.close(drainNarrator(), frame);
+    else region.update(drainNarrator(), frame);
+  };
+
+  if (mode.kind === 'panel' && !opts.quiet) region.open();
+  try {
+    for (;;) {
+      const page = readEventsFrom(eventsFile, offset);
+      offset = page.nextOffset;
+      for (const ev of page.events) foldEvent(state, ev);
+      const manifest = readManifest(dir);
+      const status: RunStatus = manifest ? liveStatus(manifest) : 'running';
+
+      if (manifest && isTerminal(status)) {
+        const rest = readEventsFrom(eventsFile, offset);
+        offset = rest.nextOffset;
+        for (const ev of rest.events) foldEvent(state, ev);
+        if (!opts.quiet) {
+          if (mode.kind === 'plain') {
+            writePlain([...page.events, ...rest.events]);
+            if (status === 'orphaned') stream.write('✗ runner died without finalizing (orphaned). See runner.log\n');
+          } else {
+            // Freeze elapsed at the recorded end — the final frame stays in scrollback.
+            paint(status, manifest.endedAt ? Date.parse(manifest.endedAt) : Date.now(), true);
+          }
+        }
+        return { exitCode: status === 'completed' ? 0 : 1 };
+      }
+
+      if (!opts.quiet) {
+        if (mode.kind === 'plain') writePlain(page.events);
+        else paint(status, Date.now(), false);
+      }
+      await sleep(mode.kind === 'panel' ? PANEL_TICK_MS : PLAIN_TICK_MS);
+    }
+  } finally {
+    process.removeListener('SIGINT', sigintHandler);
+  }
+}
+
+export async function watchCommand(
+  runId: string,
+  opts: { home?: string; plain?: boolean; noColor?: boolean },
+): Promise<number> {
+  const root = ultracodeRoot(process.cwd(), opts.home);
+  const run = getRun(root, runId);
+  if (!run) {
+    process.stderr.write(`ultracode: no run ${runId} under ${root}\n`);
+    return 1;
+  }
+  const { exitCode } = await panelLoop(run.dir, {
+    mode: 'observe',
+    plain: opts.plain,
+    noColor: opts.noColor,
+  });
+  return exitCode;
+}

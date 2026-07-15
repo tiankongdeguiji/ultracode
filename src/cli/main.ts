@@ -36,6 +36,19 @@ program
   });
 
 program
+  .command('watch')
+  .argument('<runId>')
+  .description('live progress panel: phases, per-agent tokens/elapsed, budget (Ctrl-C detaches, never stops the run)')
+  .option('--plain', 'line-per-event output instead of the panel')
+  .option('--no-color', 'panel without colors')
+  .option('--home <dir>')
+  .action(async (runId: string, opts: { plain?: boolean; color?: boolean; home?: string }) => {
+    const { watchCommand } = await import('./watch.js');
+    // commander's --no-color negates a `color` option (true by default)
+    process.exit(await watchCommand(runId, { home: opts.home, plain: opts.plain, noColor: opts.color === false }));
+  });
+
+program
   .command('status')
   .argument('<runId>')
   .description('show run status (phases, agents, budget)')
