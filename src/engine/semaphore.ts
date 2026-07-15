@@ -1,10 +1,15 @@
 import os from 'node:os';
 
+/** The one validation rule for every concurrency surface (flag, env, stored config). */
+export function isPositiveInt(n: number): boolean {
+  return Number.isInteger(n) && n > 0;
+}
+
 /** Engine default: min(10, max(2, cores - 2)); ULTRACODE_MAX_CONCURRENCY (a strict
  *  positive integer, same rule as --max-concurrency) overrides. Junk is ignored. */
 export function defaultConcurrency(): number {
   const fromEnv = Number(process.env.ULTRACODE_MAX_CONCURRENCY);
-  if (Number.isInteger(fromEnv) && fromEnv > 0) return fromEnv;
+  if (isPositiveInt(fromEnv)) return fromEnv;
   return Math.min(10, Math.max(2, os.cpus().length - 2));
 }
 

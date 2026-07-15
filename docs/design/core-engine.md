@@ -99,7 +99,7 @@ interface AgentOptions {
 }
 ```
 
-- **Semaphore**: global FIFO counting semaphore over every `agent()` (shared with nested `workflow()` children), permits = `min(16, max(2, os.cpus().length - 2))`, overridable via `--max-concurrency`. Extra calls queue.
+- **Semaphore**: global FIFO counting semaphore over every `agent()` (shared with nested `workflow()` children), permits = `min(16, max(2, os.cpus().length - 2))`, overridable via `--max-concurrency`. Extra calls queue. *(Superseded in 0.1.1: default is `min(10, max(2, cores-2))`, overridable via `--max-concurrency`, `ULTRACODE_MAX_CONCURRENCY`, or MCP `maxConcurrency`.)*
 - **Lifetime cap**: 1000 agents/run (shared counter with children) → throw `"Workflow reached max agents (1000)"`. **Item cap**: `parallel`/`pipeline` inputs > 4096 → `TypeError`.
 - **Budget gate**: before dispatch, `budget.remaining() <= 0` → throw `"Workflow budget exceeded"`.
 - **`parallel(thunks)`**: TypeError unless array of functions. `Promise.allSettled` **barrier**; a rejected thunk → `null` at its index + `failures.push("parallel[i] failed: <msg>")` + log entry. Never fail-fast. Order preserved.

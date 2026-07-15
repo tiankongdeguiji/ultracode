@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -213,6 +213,48 @@ return x`;
     // The resumed run is self-contained: its own result.json exists.
     const resultJson = JSON.parse(readFileSync(join(secondDir, 'agents/0000-one/result.json'), 'utf8'));
     expect(resultJson).toMatchObject({ value: 'cached-value', cached: true });
+  }, 40_000);
+
+  it('resume --max-concurrency: explicit override wins; no flag inherits the value frozen at creation', async () => {
+    const { resumeCommand } = await import('../../src/cli/resume.js');
+    const root = mkdtempSync(join(tmpdir(), 'uc-resume-mc-'));
+    const source = `export const meta = { name: 'mc', description: 'd' }
+return await agent('MOCK:ok v', { label: 'one' })`;
+    const firstId = newRunId();
+    const firstDir = createRunDir(root, {
+      runId: firstId,
+      name: 'mc',
+      source,
+      args: null,
+      config: { backend: 'mock', cwd: '/same', maxConcurrency: 3 },
+    });
+    await launchRunner(firstDir);
+    await waitTerminal(firstDir);
+
+    const outs: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      outs.push(String(chunk));
+      return true;
+    });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      // (1) explicit override lands in the resumed run's config.json
+      outs.length = 0;
+      expect(await resumeCommand(firstId, { home: root, detach: true, maxConcurrency: '5' })).toBe(0);
+      const overrideDir = join(root, 'runs', outs.join('').trim().split('\n')[0]!);
+      expect(readRunConfig(overrideDir).maxConcurrency).toBe(5);
+      await waitTerminal(overrideDir);
+
+      // (2) no flag → the value frozen at creation is inherited untouched
+      outs.length = 0;
+      expect(await resumeCommand(firstId, { home: root, detach: true })).toBe(0);
+      const inheritDir = join(root, 'runs', outs.join('').trim().split('\n')[0]!);
+      expect(readRunConfig(inheritDir).maxConcurrency).toBe(3);
+      await waitTerminal(inheritDir);
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
   }, 40_000);
 });
 

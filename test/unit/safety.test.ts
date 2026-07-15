@@ -212,6 +212,39 @@ describe('CLI --max-concurrency fail-fast', () => {
     }
   });
 
+  it('run persists a valid --max-concurrency into the new run config', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const { readRunConfig } = await import('../../src/store/runstore.js');
+    const { readManifest, isTerminal } = await import('../../src/store/manifest.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-mcaccept-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const outs: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      outs.push(String(chunk));
+      return true;
+    });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(await runCommand(file, { yes: true, backend: 'mock', home, maxConcurrency: '4', detach: true })).toBe(0);
+      const runId = outs.join('').trim().split('\n')[0]!;
+      const runDir = join(home, 'runs', runId);
+      expect(readRunConfig(runDir).maxConcurrency).toBe(4);
+      // Let the detached runner reach terminal so it can't outlive the test.
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        const m = readManifest(runDir);
+        if (m && isTerminal(m.status)) break;
+        if (Date.now() > deadline) throw new Error(`run not terminal: ${m?.status}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  }, 30_000);
+
   it('resume validates --max-concurrency before touching the store', async () => {
     const { resumeCommand } = await import('../../src/cli/resume.js');
     const home = join(mkdtempSync(join(tmpdir(), 'uc-mcguard-')), 'store');
