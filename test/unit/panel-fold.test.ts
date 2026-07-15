@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   createPanelState,
+  displayWidth,
   foldEvent,
   takeNarratorLines,
   formatTokens,
   formatDuration,
+  sanitizeText,
   truncateToWidth,
   type PanelSeed,
   type PanelState,
@@ -169,12 +171,40 @@ describe('format helpers', () => {
     expect(formatDuration(4_020_000)).toBe('1h07m');
   });
 
-  it('truncateToWidth is code-point safe', () => {
+  it('truncateToWidth measures display cells (wide glyphs count 2)', () => {
     expect(truncateToWidth('hello', 10)).toBe('hello');
     expect(truncateToWidth('hello', 5)).toBe('hello');
     expect(truncateToWidth('hello', 4)).toBe('hel…');
-    expect(truncateToWidth('日本語テスト', 4)).toBe('日本語…');
+    expect(truncateToWidth('日本語テスト', 12)).toBe('日本語テスト'); // 6 wide chars = 12 cells
+    expect(truncateToWidth('日本語テスト', 4)).toBe('日…'); // 2 cells + ellipsis fits a 4-cell budget
     expect(truncateToWidth('x', 0)).toBe('');
     expect(truncateToWidth('xy', 1)).toBe('…');
+  });
+
+  it('displayWidth counts CJK/emoji as 2 cells', () => {
+    expect(displayWidth('abc')).toBe(3);
+    expect(displayWidth('日本語')).toBe(6);
+    expect(displayWidth('a日b')).toBe(4);
+    expect(displayWidth('🎉')).toBe(2);
+  });
+
+  it('sanitizeText strips C0/C1 control bytes (incl. ESC and newlines) to spaces', () => {
+    expect(sanitizeText('plain text')).toBe('plain text');
+    expect(sanitizeText('a\x1b[2Jb')).toBe('a [2Jb'); // ESC neutralized → sequence is inert text
+    expect(sanitizeText('line1\nline2\r\t')).toBe('line1 line2  ');
+    expect(sanitizeText('del\x7fc1')).toBe('del c1 ');
+  });
+
+  it('fold sanitizes worker-sourced text: labels, errors, models, narrator lines', () => {
+    const s = fold(createPanelState(seed()), [
+      ev('agent_started', { seq: 0, label: 'evil\x1b[5Alabel', backend: 'mock', model: 'm\x1b[2J' }),
+      ev('agent_completed', { seq: 0, label: 'evil\x1b[5Alabel', ok: false, totalTokens: 1, error: 'boom\nline2\x1b[H' }),
+      ev('workflow_log', { message: 'hi\x1b]0;spoof\x07there' }),
+    ]);
+    const row = s.agents.get(0)!;
+    expect(row.label).toBe('evil [5Alabel');
+    expect(row.model).toBe('m [2J');
+    expect(row.error).toBe('boom line2 [H');
+    expect(takeNarratorLines(s)[0]).toBe('· hi ]0;spoof there');
   });
 });

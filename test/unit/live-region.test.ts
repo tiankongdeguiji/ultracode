@@ -48,6 +48,15 @@ describe('LiveRegion', () => {
     expect(process.listeners('exit').includes((r as unknown as { restoreCursor: () => void }).restoreCursor)).toBe(false);
   });
 
+  it('reset abandons the painted region: the next update paints below without cursor-up', () => {
+    const s = fakeStream();
+    const r = new LiveRegion(s);
+    r.update([], 'a\nb');
+    r.reset(); // e.g. terminal resize rewrapped the old frame
+    r.update([], 'c');
+    expect(s.chunks[1]).toBe('\x1b[0Jc\n');
+  });
+
   it('every repaint is exactly one write call', () => {
     const s = fakeStream();
     const r = new LiveRegion(s);

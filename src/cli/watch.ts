@@ -33,6 +33,9 @@ export interface PanelStream {
   isTTY?: boolean;
   columns?: number;
   rows?: number;
+  /** tty.WriteStream resize signal (optional — fakes/pipes may omit it) */
+  on?(event: 'resize', listener: () => void): unknown;
+  removeListener?(event: 'resize', listener: () => void): unknown;
 }
 
 export interface PanelLoopOptions {
@@ -128,8 +131,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     }
   };
 
-  const paint = (status: RunStatus, nowMs: number, final: boolean): void => {
-    const manifest = readManifest(dir);
+  const paint = (manifest: ReturnType<typeof readManifest>, status: RunStatus, nowMs: number, final: boolean): void => {
     const frame = renderFrame(state, {
       // || not ??: a detached/0-size PTY (CI, `script`) reports 0×0
       cols: stream.columns || 80,
@@ -143,12 +145,20 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     else region.update(drainNarrator(), frame);
   };
 
-  if (mode.kind === 'panel' && !opts.quiet) region.open();
+  // A resize rewraps already-painted lines and invalidates the cursor-up
+  // count — abandon the old region and paint fresh below on the next tick.
+  const onResize = (): void => region.reset();
+  if (mode.kind === 'panel' && !opts.quiet) {
+    region.open();
+    stream.on?.('resize', onResize);
+  }
   try {
     for (;;) {
       const page = readEventsFrom(eventsFile, offset);
       offset = page.nextOffset;
       for (const ev of page.events) foldEvent(state, ev);
+      // One manifest read per tick: status and spentFloor come from the same
+      // snapshot (a second read could observe a newer generation mid-frame).
       const manifest = readManifest(dir);
       const status: RunStatus = manifest ? liveStatus(manifest) : 'running';
 
@@ -162,7 +172,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
             if (status === 'orphaned') stream.write('✗ runner died without finalizing (orphaned). See runner.log\n');
           } else {
             // Freeze elapsed at the recorded end — the final frame stays in scrollback.
-            paint(status, manifest.endedAt ? Date.parse(manifest.endedAt) : Date.now(), true);
+            paint(manifest, status, manifest.endedAt ? Date.parse(manifest.endedAt) : Date.now(), true);
           }
         }
         return { exitCode: status === 'completed' ? 0 : 1 };
@@ -170,12 +180,13 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
 
       if (!opts.quiet) {
         if (mode.kind === 'plain') writePlain(page.events);
-        else paint(status, Date.now(), false);
+        else paint(manifest, status, Date.now(), false);
       }
       await sleep(mode.kind === 'panel' ? PANEL_TICK_MS : PLAIN_TICK_MS);
     }
   } finally {
     process.removeListener('SIGINT', sigintHandler);
+    stream.removeListener?.('resize', onResize);
   }
 }
 

@@ -102,10 +102,33 @@ interface Ev {
   childName?: string;
 }
 
+/**
+ * Untrusted text (labels, errors, backend-reported model ids, log lines, meta
+ * strings) must not carry control bytes into the terminal: an embedded ESC
+ * breaks out of the repaint protocol (cursor movement, screen clears, content
+ * spoofing) and a newline breaks the line-count invariant the cursor-up math
+ * depends on. Every C0/C1 byte becomes a space.
+ */
+export function sanitizeText(s: string): string {
+  return s.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
+}
+
 export function createPanelState(seed: PanelSeed): PanelState {
   return {
-    seed,
-    phases: (seed.phases ?? []).map((p) => ({ title: p.title, detail: p.detail, started: false })),
+    seed: {
+      ...seed,
+      runName: sanitizeText(seed.runName),
+      title: seed.title === undefined ? undefined : sanitizeText(seed.title),
+      phases: seed.phases?.map((p) => ({
+        title: sanitizeText(p.title),
+        detail: p.detail === undefined ? undefined : sanitizeText(p.detail),
+      })),
+    },
+    phases: (seed.phases ?? []).map((p) => ({
+      title: sanitizeText(p.title),
+      detail: p.detail === undefined ? undefined : sanitizeText(p.detail),
+      started: false,
+    })),
     agents: new Map(),
     order: [],
     children: [],
@@ -141,22 +164,22 @@ function rowFor(state: PanelState, e: Ev): AgentRow {
   if (!row) {
     row = {
       seq,
-      label: e.label ?? `#${seq}`,
-      phase: e.phase,
+      label: e.label ? sanitizeText(e.label) : `#${seq}`,
+      phase: e.phase === undefined ? undefined : sanitizeText(e.phase),
       childId: e.childId ?? state.inferredChild?.childId,
       status: 'queued',
       tokens: 0,
       estimated: false,
       attempt: 1,
     };
-    if (row.childId !== undefined && e.childName) ensureChild(state, row.childId, e.childName);
+    if (row.childId !== undefined && e.childName) ensureChild(state, row.childId, sanitizeText(e.childName));
     state.agents.set(seq, row);
     state.order.push(seq);
   }
-  if (e.label) row.label = e.label;
+  if (e.label) row.label = sanitizeText(e.label);
   if (e.phase) {
-    row.phase = e.phase;
-    ensurePhase(state, e.phase, row.childId).started = true;
+    row.phase = sanitizeText(e.phase);
+    ensurePhase(state, row.phase, row.childId).started = true;
   }
   return row;
 }
@@ -173,7 +196,7 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       }
       // Old-stream inference: a second untagged run_started is a nested child.
       const childId = -(++state.inferredChildCount);
-      state.inferredChild = ensureChild(state, childId, e.name ?? '(child)');
+      state.inferredChild = ensureChild(state, childId, sanitizeText(e.name ?? '(child)'));
       return;
     }
     case 'run_completed':
@@ -189,12 +212,12 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       return;
     }
     case 'child_started': {
-      if (e.childId !== undefined) ensureChild(state, e.childId, e.name ?? '(child)');
+      if (e.childId !== undefined) ensureChild(state, e.childId, sanitizeText(e.name ?? '(child)'));
       return;
     }
     case 'child_completed': {
       if (e.childId === undefined) return;
-      const c = ensureChild(state, e.childId, e.name ?? '(child)');
+      const c = ensureChild(state, e.childId, sanitizeText(e.name ?? '(child)'));
       c.done = true;
       c.ok = e.ok === true;
       return;
@@ -202,8 +225,8 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
     case 'phase_started': {
       if (typeof e.title !== 'string') return;
       const childId = e.childId ?? state.inferredChild?.childId;
-      if (childId !== undefined && e.childName) ensureChild(state, childId, e.childName);
-      ensurePhase(state, e.title, childId).started = true;
+      if (childId !== undefined && e.childName) ensureChild(state, childId, sanitizeText(e.childName));
+      ensurePhase(state, sanitizeText(e.title), childId).started = true;
       return;
     }
     case 'agent_queued': {
@@ -214,8 +237,8 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       const row = rowFor(state, e);
       row.status = 'running';
       row.startedTs = e.ts;
-      if (e.backend) row.backend = e.backend;
-      if (e.model) row.model = e.model;
+      if (e.backend) row.backend = sanitizeText(e.backend);
+      if (e.model) row.model = sanitizeText(e.model);
       return;
     }
     case 'agent_retry': {
@@ -236,7 +259,7 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
     }
     case 'agent_model': {
       const row = state.agents.get(e.seq ?? -1);
-      if (row && typeof e.model === 'string') row.model = e.model;
+      if (row && typeof e.model === 'string') row.model = sanitizeText(e.model);
       return;
     }
     case 'agent_completed': {
@@ -252,12 +275,12 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       } else if (e.ok === true) row.status = 'ok';
       else {
         row.status = 'failed';
-        row.error = e.error;
+        row.error = e.error === undefined ? undefined : sanitizeText(e.error);
       }
       return;
     }
     case 'workflow_log': {
-      if (typeof e.message === 'string') state.narrator.push(`· ${e.message}`);
+      if (typeof e.message === 'string') state.narrator.push(`· ${sanitizeText(e.message)}`);
       return;
     }
     case 'budget_tick': {
@@ -301,13 +324,46 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
 }
 
-/** Code-point-safe truncation with an ellipsis (display-width of wide glyphs not handled). */
+/**
+ * Approximate terminal cell width of one code point: East Asian Wide/Fullwidth
+ * ranges and emoji count 2 (close enough to wcwidth for panel truncation —
+ * undercounting would soft-wrap a line and corrupt the repaint cursor math).
+ */
+function charWidth(cp: number): number {
+  return (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+    (cp >= 0x2e80 && cp <= 0xa4cf) || // CJK radicals … Yi
+    (cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
+    (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
+    (cp >= 0xfe30 && cp <= 0xfe4f) || // CJK compatibility forms
+    (cp >= 0xff00 && cp <= 0xff60) || // fullwidth forms
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1faff) || // emoji blocks
+    (cp >= 0x20000 && cp <= 0x3fffd) // CJK extensions
+    ? 2
+    : 1;
+}
+
+/** Terminal cells occupied by s (no ANSI stripping — pass plain text). */
+export function displayWidth(s: string): number {
+  let w = 0;
+  for (const ch of s) w += charWidth(ch.codePointAt(0)!);
+  return w;
+}
+
+/** Truncation by DISPLAY CELLS with an ellipsis — wide glyphs count 2. */
 export function truncateToWidth(s: string, width: number): string {
   if (width <= 0) return '';
-  const chars = [...s];
-  if (chars.length <= width) return s;
+  if (displayWidth(s) <= width) return s;
   if (width === 1) return '…';
-  return chars.slice(0, width - 1).join('') + '…';
+  let out = '';
+  let w = 0;
+  for (const ch of s) {
+    const cw = charWidth(ch.codePointAt(0)!);
+    if (w + cw > width - 1) break;
+    out += ch;
+    w += cw;
+  }
+  return out + '…';
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +425,8 @@ function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: 
             : row.status === 'skipped'
               ? paint('2', '⊘')
               : paint('2', '⟳'); // cached
-  const label = truncateToWidth(row.label, LABEL_WIDTH).padEnd(LABEL_WIDTH);
+  const truncated = truncateToWidth(row.label, LABEL_WIDTH);
+  const label = truncated + ' '.repeat(Math.max(0, LABEL_WIDTH - displayWidth(truncated)));
   const parts: string[] = [];
   if (row.status === 'failed') {
     parts.push(paint('31', `failed: ${row.error ?? 'unknown error'}`));
@@ -521,7 +578,9 @@ function headerLines(state: PanelState, opts: FrameOptions, paint: Paint): strin
  */
 export function renderFrame(state: PanelState, opts: FrameOptions): string {
   const cols = Math.max(20, opts.cols);
-  const rowsBudget = Math.max(6, opts.rows - 1);
+  // Floor 3 = header + truncation notice + one tail line: even a 4-row
+  // terminal gets a frame that fits (never taller than the screen).
+  const rowsBudget = Math.max(3, opts.rows - 1);
   const paint: Paint = opts.color ? (code, s) => `\x1b[${code}m${s}\x1b[0m` : (_code, s) => s;
 
   let lines: string[] = [];
@@ -542,12 +601,13 @@ export function renderFrame(state: PanelState, opts: FrameOptions): string {
     const tail = lines.slice(lines.length - (rowsBudget - 2));
     lines = [lines[0]!, paint('2', `  … ${lines.length - tail.length - 1} lines hidden (terminal too small)`), ...tail];
   }
-  // Overlong lines would soft-wrap and break the repaint's cursor-up count.
-  // Truncating through SGR codes could cut a reset and bleed color, so an
-  // overlong colored line drops its color instead (rare: long error text).
+  // Overlong lines would soft-wrap and break the repaint's cursor-up count
+  // (measured in display cells — wide glyphs count 2). Truncating through SGR
+  // codes could cut a reset and bleed color, so an overlong colored line drops
+  // its color instead (rare: long error text).
   const fit = (l: string): string => {
     const plain = l.replace(ANSI_RE, '');
-    return [...plain].length <= cols ? l : truncateToWidth(plain, cols);
+    return displayWidth(plain) <= cols ? l : truncateToWidth(plain, cols);
   };
   return lines.map(fit).join('\n');
 }

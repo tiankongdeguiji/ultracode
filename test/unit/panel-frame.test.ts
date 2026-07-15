@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   createPanelState,
+  displayWidth,
   foldEvent,
   renderFrame,
   spinnerFrame,
@@ -132,16 +133,34 @@ describe('panel frame', () => {
     expect(renderFrame(s, FRAME_OPTS).split('\n')[0]).toContain('stopping…');
   });
 
-  it('never emits a line wider than cols', () => {
+  it('never emits a line wider than cols, measured in display cells (CJK labels)', () => {
     const s = richState();
     foldEvent(
       s,
       ev('agent_completed', { seq: 20, label: 'x'.repeat(60), ok: false, totalTokens: 0, error: 'e'.repeat(200) }, 1),
     );
+    foldEvent(s, ev('agent_started', { seq: 21, label: '非常に長い日本語のエージェントラベルです', phase: 'Review', backend: 'mock' }, 2));
     for (const cols of [20, 41, 80]) {
       for (const line of renderFrame(s, { ...FRAME_OPTS, cols }).split('\n')) {
-        expect([...line].length).toBeLessThanOrEqual(cols);
+        expect(displayWidth(line)).toBeLessThanOrEqual(cols);
       }
     }
+  });
+
+  it('fits terminals as small as 4 rows (frame never taller than the screen)', () => {
+    for (const rows of [4, 5, 6]) {
+      const lines = renderFrame(richState(), { ...FRAME_OPTS, rows }).split('\n');
+      expect(lines.length).toBeLessThanOrEqual(Math.max(3, rows - 1));
+    }
+  });
+
+  it('hostile control bytes in events cannot reach the frame', () => {
+    const s = createPanelState({ runName: 'inj', budgetTotal: null, startedAtMs: 0 });
+    foldEvent(s, ev('agent_started', { seq: 0, label: 'l\x1b[10A\x1b[2J', backend: 'mock', model: 'm\x9b1J' }, 1));
+    foldEvent(s, ev('agent_completed', { seq: 0, label: 'l\x1b[10A\x1b[2J', ok: false, totalTokens: 1, error: 'e\nr\rn\x1b[H' }, 2));
+    const frame = renderFrame(s, FRAME_OPTS);
+    expect(frame).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/); // only \n between lines
+    // an embedded newline in the error must not add uncounted physical rows
+    expect(frame.split('\n').every((l) => displayWidth(l) <= FRAME_OPTS.cols)).toBe(true);
   });
 });

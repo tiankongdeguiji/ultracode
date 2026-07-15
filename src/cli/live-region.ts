@@ -51,6 +51,16 @@ export class LiveRegion {
     this.stream.write(buf);
   }
 
+  /**
+   * Forget the painted region without erasing it. Used on terminal resize:
+   * the terminal rewraps already-painted lines, silently invalidating the
+   * cursor-up count — abandoning the old frame (it stays in scrollback) and
+   * painting fresh below beats corrupting the display.
+   */
+  reset(): void {
+    this.renderedLines = 0;
+  }
+
   /** Final paint (stays in scrollback), then restore the cursor and disarm the exit hook. */
   close(aboveLines: string[], finalFrame: string): void {
     this.update(aboveLines, finalFrame);
