@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateScript } from '../../src/cli/validate.js';
 import { lintWorkflowSource } from '../../src/cli/lint.js';
+import { VERSION } from '../../src/version.js';
 
 const root = join(__dirname, '../..');
 
@@ -39,6 +40,10 @@ describe('plugin bundles', () => {
     ]) {
       expect(existsSync(join(root, f)), f).toBe(true);
     }
+  });
+
+  it('engine VERSION constant matches package.json', () => {
+    expect(VERSION).toBe(pkg.version);
   });
 
   it('bundled workflow copies are valid and portable', () => {

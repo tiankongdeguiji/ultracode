@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+// A falsy version would be silently dropped by JSON.stringify, shipping a version-less manifest.
+if (!/^\d+\.\d+\.\d+/.test(version ?? '')) throw new Error(`package.json version missing or invalid: ${version}`);
 const copy = (from, to) => {
   mkdirSync(dirname(to), { recursive: true });
   cpSync(join(root, from), to, { recursive: true, force: true });
