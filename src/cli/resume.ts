@@ -103,6 +103,11 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
 
   if (opts.detach) {
     process.stdout.write(`${newId}\n`);
+    if (process.pid <= 64) {
+      process.stderr.write(
+        `⚠ this shell looks sandboxed (pid ${process.pid}): a detached runner cannot outlive a transient sandbox — prefer the MCP route or a persistent shell\n`,
+      );
+    }
     process.stderr.write(`resumed from ${runId}; monitor: ultracode watch ${newId}\n`);
     return 0;
   }

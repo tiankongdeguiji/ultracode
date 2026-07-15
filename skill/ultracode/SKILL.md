@@ -61,9 +61,11 @@ Scale to the ask: "find bugs" → few finders, single vote; "thoroughly audit" �
 ## Running (dispatch — details in `references/invoking.md`)
 
 1. **Qoder with the native Workflow tool available** → use the native tool / save to `.qoder/workflows/`. (Budget is stubbed there: pass it via `args.budgetTokens` and gate manually.)
-2. **ultracode MCP tools available** (`workflow_start`/`workflow_status`/`workflow_result`) → `workflow_start` returns a runId in <1s; poll `workflow_status` (a timed-out poll is harmless — re-poll the same runId); fetch `workflow_result` when terminal.
-3. **Shell access** → `ultracode run script.workflow.js --backend codex --yes` (append `--budget <the user's number>` ONLY if the user gave one; `--detach` for long runs, then `ultracode status <runId> --watch`). Always `ultracode validate` + `--dry-run` first — the dry run is free and catches dialect errors.
+2. **ultracode MCP tools available** (`workflow_start`/`workflow_status`/`workflow_result`) → `workflow_start` returns a runId in <1s; poll `workflow_status` (a timed-out poll is harmless — re-poll the same runId); fetch `workflow_result` when terminal. **From a sandboxed host (Codex, any per-command exec jail) this is the ONLY reliable route — the MCP server process persists outside your command sandbox.**
+3. **Shell access** → `ultracode run script.workflow.js --backend codex --yes` (append `--budget <the user's number>` ONLY if the user gave one). Always `ultracode validate` + `--dry-run` first — the dry run is free and catches dialect errors. **If your shell is sandboxed, do NOT `--detach`: the runner is SIGKILLed when your tool call's sandbox (PID namespace) tears down — symptom: `status` shows `orphaned` within seconds, manifest `pid` < 100, empty runner.log. Use the MCP route or ask to escalate the command.** In a persistent shell, `--detach` for long runs, then monitor with `ultracode watch <runId>` (or `status <runId> --watch`).
 4. Resume after failure/edit: `ultracode resume <runId> [--script edited.js]` — completed agents replay free from the journal.
+
+**Run lifecycle discipline (non-negotiable):** after launching, your NEXT action is a liveness check — the first `workflow_status` poll or `ultracode status <runId>`; a run showing `orphaned` died at launch, so diagnose instead of waiting. While a workflow runs, do NOT do the subtask work inline yourself — poll between your own steps and keep polling until terminal; never abandon a started run. Synthesize from the terminal `workflow_result`/`output.json` (plus your own verification), never instead of it.
 
 ## Safety rails (engine-enforced; don't fight them)
 

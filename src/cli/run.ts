@@ -183,6 +183,14 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
 
   if (opts.detach) {
     process.stdout.write(`${runId}\n`);
+    // A namespace-local pid means THIS CLI is inside a fresh PID namespace
+    // (agent exec jail, one-shot container) — the detached runner dies with
+    // it. Warn at launch; the corpse is otherwise silent (SIGKILL, no logs).
+    if (process.pid <= 64) {
+      process.stderr.write(
+        `⚠ this shell looks sandboxed (pid ${process.pid}): a detached runner cannot outlive a transient sandbox — prefer the MCP route or a persistent shell\n`,
+      );
+    }
     process.stderr.write(`run dir: ${dir}\nmonitor: ultracode watch ${runId}\n`);
     return 0;
   }
