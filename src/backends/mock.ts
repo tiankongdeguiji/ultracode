@@ -14,7 +14,7 @@
  */
 import { setTimeout as sleep } from 'node:timers/promises';
 import { validateWithSchema } from '../engine/ajv.js';
-import type { AgentExecutor, AgentOutcome, AgentSpec, NormalizedUsage } from './types.js';
+import type { AgentExecutor, AgentOutcome, AgentProgress, AgentSpec, NormalizedUsage } from './types.js';
 
 export interface MockStats {
   calls: number;
@@ -80,10 +80,12 @@ export class MockExecutor implements AgentExecutor {
 
   constructor(private readonly opts: { latencyMs?: number } = {}) {}
 
-  async execute(spec: AgentSpec, signal: AbortSignal): Promise<AgentOutcome> {
+  async execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (p: AgentProgress) => void): Promise<AgentOutcome> {
     this.stats.calls++;
     this.inFlight++;
     this.stats.maxConcurrent = Math.max(this.stats.maxConcurrent, this.inFlight);
+    // Deterministic progress for tests: the mock "resolves" the requested model.
+    if (spec.model !== undefined) onProgress?.({ type: 'model', model: spec.model });
     try {
       const maxAttempts = spec.retries + 1;
       let lastError = 'mock failure';
@@ -93,6 +95,11 @@ export class MockExecutor implements AgentExecutor {
           return this.outcome(spec, { ok: false, error: 'aborted', errorKind: 'interrupted', attempts: attempt });
         }
         const res = await this.attempt(spec, signal);
+        // One cumulative usage tick per attempt (same figures the outcome reports).
+        onProgress?.({ type: 'usage', usage: usageFor(spec) });
+        if (!res.ok && attempt < maxAttempts) {
+          onProgress?.({ type: 'retry', attempt: attempt + 1, maxAttempts, kind: 'task', reason: res.error });
+        }
         if (res.ok) {
           // agent({schema}) contract holds on mock too (dry-run rehearsal):
           // validate against the ORIGINAL schema, fail as the real pipeline would.
