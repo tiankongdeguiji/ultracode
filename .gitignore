@@ -4,3 +4,7 @@ dist/
 .ultracode/
 .DS_Store
 coverage/
+agent_space/
+# fully generated plugin bundles (npm run build:plugins; sources in skill/, workflows/, hostpacks/)
+dist-codex/
+dist-qoder/

@@ -1,6 +1,5 @@
 {
   "name": "ultracode",
-  "version": "0.1.0",
   "description": "Dynamic multi-agent workflow orchestration (ultracode) for Codex: skill + MCP workflow engine",
   "author": "ultracode",
   "license": "MIT",

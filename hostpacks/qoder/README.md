@@ -5,14 +5,22 @@ tool** — a faithful port of the same dialect — so this pack does not rebuild
 engine. It supplies what Qoder lacks: the *doctrine* (when/how to orchestrate)
 and the standing-mode *trigger*.
 
-## What it installs
+This plugin bundle is a **build output**: `npm run build:plugins` assembles it
+into `dist-qoder/` from `skill/`, `workflows/`, and `hostpacks/qoder/` — edit
+those sources, never the generated `dist-qoder/` tree.
 
-- The `ultracode` **skill** (`.qoder/skills/ultracode/`).
-- An **always_on rule** (`.qoder/rules/ultracode-mode.md`) — keyword / budget → orchestrate.
-- **uc-\* workflow templates** (`.qoder/workflows/`) in the portable dialect.
-- **Effort-routing agents** (`.qoder/agents/uc-xhigh.md`, `uc-verifier.md`) — Qoder's `budget`
+## What's in the bundle
+
+- The `ultracode` **skill** (`skills/ultracode/`).
+- **uc-\* workflow templates** (`workflows/`) in the portable dialect.
+- **Effort-routing agents** (`agents/uc-xhigh.md`, `uc-verifier.md`) — Qoder's `budget`
   global is stubbed and per-call `effort` isn't portable, so budget rides `args.budgetTokens`
   and effort rides `agentType`.
+
+## What `ultracode install qoder` additionally writes
+
+- The **always_on rule** (`.qoder/rules/ultracode-mode.md`) — keyword / budget → orchestrate.
+  Qoder plugins cannot bundle rules, so the trigger is installer-written.
 
 ## Manual install (until marketplace)
 
