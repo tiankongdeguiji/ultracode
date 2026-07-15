@@ -131,8 +131,9 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
   const paint = (status: RunStatus, nowMs: number, final: boolean): void => {
     const manifest = readManifest(dir);
     const frame = renderFrame(state, {
-      cols: stream.columns ?? 80,
-      rows: stream.rows ?? 24,
+      // || not ??: a detached/0-size PTY (CI, `script`) reports 0×0
+      cols: stream.columns || 80,
+      rows: stream.rows || 24,
       nowMs,
       color: mode.color,
       runStatus: status,
