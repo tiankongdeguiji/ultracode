@@ -5,6 +5,7 @@
  * clock, geometry, and events, which keeps every path deterministic in tests.
  */
 import type { TimestampedEvent } from '../store/events.js';
+import type { RunStatus } from '../store/manifest.js';
 
 export type AgentRowStatus = 'queued' | 'running' | 'ok' | 'failed' | 'skipped' | 'cached';
 
@@ -307,3 +308,247 @@ export function truncateToWidth(s: string, width: number): string {
   if (width === 1) return '…';
   return chars.slice(0, width - 1).join('') + '…';
 }
+
+// ---------------------------------------------------------------------------
+// Frame renderer
+// ---------------------------------------------------------------------------
+
+export interface FrameOptions {
+  cols: number;
+  /** terminal rows; the frame clamps itself to rows - 1 so repaint math never scrolls */
+  rows: number;
+  /** explicit clock → deterministic tests; the final frame passes endedAt */
+  nowMs: number;
+  /** false → zero SGR bytes in the output */
+  color: boolean;
+  /** from liveStatus(manifest) — events never decide run status */
+  runStatus: RunStatus;
+  /** manifest.budget.spent — may lead the folded budget_tick after a torn tail */
+  spentFloor?: number;
+}
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const VISIBLE_DONE_PER_PHASE = 3;
+const VISIBLE_QUEUED_PER_PHASE = 5;
+const LABEL_WIDTH = 24;
+
+/** Pure spinner frame — a function of the clock, so tests pin it via nowMs. */
+export function spinnerFrame(nowMs: number): string {
+  return SPINNER_FRAMES[Math.floor(nowMs / 100) % SPINNER_FRAMES.length]!;
+}
+
+type Paint = (code: string, s: string) => string;
+
+const SETTLED: ReadonlySet<AgentRowStatus> = new Set(['ok', 'failed', 'skipped', 'cached']);
+const DONE_LIKE: ReadonlySet<AgentRowStatus> = new Set(['ok', 'cached', 'skipped']);
+
+interface Section {
+  kind: 'phase' | 'child';
+  childId?: number;
+  phase?: PhaseGroup;
+  child?: ChildGroup;
+  firstSeq: number;
+}
+
+function rowsOf(state: PanelState): AgentRow[] {
+  return state.order.map((seq) => state.agents.get(seq)!).filter(Boolean);
+}
+
+function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: Paint): string {
+  const spin = row.attempt >= 2 ? paint('33', '↻') : paint('36', spinnerFrame(opts.nowMs));
+  const glyph =
+    row.status === 'running'
+      ? spin
+      : row.status === 'ok'
+        ? paint('32', '✓')
+        : row.status === 'failed'
+          ? paint('31', '✗')
+          : row.status === 'queued'
+            ? paint('2', '◌')
+            : row.status === 'skipped'
+              ? paint('2', '⊘')
+              : paint('2', '⟳'); // cached
+  const label = truncateToWidth(row.label, LABEL_WIDTH).padEnd(LABEL_WIDTH);
+  const parts: string[] = [];
+  if (row.status === 'failed') {
+    parts.push(paint('31', `failed: ${row.error ?? 'unknown error'}`));
+  } else if (row.status === 'skipped') {
+    parts.push(paint('2', 'skipped'));
+  } else if (row.status === 'cached') {
+    parts.push(paint('2', 'cached'));
+  } else if (row.status === 'queued') {
+    // no metadata — the row itself signals the wait
+  } else {
+    if (row.tokens > 0) parts.push(`${row.estimated ? '~' : ''}${formatTokens(row.tokens)} tok`);
+    const end = row.endedTs ?? opts.nowMs;
+    if (row.startedTs !== undefined) parts.push(formatDuration(end - row.startedTs));
+    if (row.model) parts.push(paint('2', row.model));
+    if (row.status === 'running' && row.attempt >= 2) parts.push(paint('33', `attempt ${row.attempt}`));
+  }
+  const meta = parts.join(paint('2', ' · '));
+  return `${indent}⎿ ${glyph} ${label}${meta ? ` ${meta}` : ''}`.trimEnd();
+}
+
+function sectionRows(state: PanelState, childId: number | undefined, phase: string | undefined): AgentRow[] {
+  return rowsOf(state).filter((r) => r.childId === childId && r.phase === phase);
+}
+
+function phaseLines(
+  state: PanelState,
+  phase: PhaseGroup | undefined,
+  childId: number | undefined,
+  indent: string,
+  opts: FrameOptions,
+  paint: Paint,
+  level: number,
+): string[] {
+  const members = sectionRows(state, childId, phase?.title);
+  const lines: string[] = [];
+  if (phase) {
+    const running = members.some((r) => r.status === 'running');
+    const glyph = running ? paint('36', spinnerFrame(opts.nowMs)) : phase.started ? '⏺' : paint('2', '⏺');
+    const done = members.filter((r) => r.status === 'ok' || r.status === 'cached').length;
+    const count = members.length > 0 ? ` (${done}/${members.length})` : '';
+    const detail = phase.detail ? paint('2', ` — ${phase.detail}`) : '';
+    const title = phase.started ? phase.title : paint('2', phase.title);
+    lines.push(`${indent}${glyph} ${title}${count}${detail}`);
+  }
+  if (level >= 2 && members.length > 0 && members.every((r) => SETTLED.has(r.status))) {
+    return lines; // fully-terminal phase collapses to its header under pressure
+  }
+  const rowIndent = phase ? `${indent}  ` : indent;
+  const visibleDone = level >= 1 ? 0 : VISIBLE_DONE_PER_PHASE;
+  const doneRows = members.filter((r) => DONE_LIKE.has(r.status));
+  const hiddenDone = doneRows.slice(0, Math.max(0, doneRows.length - visibleDone));
+  const hiddenSet = new Set(hiddenDone.map((r) => r.seq));
+  if (hiddenDone.length > 0) {
+    const tok = hiddenDone.reduce((n, r) => n + r.tokens, 0);
+    lines.push(paint('2', `${rowIndent}⎿ … +${hiddenDone.length} done${tok > 0 ? ` (${formatTokens(tok)} tok)` : ''}`));
+  }
+  const queuedRows = members.filter((r) => r.status === 'queued');
+  const hiddenQueued = queuedRows.slice(VISIBLE_QUEUED_PER_PHASE);
+  for (const row of members) {
+    if (hiddenSet.has(row.seq)) continue;
+    if (hiddenQueued.includes(row)) continue;
+    lines.push(agentRowLine(row, rowIndent, opts, paint));
+  }
+  if (hiddenQueued.length > 0) {
+    lines.push(paint('2', `${rowIndent}⎿ ◌ … +${hiddenQueued.length} queued`));
+  }
+  return lines;
+}
+
+function buildSections(state: PanelState): Section[] {
+  const rows = rowsOf(state);
+  const firstSeq = (pred: (r: AgentRow) => boolean): number => {
+    const hit = rows.find(pred);
+    return hit ? hit.seq : Number.POSITIVE_INFINITY;
+  };
+  const sections: Section[] = [];
+  // Implicit no-phase parent group (only when it has rows).
+  if (rows.some((r) => r.childId === undefined && r.phase === undefined)) {
+    sections.push({ kind: 'phase', firstSeq: firstSeq((r) => r.childId === undefined && r.phase === undefined) });
+  }
+  for (const phase of state.phases.filter((p) => p.childId === undefined)) {
+    sections.push({ kind: 'phase', phase, firstSeq: firstSeq((r) => r.childId === undefined && r.phase === phase.title) });
+  }
+  for (const child of state.children) {
+    sections.push({ kind: 'child', child, childId: child.childId, firstSeq: firstSeq((r) => r.childId === child.childId) });
+  }
+  // Chronological by first agent; empty sections keep their declared order at
+  // the bottom (upcoming seeded phases render below active work). Stable sort.
+  return sections
+    .map((s, i) => ({ s, i }))
+    .sort((a, b) => (a.s.firstSeq - b.s.firstSeq) || (a.i - b.i))
+    .map((x) => x.s);
+}
+
+function childLines(state: PanelState, child: ChildGroup, opts: FrameOptions, paint: Paint, level: number): string[] {
+  const glyph = child.done ? (child.ok ? paint('32', '▸') : paint('31', '▸')) : paint('36', '▸');
+  const lines = [`  ${glyph} ${child.name} ${paint('2', '(child)')}`];
+  const childPhases = state.phases.filter((p) => p.childId === child.childId);
+  lines.push(...phaseLines(state, undefined, child.childId, '    ', opts, paint, level));
+  for (const phase of childPhases) {
+    lines.push(...phaseLines(state, phase, child.childId, '    ', opts, paint, level));
+  }
+  return lines;
+}
+
+function footerLine(state: PanelState, opts: FrameOptions, paint: Paint): string {
+  const rows = rowsOf(state);
+  const settled = rows.filter((r) => SETTLED.has(r.status)).length;
+  const running = rows.filter((r) => r.status === 'running');
+  const queued = rows.filter((r) => r.status === 'queued').length;
+  const failed = rows.filter((r) => r.status === 'failed').length;
+  const liveTokens = Math.max(state.spentTokens, opts.spentFloor ?? 0) + running.reduce((n, r) => n + r.tokens, 0);
+  const parts = [`agents ${settled}/${rows.length}`];
+  if (running.length > 0) parts.push(`${running.length} running`);
+  if (queued > 0) parts.push(`${queued} queued`);
+  if (failed > 0) parts.push(paint('31', `${failed} failed`));
+  const total = state.seed.budgetTotal;
+  const tokens = `tokens ${formatTokens(liveTokens)}${total ? `/${formatTokens(total)}` : ''}`;
+  const elapsed = `elapsed ${formatDuration(opts.nowMs - state.seed.startedAtMs)}`;
+  return paint('2', `${parts.join(' · ')} | ${tokens} | ${elapsed}`);
+}
+
+function headerLines(state: PanelState, opts: FrameOptions, paint: Paint): string[] {
+  const statusText =
+    state.stopRequested && opts.runStatus === 'running' ? 'stopping…' : opts.runStatus;
+  const statusColor =
+    opts.runStatus === 'completed'
+      ? '32'
+      : opts.runStatus === 'failed' || opts.runStatus === 'orphaned'
+        ? '31'
+        : statusText === 'stopping…' || opts.runStatus === 'stopped'
+          ? '33'
+          : '36';
+  const name = paint('1', state.seed.runName) + (state.seed.title ? paint('2', ` — ${state.seed.title}`) : '');
+  const lines = [
+    `⏺ ${name}   ${paint(statusColor, statusText)} ${paint('2', '·')} ${formatDuration(opts.nowMs - state.seed.startedAtMs)}`,
+  ];
+  if (opts.runStatus === 'orphaned') {
+    lines.push(paint('31', '✗ runner died without finalizing (orphaned) — see runner.log'));
+  }
+  return lines;
+}
+
+/**
+ * Pure full-frame render: '\n'-joined lines, every line pre-truncated to cols
+ * (lines must never soft-wrap — the repaint cursor math counts them). Collapse
+ * escalates until the frame fits rows - 1: hide done rows per phase → hide all
+ * done rows → collapse terminal phases to headers → hard-truncate with notice.
+ */
+export function renderFrame(state: PanelState, opts: FrameOptions): string {
+  const cols = Math.max(20, opts.cols);
+  const rowsBudget = Math.max(6, opts.rows - 1);
+  const paint: Paint = opts.color ? (code, s) => `\x1b[${code}m${s}\x1b[0m` : (_code, s) => s;
+
+  let lines: string[] = [];
+  for (let level = 0; level <= 2; level++) {
+    lines = headerLines(state, opts, paint);
+    for (const section of buildSections(state)) {
+      if (section.kind === 'child' && section.child) {
+        lines.push(...childLines(state, section.child, opts, paint, level));
+      } else {
+        lines.push(...phaseLines(state, section.phase, undefined, '  ', opts, paint, level));
+      }
+    }
+    lines.push(footerLine(state, opts, paint));
+    if (lines.length <= rowsBudget) break;
+  }
+  if (lines.length > rowsBudget) {
+    // Last resort: keep the header and the most recent tail (incl. footer).
+    const tail = lines.slice(lines.length - (rowsBudget - 2));
+    lines = [lines[0]!, paint('2', `  … ${lines.length - tail.length - 1} lines hidden (terminal too small)`), ...tail];
+  }
+  // Overlong lines would soft-wrap and break the repaint's cursor-up count.
+  // Truncating through SGR codes could cut a reset and bleed color, so an
+  // overlong colored line drops its color instead (rare: long error text).
+  const fit = (l: string): string => {
+    const plain = l.replace(ANSI_RE, '');
+    return [...plain].length <= cols ? l : truncateToWidth(plain, cols);
+  };
+  return lines.map(fit).join('\n');
+}
+
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
