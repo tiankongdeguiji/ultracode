@@ -146,15 +146,17 @@ describe('MCP triad', () => {
     }
   }, 30_000);
 
-  it('workflow_start accepts maxConcurrency and persists it into the run config', async () => {
+  it('workflow_start accepts maxConcurrency; MCP resume overrides or inherits it', async () => {
     const start = (await client.callTool({
       name: 'workflow_start',
       arguments: { script: HELLO, backend: 'mock', maxConcurrency: 4 },
     })) as { structuredContent?: { runId?: string; runDir?: string }; isError?: boolean };
     expect(start.isError).toBeFalsy();
+    const runId = start.structuredContent!.runId!;
     const runDir = start.structuredContent!.runDir!;
-    const config = JSON.parse(readFileSync(join(runDir, 'config.json'), 'utf8')) as { maxConcurrency?: number };
-    expect(config.maxConcurrency).toBe(4);
+    const readMc = (dir: string) =>
+      (JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')) as { maxConcurrency?: number }).maxConcurrency;
+    expect(readMc(runDir)).toBe(4);
 
     // Non-positive values must be rejected at the zod gate (the CLI mirrors
     // this with its own fail-fast check) — SDK surfaces it as either an
@@ -170,7 +172,34 @@ describe('MCP triad', () => {
       rejected = true;
     }
     expect(rejected).toBe(true);
-  }, 30_000);
+
+    // Drive the run terminal so it can be resumed. startDetachedRun's resume
+    // config-merge is a separate implementation from the CLI's resumeCommand,
+    // so the MCP path needs its own override/inherit assertions.
+    for (let i = 0; i < 40; i++) {
+      const s = (await client.callTool({
+        name: 'workflow_status',
+        arguments: { runId, waitSeconds: 2 },
+      })) as { structuredContent?: { terminal?: boolean } };
+      if (s.structuredContent!.terminal) break;
+    }
+
+    // (1) explicit maxConcurrency on an MCP resume wins over the stored value
+    const override = (await client.callTool({
+      name: 'workflow_start',
+      arguments: { resumeFromRunId: runId, maxConcurrency: 6 },
+    })) as { structuredContent?: { runDir?: string }; isError?: boolean };
+    expect(override.isError).toBeFalsy();
+    expect(readMc(override.structuredContent!.runDir!)).toBe(6);
+
+    // (2) omission inherits the value frozen at the original run's creation
+    const inherit = (await client.callTool({
+      name: 'workflow_start',
+      arguments: { resumeFromRunId: runId },
+    })) as { structuredContent?: { runDir?: string }; isError?: boolean };
+    expect(inherit.isError).toBeFalsy();
+    expect(readMc(inherit.structuredContent!.runDir!)).toBe(4);
+  }, 45_000);
 
   it('bad script errors cleanly through workflow_start', async () => {
     const start = (await client.callTool({
