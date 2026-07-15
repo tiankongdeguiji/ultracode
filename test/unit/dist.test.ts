@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,12 @@ import { lintWorkflowSource } from '../../src/cli/lint.js';
 const root = join(__dirname, '../..');
 
 describe('plugin bundles', () => {
+  // The copied subtrees are gitignored build outputs — rebuild from the
+  // canonical sources so the assertions run against fresh, never stale, copies.
+  beforeAll(() => {
+    execFileSync('node', [join(root, 'scripts/build-plugins.mjs')], { stdio: 'pipe' });
+  });
+
   it('codex bundle: valid manifest + skill present', () => {
     const manifest = JSON.parse(readFileSync(join(root, 'dist-codex/.codex-plugin/plugin.json'), 'utf8'));
     expect(manifest.name).toBe('ultracode');

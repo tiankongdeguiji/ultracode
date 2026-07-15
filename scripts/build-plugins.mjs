@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Assemble the dist-codex / dist-qoder plugin bundles from canonical sources.
-// Marketplace distribution is deferred (internal-first); `ultracode install`
-// is the supported path. This keeps the bundles in sync for when it lands.
+// The copied subtrees are gitignored build outputs; only the plugin manifests
+// and bundle READMEs are committed. Marketplace distribution is deferred
+// (internal-first); `ultracode install` is the supported path.
 import { cpSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';

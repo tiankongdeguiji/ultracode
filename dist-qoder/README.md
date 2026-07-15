@@ -14,6 +14,9 @@ and the standing-mode *trigger*.
   global is stubbed and per-call `effort` isn't portable, so budget rides `args.budgetTokens`
   and effort rides `agentType`.
 
+Only this README and `.qoder-plugin/plugin.json` are committed; regenerate the
+`skills/`, `workflows/`, and `agents/` subtrees with `npm run build:plugins`.
+
 ## Manual install (until marketplace)
 
 ```bash

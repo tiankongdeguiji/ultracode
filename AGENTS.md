@@ -14,7 +14,7 @@ Use the gitignored `agent_space/` directory at the repo root for scratch scripts
 
 ## Generated Plugin Bundles
 
-- `dist/` is gitignored tsc output, but `dist-codex/` and `dist-qoder/` are committed generated plugin bundles: never edit them by hand. After changing `skill/`, `workflows/`, or `hostpacks/qoder/agents/`, run `npm run build:plugins` and commit the regenerated bundles (`test/unit/dist.test.ts` enforces they stay valid).
+- `dist/` (tsc output) and the copied bundle subtrees (`dist-codex/skills/`, `dist-qoder/{skills,workflows,agents}/`) are gitignored build outputs. Regenerate the bundles from the canonical `skill/`, `workflows/`, and `hostpacks/qoder/agents/` with `npm run build:plugins`; `test/unit/dist.test.ts` rebuilds them itself before asserting, so they can never go stale in CI. Only the hand-maintained plugin manifests and READMEs under `dist-codex/`/`dist-qoder/` are committed — never commit generated copies.
 - A version bump must update `package.json`, `src/version.ts`, and the hand-maintained bundle manifests `dist-codex/.codex-plugin/plugin.json` and `dist-qoder/.qoder-plugin/plugin.json` — `build:plugins` does not regenerate the manifests, and no test enforces they match.
 
 ## Testing

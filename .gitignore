@@ -5,3 +5,8 @@ dist/
 .DS_Store
 coverage/
 agent_space/
+# generated bundle subtrees (npm run build:plugins); manifests + READMEs stay committed
+dist-codex/skills/
+dist-qoder/skills/
+dist-qoder/workflows/
+dist-qoder/agents/
