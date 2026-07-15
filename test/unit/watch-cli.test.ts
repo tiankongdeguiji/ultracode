@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunId } from '../../src/store/layout.js';
 import { createRunDir } from '../../src/store/runstore.js';
-import { readManifest, isTerminal } from '../../src/store/manifest.js';
+import { readManifest, writeManifest, isTerminal } from '../../src/store/manifest.js';
 import { launchRunner } from '../../src/exec/daemonize.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { panelLoop, resolveRenderMode, watchCommand, type PanelStream } from '../../src/cli/watch.js';
@@ -161,6 +161,29 @@ return 'finished'
     expect(exitCode).toBe(0);
     expect(stream.chunks).toEqual([]);
   }, 20_000);
+
+  it('watch of an orphaned run reports it and exits 1, in both plain and panel modes', async () => {
+    const { root, runId, dir } = makeRun(HELLO);
+    // Fabricate an orphan without racing a real runner: 'running' manifest whose
+    // pidStart mismatches this live pid → isRunnerAlive false → liveStatus 'orphaned'.
+    const m = readManifest(dir)!;
+    writeManifest(dir, { ...m, status: 'running', pid: process.pid, pidStart: 'recycled-pid-start' });
+
+    const { chunks, restore } = captureStderr();
+    let code: number;
+    try {
+      code = await watchCommand(runId, { home: root, plain: true });
+    } finally {
+      restore();
+    }
+    expect(code).toBe(1);
+    expect(chunks.join('')).toContain('orphaned');
+
+    const stream = fakeTty();
+    const { exitCode } = await panelLoop(dir, { mode: 'observe', stream });
+    expect(exitCode).toBe(1);
+    expect(stream.chunks.join('')).toContain('runner died without finalizing (orphaned)');
+  });
 
   it('unknown runId fails fast with a message', async () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-watch-'));

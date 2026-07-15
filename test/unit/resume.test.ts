@@ -215,6 +215,47 @@ return x`;
     expect(resultJson).toMatchObject({ value: 'cached-value', cached: true });
   }, 40_000);
 
+  it('resume replays through child-workflow journal boundaries (child-enter/exit records)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-resume-child-'));
+    const source = `export const meta = { name: 'rc', description: 'd' }
+const a = await agent('MOCK:ok pa', { label: 'pa' })
+const c = await workflow({ script: "export const meta = { name: 'sub', description: 'd' }\\nreturn agent('MOCK:ok cv', { label: 'ca' })" }, {})
+return [a, c]`;
+
+    const firstId = newRunId();
+    const firstDir = createRunDir(root, {
+      runId: firstId,
+      name: 'rc',
+      source,
+      args: null,
+      config: { backend: 'mock', cwd: '/same' },
+    });
+    await launchRunner(firstDir);
+    await waitTerminal(firstDir);
+    expect(readManifest(firstDir)!.status).toBe('completed');
+    const firstJournal = readJournal(join(firstDir, 'journal.jsonl'));
+    expect(firstJournal.some((r) => r.t === 'child-enter')).toBe(true);
+    expect(firstJournal.some((r) => r.t === 'child-exit')).toBe(true);
+
+    const secondId = newRunId();
+    const config = readRunConfig(firstDir);
+    config.resumeFromRunId = firstId;
+    const secondDir = createRunDir(root, { runId: secondId, name: 'rc', source, args: null, config, resumedFrom: firstId });
+    await launchRunner(secondDir);
+    await waitTerminal(secondDir);
+
+    expect(readManifest(secondDir)!.status).toBe('completed');
+    const output = JSON.parse(readFileSync(join(secondDir, 'output.json'), 'utf8'));
+    expect(output.result).toEqual(['pa', 'cv']);
+    // Both the parent's and the CHILD's agents must replay from the prior
+    // journal — the child-enter/exit records may not break the agent prefix.
+    const journal = readJournal(join(secondDir, 'journal.jsonl'));
+    const agents = journal.filter((r): r is Extract<JournalRecord, { t: 'agent' }> => r.t === 'agent');
+    expect(agents).toHaveLength(2);
+    expect(agents.every((a) => a.cached === true)).toBe(true);
+    expect(journal.some((r) => r.t === 'child-enter')).toBe(true);
+  }, 40_000);
+
   it('resume --max-concurrency: explicit override wins; no flag inherits the value frozen at creation', async () => {
     const { resumeCommand } = await import('../../src/cli/resume.js');
     const root = mkdtempSync(join(tmpdir(), 'uc-resume-mc-'));
