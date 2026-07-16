@@ -97,22 +97,30 @@ describe('plugin bundles', () => {
       name: 'uc-npmver-fixture', version: '1.2.3', lockfileVersion: 3, packages: { '': { version: '1.2.3' } },
     }, null, 2) + '\n');
     writeFileSync(join(dir, 'src/version.ts'), `${BANNER}export const VERSION = '1.2.3';\n`);
-    const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+    // Hermetic: pin npm + git config so a contributor's global .npmrc
+    // (ignore-scripts / package-lock=false) or git config (gpgsign, hooksPath)
+    // can't fail this spuriously. Local `git config user.*` below still applies.
+    const env = {
+      ...process.env,
+      npm_config_ignore_scripts: 'false',
+      npm_config_package_lock: 'true',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_SYSTEM: '/dev/null',
+    };
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, encoding: 'utf8', env });
     git('init', '-q');
     git('config', 'user.email', 'test@example.com');
     git('config', 'user.name', 'test');
     git('add', '-A');
     git('commit', '-qm', 'init');
-    execFileSync('npm', ['version', 'patch', '--no-git-tag-version'], { cwd: dir, stdio: 'pipe' });
+    execFileSync('npm', ['version', 'patch', '--no-git-tag-version'], { cwd: dir, stdio: 'pipe', env });
 
-    const staged = execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: dir, encoding: 'utf8' })
-      .split('\n').filter(Boolean).sort();
+    const staged = git('diff', '--cached', '--name-only').split('\n').filter(Boolean).sort();
     expect(staged).toEqual(['package-lock.json', 'package.json', 'src/version.ts']);
-    const stagedLock = JSON.parse(execFileSync('git', ['show', ':package-lock.json'], { cwd: dir, encoding: 'utf8' }));
+    const stagedLock = JSON.parse(git('show', ':package-lock.json'));
     expect(stagedLock.version).toBe('1.2.4');
     expect(stagedLock.packages[''].version).toBe('1.2.4');
-    expect(execFileSync('git', ['show', ':src/version.ts'], { cwd: dir, encoding: 'utf8' }))
-      .toBe(`${BANNER}export const VERSION = '1.2.4';\n`);
+    expect(git('show', ':src/version.ts')).toBe(`${BANNER}export const VERSION = '1.2.4';\n`);
   });
 
   it('sync-version regenerates src/version.ts from package.json', () => {
