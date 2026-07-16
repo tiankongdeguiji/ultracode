@@ -22,6 +22,20 @@ export function readMaxConcurrencyOpt(raw: string | undefined): { ok: true; valu
 }
 
 /**
+ * Shared --count guard for `list`: absent → ok with no value; invalid → writes
+ * the canonical error to stderr and reports failure, mirroring readMaxConcurrencyOpt.
+ */
+export function readCountOpt(raw: string | undefined): { ok: true; value?: number } | { ok: false } {
+  if (raw === undefined) return { ok: true };
+  const n = Number(raw);
+  if (!isPositiveInt(n)) {
+    process.stderr.write('ultracode: --count must be a positive integer\n');
+    return { ok: false };
+  }
+  return { ok: true, value: n };
+}
+
+/**
  * Shared nesting guard for `run` and `resume`: the engine stamps
  * ULTRACODE_INSIDE_RUN on every spawned worker, and a worker starting fresh
  * detached runs is how workflow fork-bombs happen (each run's workers spawn

@@ -8,10 +8,11 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readEventsFrom, type TimestampedEvent } from '../store/events.js';
 import { isTerminal, readManifest } from '../store/manifest.js';
-import { getRun, listRuns, reapOrphans } from '../store/runstore.js';
+import { getRun, recentRuns, reapOrphans } from '../store/runstore.js';
 import { stopRun } from '../exec/stop.js';
 import { ultracodeRoot } from '../store/layout.js';
 import { sanitizeText } from './panel.js';
+import { readCountOpt } from './options.js';
 
 /**
  * One event → one plain line. The output reaches real TTYs unsanitized-context
@@ -161,15 +162,14 @@ export async function stopCommand(runId: string, opts: { home?: string }): Promi
   return 0;
 }
 
-export function listCommand(opts: { all?: boolean; reap?: boolean; json?: boolean; home?: string }): number {
+export function listCommand(opts: { all?: boolean; reap?: boolean; json?: boolean; home?: string; count?: string }): number {
   const root = ultracodeRoot(process.cwd(), opts.home);
   if (opts.reap) {
     for (const id of reapOrphans(root)) process.stderr.write(`reaped ${id}\n`);
   }
-  let runs = listRuns(root);
-  if (!opts.all) {
-    runs = runs.filter((r) => !isTerminal(r.effectiveStatus) || Date.parse(r.manifest.startedAt) > Date.now() - 24 * 3600e3);
-  }
+  const countOpt = readCountOpt(opts.count);
+  if (!countOpt.ok) return 1;
+  const { runs, hidden } = recentRuns(root, { all: opts.all, count: countOpt.value });
   if (opts.json) {
     process.stdout.write(
       JSON.stringify(
@@ -184,13 +184,15 @@ export function listCommand(opts: { all?: boolean; reap?: boolean; json?: boolea
     process.stdout.write(`no runs under ${root}\n`);
     return 0;
   }
-  for (const r of runs) {
+  // Newest-first for the human list so the truncation footer reads naturally.
+  for (const r of [...runs].reverse()) {
     process.stdout.write(
       sanitizeText(
         `${r.runId}  ${r.effectiveStatus.padEnd(9)}  agents:${String(r.manifest.agentCount).padEnd(4)} ${r.manifest.name}  (${r.manifest.startedAt})`,
       ) + '\n',
     );
   }
+  if (hidden > 0) process.stdout.write(`… and ${hidden} more (use --count <n> or --all)\n`);
   return 0;
 }
 

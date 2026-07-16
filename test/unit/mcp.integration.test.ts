@@ -159,6 +159,47 @@ describe('MCP triad', () => {
     expect(entry).toBeDefined();
   }, 60_000);
 
+  it('workflow_list caps to the 10 most recent by default and honors count, reporting hidden', async () => {
+    // Isolated store (via the cwd input) so accumulated runs from other tests
+    // don't perturb the exact cap/hidden counts.
+    const isolated = mkdtempSync(join(tmpdir(), 'uc-mcp-list-'));
+    const runsBase = join(isolated, '.ultracode', 'runs');
+    const base = Date.now();
+    for (let i = 0; i < 12; i++) {
+      const runId = 'wf_cap' + String(i).padStart(4, '0');
+      const dir = join(runsBase, runId);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'manifest.json'),
+        JSON.stringify({
+          runId,
+          name: 'cap',
+          status: 'running',
+          pid: process.pid,
+          pidStart: readProcStat(process.pid)?.starttime,
+          startedAt: new Date(base - i * 60_000).toISOString(),
+          heartbeatAt: new Date().toISOString(),
+          phases: [],
+          agentCount: 0,
+          budget: { total: null, spent: 0 },
+          backendDefault: 'mock',
+          engineVersion: '0.0.0',
+        }),
+      );
+    }
+    const def = (await client.callTool({ name: 'workflow_list', arguments: { cwd: isolated } })) as {
+      structuredContent?: { runs: unknown[]; hidden: number };
+    };
+    expect(def.structuredContent!.runs).toHaveLength(10);
+    expect(def.structuredContent!.hidden).toBe(2);
+
+    const capped = (await client.callTool({ name: 'workflow_list', arguments: { cwd: isolated, count: 2 } })) as {
+      structuredContent?: { runs: unknown[]; hidden: number };
+    };
+    expect(capped.structuredContent!.runs).toHaveLength(2);
+    expect(capped.structuredContent!.hidden).toBe(10);
+  }, 20_000);
+
   it('refuses workflow_start and workflow_stop from inside a run (recursion / confused-deputy guard)', async () => {
     // A worker that inherited the MCP server has ULTRACODE_INSIDE_RUN set: it
     // must not launch fresh runs, nor make this unsandboxed process signal an

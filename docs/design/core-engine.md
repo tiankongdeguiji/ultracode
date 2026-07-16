@@ -276,7 +276,7 @@ ultracode status <runId> [--watch] [--json]     # phases, agent table, budget, h
 ultracode logs   <runId> [--follow] [--agent seq]
 ultracode resume <runId> [--script f] [--args j]
 ultracode stop   <runId>
-ultracode list   [--all] [--reap] [--json]
+ultracode list   [--all] [--count <n>] [--reap] [--json]   # default: 10 most recent
 ultracode validate <script.js>                   # meta + acorn + dry compile
 ultracode doctor                                 # probe all backends: binary, version, auth mode, parallel-safety warnings
 ultracode mcp                                    # start MCP stdio server
@@ -289,7 +289,7 @@ stdio transport, no session-affinity assumptions (2026-07-28-ready). Tools (neve
 - **`workflow_start`** `{script?|scriptPath?|name?, args?, backend?, budget?, resumeFromRunId?}` → returns in <1s: `{ runId, scriptPath, monitor: 'call workflow_status with runId', summary }`. Mirrors the Workflow tool's fire-and-forget contract.
 - **`workflow_status`** `{runId, waitSeconds?: number /* clamped to 50 */, sinceEventOffset?: number}` → **long-poll**: returns immediately if terminal or new events exist past the offset, else waits up to `min(waitSeconds,50)`s (safely under every host default timeout: Codex 300s—and 60s on legacy installs—Qoder/Gemini 600s). Response: `{ status, phases, agentsRunning, agentsDone, budget, logTail, nextEventOffset }`. Emits `notifications/progress` against the caller's progressToken during the wait (UX for Qoder/Gemini; Codex just logs it).
 - **`workflow_result`** `{runId}` → `output.json` content as `structuredContent` + failures + artifact paths; error `-32602`-style tool error if not terminal (with current status so the model self-corrects).
-- **`workflow_stop`** `{runId}`, **`workflow_list`** `{}`.
+- **`workflow_stop`** `{runId}`, **`workflow_list`** `{all?, count?}` → `{runs, hidden}` (10 most recent unless `all` or `count`).
 
 Because runs are detached, the MCP server is stateless over the run store: it can be killed and restarted (or run as multiple instances for multiple host sessions) with no run loss.
 

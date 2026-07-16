@@ -23,7 +23,7 @@ import { startDetachedRun } from '../exec/start.js';
 import { stopRun } from '../exec/stop.js';
 import { readEventsFrom, type TimestampedEvent } from '../store/events.js';
 import { isTerminal } from '../store/manifest.js';
-import { getRun, listRuns } from '../store/runstore.js';
+import { getRun, recentRuns } from '../store/runstore.js';
 import { ultracodeRoot } from '../store/layout.js';
 import { renderEvent } from '../cli/lifecycle.js';
 import { readFileSync, existsSync } from 'node:fs';
@@ -253,21 +253,22 @@ export function createServer(baseCwd: string): McpServer {
   server.registerTool(
     'workflow_list',
     {
-      description: 'List workflow runs in the project run store.',
-      inputSchema: { cwd: z.string().optional(), all: z.boolean().optional() },
+      description: 'List workflow runs in the project run store. Returns the 10 most recent by default; pass all=true for every run, or count=N.',
+      inputSchema: { cwd: z.string().optional(), all: z.boolean().optional(), count: z.number().int().positive().optional() },
     },
     async (input) => {
-      const runs = listRuns(rootFor(input.cwd))
-        .filter((r) => input.all || !isTerminal(r.effectiveStatus) || Date.parse(r.manifest.startedAt) > Date.now() - 24 * 3600e3)
-        .map((r) => ({
+      const { runs, hidden } = recentRuns(rootFor(input.cwd), { all: input.all, count: input.count });
+      return ok({
+        runs: runs.map((r) => ({
           runId: r.runId,
           status: r.effectiveStatus,
           name: r.manifest.name,
           startedAt: r.manifest.startedAt,
           agents: r.manifest.agentCount,
           tokens: r.manifest.budget.spent,
-        }));
-      return ok({ runs });
+        })),
+        hidden,
+      });
     },
   );
 
