@@ -24,7 +24,7 @@ program
   .option('--max-concurrency <n>', 'concurrent agent cap (default min(10, max(2, cores-2)); env ULTRACODE_MAX_CONCURRENCY overrides the default)')
   .option('--budget <spec>', 'token budget: 500k, +500k, 2m (hard dispatch-gate ceiling)')
   .option('--permission <mode>', 'worker sandbox: safe|auto|danger (read-only/workspace-write/full)', 'auto')
-  .option('--timeout <minutes>', 'wall-clock cap in minutes (default: unlimited; on resume 0 clears an inherited cap)')
+  .option('--timeout <minutes>', 'wall-clock cap in minutes (default: unlimited)')
   .option('--dry-run', 'rehearse on the mock backend: no tokens, no run dir')
   .option('--yes', 'skip the review-before-run confirmation')
   .option('--detach', 'print runId and return immediately')

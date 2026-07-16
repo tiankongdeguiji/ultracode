@@ -174,7 +174,12 @@ export class AgentCallExecutor implements AgentExecutor {
       // Watchdog kills are excluded.
       if (resumePlan !== null && !last.exit.ok && !signal.aborted && last.exit.errorKind !== 'stalled' && last.sessionId === undefined) {
         const remainingMs = attemptBudgetMs === undefined ? undefined : attemptBudgetMs - (Date.now() - attemptStartedAt);
-        if (remainingMs !== undefined && remainingMs <= 0) {
+        // A sub-second remainder cannot cover CLI startup — synthesize the
+        // timeout instead of spawning a doomed process into SIGTERM churn.
+        // (The dead resume's AttemptResult is replaced by the rerun on the
+        // spawn path — deliberate: with no session event it carries ~zero
+        // usage/toolCalls, and estimating it would fabricate tokens.)
+        if (remainingMs !== undefined && remainingMs < 1_000) {
           last = {
             ...last,
             exit: { ok: false, errorKind: 'stalled', retryable: true, message: `attempt timed out after ${attemptBudgetMs}ms` },

@@ -24,6 +24,7 @@ export interface RunConfig {
   budgetTotal?: number | null;
   logCap?: number;
   permission?: 'safe' | 'auto' | 'danger';
+  /** run wall-clock cap (ms); unset = unlimited (0 at start-time clears an inherited cap) */
   wallClockMs?: number;
   /** run-wide default per-attempt agent timeout (ms); script-level opts.timeoutMs still wins */
   attemptTimeoutMs?: number;

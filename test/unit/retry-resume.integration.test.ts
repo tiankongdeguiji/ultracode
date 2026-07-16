@@ -254,6 +254,18 @@ describe('task-retry resume', () => {
     expect(adapter.spawnCalls).toBe(2);
   });
 
+  it('non-cumulative usage (claude/qoder-style) sums across a resumed retry on the same session', async () => {
+    const adapter = new ScriptedAdapter([
+      { lines: [{ session: 's1' }, { usage: { inputTokens: 100, outputTokens: 10 } }], exit: 1 },
+      { lines: [{ session: 's1' }, { usage: { inputTokens: 200, outputTokens: 20 } }, { done: true }], exit: 0 },
+    ]);
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    expect(outcome.ok).toBe(true);
+    // per-attempt (non-thread-cumulative) figures add up — no dedupe, no estimate
+    expect(outcome.usage.totalTokens).toBe(330);
+    expect(outcome.usage.estimated).toBe(false);
+  });
+
   it('a timeoutMs beyond the setTimeout range never insta-kills the attempt', async () => {
     const adapter = new ScriptedAdapter([{ lines: [{ text: 'quick' }, { done: true }], exit: 0 }]);
     const outcome = await new AgentCallExecutor(adapter).execute(spec({ timeoutMs: 2 ** 31 }), SIGNAL);
@@ -279,14 +291,15 @@ describe('task-retry resume', () => {
       { lines: [], exit: 1, delayMs: 2_500 }, // resume: zero events, dies on its own late in the budget
       { lines: [], exit: 0, hang: true }, // fresh fallback: hangs → must be killed at the REMAINING budget
     ]);
-    const started = Date.now();
     const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 4_000 }), SIGNAL);
-    const elapsed = Date.now() - started;
     expect(outcome.ok).toBe(false);
-    expect(outcome.error).toContain('timed out');
-    // one 4s deadline for the whole logical attempt: expected ~4.2-4.7s incl.
-    // spawn overhead; a second full window would land at ~6.6s+. The 5.5s
-    // threshold leaves ~1s of jitter margin on both sides.
-    expect(elapsed).toBeLessThan(5_500);
+    // Deterministic shape assertion, no wall-clock race: the fallback's kill
+    // message carries ITS timer value — a remainder (4000 − ~2500 − overhead)
+    // if the deadline is shared, the full 4000 if a second window was armed.
+    const killedAfterMs = Number(/attempt timed out after (\d+)ms/.exec(outcome.error ?? '')?.[1]);
+    expect(killedAfterMs).toBeGreaterThanOrEqual(1_000); // above the synthesize-floor: a real remainder spawn ran
+    expect(killedAfterMs).toBeLessThan(4_000); // strictly less than a second full window
+    expect(adapter.resumeCalls).toHaveLength(1);
+    expect(adapter.spawnCalls).toBe(2); // attempt 1 + the fallback rerun
   }, 15_000);
 });

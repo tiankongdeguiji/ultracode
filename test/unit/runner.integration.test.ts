@@ -197,6 +197,35 @@ describe('detached runner', () => {
     }
   }, 40_000);
 
+  it('junk in worker-writable config fails closed: bogus permission → safe, non-int wallClockMs → loud uncapped', async () => {
+    // The fake binary records its argv so the sandbox flag the executor
+    // actually passed is observable.
+    const binDir = mkdtempSync(join(tmpdir(), 'uc-fakebin-'));
+    const fake = join(binDir, 'fake-claude.sh');
+    const argvFile = join(binDir, 'argv.txt');
+    writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\nsleep 30\n`, { mode: 0o755 });
+    const prev = process.env.ULTRACODE_CLAUDE_BIN;
+    process.env.ULTRACODE_CLAUDE_BIN = fake;
+    try {
+      const { dir } = makeRun(TIMEOUT_PROBE(''), {
+        backend: 'claude',
+        permission: 'bogus', // worker-writable junk must fall CLOSED to 'safe'
+        wallClockMs: 2.5, // non-int junk must log loudly and run uncapped
+        attemptTimeoutMs: 700,
+      });
+      await launchRunner(dir);
+      await waitTerminal(dir);
+      expect(readFileSync(join(dir, 'events.jsonl'), 'utf8')).toContain('wall-clock cap 2.5ms is invalid — running uncapped');
+      const argv = readFileSync(argvFile, 'utf8').split('\n');
+      const modeAt = argv.indexOf('--permission-mode');
+      expect(modeAt).toBeGreaterThan(-1);
+      expect(argv[modeAt + 1]).toBe('default'); // claude's 'safe' mapping, not auto's acceptEdits
+    } finally {
+      if (prev === undefined) delete process.env.ULTRACODE_CLAUDE_BIN;
+      else process.env.ULTRACODE_CLAUDE_BIN = prev;
+    }
+  }, 40_000);
+
   it('run survives launcher death by construction (launcher already exited: we are polling from a different process)', async () => {
     // The launcher (this test) returns from launchRunner immediately after
     // status flips to running; the runner keeps executing detached. This
