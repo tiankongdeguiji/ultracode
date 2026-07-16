@@ -120,14 +120,26 @@ describe('MCP triad', () => {
     // pins the runner→executor plumbing, not just config.json persistence
     expect(eventLog).toContain('attempt timeout 90000ms (run-level override)');
 
-    // Timeouts are opt-in: with no params the stored config carries neither key.
+    // Timeouts are opt-in: with no params the stored config carries neither key
+    // and the runner arms NO wall-clock cap (unlimited by default).
     const plain = (await client.callTool({
       name: 'workflow_start',
       arguments: { script: HELLO, backend: 'mock' },
-    })) as { structuredContent?: { runDir?: string } };
+    })) as { structuredContent?: { runId?: string; runDir?: string } };
     const plainConfig = JSON.parse(readFileSync(join(plain.structuredContent!.runDir!, 'config.json'), 'utf8'));
     expect('wallClockMs' in plainConfig).toBe(false);
     expect('attemptTimeoutMs' in plainConfig).toBe(false);
+    let plainStatus: Record<string, any> = {};
+    for (let i = 0; i < 40; i++) {
+      const s = (await client.callTool({
+        name: 'workflow_status',
+        arguments: { runId: plain.structuredContent!.runId!, waitSeconds: 2 },
+      })) as { structuredContent?: Record<string, any> };
+      plainStatus = s.structuredContent!;
+      if (plainStatus.terminal) break;
+    }
+    expect(plainStatus.status).toBe('completed');
+    expect(readFileSync(join(plain.structuredContent!.runDir!, 'events.jsonl'), 'utf8')).not.toContain('wall-clock cap');
   }, 60_000);
 
   it('long-poll is not woken by agent_usage ticks (renderable lines only)', async () => {

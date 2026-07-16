@@ -62,7 +62,7 @@ export function createServer(baseCwd: string): McpServer {
         'Launch a workflow (fire-and-forget; returns runId in <1s). Provide script (inline dialect text) ' +
         'or scriptPath, or resumeFromRunId to resume a terminal run (completed agents replay free). ' +
         'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend (REQUIRED for a fresh start) is one of mock|codex|qoder|claude|gemini — mock returns fabricated stubs (rehearsal only), so pass a real backend for real work. ' +
-        'wallClockMs (run wall-clock cap, default 60 minutes) and attemptTimeoutMs (per-attempt agent timeout, default 20 minutes; per-call opts.timeoutMs still wins) are unclamped — pass them ONLY when the user explicitly asked for a time limit, and never invent one.',
+        'wallClockMs (run wall-clock cap) and attemptTimeoutMs (per-attempt agent timeout; per-call opts.timeoutMs still wins) are unclamped and default to UNLIMITED — pass them ONLY when the user explicitly asked for a time limit, and never invent one.',
       inputSchema: {
         script: z.string().optional(),
         scriptPath: z.string().optional(),

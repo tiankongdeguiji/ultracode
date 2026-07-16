@@ -67,14 +67,13 @@ export interface AgentCallOptions {
   artifactDir?: (spec: AgentSpec) => string;
   /** default permission for spawned workers; 'auto' = workspace-write */
   permission?: AgentRequest['permission'];
-  /** per-attempt hard timeout (default 20 minutes) */
+  /** per-attempt hard timeout; unset = unlimited (timeouts are user-opt-in) */
   attemptTimeoutMs?: number;
   onToolEvent?: (spec: AgentSpec, name: string, status: 'started' | 'completed' | 'failed' | 'declined') => void;
   /** min gap between live usage ticks per agent (0 = every change; for tests) */
   usageTickIntervalMs?: number;
 }
 
-export const DEFAULT_ATTEMPT_TIMEOUT_MS = 20 * 60_000;
 export const USAGE_TICK_INTERVAL_MS = 1000;
 /** Longest delay Node's setTimeout honors (2^31−1 ms); a larger value overflows
  *  and fires immediately, so callers treat anything beyond it as "no timer". */
@@ -566,12 +565,14 @@ export class AgentCallExecutor implements AgentExecutor {
         escalationTimers.push(setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref());
       };
 
-      const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
+      // Timeouts are user-opt-in: no per-call timeoutMs and no run-level
+      // attemptTimeoutMs means the attempt runs unlimited. Past the timer
+      // range the caller asked for "effectively uncapped" — arming would
+      // overflow to an immediate fire and insta-kill the attempt.
+      const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
       let timedOut = false;
       let stalled = false;
-      // Past the timer range the caller asked for "effectively uncapped" —
-      // arming would overflow to an immediate fire and insta-kill the attempt.
-      if (timeoutMs <= MAX_TIMER_DELAY_MS) {
+      if (timeoutMs !== undefined && timeoutMs <= MAX_TIMER_DELAY_MS) {
         timer = setTimeout(() => {
           timedOut = true;
           killWithEscalation();

@@ -34,7 +34,7 @@ export const meta = {
 | `isolation: 'worktree'` | fresh git worktree — ONLY for parallel file mutation that would conflict |
 | `backend` | ultracode engine only: route this call to a specific worker CLI (codex/qoder/claude/gemini/mock) |
 | `retries` | task retry budget 0–5 (independent of schema-repair retries); a retry resumes the failed attempt's backend session when the backend supports it, so prior progress carries over |
-| `timeoutMs` | per-attempt hard timeout (default 20m; run-wide default via `workflow_start`'s `attemptTimeoutMs`) |
+| `timeoutMs` | per-attempt hard timeout (default: unlimited; run-wide default via `workflow_start`'s `attemptTimeoutMs`) |
 | `stallMs` | watchdog: kill + retry if the worker emits nothing for this long |
 | `skip: true, skipReason` | resolve to `null` without spawning (journaled) |
 
@@ -66,7 +66,7 @@ Progress grouping (seeded from `meta.phases`, matched by exact title) and narrat
 
 ## Caps (engine-enforced, loudly reported)
 
-Concurrency default `min(10, max(2, cores−2))` — `--max-concurrency`, `ULTRACODE_MAX_CONCURRENCY`, or `workflow_start`'s `maxConcurrency` override it (FIFO queue beyond the cap; the env var seeds fresh runs only — resumes inherit the stored value unless explicitly overridden); lifetime 1000 agents hard / 50 soft default (`--max-agents`); 4096 items per parallel/pipeline call; per-attempt timeout 20m default (per-call `timeoutMs` wins over `workflow_start`'s `attemptTimeoutMs`); run wall-clock 60m default (`--timeout <minutes>` or `workflow_start`'s `wallClockMs`). The `workflow_start` timeout params (`attemptTimeoutMs`, `wallClockMs`) are user-opt-in only, like budgets: set them only when the user explicitly asked for a time limit.
+Concurrency default `min(10, max(2, cores−2))` — `--max-concurrency`, `ULTRACODE_MAX_CONCURRENCY`, or `workflow_start`'s `maxConcurrency` override it (FIFO queue beyond the cap; the env var seeds fresh runs only — resumes inherit the stored value unless explicitly overridden); lifetime 1000 agents hard / 50 soft default (`--max-agents`); 4096 items per parallel/pipeline call. Timeouts are user-opt-in and default to UNLIMITED, like budgets: per-attempt via per-call `timeoutMs` (wins) or `workflow_start`'s `attemptTimeoutMs`; run wall-clock via `--timeout <minutes>` or `workflow_start`'s `wallClockMs`. Set them only when the user explicitly asked for a time limit; without one a wedged worker runs until stopped (`stallMs` is the opt-in liveness guard).
 
 ## Failure-handling idioms
 
