@@ -605,10 +605,11 @@ export function renderFrame(state: PanelState, opts: FrameOptions): string {
   const rowsBudget = Math.max(3, opts.rows - 1);
   const paint: Paint = opts.color ? (code, s) => `\x1b[${code}m${s}\x1b[0m` : (_code, s) => s;
 
+  const sections = buildSections(state); // loop-invariant across collapse levels
   let lines: string[] = [];
   for (let level = 0; level <= 2; level++) {
     lines = headerLines(state, opts, paint);
-    for (const section of buildSections(state)) {
+    for (const section of sections) {
       if (section.kind === 'child' && section.child) {
         lines.push(...childLines(state, section.child, opts, paint, level));
       } else {

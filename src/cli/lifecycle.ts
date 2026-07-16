@@ -11,8 +11,20 @@ import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, listRuns, reapOrphans } from '../store/runstore.js';
 import { stopRun } from '../exec/stop.js';
 import { ultracodeRoot } from '../store/layout.js';
+import { sanitizeText } from './panel.js';
 
+/**
+ * One event → one plain line. The output reaches real TTYs unsanitized-context
+ * (`logs` on stdout, `watch/run --plain`, MCP logTail), so the assembled line
+ * is passed through sanitizeText: worker-sourced fields (labels, errors, log
+ * messages, backend model ids) must not carry live control bytes.
+ */
 export function renderEvent(ev: TimestampedEvent): string | null {
+  const line = renderEventLine(ev);
+  return line === null ? null : sanitizeText(line);
+}
+
+function renderEventLine(ev: TimestampedEvent): string | null {
   switch (ev.type) {
     case 'run_started':
       return `▶ run started: ${ev.name}`;

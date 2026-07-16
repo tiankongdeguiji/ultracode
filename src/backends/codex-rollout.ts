@@ -36,14 +36,14 @@ export function codexUsageToPartial(u: Record<string, unknown>): Partial<Normali
 }
 
 const DISCOVERY_TIMEOUT_MS = 30_000;
-/** A rollout last written this long before the sidecar started is a resumed
- *  session — tail only NEW records so prior attempts' usage isn't re-ticked. */
+/** Fallback only (the executor passes resumedSession explicitly): a rollout
+ *  last written this long before the sidecar started is not this attempt's. */
 const RESUMED_SESSION_AGE_MS = 30_000;
 
 export function createCodexRolloutSidecar(
   sessionId: string,
   emit: (ev: AgentEvent) => void,
-  opts: { home?: string; pollMs?: number } = {},
+  opts: { home?: string; pollMs?: number; resumedSession?: boolean } = {},
 ): AgentSidecar {
   const pollMs = opts.pollMs ?? 500;
   const sessionsDir = join(opts.home ?? process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'sessions');
@@ -69,7 +69,12 @@ export function createCodexRolloutSidecar(
       if (!hit) continue;
       file = join(dir, hit);
       const stat = statSync(file);
-      if (stat.mtimeMs < startedAt - RESUMED_SESSION_AGE_MS) offset = stat.size;
+      // A resumed session (schema repair rewrites the SAME rollout seconds
+      // later, so mtime alone can't tell) tails only records newer than this
+      // attempt — replaying the prior attempt's token_counts would double the
+      // live figure until turn.completed corrects it. The stale-mtime check
+      // stays as a fallback for unflagged callers.
+      if (opts.resumedSession || stat.mtimeMs < startedAt - RESUMED_SESSION_AGE_MS) offset = stat.size;
       return;
     }
   };

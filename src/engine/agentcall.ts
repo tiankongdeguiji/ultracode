@@ -273,7 +273,7 @@ export class AgentCallExecutor implements AgentExecutor {
           ...req,
           prompt: freshRepairPrompt(spec.prompt, lastRaw, lastErrors, schema),
         });
-      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, tracker?.onStreamEvent);
+      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, tracker?.onStreamEvent, resumePlan !== null);
       usages.push(current);
       tracker?.attemptSettled(usages);
       if (!current.exit.ok) {
@@ -386,6 +386,8 @@ export class AgentCallExecutor implements AgentExecutor {
     signal: AbortSignal,
     attempt: number,
     onStreamEvent?: (ev: AgentEvent) => void,
+    /** the plan resumes an existing backend session (schema repair via buildResume) */
+    resumedSession = false,
   ): Promise<AttemptResult> {
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
@@ -428,7 +430,7 @@ export class AgentCallExecutor implements AgentExecutor {
             // list — so accounting is untouched by construction.
             if (!sidecar && onStreamEvent && this.adapter.createSidecar) {
               try {
-                sidecar = this.adapter.createSidecar(ev.sessionId, onStreamEvent) ?? undefined;
+                sidecar = this.adapter.createSidecar(ev.sessionId, onStreamEvent, { resumedSession }) ?? undefined;
               } catch {
                 /* best-effort */
               }

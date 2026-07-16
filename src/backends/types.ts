@@ -167,8 +167,14 @@ export interface BackendAdapter {
    *  usage/model (codex exec --json swallows TokenCount and never names the
    *  model): started once the session id is known; emits DISPLAY-ONLY
    *  AgentEvents (interim usage, session model) into the progress path —
-   *  never into accounting. Must be best-effort: errors degrade silently. */
-  createSidecar?(sessionId: string, emit: (ev: AgentEvent) => void): AgentSidecar | null;
+   *  never into accounting. Must be best-effort: errors degrade silently.
+   *  resumedSession: this attempt resumed an EXISTING backend session
+   *  (schema repair) — tail only records newer than the attempt. */
+  createSidecar?(
+    sessionId: string,
+    emit: (ev: AgentEvent) => void,
+    opts?: { resumedSession?: boolean },
+  ): AgentSidecar | null;
   probe(): Promise<BackendProbe>;
   /** Reject/normalize schema BEFORE spawn where the backend enforces a subset (codex strict). */
   checkSchema?(schema: JsonSchema): { ok: true; wireSchema: JsonSchema } | { ok: false; reason: string };

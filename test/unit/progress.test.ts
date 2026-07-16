@@ -232,8 +232,10 @@ describe('AgentCallExecutor progress', () => {
 
   it('starts the adapter sidecar on the session event and closes it after the attempt', async () => {
     const closed: string[] = [];
+    const sidecarOpts: ({ resumedSession?: boolean } | undefined)[] = [];
     class SidecarAdapter extends FakeAdapter {
-      override createSidecar(sessionId: string, emit: (ev: AgentEvent) => void) {
+      override createSidecar(sessionId: string, emit: (ev: AgentEvent) => void, opts?: { resumedSession?: boolean }) {
+        sidecarOpts.push(opts);
         emit({ kind: 'session', sessionId, model: 'sidecar-model' });
         emit({ kind: 'usage', usage: { inputTokens: 40, outputTokens: 2 }, interim: true });
         return { close: () => closed.push(sessionId) };
@@ -249,6 +251,7 @@ describe('AgentCallExecutor progress', () => {
     expect(tokens(events)[0]).toBe(42); // the sidecar's interim tick reached the tracker
     expect(outcome.usage.totalTokens).toBe(110); // …but never the accounting
     expect(closed).toEqual(['s9']);
+    expect(sidecarOpts).toEqual([{ resumedSession: false }]); // fresh spawn, not a repair resume
 
     // Without onProgress there is no consumer — the sidecar must not start.
     const adapter2 = new SidecarAdapter('native', [

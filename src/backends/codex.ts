@@ -1,5 +1,7 @@
 /**
- * codex exec adapter (pinned against codex-cli 0.142.x).
+ * codex exec adapter (pinned against codex-cli 0.142.x; the exec --json event
+ * shape re-verified live on 0.144.4 — the rollout sidecar in codex-rollout.ts
+ * is verified against 0.144.4 only).
  *
  * Load-bearing quirks (verified against codex-cli 0.142.x source and live
  * exec/--output-schema behavior):
@@ -244,8 +246,8 @@ export class CodexAdapter implements BackendAdapter {
 
   /** Live usage + resolved model via the session rollout file — exec --json
    *  itself never surfaces either (display-only; see codex-rollout.ts). */
-  createSidecar(sessionId: string, emit: (ev: AgentEvent) => void) {
-    return createCodexRolloutSidecar(sessionId, emit);
+  createSidecar(sessionId: string, emit: (ev: AgentEvent) => void, opts?: { resumedSession?: boolean }) {
+    return createCodexRolloutSidecar(sessionId, emit, { resumedSession: opts?.resumedSession });
   }
 
   extractUsage(events: AgentEvent[]): NormalizedUsage {

@@ -21,6 +21,9 @@ function rolloutDir(home: string): string {
 
 const turnContext = (model: string): string =>
   JSON.stringify({ timestamp: 't', type: 'turn_context', payload: { turn_id: 'turn-1', model, effort: 'xhigh' } }) + '\n';
+// total_token_usage deliberately DIFFERS from last_token_usage (cumulative vs
+// per-response): a regression that reads the cumulative figure re-ticks
+// ever-growing totals and must fail these assertions.
 const tokenCount = (input: number, cached: number, output: number): string =>
   JSON.stringify({
     timestamp: 't',
@@ -28,7 +31,13 @@ const tokenCount = (input: number, cached: number, output: number): string =>
     payload: {
       type: 'token_count',
       info: {
-        total_token_usage: { input_tokens: input, cached_input_tokens: cached, output_tokens: output, reasoning_output_tokens: 0, total_tokens: input + output },
+        total_token_usage: {
+          input_tokens: input * 7 + 13,
+          cached_input_tokens: cached * 7 + 13,
+          output_tokens: output * 7 + 13,
+          reasoning_output_tokens: 0,
+          total_tokens: (input + output) * 7 + 26,
+        },
         last_token_usage: { input_tokens: input, cached_input_tokens: cached, output_tokens: output, reasoning_output_tokens: 0, total_tokens: input + output },
       },
     },
@@ -81,6 +90,27 @@ describe('codex rollout sidecar', () => {
     sidecar.close();
     expect(events).toEqual([
       { kind: 'usage', usage: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 10, reasoningTokens: 0 }, interim: true },
+    ]);
+  });
+
+  it('resumedSession flag seeks to EOF even when the rollout mtime is fresh (schema repair)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'uc-codex-home-'));
+    const dir = rolloutDir(home);
+    const sid = '0199-repair-1';
+    const file = join(dir, `rollout-2026-01-01T00-00-00-${sid}.jsonl`);
+    // Prior attempt finished SECONDS ago: mtime is fresh, so only the explicit
+    // flag can prevent re-ticking its history.
+    writeFileSync(file, turnContext('gpt-5.6-sol') + tokenCount(9999, 0, 999));
+
+    const { events, emit } = collect();
+    const sidecar = createCodexRolloutSidecar(sid, emit, { home, pollMs: 20, resumedSession: true });
+    await sleep(120);
+    expect(events).toEqual([]); // history skipped despite fresh mtime
+    appendFileSync(file, tokenCount(50, 0, 5));
+    await sleep(120);
+    sidecar.close();
+    expect(events).toEqual([
+      { kind: 'usage', usage: { inputTokens: 50, cachedInputTokens: 0, outputTokens: 5, reasoningTokens: 0 }, interim: true },
     ]);
   });
 
