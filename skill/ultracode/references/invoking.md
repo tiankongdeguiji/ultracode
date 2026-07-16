@@ -29,7 +29,7 @@
 | gemini | `gemini -p` | emulated (prompt contract + validate/retry) | `GEMINI_API_KEY` |
 | mock | built-in | schema-aware stubs | n/a — free, use for --dry-run |
 
-`--permission safe` is backend-asymmetric: codex maps it to a read-only **sandbox** (workers still execute commands — queries and profilers work, writes/network blocked); claude/qoder map it to the headless default **permission mode**, which auto-rejects every tool call — those workers can only read files and reason. A workflow whose agents must run read-only commands breaks silently when switched from codex to claude under `safe` (agents report "unverified"/empty results and the engine logs "actions auto-rejected" warnings). Fix: embed the evidence in prompts, or run those workers with `--permission auto`.
+Permission is user-controlled: default to `--permission auto` and pass a user-specified permission verbatim. `--permission safe` is backend-asymmetric: codex maps it to a read-only **sandbox** (workers still execute commands — queries and profilers work, writes/network blocked); claude/qoder map it to the headless default **permission mode**, which auto-rejects every tool call — those workers can only read files and reason. A workflow whose agents must run read-only commands breaks silently when switched from codex to claude under `safe` (agents report "unverified"/empty results and the engine logs "actions auto-rejected" warnings). If the user asked for `safe` and workers need to execute read-only commands, tell the user and embed the evidence in prompts instead.
 
 ## Workflow lifecycle discipline
 
