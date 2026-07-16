@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClaudeAdapter } from '../../src/backends/claude.js';
 import { QoderAdapter } from '../../src/backends/qoder.js';
@@ -156,5 +157,24 @@ describe('backend factory', () => {
       expect(createExecutorForBackend(b)).not.toBeNull();
     }
     expect(createExecutorForBackend('nonesuch')).toBeNull();
+  });
+
+  it('wires the codex MCP kill-switch to the config detector (the fork-bomb defense)', async () => {
+    // The adapter flag and the detector are tested in isolation elsewhere; this
+    // pins the load-bearing wiring line in createExecutorForBackend — if a
+    // refactor drops the constructor argument, isolation vanishes silently.
+    const { createExecutorForBackend } = await import('../../src/engine/agentcall.js');
+    const home = mkdtempSync(join(tmpdir(), 'uc-codexwire-'));
+    writeFileSync(join(home, 'config.toml'), '[mcp_servers.ultracode]\ncommand = "node"\n');
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    try {
+      const ex = createExecutorForBackend('codex') as unknown as { adapter: BackendAdapter };
+      const plan = ex.adapter.buildSpawn({ prompt: 'p', cwd: '/w', permission: 'auto', env: {} });
+      expect(plan.argv.join(' ')).toContain('mcp_servers.ultracode.enabled=false');
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prev;
+    }
   });
 });

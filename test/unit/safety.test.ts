@@ -181,6 +181,114 @@ describe('silent no-op detector', () => {
   });
 });
 
+describe('CLI nesting guard (ULTRACODE_INSIDE_RUN)', () => {
+  const SCRIPT = `export const meta = { name: 't', description: 'd' }\nreturn 1`;
+
+  function withInsideRun<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.ULTRACODE_INSIDE_RUN;
+    process.env.ULTRACODE_INSIDE_RUN = '1';
+    return fn().finally(() => {
+      if (prev === undefined) delete process.env.ULTRACODE_INSIDE_RUN;
+      else process.env.ULTRACODE_INSIDE_RUN = prev;
+    });
+  }
+
+  it('run refuses inside a worker before creating any run state', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-nestguard-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
+      return true;
+    });
+    try {
+      await withInsideRun(async () => {
+        expect(await runCommand(file, { yes: true, backend: 'mock', home })).toBe(1);
+      });
+      expect(chunks.join('')).toContain('inside an ultracode worker');
+      // The refused WORKER reads this message — it must not advertise the
+      // override flag (agents follow remediation hints in errors).
+      expect(chunks.join('')).not.toContain('--allow-nested');
+      expect(existsSync(home)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('run --dry-run stays exempt (in-process mock rehearsal, no run state)', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-nestdry-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await withInsideRun(async () => {
+        expect(await runCommand(file, { yes: true, backend: 'mock', home, dryRun: true })).toBe(0);
+      });
+      expect(existsSync(home)).toBe(false);
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('run --allow-nested overrides the guard', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const { readManifest, isTerminal } = await import('../../src/store/manifest.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-nestallow-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const outs: string[] = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((c) => {
+      outs.push(String(c));
+      return true;
+    });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await withInsideRun(async () => {
+        expect(
+          await runCommand(file, { yes: true, backend: 'mock', home, detach: true, allowNested: true }),
+        ).toBe(0);
+      });
+      // Let the detached runner reach terminal so it can't outlive the test.
+      const runDir = join(home, 'runs', outs.join('').trim().split('\n')[0]!);
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        const m = readManifest(runDir);
+        if (m && isTerminal(m.status)) break;
+        if (Date.now() > deadline) throw new Error(`run not terminal: ${m?.status}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  }, 30_000);
+
+  it('resume refuses inside a worker (before touching the store)', async () => {
+    const { resumeCommand } = await import('../../src/cli/resume.js');
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
+      return true;
+    });
+    try {
+      await withInsideRun(async () => {
+        expect(await resumeCommand('wf_whatever', { home: mkdtempSync(join(tmpdir(), 'uc-nestres-')) })).toBe(1);
+      });
+      expect(chunks.join('')).toContain('inside an ultracode worker');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 describe('CLI --max-concurrency fail-fast', () => {
   const SCRIPT = `export const meta = { name: 't', description: 'd' }\nreturn 1`;
   const BAD_VALUES = ['0', '-1', '2.5', 'abc', ''];

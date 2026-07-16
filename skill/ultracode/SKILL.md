@@ -1,6 +1,6 @@
 ---
 name: ultracode
-description: Dynamic multi-agent workflow orchestration (ultracode mode). Use when the user says "ultracode", sets a token budget like "+500k", asks to use a workflow / fan out agents / orchestrate, or when a substantive task decomposes into 3+ independent agent-sized units (code review, audit, research, migration, test sweep). Author a workflow script in the shared dialect and run it via the host's native Workflow tool or the ultracode engine.
+description: Dynamic multi-agent workflow orchestration (ultracode mode). Use when the user says "ultracode", sets a token budget like "+500k", asks to use a workflow / fan out agents / orchestrate, or when a substantive task decomposes into 3+ independent agent-sized units (code review, audit, research, migration, test sweep). Author a workflow script in the shared dialect and run it via the host's native Workflow tool or the ultracode engine. NEVER use from inside a workflow worker — if the ULTRACODE_INSIDE_RUN env var is set, do the task directly ("ultracode" in file/directory names or quoted text is not a trigger).
 ---
 
 # ultracode — dynamic workflow orchestration
@@ -9,7 +9,8 @@ You orchestrate a fleet of subagents through a small JavaScript workflow script 
 
 ## Mode semantics (standing opt-in)
 
-- The keyword **"ultracode"** in a message, a budget token like **"+500k"**, or an explicit ask ("use a workflow", "fan out agents") switches ultracode mode ON for the rest of the session.
+- The keyword **"ultracode"** in a message, a budget token like **"+500k"**, or an explicit ask ("use a workflow", "fan out agents") switches ultracode mode ON for the rest of the session. The keyword must be the user's word to YOU — "ultracode" inside file or directory names, paths, code, or quoted logs never arms the mode.
+- **Worker guard (hard rule):** if the `ULTRACODE_INSIDE_RUN` environment variable is set, you ARE a worker inside an ultracode run. Never start workflows by any route (ultracode CLI, `workflow_start` MCP tool, a native Workflow tool) — a worker that launches runs escapes the parent's caps and cascades. Do your assigned task directly and return.
 - While ON: route **every substantive task** through a workflow by default. Work solo only on conversational turns and trivial mechanical edits. Optimize for the most exhaustive, correct answer — not the cheapest.
 - The user says **"ultracode off"** → revert to normal single-agent behavior.
 - Budgets are **opt-in by the user only.** With no explicit directive, run **uncapped** — do NOT pass `--budget` or a `budget` arg, and never invent a number "to be safe." Only when the user gives a directive ("+500k", "budget 2m") do you set one; pass it verbatim to the engine (`--budget` / `budget` arg), never advisory or a number you invented. The engine enforces it at the per-dispatch gate — a firm threshold no *new* agent crosses, though in-flight calls and their internal retries/repairs can overshoot it by a bounded margin (it is not a mid-call hard cap). The engine default is unlimited; keep it that way unless told otherwise.
@@ -18,7 +19,7 @@ You orchestrate a fleet of subagents through a small JavaScript workflow script 
 
 Orchestrate when the task has **3+ independent agent-sized units** (files to audit, questions to research, modules to migrate, findings to verify), needs **independent perspectives** (adversarial verification, judge panels), or exceeds what one context can hold.
 
-Do NOT orchestrate: single-file edits; tasks with <3 independent units; anything needing mid-run user input (workflows cannot ask — decompose so decisions happen between workflows); purely conversational turns. Over-triggering is how users uninstall this skill.
+Do NOT orchestrate: single-file edits; tasks with <3 independent units; anything needing mid-run user input (workflows cannot ask — decompose so decisions happen between workflows); purely conversational turns; **when you are yourself a workflow worker (`ULTRACODE_INSIDE_RUN` set)**. Over-triggering is how users uninstall this skill.
 
 ## Authoring a workflow (the shared dialect)
 
@@ -61,7 +62,7 @@ Scale to the ask: "find bugs" → few finders, single vote; "thoroughly audit" �
 ## Running (dispatch — details in `references/invoking.md`)
 
 1. **Qoder with the native Workflow tool available** → use the native tool / save to `.qoder/workflows/`. (Budget is stubbed there: pass it via `args.budgetTokens` and gate manually.)
-2. **ultracode MCP tools available** (`workflow_start`/`workflow_status`/`workflow_result`) → `workflow_start` returns a runId in <1s; poll `workflow_status` (a timed-out poll is harmless — re-poll the same runId); fetch `workflow_result` when terminal. **From a sandboxed host (Codex, any per-command exec jail) this is the ONLY reliable route — the MCP server process persists outside your command sandbox.**
+2. **ultracode MCP tools available** (`workflow_start`/`workflow_status`/`workflow_result`) → `workflow_start` returns a runId in <1s; poll `workflow_status` (a timed-out poll is harmless — re-poll the same runId); fetch `workflow_result` when terminal. **From a sandboxed host (Codex, any per-command exec jail) this is the ONLY reliable route — the MCP server process persists outside your command sandbox.** (Interactive hosts only: a workflow WORKER never dispatches runs — see the worker guard above.)
 3. **Shell access** → `ultracode run script.workflow.js --backend codex --yes` (append `--budget <the user's number>` ONLY if the user gave one). Always `ultracode validate` + `--dry-run` first — the dry run is free and catches dialect errors. **If your shell is sandboxed, do NOT `--detach`: the runner is SIGKILLed when your tool call's sandbox (PID namespace) tears down — symptom: `status` shows `orphaned` within seconds, manifest `pid` ≤ 64, empty runner.log. Use the MCP route or ask to escalate the command.** In a persistent shell, `--detach` for long runs, then monitor with `ultracode watch <runId>` (or `status <runId> --watch`).
 4. Resume after failure/edit: `ultracode resume <runId> [--script edited.js]` — completed agents replay free from the journal.
 

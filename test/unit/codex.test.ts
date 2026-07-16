@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CodexAdapter, classifyFailureMessage } from '../../src/backends/codex.js';
+import { CodexAdapter, classifyFailureMessage, codexConfigHasUltracodeMcp } from '../../src/backends/codex.js';
 import { NdjsonSplitter } from '../../src/backends/ndjson.js';
 import type { AgentEvent, AgentRequest } from '../../src/backends/types.js';
 
@@ -64,6 +65,78 @@ describe('CodexAdapter.buildSpawn', () => {
     const plan = new CodexAdapter().buildResume('thread-123', 'fix the JSON', req())!;
     expect(plan.argv.slice(0, 3)).toEqual(['exec', 'resume', 'thread-123']);
     expect(plan.stdinData).toBe('fix the JSON');
+  });
+
+  it('hideUltracodeMcp appends the MCP kill-switch on spawn AND resume; default stays clean', () => {
+    const KILL = ['-c', 'mcp_servers.ultracode.enabled=false'];
+    for (const plan of [
+      new CodexAdapter(undefined, true).buildSpawn(req()),
+      new CodexAdapter(undefined, true).buildResume('thread-123', 'fix', req())!,
+    ]) {
+      const at = plan.argv.indexOf(KILL[0]!);
+      expect(plan.argv.slice(at, at + 2)).toEqual(KILL);
+      expect(plan.argv.at(-1)).toBe('-'); // stdin positional stays last
+    }
+    // Unconditional emission would hard-fail codex startup ("invalid transport")
+    // on machines without [mcp_servers.ultracode] in config.toml.
+    expect(new CodexAdapter().buildSpawn(req()).argv.join(' ')).not.toContain('mcp_servers');
+    expect(new CodexAdapter().buildResume('t', 'f', req())!.argv.join(' ')).not.toContain('mcp_servers');
+  });
+});
+
+describe('codexConfigHasUltracodeMcp', () => {
+  function homeWith(config?: string): string {
+    const home = mkdtempSync(join(tmpdir(), 'uc-codexhome-'));
+    if (config !== undefined) writeFileSync(join(home, 'config.toml'), config);
+    return home;
+  }
+
+  it('detects the installer-registered server; false without it or without a config', () => {
+    expect(codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith() })).toBe(false); // no config.toml
+    expect(
+      codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith('model = "gpt-5"\n[mcp_servers.other]\ncommand = "x"\n') }),
+    ).toBe(false);
+    expect(
+      codexConfigHasUltracodeMcp({
+        CODEX_HOME: homeWith('model = "gpt-5"\n\n[mcp_servers.ultracode]\ncommand = "node"\nargs = ["main.js", "mcp"]\n'),
+      }),
+    ).toBe(true);
+  });
+
+  it('detects hand-edited TOML spellings (a missed one silently drops the kill-switch)', () => {
+    for (const config of [
+      '[ mcp_servers . ultracode ]\ncommand = "node"\n', // whitespace in header
+      '[mcp_servers."ultracode"]\ncommand = "node"\n', // quoted key
+      '[mcp_servers.ultracode.env]\nFOO = "1"\n', // subtable only
+      'mcp_servers.ultracode.command = "node"\n', // root dotted keys
+      'mcp_servers.ultracode = { command = "node" }\n', // root inline table
+      '[mcp_servers]\nother = { command = "x", args = ["y"] }\nultracode = { command = "node" }\n', // member
+      '[mcp_servers]\nultracode.command = "node"\n', // dotted member
+    ]) {
+      expect(codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith(config) })).toBe(true);
+    }
+    for (const config of [
+      '[mcp_servers.ultracoded]\ncommand = "x"\n', // name is a prefix, not ours
+      '[other_table]\nultracode = { command = "x" }\n', // right key, wrong table
+      '# [mcp_servers.ultracode] mentioned in a comment only\n',
+    ]) {
+      expect(codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith(config) })).toBe(false);
+    }
+  });
+
+  it('treats empty CODEX_HOME as unset — never reads a cwd-relative config.toml', () => {
+    // A repo-planted ./config.toml registering the name would otherwise force
+    // the kill-switch against an UNREGISTERED server and hard-fail every worker.
+    const dir = homeWith('[mcp_servers.ultracode]\ncommand = "planted"\n');
+    const prevCwd = process.cwd();
+    process.chdir(dir);
+    try {
+      // '' must behave exactly like unset (resolve to the real ~/.codex),
+      // regardless of what the current directory contains.
+      expect(codexConfigHasUltracodeMcp({ CODEX_HOME: '' })).toBe(codexConfigHasUltracodeMcp({}));
+    } finally {
+      process.chdir(prevCwd);
+    }
   });
 });
 

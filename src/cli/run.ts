@@ -12,7 +12,7 @@ import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
 import { attachForeground, printOutput } from './lifecycle.js';
-import { readMaxConcurrencyOpt } from './options.js';
+import { readMaxConcurrencyOpt, refuseInsideWorker } from './options.js';
 import { validateScript } from './validate.js';
 
 export interface RunCliOptions {
@@ -30,6 +30,7 @@ export interface RunCliOptions {
   plain?: boolean;
   noColor?: boolean;
   home?: string;
+  allowNested?: boolean;
 }
 
 /**
@@ -38,6 +39,11 @@ export interface RunCliOptions {
  * survives). --detach prints the runId and returns immediately.
  */
 export async function runCommand(file: string, opts: RunCliOptions): Promise<number> {
+  // --dry-run stays exempt: it rehearses in-process on the mock backend (no
+  // tokens, no run dir), and a worker validating a workflow it authored is a
+  // legitimate task.
+  if (!opts.dryRun && refuseInsideWorker('start a run', opts.allowNested)) return 1;
+
   const backend = opts.backend ?? 'mock';
   if (!IMPLEMENTED_BACKENDS.has(backend)) {
     process.stderr.write(

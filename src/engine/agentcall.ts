@@ -34,7 +34,7 @@ import type {
   NormalizedUsage,
   SpawnPlan,
 } from '../backends/types.js';
-import { CodexAdapter } from '../backends/codex.js';
+import { CodexAdapter, codexConfigHasUltracodeMcp } from '../backends/codex.js';
 import { QoderAdapter } from '../backends/qoder.js';
 import { ClaudeAdapter } from '../backends/claude.js';
 import { GeminiAdapter } from '../backends/gemini.js';
@@ -653,7 +653,10 @@ export class AgentCallExecutor implements AgentExecutor {
 export function createExecutorForBackend(backend: string, opts: AgentCallOptions = {}): AgentExecutor | null {
   switch (backend) {
     case 'codex':
-      return new AgentCallExecutor(new CodexAdapter(), opts);
+      // Worker isolation: hide our own MCP server (pre-approved workflow_start)
+      // from codex workers — see MCP_KILL_SWITCH in the adapter. Conditional
+      // because the override is invalid TOML when the server isn't registered.
+      return new AgentCallExecutor(new CodexAdapter(undefined, codexConfigHasUltracodeMcp()), opts);
     case 'qoder':
       return new AgentCallExecutor(new QoderAdapter(), opts);
     case 'claude':

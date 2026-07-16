@@ -36,12 +36,69 @@ import { checkCodexStrictSchema } from './schema-strict.js';
 import { codexUsageToPartial, createCodexRolloutSidecar } from './codex-rollout.js';
 import type { JsonSchema } from './types.js';
 import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 const PERMISSION_TO_SANDBOX: Record<AgentRequest['permission'], string> = {
   safe: 'read-only',
   auto: 'workspace-write',
   danger: 'danger-full-access',
 };
+
+/**
+ * Worker isolation: hide the ultracode MCP server from spawned workers.
+ * In a trusted-project cwd, `codex exec` loads the user's global config.toml
+ * MCP servers — including `mcp_servers.ultracode` with pre-approved
+ * workflow_start — and codex spawns MCP servers with a sanitized env, so the
+ * ULTRACODE_INSIDE_RUN marker never reaches the server's own recursion guard.
+ * Workers then recursively launch runs (the 2026-07-16 fork-bomb: 1,300+
+ * nested runs until quota exhaustion). `enabled=false` is live-verified on
+ * codex-cli 0.144.5 to drop the server's tools and instructions entirely.
+ */
+const MCP_KILL_SWITCH = ['-c', 'mcp_servers.ultracode.enabled=false'];
+
+/** True when the user's codex config registers our MCP server. The kill-switch
+ *  override is only valid TOML then — applied to an UNREGISTERED server name it
+ *  hard-fails codex startup with "invalid transport" (an entry with `enabled`
+ *  alone has no command). Fail-open: unreadable config → no flag (status quo). */
+export function codexConfigHasUltracodeMcp(env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    // Empty CODEX_HOME means unset (codex semantics, matches codexHome() in
+    // codex-auth.ts) — `??` alone would read a CWD-RELATIVE ./config.toml,
+    // letting a repo-planted file flip the flag for an unregistered server
+    // and hard-fail every worker in the run.
+    const home = env.CODEX_HOME?.length ? env.CODEX_HOME : join(homedir(), '.codex');
+    const toml = readFileSync(join(home, 'config.toml'), 'utf8');
+    // Line-scan instead of a TOML dependency: recognize every real spelling of
+    // a registration for the name 'ultracode' (the installer writes the first;
+    // hand-edited configs use the others) — a missed spelling silently drops
+    // the primary fork-bomb defense. Quoted keys accepted throughout.
+    //   [mcp_servers.ultracode]            (+ subtables like [...ultracode.env])
+    //   mcp_servers.ultracode.command = …  (root-level dotted keys)
+    //   [mcp_servers] + ultracode = { … }  (inline-table / dotted member)
+    const KEY = /^(?:ultracode|"ultracode"|'ultracode')$/;
+    let table = '';
+    for (const raw of toml.split('\n')) {
+      const line = raw.trim();
+      const header = line.match(/^\[\s*(.+?)\s*\]/);
+      if (header) {
+        table = header[1]!;
+        const parts = table.split('.').map((p) => p.trim());
+        if (parts[0] === 'mcp_servers' && parts[1] !== undefined && KEY.test(parts[1])) return true;
+        continue;
+      }
+      const key = line.match(/^([^=\s]+(?:\s*\.\s*[^=\s]+)*)\s*=/);
+      if (!key) continue;
+      const parts = key[1]!.split('.').map((p) => p.trim());
+      if (table === '' && parts[0] === 'mcp_servers' && parts[1] !== undefined && KEY.test(parts[1])) return true;
+      if (table === 'mcp_servers' && KEY.test(parts[0]!)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 interface CodexItem {
   id?: string;
@@ -57,7 +114,12 @@ export class CodexAdapter implements BackendAdapter {
   readonly id = 'codex' as const;
   readonly structuredOutput = 'native' as const;
 
-  constructor(private readonly bin = process.env.ULTRACODE_CODEX_BIN ?? 'codex') {}
+  constructor(
+    private readonly bin = process.env.ULTRACODE_CODEX_BIN ?? 'codex',
+    /** append MCP_KILL_SWITCH to worker argv — pass codexConfigHasUltracodeMcp();
+     *  must stay false when [mcp_servers.ultracode] is absent (startup error). */
+    private readonly hideUltracodeMcp = false,
+  ) {}
 
   probe(): Promise<BackendProbe> {
     return new Promise((resolve) => {
@@ -88,6 +150,7 @@ export class CodexAdapter implements BackendAdapter {
     ];
     if (req.model) argv.push('-m', req.model);
     if (req.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(req.effort)}`);
+    if (this.hideUltracodeMcp) argv.push(...MCP_KILL_SWITCH);
     const plan: SpawnPlan = {
       bin: this.bin,
       argv,
@@ -116,6 +179,7 @@ export class CodexAdapter implements BackendAdapter {
       PERMISSION_TO_SANDBOX[req.permission],
     ];
     if (req.model) argv.push('-m', req.model);
+    if (this.hideUltracodeMcp) argv.push(...MCP_KILL_SWITCH);
     const plan: SpawnPlan = { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
     if (req.schema) plan.schemaTempFile = { content: JSON.stringify(req.schema) };
     argv.push('-');
