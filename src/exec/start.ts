@@ -21,7 +21,9 @@ export interface StartRunInput {
   maxAgents?: number;
   maxConcurrency?: number;
   permission?: 'safe' | 'auto' | 'danger';
+  /** run wall-clock cap in ms; 0 clears an inherited cap (unlimited) */
   wallClockMs?: number;
+  /** run-wide per-attempt timeout in ms; 0 clears an inherited cap (unlimited) */
   attemptTimeoutMs?: number;
   resumeFromRunId?: string;
   cwd?: string;
@@ -36,6 +38,12 @@ export interface StartRunResult {
 
 export const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex', 'qoder', 'claude', 'gemini']);
 
+/** Timeout caps are opt-in and resume-inherited; 0 is the explicit "clear the
+ *  inherited cap" value (an undefined key never overrides a stored one). */
+function clearableCap(ms: number | undefined): number | undefined {
+  return ms === 0 ? undefined : ms;
+}
+
 export async function startDetachedRun(input: StartRunInput): Promise<StartRunResult> {
   const cwd = input.cwd ?? process.cwd();
   const root = ultracodeRoot(cwd, input.home);
@@ -49,8 +57,8 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     maxConcurrency: input.maxConcurrency ?? defaultConcurrency(),
     budgetTotal: input.budgetTotal ?? null,
     permission: input.permission ?? 'auto',
-    wallClockMs: input.wallClockMs,
-    attemptTimeoutMs: input.attemptTimeoutMs,
+    wallClockMs: clearableCap(input.wallClockMs),
+    attemptTimeoutMs: clearableCap(input.attemptTimeoutMs),
     resumeFromRunId: undefined as string | undefined,
   };
 
@@ -82,8 +90,8 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     if (input.maxConcurrency !== undefined) config.maxConcurrency = input.maxConcurrency;
     if (input.budgetTotal !== undefined) config.budgetTotal = input.budgetTotal;
     if (input.permission !== undefined) config.permission = input.permission;
-    if (input.wallClockMs !== undefined) config.wallClockMs = input.wallClockMs;
-    if (input.attemptTimeoutMs !== undefined) config.attemptTimeoutMs = input.attemptTimeoutMs;
+    if (input.wallClockMs !== undefined) config.wallClockMs = clearableCap(input.wallClockMs);
+    if (input.attemptTimeoutMs !== undefined) config.attemptTimeoutMs = clearableCap(input.attemptTimeoutMs);
   }
 
   if (input.scriptPath) source = readFileSync(input.scriptPath, 'utf8');

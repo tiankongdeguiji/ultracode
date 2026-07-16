@@ -167,17 +167,25 @@ export class AgentCallExecutor implements AgentExecutor {
       // the backend could not load the killed session's rollout, whatever
       // diagnostics it printed) failed as a MECHANISM, not as an attempt.
       // Rerun the same attempt fresh so a broken resume never burns a task
-      // retry — but against the SAME deadline: the rerun gets only the budget
-      // the dead resume left, never a second full window (floored at 1s so it
-      // can at least report a timely failure). Watchdog kills are excluded.
+      // retry — but strictly within the SAME deadline: the rerun gets exactly
+      // the budget the dead resume left, never a second full window. With no
+      // budget left the attempt is out of time either way — synthesize the
+      // timeout instead of borrowing time the caller never granted.
+      // Watchdog kills are excluded.
       if (resumePlan !== null && !last.exit.ok && !signal.aborted && last.exit.errorKind !== 'stalled' && last.sessionId === undefined) {
-        const remainingMs =
-          attemptBudgetMs === undefined ? undefined : Math.max(1_000, attemptBudgetMs - (Date.now() - attemptStartedAt));
-        last = await this.runAttempt(spec, this.adapter.buildSpawn(req), signal, attempt, {
-          onStreamEvent: tracker?.onStreamEvent,
-          stderrSuffix: '-fresh',
-          timeoutOverrideMs: remainingMs,
-        });
+        const remainingMs = attemptBudgetMs === undefined ? undefined : attemptBudgetMs - (Date.now() - attemptStartedAt);
+        if (remainingMs !== undefined && remainingMs <= 0) {
+          last = {
+            ...last,
+            exit: { ok: false, errorKind: 'stalled', retryable: true, message: `attempt timed out after ${attemptBudgetMs}ms` },
+          };
+        } else {
+          last = await this.runAttempt(spec, this.adapter.buildSpawn(req), signal, attempt, {
+            onStreamEvent: tracker?.onStreamEvent,
+            stderrSuffix: '-fresh',
+            timeoutOverrideMs: remainingMs,
+          });
+        }
       }
       attemptsUsed = attempt;
       usages.push(last);

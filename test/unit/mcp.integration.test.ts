@@ -142,6 +142,16 @@ describe('MCP triad', () => {
     }
     expect(plainStatus.status).toBe('completed');
     expect(readFileSync(join(plain.structuredContent!.runDir!, 'events.jsonl'), 'utf8')).not.toContain('wall-clock cap');
+
+    // Resume inherits stored caps; 0 explicitly clears them back to unlimited.
+    const cleared = (await client.callTool({
+      name: 'workflow_start',
+      arguments: { resumeFromRunId: runId, wallClockMs: 0, attemptTimeoutMs: 0 },
+    })) as { structuredContent?: { runDir?: string }; isError?: boolean };
+    expect(cleared.isError).toBeFalsy();
+    const clearedConfig = JSON.parse(readFileSync(join(cleared.structuredContent!.runDir!, 'config.json'), 'utf8'));
+    expect('wallClockMs' in clearedConfig).toBe(false);
+    expect('attemptTimeoutMs' in clearedConfig).toBe(false);
   }, 60_000);
 
   it('long-poll is not woken by agent_usage ticks (renderable lines only)', async () => {
