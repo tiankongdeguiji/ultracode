@@ -65,25 +65,14 @@ describe('plugin bundles', () => {
     expect(lock.packages?.['']?.version).toBe(pkg.version);
   });
 
-  it('the `version` npm hook regenerates and stages all three version files', () => {
-    // scripts/ is outside eslint + the src-only typecheck, and the sync-version
-    // tests below invoke the script directly with an argv override — so this
-    // static guard plus the `npm version` integration test below are the only
-    // things pinning the npm lifecycle wiring. In no-tag mode npm stages nothing
-    // itself, so the hook must stage all three files or a plain `git commit`
-    // could record only the mirror and recreate the drift this change prevents.
-    const v = pkg.scripts?.version ?? '';
-    expect(v).toMatch(/sync-version\.mjs\b.*&&.*\bgit add\b/);
-    for (const f of ['src/version.ts', 'package.json', 'package-lock.json']) {
-      expect(v, f).toContain(f);
-    }
-  });
-
-  it('npm version --no-git-tag-version stages package.json, lock, and version.ts together', () => {
-    // Regression guard for the Codex finding: in no-tag mode npm stages nothing,
-    // so a partial stage (only the mirror) would let a plain commit reintroduce
-    // drift. Also pins that npm updates the lock BEFORE the hook runs (the staged
-    // lock must already carry the bumped version).
+  it('npm version --no-git-tag-version runs the real hook and stages all three files', () => {
+    // Sources the REAL `version` hook from the repo package.json and runs it end
+    // to end, so a typo in the actual hook (or its removal) fails here — not just
+    // in a hand-copied duplicate. In no-tag mode npm stages nothing itself, so a
+    // partial stage (only the mirror) would let a plain commit reintroduce drift;
+    // also pins that npm updates the lock BEFORE the hook (staged lock must carry
+    // the bump).
+    expect(pkg.scripts?.version, 'package.json must define a `version` hook').toBeTruthy();
     const dir = mkdtempSync(join(tmpdir(), 'uc-npmver-'));
     mkdirSync(join(dir, 'src'), { recursive: true });
     mkdirSync(join(dir, 'scripts'), { recursive: true });
@@ -91,7 +80,7 @@ describe('plugin bundles', () => {
     cpSync(join(root, 'scripts/sync-version.mjs'), join(dir, 'scripts/sync-version.mjs'));
     writeFileSync(join(dir, 'package.json'), JSON.stringify({
       name: 'uc-npmver-fixture', version: '1.2.3',
-      scripts: { version: 'node scripts/sync-version.mjs && git add src/version.ts package.json package-lock.json' },
+      scripts: { version: pkg.scripts.version },
     }, null, 2) + '\n');
     writeFileSync(join(dir, 'package-lock.json'), JSON.stringify({
       name: 'uc-npmver-fixture', version: '1.2.3', lockfileVersion: 3, packages: { '': { version: '1.2.3' } },
