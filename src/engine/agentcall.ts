@@ -76,6 +76,27 @@ export interface AgentCallOptions {
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 20 * 60_000;
 export const USAGE_TICK_INTERVAL_MS = 1000;
+/** Longest delay Node's setTimeout honors (2^31−1 ms); a larger value overflows
+ *  and fires immediately, so callers treat anything beyond it as "no timer". */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/** Session ids arrive on the worker's own stdout stream — validate the shape
+ *  before one re-enters an argv, where a forged leading-dash "id" would parse
+ *  as a flag on the resume command line. */
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+export function resumableSessionId(id: string | undefined): string | undefined {
+  return id !== undefined && SESSION_ID_RE.test(id) ? id : undefined;
+}
+
+/** Follow-up prompt for a task retry that resumes the interrupted session —
+ *  the session already holds the original prompt and all prior tool progress. */
+export function resumeContinuationPrompt(reason: string): string {
+  return (
+    `The previous attempt was interrupted (${reason}). ` +
+    'Your earlier progress in this conversation and any files you already wrote still exist. ' +
+    'Continue the original task from where you left off — do not start over — and return the final result.'
+  );
+}
 
 interface AttemptResult {
   exit: ExitClass;
@@ -128,8 +149,32 @@ export class AgentCallExecutor implements AgentExecutor {
       if (signal.aborted) {
         return this.toOutcome(spec, last, usages, attemptsUsed, 'aborted');
       }
-      const plan = this.adapter.buildSpawn(req);
-      last = await this.runAttempt(spec, plan, signal, attempt, tracker?.onStreamEvent);
+      // A task retry RESUMES the failed attempt's backend session when the
+      // adapter supports it: the session already holds the prompt and every
+      // tool result, so a timed-out attempt continues from its progress
+      // instead of re-deriving 20 minutes of work from scratch. Fresh spawn
+      // when the failed attempt surfaced no (valid) session id or the
+      // adapter cannot resume.
+      const resumeSession = last !== undefined ? resumableSessionId(last.sessionId) : undefined;
+      const resumePlan =
+        resumeSession !== undefined
+          ? this.adapter.buildResume(resumeSession, resumeContinuationPrompt(last!.exit.message), req)
+          : null;
+      last = await this.runAttempt(
+        spec,
+        resumePlan ?? this.adapter.buildSpawn(req),
+        signal,
+        attempt,
+        tracker?.onStreamEvent,
+        resumePlan !== null,
+      );
+      // A resume that dies instantly with zero events (and not by watchdog
+      // kill) failed as a MECHANISM — e.g. the backend could not load the
+      // killed session's rollout — not as an attempt. Rerun the same attempt
+      // fresh so a broken resume never burns a task retry.
+      if (resumePlan !== null && !last.exit.ok && !signal.aborted && last.exit.errorKind !== 'stalled' && last.events.length === 0) {
+        last = await this.runAttempt(spec, this.adapter.buildSpawn(req), signal, attempt, tracker?.onStreamEvent, false, '-fresh');
+      }
       attemptsUsed = attempt;
       usages.push(last);
       tracker?.attemptSettled(usages);
@@ -272,7 +317,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // schema repairs share one display sequence, so attempt is always >= 2
       // whenever an extra spawn is running.
       tracker?.retry(attemptsUsed + round + 1, attemptsUsed + SCHEMA_REPAIR_LIMIT, 'schema-repair', lastErrors.slice(0, 3).join('; '));
-      const sessionId = current.sessionId ?? first.sessionId;
+      const sessionId = resumableSessionId(current.sessionId) ?? resumableSessionId(first.sessionId);
       const resumePlan =
         sessionId !== undefined ? this.adapter.buildResume(sessionId, resumeRepairPrompt(lastErrors, schema), req) : null;
       const plan =
@@ -322,22 +367,30 @@ export class AgentCallExecutor implements AgentExecutor {
     // an `exec resume` attempt's figure already contains every prior attempt
     // on the same session, so count only the LAST cumulative report per
     // session — summing would double-count the shared prefix.
-    const counted: AttemptResult[] = [];
+    const isCumulative = (a: AttemptResult): boolean =>
+      a.sessionId !== undefined &&
+      a.events.some((e) => e.kind === 'usage' && !e.interim && e.threadCumulative === true);
+    // A session's LAST cumulative report also covers every EARLIER attempt on
+    // that session that died before reporting anything (a timed-out attempt
+    // later resumed) — estimating those would double-count. Attempts AFTER it
+    // are not covered and must still be estimated, so track the position.
+    const lastCumulativeAt = new Map<string, number>();
+    attempts.forEach((a, i) => {
+      if (isCumulative(a)) lastCumulativeAt.set(a.sessionId!, i);
+    });
+    const counted: { a: AttemptResult; at: number }[] = [];
     const cumulativeIdx = new Map<string, number>();
-    for (const a of attempts) {
-      const cumulative =
-        a.sessionId !== undefined &&
-        a.events.some((e) => e.kind === 'usage' && !e.interim && e.threadCumulative === true);
-      if (cumulative) {
+    attempts.forEach((a, at) => {
+      if (isCumulative(a)) {
         const prev = cumulativeIdx.get(a.sessionId!);
         if (prev !== undefined) {
-          counted[prev] = a;
-          continue;
+          counted[prev] = { a, at };
+          return;
         }
         cumulativeIdx.set(a.sessionId!, counted.length);
       }
-      counted.push(a);
-    }
+      counted.push({ a, at });
+    });
 
     let input = 0;
     let output = 0;
@@ -345,7 +398,7 @@ export class AgentCallExecutor implements AgentExecutor {
     let reasoning = 0;
     let realAny = false;
     let estimatedAny = false;
-    for (const a of counted) {
+    for (const { a, at } of counted) {
       const u = this.adapter.extractUsage(a.events);
       if (u.totalTokens > 0) {
         realAny = true;
@@ -353,6 +406,10 @@ export class AgentCallExecutor implements AgentExecutor {
         output += u.outputTokens;
         cached += u.cachedInputTokens;
         reasoning += u.reasoningTokens;
+      } else if (a.sessionId !== undefined && (lastCumulativeAt.get(a.sessionId) ?? -1) > at) {
+        // Reported nothing (killed before turn.completed), but a LATER resume
+        // on the same session reported the thread total — already counted.
+        continue;
       } else {
         // This attempt reported no usage — estimate it (its prompt + its own
         // output) rather than dropping it, so a failed attempt or schema-repair
@@ -394,8 +451,11 @@ export class AgentCallExecutor implements AgentExecutor {
     signal: AbortSignal,
     attempt: number,
     onStreamEvent?: (ev: AgentEvent) => void,
-    /** the plan resumes an existing backend session (schema repair via buildResume) */
+    /** the plan resumes an existing backend session (task retry or schema repair via buildResume) */
     resumedSession = false,
+    /** stderr artifact suffix; distinguishes a same-attempt rerun (the fresh
+     *  fallback after a dead resume) so it can't clobber the resume's stderr */
+    stderrSuffix = '',
   ): Promise<AttemptResult> {
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
@@ -509,11 +569,15 @@ export class AgentCallExecutor implements AgentExecutor {
       const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
       let timedOut = false;
       let stalled = false;
-      timer = setTimeout(() => {
-        timedOut = true;
-        killWithEscalation();
-      }, timeoutMs);
-      timer.unref();
+      // Past the timer range the caller asked for "effectively uncapped" —
+      // arming would overflow to an immediate fire and insta-kill the attempt.
+      if (timeoutMs <= MAX_TIMER_DELAY_MS) {
+        timer = setTimeout(() => {
+          timedOut = true;
+          killWithEscalation();
+        }, timeoutMs);
+        timer.unref();
+      }
 
       // Stall watchdog: no stream activity within stallMs → kill and retry.
       let lastActivityAt = Date.now();
@@ -555,7 +619,7 @@ export class AgentCallExecutor implements AgentExecutor {
       consume(parser.end());
 
       if (artifactDir) {
-        writeFileNoFollow(join(artifactDir, `stderr.attempt${attempt}.log`), stderrTail.text);
+        writeFileNoFollow(join(artifactDir, `stderr.attempt${attempt}${stderrSuffix}.log`), stderrTail.text);
       }
 
       let exit = this.adapter.classifyExit(code, sig, events, stderrTail.text);

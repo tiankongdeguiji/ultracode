@@ -90,6 +90,46 @@ describe('MCP triad', () => {
     expect(result.structuredContent!.artifacts.runDir).toContain(runId);
   }, 60_000);
 
+  it('workflow_start passes wallClockMs/attemptTimeoutMs through unclamped; omitting them leaves config bare', async () => {
+    const start = (await client.callTool({
+      name: 'workflow_start',
+      // 2^31 ms exceeds Node's timer range — the runner must run uncapped, not insta-stop
+      arguments: { script: HELLO, backend: 'mock', wallClockMs: 2 ** 31, attemptTimeoutMs: 90_000 },
+    })) as { structuredContent?: { runId?: string; runDir?: string }; isError?: boolean };
+    expect(start.isError).toBeFalsy();
+    const runId = start.structuredContent!.runId!;
+    const runDir = start.structuredContent!.runDir!;
+    const config = JSON.parse(readFileSync(join(runDir, 'config.json'), 'utf8'));
+    expect(config.wallClockMs).toBe(2 ** 31);
+    expect(config.attemptTimeoutMs).toBe(90_000);
+
+    let status: Record<string, any> = {};
+    let offset = 0;
+    for (let i = 0; i < 40; i++) {
+      const s = (await client.callTool({
+        name: 'workflow_status',
+        arguments: { runId, waitSeconds: 2, sinceEventOffset: offset },
+      })) as { structuredContent?: Record<string, any> };
+      status = s.structuredContent!;
+      offset = status.nextEventOffset;
+      if (status.terminal) break;
+    }
+    expect(status.status).toBe('completed');
+    const eventLog = readFileSync(join(runDir, 'events.jsonl'), 'utf8');
+    expect(eventLog).toContain('outside timer range — running uncapped');
+    // pins the runner→executor plumbing, not just config.json persistence
+    expect(eventLog).toContain('attempt timeout 90000ms (run-level override)');
+
+    // Timeouts are opt-in: with no params the stored config carries neither key.
+    const plain = (await client.callTool({
+      name: 'workflow_start',
+      arguments: { script: HELLO, backend: 'mock' },
+    })) as { structuredContent?: { runDir?: string } };
+    const plainConfig = JSON.parse(readFileSync(join(plain.structuredContent!.runDir!, 'config.json'), 'utf8'));
+    expect('wallClockMs' in plainConfig).toBe(false);
+    expect('attemptTimeoutMs' in plainConfig).toBe(false);
+  }, 60_000);
+
   it('long-poll is not woken by agent_usage ticks (renderable lines only)', async () => {
     // Fabricated live run: manifest points at THIS (alive) process so
     // liveStatus stays 'running'; events.jsonl holds only null-rendered ticks.

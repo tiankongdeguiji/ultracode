@@ -29,7 +29,7 @@ import type { SharedRunState } from '../engine/hostapi.js';
  * Routes each agent to its backend's executor (per-call `backend:` override
  * in agent() options; run config supplies the default).
  */
-function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): AgentExecutor {
+function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger', attemptTimeoutMs?: number): AgentExecutor {
   const cache = new Map<string, AgentExecutor>();
   const artifactDir = (spec: AgentSpec) => join(dir, 'agents', agentDirName(spec.seq, spec.label));
   const resolve = (backend: string): AgentExecutor => {
@@ -38,7 +38,7 @@ function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): A
       ex =
         backend === 'mock'
           ? new MockExecutor()
-          : (createExecutorForBackend(backend, { artifactDir, permission }) ??
+          : (createExecutorForBackend(backend, { artifactDir, permission, attemptTimeoutMs }) ??
             (() => {
               throw new Error(`backend '${backend}' is not implemented yet`);
             })());
@@ -128,13 +128,20 @@ export async function runnerMain(dir: string): Promise<number> {
   });
 
   // Wall-clock cap (default 60 minutes) — a loud stop, never a silent one.
+  // Out-of-range values (≤0, NaN, beyond Node's 2^31−1 ms timer ceiling, where
+  // setTimeout overflows and fires immediately) run uncapped, saying so loudly.
   const wallClockMs = config.wallClockMs ?? 60 * 60_000;
-  const wallTimer = setTimeout(() => {
-    events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms exceeded — stopping run` });
-    abort.abort(new Error(`wall-clock cap ${wallClockMs}ms exceeded`));
-    armHardStop('wall-clock cap');
-  }, wallClockMs);
-  wallTimer.unref();
+  let wallTimer: ReturnType<typeof setTimeout> | undefined;
+  if (Number.isFinite(wallClockMs) && wallClockMs > 0 && wallClockMs <= 2 ** 31 - 1) {
+    wallTimer = setTimeout(() => {
+      events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms exceeded — stopping run` });
+      abort.abort(new Error(`wall-clock cap ${wallClockMs}ms exceeded`));
+      armHardStop('wall-clock cap');
+    }, wallClockMs);
+    wallTimer.unref();
+  } else {
+    events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms is outside timer range — running uncapped` });
+  }
 
   // Parse up-front to seed the journal chain (executeWorkflow re-parses; cheap).
   // The seed folds in permission so a resume under a different permission does
@@ -176,9 +183,18 @@ export async function runnerMain(dir: string): Promise<number> {
   const repoRoot = repoRootSync(config.cwd);
   if (repoRoot) shared.worktrees = createWorktreeManager(repoRoot, worktreesRootFor(dir));
 
+  // Same worker-writable-config caution as maxConcurrency above: junk in
+  // attemptTimeoutMs falls back to the executor's 20-minute default. Applied
+  // loudly so the override is observable in events.jsonl.
+  const attemptTimeoutMs =
+    config.attemptTimeoutMs !== undefined && isPositiveInt(config.attemptTimeoutMs) ? config.attemptTimeoutMs : undefined;
+  if (attemptTimeoutMs !== undefined) {
+    events.write({ type: 'workflow_log', message: `attempt timeout ${attemptTimeoutMs}ms (run-level override)` });
+  }
+
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
-    executor: makeExecutorMux(dir, config.permission ?? 'auto'),
+    executor: makeExecutorMux(dir, config.permission ?? 'auto', attemptTimeoutMs),
     cacheLookup: replay?.lookup,
     args,
     budgetAccount,
@@ -270,7 +286,7 @@ export async function runnerMain(dir: string): Promise<number> {
   });
 
   clearInterval(heartbeat);
-  clearTimeout(wallTimer);
+  if (wallTimer) clearTimeout(wallTimer);
   if (hardStopTimer) clearTimeout(hardStopTimer); // workflow unwound on its own
   if (replay) {
     events.write({

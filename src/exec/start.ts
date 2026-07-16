@@ -22,6 +22,7 @@ export interface StartRunInput {
   maxConcurrency?: number;
   permission?: 'safe' | 'auto' | 'danger';
   wallClockMs?: number;
+  attemptTimeoutMs?: number;
   resumeFromRunId?: string;
   cwd?: string;
   home?: string;
@@ -49,6 +50,7 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     budgetTotal: input.budgetTotal ?? null,
     permission: input.permission ?? 'auto',
     wallClockMs: input.wallClockMs,
+    attemptTimeoutMs: input.attemptTimeoutMs,
     resumeFromRunId: undefined as string | undefined,
   };
 
@@ -81,6 +83,7 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     if (input.budgetTotal !== undefined) config.budgetTotal = input.budgetTotal;
     if (input.permission !== undefined) config.permission = input.permission;
     if (input.wallClockMs !== undefined) config.wallClockMs = input.wallClockMs;
+    if (input.attemptTimeoutMs !== undefined) config.attemptTimeoutMs = input.attemptTimeoutMs;
   }
 
   if (input.scriptPath) source = readFileSync(input.scriptPath, 'utf8');

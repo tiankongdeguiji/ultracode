@@ -25,6 +25,8 @@ export interface RunConfig {
   logCap?: number;
   permission?: 'safe' | 'auto' | 'danger';
   wallClockMs?: number;
+  /** run-wide default per-attempt agent timeout (ms); script-level opts.timeoutMs still wins */
+  attemptTimeoutMs?: number;
   resumeFromRunId?: string;
 }
 

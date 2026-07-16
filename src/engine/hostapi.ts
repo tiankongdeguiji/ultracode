@@ -275,6 +275,10 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       throw new TypeError('agent() schema must be a JSON Schema object');
     }
     const retries = Math.max(0, Math.min(MAX_TASK_RETRIES, Math.trunc(o.retries ?? 0)));
+    // Junk timeoutMs (strings, NaN, ≤0) falls back to the executor default:
+    // a '30m'-style mistake must not silently disarm the attempt timer, and a
+    // 0 must not insta-kill every attempt.
+    const timeoutMs = typeof o.timeoutMs === 'number' && Number.isFinite(o.timeoutMs) && o.timeoutMs > 0 ? o.timeoutMs : undefined;
     const phaseTitle = o.phase !== undefined ? ensurePhase(String(o.phase)) : currentPhase;
     return {
       seq,
@@ -290,7 +294,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       cwd: o.cwd ?? opts.cwd,
       retries,
       stallMs: o.stallMs,
-      timeoutMs: o.timeoutMs,
+      timeoutMs,
       skip: o.skip === true,
       skipReason: o.skipReason,
     };
