@@ -6,6 +6,7 @@ import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir, getRun, readRunArgs, readRunConfig, reapOrphans } from '../store/runstore.js';
 import { isTerminal } from '../store/manifest.js';
 import { launchRunner } from '../exec/daemonize.js';
+import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { attachForeground, printOutput } from './lifecycle.js';
 import { readMaxConcurrencyOpt } from './options.js';
 
@@ -103,7 +104,7 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
 
   if (opts.detach) {
     process.stdout.write(`${newId}\n`);
-    if (process.pid <= 64) {
+    if (looksNamespaceLocal(process.pid)) {
       process.stderr.write(
         `⚠ this shell looks sandboxed (pid ${process.pid}): a detached runner cannot outlive a transient sandbox — prefer the MCP route or a persistent shell\n`,
       );

@@ -114,6 +114,27 @@ describe('codex rollout sidecar', () => {
     ]);
   });
 
+  it('reassembles a record split across appends and skips garbage lines without dying', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'uc-codex-home-'));
+    const dir = rolloutDir(home);
+    const sid = '0199-torn-1';
+    const { events, emit } = collect();
+    const sidecar = createCodexRolloutSidecar(sid, emit, { home, pollMs: 20 });
+    const file = join(dir, `rollout-2026-01-01T00-00-00-${sid}.jsonl`);
+    const whole = tokenCount(100, 0, 10);
+    // First half of a record (no newline) — must be carried, not parsed.
+    writeFileSync(file, whole.slice(0, 40));
+    await sleep(100);
+    expect(events).toEqual([]);
+    // Second half + a garbage line + another valid tick: the garbage line must
+    // be skipped (a throw here would clearInterval and kill all later ticks).
+    appendFileSync(file, whole.slice(40) + 'not json at all\n' + tokenCount(200, 0, 20));
+    await sleep(120);
+    sidecar.close();
+    const ticks = events.filter((e): e is Extract<AgentEvent, { kind: 'usage' }> => e.kind === 'usage');
+    expect(ticks.map((t) => t.usage.inputTokens)).toEqual([100, 200]);
+  });
+
   it('missing session degrades silently', async () => {
     const home = mkdtempSync(join(tmpdir(), 'uc-codex-home-'));
     const { events, emit } = collect();

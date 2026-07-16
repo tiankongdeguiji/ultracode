@@ -182,6 +182,8 @@ describe('format helpers', () => {
     expect(formatTokens(12_345)).toBe('12.3k');
     expect(formatTokens(20_000)).toBe('20k');
     expect(formatTokens(145_200)).toBe('145.2k');
+    expect(formatTokens(999_949)).toBe('999.9k');
+    expect(formatTokens(999_950)).toBe('1m'); // never "1000k"
     expect(formatTokens(1_450_000)).toBe('1.45m');
     expect(formatTokens(2_000_000)).toBe('2m');
   });
@@ -204,11 +206,15 @@ describe('format helpers', () => {
     expect(truncateToWidth('xy', 1)).toBe('…');
   });
 
-  it('displayWidth counts CJK/emoji as 2 cells', () => {
+  it('displayWidth counts CJK/emoji as 2 cells, and ambiguous symbols as 2 (safe overcount)', () => {
     expect(displayWidth('abc')).toBe(3);
     expect(displayWidth('日本語')).toBe(6);
     expect(displayWidth('a日b')).toBe(4);
     expect(displayWidth('🎉')).toBe(2);
+    expect(displayWidth('✅')).toBe(2); // emoji-presentation misc symbol
+    expect(displayWidth('⚡')).toBe(2);
+    expect(displayWidth('🀄')).toBe(2); // mahjong block below U+1F300
+    expect(displayWidth('✓')).toBe(2); // wcwidth says 1 — deliberately overcounted (undercount soft-wraps)
   });
 
   it('sanitizeText strips C0/C1 control bytes (incl. ESC and newlines) to spaces', () => {

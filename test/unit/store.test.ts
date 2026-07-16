@@ -115,6 +115,20 @@ describe('events', () => {
     expect(pages).toBeGreaterThan(1); // it actually paged
     expect(seen).toEqual(Array.from({ length: 50 }, (_, i) => i)); // nothing lost or torn
   });
+
+  it('a single line larger than maxBytes cannot stall the tail (window grows to the newline)', () => {
+    const dir = tmpRoot();
+    const file = join(dir, 'events.jsonl');
+    const w = new EventWriter(file);
+    w.write({ type: 'workflow_log', message: 'x'.repeat(2000) }); // ≫ the 256-byte page below
+    w.write({ type: 'run_completed' });
+    w.close();
+
+    const page1 = readEventsFrom(file, 0, 256);
+    expect(page1.events.map((e) => e.type)).toEqual(['workflow_log', 'run_completed']);
+    expect(page1.hasMore).toBe(false);
+    expect(readEventsFrom(file, page1.nextOffset, 256).events).toEqual([]);
+  });
 });
 
 describe('runstore', () => {

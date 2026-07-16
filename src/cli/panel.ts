@@ -314,7 +314,8 @@ const trimZeros = (s: string): string => s.replace(/\.?0+$/, '');
 /** 950 → "950", 12_345 → "12.3k", 145_200 → "145.2k", 1_450_000 → "1.45m". */
 export function formatTokens(n: number): string {
   if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${trimZeros((n / 1000).toFixed(1))}k`;
+  // 999_950+ would render "1000.0k" — promote to the m branch instead.
+  if (n < 999_950) return `${trimZeros((n / 1000).toFixed(1))}k`;
   return `${trimZeros((n / 1_000_000).toFixed(2))}m`;
 }
 
@@ -334,17 +335,23 @@ export function formatDuration(ms: number): string {
  */
 function charWidth(cp: number): number {
   return (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+    (cp >= 0x2600 && cp <= 0x27bf) || // misc symbols/dingbats — often emoji-presentation (✅⚡): assume 2, see below
     (cp >= 0x2e80 && cp <= 0xa4cf) || // CJK radicals … Yi
     (cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
     (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
     (cp >= 0xfe30 && cp <= 0xfe4f) || // CJK compatibility forms
     (cp >= 0xff00 && cp <= 0xff60) || // fullwidth forms
     (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f000 && cp <= 0x1f2ff) || // enclosed/mahjong/domino symbol blocks
     (cp >= 0x1f300 && cp <= 0x1faff) || // emoji blocks
     (cp >= 0x20000 && cp <= 0x3fffd) // CJK extensions
     ? 2
     : 1;
 }
+// Width policy: UNDERCOUNTING is the unsafe direction (a wider-than-counted
+// line soft-wraps and desyncs the repaint cursor math), so ambiguous
+// symbol/emoji ranges are assumed wide even where wcwidth says 1 (✓ ✗ ⟳ get
+// overcounted) — the cost is truncating a hair early on narrow terminals.
 
 /** Terminal cells occupied by s (no ANSI stripping — pass plain text). */
 export function displayWidth(s: string): number {

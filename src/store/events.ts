@@ -53,11 +53,20 @@ export function readEventsFrom(file: string, offset: number, maxBytes?: number):
 
   const fd = openSync(file, 'r');
   try {
-    const buf = Buffer.alloc(end - offset);
-    readSync(fd, buf, 0, buf.length, offset);
-    const text = buf.toString('utf8');
+    let window = end - offset;
+    let text: string;
+    for (;;) {
+      const buf = Buffer.alloc(window);
+      readSync(fd, buf, 0, window, offset);
+      text = buf.toString('utf8');
+      // A single line larger than the window must not stall the tail forever
+      // (no newline → no offset progress): grow the window until a newline
+      // lands or EOF — a genuinely torn tail then waits for the writer.
+      if (text.lastIndexOf('\n') !== -1 || offset + window >= size) break;
+      window = Math.min(size - offset, window * 2);
+    }
     const lastNewline = text.lastIndexOf('\n');
-    if (lastNewline === -1) return { events: [], nextOffset: offset };
+    if (lastNewline === -1) return { events: [], nextOffset: offset, hasMore: false };
     const complete = text.slice(0, lastNewline);
     const consumed = Buffer.byteLength(complete, 'utf8') + 1;
     const events: TimestampedEvent[] = [];

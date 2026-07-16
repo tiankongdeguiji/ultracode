@@ -6,6 +6,7 @@ import { executeWorkflow, validateArgsAgainstInputSchema } from '../engine/run.j
 import { defaultConcurrency } from '../engine/semaphore.js';
 import { MockExecutor } from '../backends/mock.js';
 import { parseBudget } from '../budget/parse.js';
+import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
@@ -186,7 +187,7 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
     // A namespace-local pid means THIS CLI is inside a fresh PID namespace
     // (agent exec jail, one-shot container) — the detached runner dies with
     // it. Warn at launch; the corpse is otherwise silent (SIGKILL, no logs).
-    if (process.pid <= 64) {
+    if (looksNamespaceLocal(process.pid)) {
       process.stderr.write(
         `⚠ this shell looks sandboxed (pid ${process.pid}): a detached runner cannot outlive a transient sandbox — prefer the MCP route or a persistent shell\n`,
       );

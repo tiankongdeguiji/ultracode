@@ -13,6 +13,7 @@ import { readEventsFrom } from '../store/events.js';
 import { isTerminal, readManifest, type RunStatus } from '../store/manifest.js';
 import { getRun, isRunnerAlive, liveStatus } from '../store/runstore.js';
 import { ultracodeRoot } from '../store/layout.js';
+import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { LiveRegion } from './live-region.js';
 import { renderEvent } from './lifecycle.js';
@@ -177,11 +178,11 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
           if (mode.kind === 'plain' && !opts.quiet) writePlain(rest.events);
           if (!rest.hasMore) break;
         }
-        // A namespace-local pid (1-64) means the runner was born inside a fresh
+        // A namespace-local pid means the runner was born inside a fresh
         // PID namespace — a transient sandbox (agent exec jail, one-shot
         // container) that SIGKILLs everything in it when the launcher returns.
         const sandboxHint =
-          status === 'orphaned' && manifest.pid > 0 && manifest.pid <= 64
+          status === 'orphaned' && looksNamespaceLocal(manifest.pid)
             ? `runner pid ${manifest.pid} looks namespace-local — the run was likely launched inside a transient sandbox (agent shell / one-shot container) that was torn down. Launch from a persistent shell, or keep the launching command attached until the run completes.`
             : undefined;
         if (!opts.quiet) {

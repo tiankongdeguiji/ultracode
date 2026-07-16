@@ -144,7 +144,9 @@ export function createServer(baseCwd: string): McpServer {
         const run = getRun(root, input.runId);
         if (!run) return fail(`no run ${input.runId} under ${root}`);
         const eventsFile = join(run.dir, 'events.jsonl');
-        const page = readEventsFrom(eventsFile, offset);
+        // Bounded read: a first poll against a long-running backlog must not
+        // allocate/parse the whole file (clients page via nextEventOffset).
+        const page = readEventsFrom(eventsFile, offset, 4 * 1024 * 1024);
         offset = page.nextOffset; // consume even null-rendered pages so ticks are never re-read
         const terminal = isTerminal(run.effectiveStatus);
         // Wake on RENDERABLE lines, not raw events: agent_usage ticks arrive

@@ -121,7 +121,7 @@ key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0"
         + stableStringify({ agentType, isolation, model, effort, schema, backend, cwd }))
 ```
 
-(`stableStringify` = sorted-key deterministic JSON; absent fields omitted.) Records: `{t:'started', runId, engineVersion, scriptHash, argsHash}`, `{t:'agent', seq, key, status:'ok'|'error'|'skip', label, phase, backend, model?, sessionId?, usage, resultRef, error?}`, `{t:'child-enter'|'child-exit', name}`.
+(`stableStringify` = sorted-key deterministic JSON; absent fields omitted.) Records: `{t:'started', runId, engineVersion, scriptHash, argsHash}`, `{t:'agent', seq, key, status:'ok'|'error'|'skip', label, phase, backend, model?, sessionId?, totalTokens, resultRef, error?}`, `{t:'child-enter'|'child-exit', name}`.
 
 **Resume** (`resumeFromRunId`): prior run must be terminal (pid dead + manifest status ∉ running). New run gets fresh runId + fresh journal; the old journal is loaded as an ordered replay queue. `nextCachedResult(key)` compares sequentially; every hit resolves that `agent()` **instantly** from `resultRef` (re-read from the old run's `agents/` dir); the **first miss sets `prefixMissed = true` and disables all later hits** — exactly the longest-unchanged-prefix contract. Determinism holds because banned entropy sources + instant cached resolution make the microtask interleaving reproducible up to the first live call; beyond that everything runs live anyway. Same script + same args ⇒ full cache hit.
 
@@ -315,7 +315,7 @@ script: await agent(prompt, {schema, label})
         → events.jsonl (agent_progress), transcript.jsonl (raw)
       exit → adapter.classifyExit → retryable? (retries/stallMs budget) → respawn or fail
       structured pipeline: extract → ajv(original schema) → repair-resume ≤2 → value | WorkflowSchemaError
-      usage → BudgetAccount.add → journal.append({t:'agent', key, status, usage, resultRef})
+      usage → BudgetAccount.add → journal.append({t:'agent', key, status, totalTokens, resultRef})
   → semaphore.release() → resolve/throw into script
 script ends → output.json + manifest(status) → events.jsonl run_completed → (foreground CLI exits / MCP long-poll returns)
 ```
