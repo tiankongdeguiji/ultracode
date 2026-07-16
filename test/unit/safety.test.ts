@@ -237,39 +237,34 @@ describe('CLI nesting guard (ULTRACODE_INSIDE_RUN)', () => {
     }
   });
 
-  it('run --allow-nested overrides the guard', async () => {
+  it('run --allow-nested passes the guard (reaches source resolution, not the refusal)', async () => {
+    // No detached runner: a nonexistent workflow fails at resolution — AFTER the
+    // guard — which proves the override without spawning a process (the guard's
+    // truth table is covered directly below). Spawn-heavy checks live in
+    // *.integration.test.ts.
     const { runCommand } = await import('../../src/cli/run.js');
-    const { readManifest, isTerminal } = await import('../../src/store/manifest.js');
-    const dir = mkdtempSync(join(tmpdir(), 'uc-nestallow-'));
-    const file = join(dir, 't.workflow.js');
-    writeFileSync(file, SCRIPT);
-    const home = join(dir, 'store');
-    const outs: string[] = [];
-    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((c) => {
-      outs.push(String(c));
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
       return true;
     });
-    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       await withInsideRun(async () => {
         expect(
-          await runCommand(file, { yes: true, backend: 'mock', home, detach: true, allowNested: true }),
-        ).toBe(0);
+          await runCommand('/no/such/uc-workflow.js', {
+            yes: true,
+            backend: 'mock',
+            home: mkdtempSync(join(tmpdir(), 'uc-nestallow-')),
+            allowNested: true,
+          }),
+        ).toBe(1);
       });
-      // Let the detached runner reach terminal so it can't outlive the test.
-      const runDir = join(home, 'runs', outs.join('').trim().split('\n')[0]!);
-      const deadline = Date.now() + 15_000;
-      for (;;) {
-        const m = readManifest(runDir);
-        if (m && isTerminal(m.status)) break;
-        if (Date.now() > deadline) throw new Error(`run not terminal: ${m?.status}`);
-        await new Promise((r) => setTimeout(r, 100));
-      }
+      expect(chunks.join('')).not.toContain('inside an ultracode worker');
+      expect(chunks.join('')).toContain('cannot resolve workflow');
     } finally {
-      outSpy.mockRestore();
-      errSpy.mockRestore();
+      spy.mockRestore();
     }
-  }, 30_000);
+  });
 
   it('resume refuses inside a worker (before touching the store)', async () => {
     const { resumeCommand } = await import('../../src/cli/resume.js');
