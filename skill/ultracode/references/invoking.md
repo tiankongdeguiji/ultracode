@@ -23,7 +23,7 @@
 
 | backend | worker CLI | structured output | parallel-safe auth |
 |---|---|---|---|
-| codex | `codex exec --json` | native `--output-schema` (strict subset) | `CODEX_API_KEY` |
+| codex | `codex exec --json` (+ rollout sidecar for live tokens/model) | native `--output-schema` (strict subset) | `CODEX_API_KEY` |
 | qoder | `qodercli --print` | native `--json-schema` (+ engine revalidation) | `QODER_PERSONAL_ACCESS_TOKEN` (beware stored /login creds) |
 | claude | `claude -p` | native `--json-schema` | CLI-managed |
 | gemini | `gemini -p` | emulated (prompt contract + validate/retry) | `GEMINI_API_KEY` |

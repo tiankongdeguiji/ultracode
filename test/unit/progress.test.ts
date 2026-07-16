@@ -184,6 +184,81 @@ describe('AgentCallExecutor progress', () => {
     expect(tokens(events)).toEqual([110, 220]);
   });
 
+  it('thread-cumulative usage (codex exec resume): last report per session wins, distinct sessions sum', async () => {
+    // Adapter emulating codex semantics: usage events are session-cumulative.
+    class CumulativeAdapter extends FakeAdapter {
+      constructor(runs: { lines: object[]; exit?: number }[], private readonly resumable: boolean) {
+        super('emulated', runs);
+      }
+      override buildResume(_s: string, _p: string, req: AgentRequest): SpawnPlan | null {
+        return this.resumable ? this.buildSpawn(req) : null;
+      }
+      override createParser() {
+        const inner = super.createParser();
+        return {
+          push: (line: string) =>
+            inner.push(line).map((ev) => (ev.kind === 'usage' && !ev.interim ? { ...ev, threadCumulative: true } : ev)),
+          end: () => inner.end(),
+        };
+      }
+    }
+
+    // Schema repair resumes the SAME session: attempt 2's 150 already contains
+    // attempt 1's 100 → merged total must be 150, not 250.
+    const sameSession = new CumulativeAdapter(
+      [
+        { lines: [{ session: 's1' }, { text: '{"count": "bad"}' }, { done: true, usage: { inputTokens: 90, outputTokens: 10 } }] },
+        { lines: [{ session: 's1' }, { text: '{"count": 7}' }, { done: true, usage: { inputTokens: 130, outputTokens: 20 } }] },
+      ],
+      true,
+    );
+    const schema: JsonSchema = { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] };
+    const out1 = await new AgentCallExecutor(sameSession, { usageTickIntervalMs: 0 }).execute(spec({ schema }), signal);
+    expect(out1.ok).toBe(true);
+    expect(out1.usage.totalTokens).toBe(150);
+
+    // Task retries spawn FRESH sessions: cumulative flags on distinct sessions sum.
+    const distinctSessions = new CumulativeAdapter(
+      [
+        { lines: [{ session: 's1' }, { done: true, usage: { inputTokens: 90, outputTokens: 10 } }], exit: 1 },
+        { lines: [{ session: 's2' }, { text: 'ok' }, { done: true, usage: { inputTokens: 70, outputTokens: 10 } }] },
+      ],
+      false,
+    );
+    const out2 = await new AgentCallExecutor(distinctSessions, { usageTickIntervalMs: 0 }).execute(spec({ retries: 1 }), signal);
+    expect(out2.ok).toBe(true);
+    expect(out2.usage.totalTokens).toBe(180);
+  });
+
+  it('starts the adapter sidecar on the session event and closes it after the attempt', async () => {
+    const closed: string[] = [];
+    class SidecarAdapter extends FakeAdapter {
+      override createSidecar(sessionId: string, emit: (ev: AgentEvent) => void) {
+        emit({ kind: 'session', sessionId, model: 'sidecar-model' });
+        emit({ kind: 'usage', usage: { inputTokens: 40, outputTokens: 2 }, interim: true });
+        return { close: () => closed.push(sessionId) };
+      }
+    }
+    const adapter = new SidecarAdapter('native', [
+      { lines: [{ session: 's9' }, { text: 'ok' }, { done: true, usage: { inputTokens: 100, outputTokens: 10 } }] },
+    ]);
+    const { events, onProgress } = collect();
+    const outcome = await new AgentCallExecutor(adapter, { usageTickIntervalMs: 0 }).execute(spec(), signal, onProgress);
+    expect(outcome.ok).toBe(true);
+    expect(events.filter((p) => p.type === 'model')).toEqual([{ type: 'model', model: 'sidecar-model' }]);
+    expect(tokens(events)[0]).toBe(42); // the sidecar's interim tick reached the tracker
+    expect(outcome.usage.totalTokens).toBe(110); // …but never the accounting
+    expect(closed).toEqual(['s9']);
+
+    // Without onProgress there is no consumer — the sidecar must not start.
+    const adapter2 = new SidecarAdapter('native', [
+      { lines: [{ session: 's10' }, { done: true, usage: { inputTokens: 1, outputTokens: 1 } }] },
+    ]);
+    closed.length = 0;
+    await new AgentCallExecutor(adapter2, {}).execute(spec(), signal);
+    expect(closed).toEqual([]);
+  });
+
   it('works without an onProgress callback (no observable change)', async () => {
     const adapter = new FakeAdapter('native', [
       { lines: [{ iu: { inputTokens: 1, outputTokens: 1 } }, { done: true, usage: { inputTokens: 5, outputTokens: 5 } }] },

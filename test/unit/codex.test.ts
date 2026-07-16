@@ -79,6 +79,10 @@ describe('CodexAdapter parser + classifyExit on golden fixtures', () => {
     const messages = events.filter((e) => e.kind === 'message');
     expect(messages.at(-1)).toMatchObject({ text: 'hello' });
 
+    // turn.completed reports the SESSION total — flagged so the executor
+    // never sums a resumed attempt on top of its own prefix.
+    expect(events.find((e) => e.kind === 'usage')).toMatchObject({ threadCumulative: true });
+
     const usage = adapter.extractUsage(events);
     // codex reports cached ⊂ input and reasoning ⊂ output: the adapter emits
     // uncached input (12090-9600) and drops reasoning (already in output) so

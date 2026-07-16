@@ -27,6 +27,7 @@ import type {
   AgentOutcome,
   AgentProgress,
   AgentRequest,
+  AgentSidecar,
   AgentSpec,
   BackendAdapter,
   ExitClass,
@@ -309,13 +310,34 @@ export class AgentCallExecutor implements AgentExecutor {
   }
 
   private mergedUsage(spec: AgentSpec, attempts: AttemptResult[]) {
+    // Backends that report THREAD-CUMULATIVE totals (codex turn.completed):
+    // an `exec resume` attempt's figure already contains every prior attempt
+    // on the same session, so count only the LAST cumulative report per
+    // session — summing would double-count the shared prefix.
+    const counted: AttemptResult[] = [];
+    const cumulativeIdx = new Map<string, number>();
+    for (const a of attempts) {
+      const cumulative =
+        a.sessionId !== undefined &&
+        a.events.some((e) => e.kind === 'usage' && !e.interim && e.threadCumulative === true);
+      if (cumulative) {
+        const prev = cumulativeIdx.get(a.sessionId!);
+        if (prev !== undefined) {
+          counted[prev] = a;
+          continue;
+        }
+        cumulativeIdx.set(a.sessionId!, counted.length);
+      }
+      counted.push(a);
+    }
+
     let input = 0;
     let output = 0;
     let cached = 0;
     let reasoning = 0;
     let realAny = false;
     let estimatedAny = false;
-    for (const a of attempts) {
+    for (const a of counted) {
       const u = this.adapter.extractUsage(a.events);
       if (u.totalTokens > 0) {
         realAny = true;
@@ -393,6 +415,7 @@ export class AgentCallExecutor implements AgentExecutor {
     let declinedActions = 0;
     let outputChars = 0;
 
+    let sidecar: AgentSidecar | undefined;
     const consume = (evs: AgentEvent[]): void => {
       for (const ev of evs) {
         events.push(ev);
@@ -400,6 +423,16 @@ export class AgentCallExecutor implements AgentExecutor {
           case 'session':
             sessionId = ev.sessionId;
             onStreamEvent?.(ev);
+            // Display-only side channel (e.g. codex rollout tail): its events
+            // feed the progress tracker only — never the attempt's event
+            // list — so accounting is untouched by construction.
+            if (!sidecar && onStreamEvent && this.adapter.createSidecar) {
+              try {
+                sidecar = this.adapter.createSidecar(ev.sessionId, onStreamEvent) ?? undefined;
+              } catch {
+                /* best-effort */
+              }
+            }
             break;
           case 'usage':
             onStreamEvent?.(ev);
@@ -554,6 +587,11 @@ export class AgentCallExecutor implements AgentExecutor {
       for (const t of escalationTimers) clearTimeout(t);
       if (onAbort) signal.removeEventListener('abort', onAbort);
       if (transcriptFd !== undefined) closeSync(transcriptFd);
+      try {
+        sidecar?.close();
+      } catch {
+        /* display-only */
+      }
       if (artifactDir) rmSync(join(artifactDir, 'pgid'), { force: true });
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }

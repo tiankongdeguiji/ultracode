@@ -126,8 +126,10 @@ export type AgentEvent =
   /** assistant text; consumers keep the LAST one (codex #19816) */
   | { kind: 'message'; text: string }
   | { kind: 'tool'; name: string; status: 'started' | 'completed' | 'failed' | 'declined' }
-  /** interim: a mid-run snapshot (per API call) — excluded from usage accounting */
-  | { kind: 'usage'; usage: Partial<NormalizedUsage>; interim?: boolean }
+  /** interim: a mid-run snapshot (per API call) — excluded from usage accounting.
+   *  threadCumulative: the figure is the session's running total, not this
+   *  attempt's own (codex turn.completed) — resumed attempts repeat the prefix. */
+  | { kind: 'usage'; usage: Partial<NormalizedUsage>; interim?: boolean; threadCumulative?: boolean }
   | {
       kind: 'result';
       text?: string;
@@ -153,9 +155,20 @@ export interface BackendProbe {
   warnings?: string[];
 }
 
+/** Handle for a display-only live-progress side channel (see BackendAdapter.createSidecar). */
+export interface AgentSidecar {
+  close(): void;
+}
+
 export interface BackendAdapter {
   readonly id: BackendId;
   readonly structuredOutput: 'native' | 'emulated';
+  /** Optional live-progress sidecar for backends whose stdout stream omits
+   *  usage/model (codex exec --json swallows TokenCount and never names the
+   *  model): started once the session id is known; emits DISPLAY-ONLY
+   *  AgentEvents (interim usage, session model) into the progress path —
+   *  never into accounting. Must be best-effort: errors degrade silently. */
+  createSidecar?(sessionId: string, emit: (ev: AgentEvent) => void): AgentSidecar | null;
   probe(): Promise<BackendProbe>;
   /** Reject/normalize schema BEFORE spawn where the backend enforces a subset (codex strict). */
   checkSchema?(schema: JsonSchema): { ok: true; wireSchema: JsonSchema } | { ok: false; reason: string };
