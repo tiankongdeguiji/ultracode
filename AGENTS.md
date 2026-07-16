@@ -8,6 +8,12 @@ Canonical instructions for AI coding agents in this repository. `CLAUDE.md` impo
 - No build step is needed to develop: tests import `src/` directly and `npm run dev` runs the CLI from source via tsx. `npm run build` (tsc into the gitignored `dist/`) is only for packaging or `npm link`.
 - Linux and macOS only. Windows is unsupported by design (POSIX process-group semantics); do not "fix" the win32 guard in `src/cli/main.ts`.
 
+## Worktrees
+
+- Do your work in a new git worktree branched from `origin/main` (fetch first), not the primary checkout, and open the PR from that branch.
+- A fresh worktree has no `node_modules` — run `npm ci` in it before the test suite.
+- Before removing a worktree, copy anything worth keeping from its `agent_space/` (Scratch Space) into the main checkout's — both are gitignored and local-only, so removal discards the worktree's scratch for good.
+
 ## Scratch Space
 
 Use the gitignored `agent_space/` directory at the repo root for scratch scripts, throwaway configs, experiment outputs, and working notes. Never commit files from it, and never reference its contents from tracked files (it exists only in the local checkout) — where context is needed, explain it inline instead. Do NOT use `.ultracode/` as scratch — that is the engine's own run store, written at runtime.
@@ -15,7 +21,7 @@ Use the gitignored `agent_space/` directory at the repo root for scratch scripts
 ## Generated Plugin Bundles
 
 - `dist/` (tsc output) and the plugin bundles `dist-codex/`/`dist-qoder/` are fully gitignored build outputs — never commit anything under them. `npm run build:plugins` assembles the bundles from the canonical sources (`skill/`, `workflows/`, `hostpacks/<host>/` — the latter holds each bundle's manifest template and README), and `test/unit/dist.test.ts` rebuilds them itself before asserting, so they can never go stale in CI.
-- A version bump must update `package.json` and `src/version.ts` (`test/unit/dist.test.ts` enforces they match); the bundle manifests take their `version` from `package.json` at build time.
+- Bump the version with one command: `npm version <patch|minor|major|x.y.z> --no-git-tag-version`. npm updates `package.json` and `package-lock.json` (both version fields), and the `version` lifecycle script regenerates `src/version.ts` from `package.json`. `package.json` is the single source of truth; `test/unit/dist.test.ts` enforces that every mirror matches it (the `VERSION` constant, both `package-lock.json` version fields, and the bundle manifests, which take their `version` from `package.json` at build time). Always change the version through `npm version`, never by hand-editing a mirror; if `package.json` was already hand-edited, re-sync every mirror in one shot with `npm version <that-version> --allow-same-version --no-git-tag-version`. For a tagged release commit, drop `--no-git-tag-version` and pass a Conventional-Commits message so the auto-generated commit conforms: `npm version <x> -m 'chore: bump version to %s'`.
 
 ## Testing
 

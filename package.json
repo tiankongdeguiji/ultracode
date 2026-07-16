@@ -25,7 +25,8 @@
     "test:watch": "vitest",
     "lint": "eslint src test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "build:plugins": "node scripts/build-plugins.mjs"
+    "build:plugins": "node scripts/build-plugins.mjs",
+    "version": "node scripts/sync-version.mjs && git add src/version.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.0",

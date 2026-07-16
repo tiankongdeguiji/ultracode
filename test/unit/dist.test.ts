@@ -51,6 +51,58 @@ describe('plugin bundles', () => {
     expect(VERSION).toBe(pkg.version);
   });
 
+  it('package-lock.json version fields match package.json', () => {
+    // npm keeps these in sync during `npm version`, but a hand-edited
+    // package.json bypasses that — this guard is what would have caught the
+    // drift that commit "sync package-lock.json with the 0.1.2 version bump"
+    // had to patch after the fact. Both the top-level and root-package fields
+    // are checked because lockfileVersion 3 stores the version in both.
+    const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
+    expect(lock.version).toBe(pkg.version);
+    expect(lock.packages?.['']?.version).toBe(pkg.version);
+  });
+
+  it('sync-version regenerates src/version.ts from package.json', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-syncver-'));
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '9.9.9' }));
+    writeFileSync(join(dir, 'src/version.ts'), `export const VERSION = '0.0.0';\n`);
+    execFileSync('node', [join(root, 'scripts/sync-version.mjs'), dir], { stdio: 'pipe' });
+    expect(readFileSync(join(dir, 'src/version.ts'), 'utf8')).toBe(`export const VERSION = '9.9.9';\n`);
+  });
+
+  it('sync-version rejects a bad version and leaves src/version.ts untouched', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-syncbad-'));
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    const original = `export const VERSION = '0.0.0';\n`;
+    writeFileSync(join(dir, 'src/version.ts'), original);
+    for (const bad of [{}, { version: '1.2.3junk' }, { version: '01.2.3' }, { version: '1.2.3\n' }]) {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify(bad));
+      let stderr = '';
+      try {
+        execFileSync('node', [join(root, 'scripts/sync-version.mjs'), dir], { stdio: 'pipe' });
+      } catch (e) {
+        stderr = String((e as { stderr?: unknown }).stderr ?? '');
+      }
+      expect(stderr, JSON.stringify(bad)).toMatch(/version missing or invalid/);
+    }
+    expect(readFileSync(join(dir, 'src/version.ts'), 'utf8')).toBe(original);
+  });
+
+  it('sync-version creates src/version.ts when missing, then is a byte-identical no-op', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-syncnew-'));
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '3.4.5' }));
+    const target = join(dir, 'src/version.ts');
+    // No src/ dir at all -> exercises the read-fails / mkdirSync-then-create branch.
+    const out1 = execFileSync('node', [join(root, 'scripts/sync-version.mjs'), dir], { encoding: 'utf8' });
+    expect(readFileSync(target, 'utf8')).toBe(`export const VERSION = '3.4.5';\n`);
+    expect(out1).toMatch(/-> 3\.4\.5/);
+    // Second run with the file already current -> no-op branch, no rewrite.
+    const out2 = execFileSync('node', [join(root, 'scripts/sync-version.mjs'), dir], { encoding: 'utf8' });
+    expect(readFileSync(target, 'utf8')).toBe(`export const VERSION = '3.4.5';\n`);
+    expect(out2).toMatch(/already at 3\.4\.5/);
+  });
+
   it('rebuild wipes stale files from prior outputs', () => {
     expect(existsSync(join(root, 'dist-codex/STALE.txt'))).toBe(false);
     expect(existsSync(join(root, 'dist-qoder/STALE.txt'))).toBe(false);

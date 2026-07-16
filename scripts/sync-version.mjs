@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+// Regenerate src/version.ts from package.json so the engine's VERSION constant
+// always mirrors the published package version. Runs as the `version` npm
+// lifecycle script during `npm version <bump>` (npm has by then already updated
+// package.json AND package-lock.json). It rewrites ONLY src/version.ts, so it is
+// not a full drift repair on its own — to re-sync every mirror after a manual
+// package.json edit, run `npm version <that-version> --allow-same-version`, which
+// updates the lockfile and triggers this script. package.json is the single
+// source of truth; test/unit/dist.test.ts guards every mirror (this constant,
+// both package-lock version fields, the bundle manifests) against it.
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { assertSemver } from './semver.mjs';
+
+// Optional argv override of the root (exists for tests); default is the repo root.
+const root = process.argv[2] ? resolve(process.argv[2]) : join(dirname(fileURLToPath(import.meta.url)), '..');
+const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+assertSemver(version);
+
+const target = join(root, 'src/version.ts');
+const next = `export const VERSION = '${version}';\n`;
+// Write only when the content changes so a no-op bump doesn't churn git/mtime.
+let current = '';
+try {
+  current = readFileSync(target, 'utf8');
+} catch {
+  mkdirSync(dirname(target), { recursive: true });
+}
+if (current === next) {
+  console.log(`src/version.ts already at ${version}`);
+} else {
+  writeFileSync(target, next);
+  console.log(`src/version.ts -> ${version}`);
+}

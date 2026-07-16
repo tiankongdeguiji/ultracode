@@ -6,19 +6,14 @@
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertSemver } from './semver.mjs';
 
 // Optional argv override of the root used for BOTH reading canonical sources
 // and writing the dist-* outputs (exists for tests); default is the repo root.
 const root = process.argv[2] ? resolve(process.argv[2]) : join(dirname(fileURLToPath(import.meta.url)), '..');
 const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-// A falsy version would be silently dropped by JSON.stringify, and a malformed
-// one would ship in both manifests — require a valid SemVer 2.0.0 string
-// (official semver.org pattern: no leading zeros, no empty prerelease ids).
-const SEMVER =
-  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
-if (typeof version !== 'string' || !SEMVER.test(version)) {
-  throw new Error(`package.json version missing or invalid: ${JSON.stringify(version)}`);
-}
+// A malformed version would ship in both manifests — validate before stamping.
+assertSemver(version);
 const copy = (from, to) => {
   mkdirSync(dirname(to), { recursive: true });
   cpSync(join(root, from), to, { recursive: true, force: true });
