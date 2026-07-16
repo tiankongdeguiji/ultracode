@@ -5,22 +5,31 @@
  * (observe mode — Ctrl-C detaches, never signals the run) and the foreground
  * attach of run/resume (attach mode — Ctrl-C owns the run). Falls back to the
  * classic line-per-event stream for pipes, TERM=dumb, or --plain.
+ *
+ * When BOTH the output stream and stdin are TTYs the panel is interactive:
+ * ↑/↓ (or j/k) select an agent row, ⏎ opens a per-agent detail view (prompt /
+ * tool activity / outcome, read lazily from the agent's artifact dir), esc
+ * goes back, q detaches. Raw-mode stdin swallows terminal signals, so Ctrl-C
+ * arrives as a byte and is routed to the exact SIGINT semantics above.
  */
-import { readFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readEventsFrom } from '../store/events.js';
 import { isTerminal, readManifest, type RunStatus } from '../store/manifest.js';
 import { getRun, isRunnerAlive, liveStatus } from '../store/runstore.js';
-import { ultracodeRoot } from '../store/layout.js';
+import { agentDirName, ultracodeRoot } from '../store/layout.js';
 import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { LiveRegion } from './live-region.js';
 import { renderEvent } from './lifecycle.js';
+import { attachKeys, type Key, type KeyInput } from './keys.js';
+import { renderDetailFrame, type AgentArtifacts } from './panel-detail.js';
 import {
   createPanelState,
   foldEvent,
   renderFrame,
+  selectableSeqs,
   takeNarratorLines,
   type PanelSeed,
 } from './panel.js';
@@ -51,6 +60,34 @@ export interface PanelLoopOptions {
   noColor?: boolean;
   /** default process.stderr — progress is never machine output */
   stream?: PanelStream;
+  /** keyboard source, default process.stdin — interactivity engages only when
+   *  it is a raw-mode-capable TTY (and the panel itself is rendering) */
+  input?: KeyInput;
+}
+
+/** Bounds one artifact read: prompts/results beyond this render truncated. */
+const ARTIFACT_READ_CAP = 64 * 1024;
+
+/**
+ * Read a worker-writable artifact without following symlinks (a worker may
+ * have planted one — mirror of safe-write's O_NOFOLLOW stance on the read
+ * side), capped at ARTIFACT_READ_CAP. undefined when unreadable (not yet
+ * written, symlink, permission) — callers retry on a later paint.
+ */
+function readArtifact(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const size = fstatSync(fd).size;
+    const len = Math.min(size, ARTIFACT_READ_CAP);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, 0);
+    return size > ARTIFACT_READ_CAP ? buf.toString('utf8') + '\n… truncated' : buf.toString('utf8');
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 /** Gating precedence: --plain / not-a-TTY / TERM=dumb → line mode; NO_COLOR / --no-color strip SGR only. */
@@ -137,19 +174,151 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     }
   };
 
+  // ---- interactive UI state (viewer-local; never part of the event fold) ----
+  interface UiState {
+    view: 'overview' | 'detail';
+    selectedSeq?: number;
+    detailScroll: number;
+    promptExpanded: boolean;
+  }
+  const ui: UiState = { view: 'overview', detailScroll: 0, promptExpanded: false };
+  const artifacts = new Map<number, AgentArtifacts>();
+  let finished = false;
+  let lastManifest: ReturnType<typeof readManifest>;
+  let lastStatus: RunStatus = 'running';
+
+  /** Lazy per-agent artifact reads, cached once readable; result.json only after settle. */
+  const artifactsFor = (seq: number, final: boolean): AgentArtifacts => {
+    let art = artifacts.get(seq);
+    if (!art) {
+      art = {};
+      artifacts.set(seq, art);
+    }
+    const row = state.agents.get(seq);
+    if (!row) return art;
+    const agentDir = join(dir, 'agents', agentDirName(row.seq, row.label));
+    if (art.prompt === undefined) art.prompt = readArtifact(join(agentDir, 'prompt.md'));
+    if (art.result === undefined && (row.endedTs !== undefined || final)) {
+      const raw = readArtifact(join(agentDir, 'result.json'));
+      if (raw !== undefined) {
+        try {
+          art.result = JSON.parse(raw) as unknown;
+        } catch {
+          /* torn write — retry next paint */
+        }
+      }
+    }
+    return art;
+  };
+
   const paint = (manifest: ReturnType<typeof readManifest>, status: RunStatus, nowMs: number, final: boolean): void => {
-    const frame = renderFrame(state, {
-      // || not ??: a detached/0-size PTY (CI, `script`) reports 0×0
-      cols: stream.columns || 80,
-      rows: stream.rows || 24,
-      nowMs,
-      color: mode.color,
-      runStatus: status,
-      spentFloor: manifest?.budget.spent,
-    });
+    // || not ??: a detached/0-size PTY (CI, `script`) reports 0×0
+    const cols = stream.columns || 80;
+    const rows = stream.rows || 24;
+    const base = { cols, rows, nowMs, color: mode.color, runStatus: status, spentFloor: manifest?.budget.spent };
+    let frame: string;
+    if (interactive && ui.view === 'detail' && ui.selectedSeq !== undefined && state.agents.has(ui.selectedSeq)) {
+      const detail = renderDetailFrame(state, ui.selectedSeq, artifactsFor(ui.selectedSeq, final), {
+        ...base,
+        scroll: ui.detailScroll,
+        promptExpanded: ui.promptExpanded,
+        keymap: final ? undefined : DETAIL_KEYMAP,
+      });
+      ui.detailScroll = Math.min(ui.detailScroll, detail.maxScroll); // self-heal on shrink/resize
+      frame = detail.text;
+    } else {
+      frame = renderFrame(state, {
+        ...base,
+        selectedSeq: interactive ? ui.selectedSeq : undefined,
+        keymap: interactive && !final ? overviewKeymap : undefined,
+      });
+    }
     if (final) region.close(drainNarrator(), frame);
     else region.update(drainNarrator(), frame);
   };
+
+  /** Immediate feedback on a keypress: repaint from the last tick's snapshot.
+   *  Safe because readEventsFrom is sync — 'data' events only fire while the
+   *  loop is parked at sleep(), never mid-fold; the next tick repaints again
+   *  with ≤125ms-fresher state. */
+  const repaintNow = (): void => {
+    if (finished || opts.quiet || mode.kind !== 'panel') return;
+    paint(lastManifest, lastStatus, Date.now(), false);
+  };
+
+  const moveSelection = (delta: 1 | -1): void => {
+    const seqs = selectableSeqs(state);
+    if (seqs.length === 0) return;
+    const idx = ui.selectedSeq === undefined ? -1 : seqs.indexOf(ui.selectedSeq);
+    if (idx === -1) ui.selectedSeq = delta === 1 ? seqs[0] : seqs.at(-1);
+    else ui.selectedSeq = seqs[Math.min(seqs.length - 1, Math.max(0, idx + delta))];
+  };
+
+  const detachViewer = (): void => {
+    stream.write('\n■ detached (the run continues); re-attach: ultracode watch\n');
+    process.exit(130); // keys' exit backstop restores cooked mode; LiveRegion's restores the cursor
+  };
+
+  const onSigCont = (): void => {
+    keysAtt = attachKeys(input, onKey);
+    stream.write('\x1b[?25l'); // re-hide the cursor (inverse of the suspend hand-back)
+    region.reset();
+    repaintNow();
+  };
+
+  const suspend = (): void => {
+    // Hand the terminal back to the shell: cooked mode, visible cursor, and
+    // the painted region left behind in scrollback.
+    keysAtt.detach();
+    stream.write('\x1b[?25h');
+    region.reset();
+    process.once('SIGCONT', onSigCont);
+    process.kill(process.pid, 'SIGTSTP');
+  };
+
+  const onKey = (key: Key): void => {
+    if (finished) return;
+    if (key.type === 'ctrl-c') {
+      sigintHandler();
+      repaintNow(); // surface the stop notice without waiting for the tick
+      return;
+    }
+    if (key.type === 'ctrl-d' || (key.type === 'char' && key.ch === 'q')) {
+      detachViewer();
+      return;
+    }
+    if (key.type === 'ctrl-z') {
+      suspend();
+      return;
+    }
+    if (ui.view === 'detail') {
+      if (key.type === 'esc') ui.view = 'overview'; // selection retained
+      else if (key.type === 'down' || (key.type === 'char' && key.ch === 'j')) ui.detailScroll++;
+      else if (key.type === 'up' || (key.type === 'char' && key.ch === 'k')) ui.detailScroll = Math.max(0, ui.detailScroll - 1);
+      else if (key.type === 'enter') ui.promptExpanded = !ui.promptExpanded;
+      else return;
+    } else {
+      if (key.type === 'down' || (key.type === 'char' && key.ch === 'j')) moveSelection(1);
+      else if (key.type === 'up' || (key.type === 'char' && key.ch === 'k')) moveSelection(-1);
+      else if (key.type === 'enter') {
+        if (ui.selectedSeq === undefined) moveSelection(1);
+        else {
+          ui.view = 'detail';
+          ui.detailScroll = 0;
+          ui.promptExpanded = false;
+        }
+      } else if (key.type === 'esc') ui.selectedSeq = undefined;
+      else return;
+    }
+    repaintNow();
+  };
+
+  const input: KeyInput = opts.input ?? process.stdin;
+  let keysAtt =
+    mode.kind === 'panel' && !opts.quiet ? attachKeys(input, onKey) : { interactive: false, detach: (): void => {} };
+  const interactive = keysAtt.interactive;
+  const overviewKeymap = `↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c ${opts.mode === 'attach' ? 'stop' : 'detach'}`;
+  const DETAIL_KEYMAP = 'j/k scroll · ⏎ prompt · esc back · q detach';
 
   // A resize rewraps already-painted lines and invalidates the cursor-up
   // count — abandon the old region and paint fresh below on the next tick.
@@ -168,6 +337,8 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
       // snapshot (a second read could observe a newer generation mid-frame).
       const manifest = readManifest(dir);
       const status: RunStatus = manifest ? liveStatus(manifest) : 'running';
+      lastManifest = manifest;
+      lastStatus = status;
 
       if (manifest && isTerminal(status)) {
         if (mode.kind === 'plain' && !opts.quiet) writePlain(page.events);
@@ -192,7 +363,10 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
             if (sandboxHint) stream.write(`⚠ ${sandboxHint}\n`);
           } else {
             if (sandboxHint) notices.push(`· ⚠ ${sandboxHint}`);
-            // Freeze elapsed at the recorded end — the final frame stays in scrollback.
+            // Freeze elapsed at the recorded end — the final frame stays in
+            // scrollback (in the detail view when one is open: the user's
+            // context, now showing the final outcome).
+            finished = true;
             paint(manifest, status, manifest.endedAt ? Date.parse(manifest.endedAt) : Date.now(), true);
           }
         }
@@ -205,7 +379,10 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
       await sleep(mode.kind === 'panel' ? PANEL_TICK_MS : PLAIN_TICK_MS);
     }
   } finally {
+    finished = true;
+    keysAtt.detach();
     process.removeListener('SIGINT', sigintHandler);
+    process.removeListener('SIGCONT', onSigCont);
     stream.removeListener?.('resize', onResize);
   }
 }

@@ -128,7 +128,7 @@ key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0"
 
 ### 1.5 Progress events
 
-The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens,estimated?}, workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `logs --follow`, and MCP long-poll all tail this file by byte offset (`status --watch` polls manifest.json instead); the MCP long-poll wakes only on *renderable* lines, so usage ticks never spin it.
+The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_tool {seq,name,status:'started'|'completed'|'failed'|'declined'}` (unthrottled discrete tool-call tick, display-only — name sanitized + capped at 80 chars at emission, ≤5000 events per dispatch; feeds the panel's live count and detail-view activity feed), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens,estimated?,toolCalls?}` (`toolCalls` is the authoritative started-tool count; absent on skip/cached and on pre-0.2 streams), `workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `logs --follow`, and MCP long-poll all tail this file by byte offset (`status --watch` polls manifest.json instead); the MCP long-poll wakes only on *renderable* lines, so usage and tool ticks never spin it.
 
 ---
 
@@ -150,12 +150,12 @@ export interface SpawnPlan { bin: string; argv: string[]; env: Record<string,str
 }
 
 export type AgentEvent =
-  | { kind:'session';  sessionId: string }
+  | { kind:'session';  sessionId: string; model?: string }  // model when the stream reports one (init lines)
   | { kind:'message';  text: string }                       // assistant text; consumers keep the LAST
-  | { kind:'tool';     name: string; status:'started'|'completed'|'failed' }
-  | { kind:'usage';    usage: Partial<NormalizedUsage> }
+  | { kind:'tool';     name: string; status:'started'|'completed'|'failed'|'declined' }
+  | { kind:'usage';    usage: Partial<NormalizedUsage>; interim?: boolean; threadCumulative?: boolean }
   | { kind:'result';   text?: string; structured?: unknown; isError: boolean;
-      errorKind?: ErrorKind; raw: unknown }
+      errorKind?: ErrorKind; raw?: unknown }
   | { kind:'notice';   message: string };                    // benign (e.g. codex "Reconnecting… n/5")
 
 export type ErrorKind = 'auth'|'schema-rejected'|'max-turns'|'budget'|'rate-limit'
@@ -271,7 +271,9 @@ ultracode run <script.js | name> [--args '<json>'] [--backend id]
               [--budget 500k|+500k] [--max-concurrency N] [--permission safe|auto|danger]
               [--timeout minutes] [--detach] [--json] [--plain] [--no-color]
    # default: FOREGROUND attach (live panel on a TTY), exit 0/1 mirrors run status; --detach prints runId + paths
-ultracode watch  <runId> [--plain] [--no-color] # live panel: phases, per-agent tokens/elapsed, budget; Ctrl-C detaches
+ultracode watch  <runId> [--plain] [--no-color] # live panel: phases, per-agent tokens/elapsed, budget; Ctrl-C detaches.
+                                                # Interactive on a TTY: ↑/↓ (j/k) select an agent, ⏎ opens its detail view
+                                                # (prompt / tool activity / outcome), esc back, q detach
 ultracode status <runId> [--watch] [--json]     # phases, agent table, budget, heartbeat
 ultracode logs   <runId> [--follow] [--agent seq]
 ultracode resume <runId> [--script f] [--args j]

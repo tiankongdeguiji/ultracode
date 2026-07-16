@@ -252,6 +252,15 @@ return { r }`);
     expect(output.error).toBeUndefined();
   });
 
+  it('MOCK:tools makes totalToolCalls exact (including zero)', async () => {
+    const { output } = await run(`
+const a = await agent('MOCK:tools 4 MOCK:ok done', { label: 'busy' })
+const b = await agent('MOCK:tools 0 MOCK:ok done', { label: 'idle' })
+return { a, b }`);
+    expect(output.error).toBeUndefined();
+    expect(output.totalToolCalls).toBe(4); // 4 + explicit 0 — not the historical 1-per-agent default
+  });
+
   it('script throw sets error and preserves partials', async () => {
     const { output } = await run(`
 await agent('MOCK:ok first')

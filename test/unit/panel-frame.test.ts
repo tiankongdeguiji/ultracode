@@ -187,6 +187,60 @@ describe('panel frame', () => {
     expect(lines[childIdx + 2]).toContain('✓ c-scan');
   });
 
+  it('selectedSeq marks the row with ❯ (bold cyan in color mode) without shifting other lines', () => {
+    const base = renderFrame(richState(), FRAME_OPTS).split('\n');
+    const selected = renderFrame(richState(), { ...FRAME_OPTS, selectedSeq: 6 }).split('\n');
+    expect(selected).toHaveLength(base.length);
+    const idx = base.findIndex((l) => l.includes('review cli'));
+    expect(selected[idx]).toBe(base[idx]!.replace('⎿', '❯')); // marker only — spacing identical
+    for (let i = 0; i < base.length; i++) {
+      if (i !== idx) expect(selected[i]).toBe(base[i]);
+    }
+    const colored = renderFrame(richState(), { ...FRAME_OPTS, color: true, selectedSeq: 6 });
+    expect(colored).toContain('\x1b[36;1m❯\x1b[0m');
+    expect(colored).toContain('\x1b[1mreview cli'); // bold label
+  });
+
+  it('the selected row is exempt from collapse folding at every level', () => {
+    // Level 0: repo-mapper (seq 0) folds into "+1 done" by default…
+    const base = renderFrame(richState(), FRAME_OPTS);
+    expect(base).toContain('… +1 done');
+    expect(base).not.toContain('repo-mapper');
+    // …but stays visible while selected (and the fold notice disappears with it).
+    const withSel = renderFrame(richState(), { ...FRAME_OPTS, selectedSeq: 0 });
+    expect(withSel).toContain('❯ ✓ repo-mapper');
+    expect(withSel).not.toContain('… +1 done');
+    // Level 2 (small terminal): the fully-settled Explore phase collapses to
+    // its header unless the selection lives inside it. (The last-resort
+    // hard truncation on even smaller terminals is selection-blind by design.)
+    const small = renderFrame(richState(), { ...FRAME_OPTS, rows: 16, selectedSeq: 0 });
+    expect(small).toContain('❯ ✓ repo-mapper');
+    expect(small.split('\n').length).toBeLessThanOrEqual(15);
+    const noSel = renderFrame(richState(), { ...FRAME_OPTS, rows: 16 });
+    expect(noSel).not.toContain('repo-mapper'); // without selection the phase folds to its header
+  });
+
+  it('selection also survives the queued-overflow fold', () => {
+    const s = createPanelState({ runName: 'q', budgetTotal: null, startedAtMs: 0 });
+    foldEvent(s, ev('phase_started', { title: 'P' }));
+    for (let i = 0; i < 8; i++) foldEvent(s, ev('agent_queued', { seq: i, label: `q${i}`, phase: 'P' }, i));
+    const frame = renderFrame(s, { ...FRAME_OPTS, nowMs: 10_000, selectedSeq: 7 });
+    expect(frame).toContain('❯ ◌ q7');
+    expect(frame).toContain('… +2 queued'); // one fewer hidden — the selected row escaped the fold
+  });
+
+  it('keymap renders as the last line and counts toward the height budget', () => {
+    const keymap = '↑/↓ select · ⏎ details · q detach';
+    const frame = renderFrame(richState(), { ...FRAME_OPTS, keymap });
+    expect(frame.split('\n').at(-1)).toBe(keymap);
+    for (const rows of [4, 6, 12]) {
+      const lines = renderFrame(richState(), { ...FRAME_OPTS, rows, keymap }).split('\n');
+      expect(lines.length).toBeLessThanOrEqual(Math.max(1, rows - 1));
+    }
+    const colored = renderFrame(richState(), { ...FRAME_OPTS, color: true, keymap });
+    expect(colored).toContain(`\x1b[2m${keymap}\x1b[0m`);
+  });
+
   it('hostile control bytes in events cannot reach the frame', () => {
     const s = createPanelState({ runName: 'inj', budgetTotal: null, startedAtMs: 0 });
     foldEvent(s, ev('agent_started', { seq: 0, label: 'l\x1b[10A\x1b[2J', backend: 'mock', model: 'm\x9b1J' }, 1));

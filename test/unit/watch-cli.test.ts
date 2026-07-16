@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -61,6 +62,32 @@ function fakeTty(): PanelStream & { chunks: string[] } {
       return true;
     },
   };
+}
+
+/** stdin-shaped fake: press() delivers bytes as if typed on a raw-mode TTY. */
+function fakeStdin(isTTY = true) {
+  const emitter = new EventEmitter();
+  const s = {
+    isTTY,
+    rawCalls: [] as boolean[],
+    setRawMode(m: boolean) {
+      s.rawCalls.push(m);
+    },
+    on: (e: 'data', l: (c: Buffer | string) => void) => emitter.on(e, l),
+    removeListener: (e: 'data', l: (c: Buffer | string) => void) => emitter.removeListener(e, l),
+    resume: () => {},
+    pause: () => {},
+    press: (seq: string) => emitter.emit('data', Buffer.from(seq, 'utf8')),
+  };
+  return s;
+}
+
+async function waitForOutput(chunks: string[], needle: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!chunks.join('').includes(needle)) {
+    if (Date.now() > deadline) throw new Error(`never painted: ${needle}`);
+    await sleep(50);
+  }
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -267,4 +294,101 @@ return 1
     expect(code).toBe(1);
     expect(chunks.join('')).toContain('no run wf_000000000000');
   });
+});
+
+describe('interactive panel', () => {
+  const BUSY = `export const meta = { name: 'busy', description: 'd', phases: [{ title: 'Work' }] }
+phase('Work')
+await agent('MOCK:tools 2 MOCK:delay 15000 MOCK:ok done', { label: 'worker' })
+return 1
+`;
+
+  it('selects with arrows, drills into the live detail view, escs back, and freezes detail on stop', async () => {
+    const { dir } = makeRun(BUSY);
+    const { pid } = await launchRunner(dir);
+    const stream = fakeTty();
+    const stdin = fakeStdin();
+    const loop = panelLoop(dir, { mode: 'observe', noColor: true, stream, input: stdin });
+
+    await waitForOutput(stream.chunks, 'worker'); // agent row folded and painted
+    expect(stream.chunks.join('')).toContain('↑/↓ select'); // overview keymap on
+
+    stdin.press('\x1b[B'); // ↓ selects the first row — repaint is immediate
+    expect(stream.chunks.at(-1)).toContain('❯');
+
+    stdin.press('\r'); // ⏎ opens the detail view
+    const detail = stream.chunks.at(-1)!;
+    expect(detail).toContain('Prompt · 1 line'); // prompt.md readable while RUNNING (early write)
+    expect(detail).toContain('MOCK:tools 2 MOCK:delay 15000');
+    expect(detail).toContain('2 tool calls');
+    expect(detail).toContain('tool:mock-2');
+    expect(detail).toContain('Still running…');
+    expect(detail).toContain('j/k scroll');
+
+    stdin.press('\x1b'); // esc back to the overview, selection retained
+    expect(stream.chunks.at(-1)).toContain('❯');
+    expect(stream.chunks.at(-1)).not.toContain('Outcome');
+
+    stdin.press('\r'); // back into detail, then let the run get stopped under us
+    process.kill(pid, 'SIGTERM');
+    const { exitCode } = await loop;
+    expect(exitCode).toBe(1);
+    const final = stream.chunks.at(-2)!; // last frame write (before the cursor restore)
+    expect(final).toContain('Outcome'); // frozen in the detail view the user was reading
+    expect(final).toContain('failed: aborted'); // the stop settled the in-flight agent
+    expect(final).not.toContain('j/k scroll'); // keys are dead on the final frame
+    expect(stdin.rawCalls[0]).toBe(true);
+    expect(stdin.rawCalls.at(-1)).toBe(false); // cooked mode restored by the loop's finally
+  }, 30_000);
+
+  it('a 0x03 byte in attach mode triggers the graceful stop (raw mode swallows real SIGINT)', async () => {
+    const { dir } = makeRun(BUSY);
+    await launchRunner(dir);
+    const stream = fakeTty();
+    const stdin = fakeStdin();
+    const loop = panelLoop(dir, { mode: 'attach', noColor: true, stream, input: stdin });
+    await waitForOutput(stream.chunks, 'worker');
+
+    stdin.press('\x03');
+    const { exitCode } = await loop; // first ^C SIGTERMs the runner; the loop follows it to 'stopped'
+    expect(exitCode).toBe(1);
+    expect(stream.chunks.join('')).toContain('stopping run (Ctrl-C again to detach immediately)');
+    expect(readManifest(dir)!.status).toBe('stopped');
+  }, 30_000);
+
+  it('q detaches the viewer with exit 130 while the run continues', async () => {
+    const { dir } = makeRun(BUSY);
+    const { pid } = await launchRunner(dir);
+    const stream = fakeTty();
+    const stdin = fakeStdin();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('exit-called');
+    }) as never);
+    const loop = panelLoop(dir, { mode: 'attach', noColor: true, stream, input: stdin });
+    try {
+      await waitForOutput(stream.chunks, 'worker');
+      expect(() => stdin.press('q')).toThrow('exit-called');
+      expect(exitSpy).toHaveBeenCalledWith(130);
+      expect(stream.chunks.join('')).toContain('■ detached (the run continues)');
+      expect(readManifest(dir)!.status).toBe('running'); // q never signals the run
+    } finally {
+      exitSpy.mockRestore();
+      process.kill(pid, 'SIGTERM'); // cleanup; let the loop finish
+      await loop;
+    }
+  }, 30_000);
+
+  it('non-TTY stdin stays non-interactive: no raw mode, no keymap, no selection marker', async () => {
+    const { dir } = makeRun(HELLO);
+    await launchRunner(dir);
+    await waitTerminal(dir);
+    const stream = fakeTty();
+    const stdin = fakeStdin(false);
+    const { exitCode } = await panelLoop(dir, { mode: 'observe', noColor: true, stream, input: stdin });
+    expect(exitCode).toBe(0);
+    expect(stdin.rawCalls).toEqual([]);
+    const out = stream.chunks.join('');
+    expect(out).not.toContain('↑/↓ select');
+    expect(out).not.toContain('❯');
+  }, 20_000);
 });

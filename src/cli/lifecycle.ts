@@ -40,8 +40,10 @@ function renderEventLine(ev: TimestampedEvent): string | null {
       return `   agent[${ev.seq}] ${ev.label} ${ev.ok ? `done (${ev.totalTokens} tok)` : `FAILED: ${ev.error ?? ''}`}`;
     case 'agent_usage':
     case 'agent_model':
+    case 'agent_tool':
       // Live-tick noise for folding panels only: line consumers (logs
-      // --follow, MCP logTail) would emit ~1 line/s per running agent.
+      // --follow, MCP logTail) would emit ~1 line/s per running agent —
+      // and per-tool lines would also wake the MCP long-poll per call.
       return null;
     case 'child_started':
       return `▸ child workflow: ${ev.name}`;
