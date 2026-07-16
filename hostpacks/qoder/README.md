@@ -19,7 +19,7 @@ those sources, never the generated `dist-qoder/` tree.
 
 ## What `ultracode install qoder` additionally writes
 
-- The **always_on rule** (`.qoder/rules/ultracode-mode.md`) — keyword / budget → orchestrate.
+- The **always_on rule** (`.qoder/rules/ultracode-mode.md`) — the keyword "ultracode" → orchestrate.
   Qoder plugins cannot bundle rules, so the trigger is installer-written.
 
 ## Manual install (until marketplace)

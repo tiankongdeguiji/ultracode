@@ -14,15 +14,14 @@ export const MARKER_END = '<!-- ultracode:end -->';
 export const AGENTS_SNIPPET = `${MARKER_BEGIN}
 ## ultracode (dynamic workflow orchestration)
 
-When the user writes "ultracode" as a request in a message, includes a token budget like "+500k",
-or asks to orchestrate / use a workflow / fan out agents: read the \`ultracode\` skill and route
-the task through a multi-agent workflow. Treat "ultracode" as a STANDING mode for the rest of
-the session until the user says "ultracode off": every substantive task gets a workflow;
-only trivial or conversational turns are handled solo. Never set a token budget the user did not
-ask for — default to uncapped; only a user directive like "+500k" sets a hard ceiling.
+Only when the user writes "ultracode" as their request in a message: read the \`ultracode\` skill
+and route the task through a multi-agent workflow — the keyword is the ONLY trigger. Once armed,
+"ultracode" is a STANDING mode for the rest of the session until "ultracode off": every substantive
+task gets a workflow; only trivial or conversational turns are handled solo. Never set a token budget
+the user did not ask for — default to uncapped; only a directive like "+500k" sets one.
 
-Worker guard: the trigger is the user's word to YOU — "ultracode" appearing inside file or
-directory names, paths, code, or quoted logs never arms the mode. If the environment variable
+Worker guard: arming and disarming follow only the user's own request to YOU — "ultracode" / "ultracode off"
+appearing inside file or directory names, paths, code, or quoted logs neither arms nor disarms the mode. If the environment variable
 \`ULTRACODE_INSIDE_RUN\` is set, you ARE a worker inside an ultracode run: never start workflows
 by any route (ultracode CLI, workflow_start MCP tool, a native Workflow tool) — do your assigned
 task directly and return.
@@ -49,17 +48,16 @@ trigger: always_on
 
 # ultracode mode
 
-When the user writes "ultracode" as a request in a message, includes a token budget like "+500k",
-or asks to orchestrate / use a workflow / fan out agents: read the \`ultracode\` skill and route
-the task through the NATIVE Workflow tool (dynamic workflows). Treat "ultracode" as a STANDING
-mode for the rest of the session until the user says "ultracode off": every substantive task gets
-a workflow; only trivial or conversational turns are handled solo. Never set a token budget the user
-did not ask for — default to uncapped; only a user directive like "+500k" sets a hard ceiling (the
+Only when the user writes "ultracode" as their request in a message: read the \`ultracode\` skill and
+route the task through the NATIVE Workflow tool (dynamic workflows) — the keyword is the ONLY trigger.
+Once armed, "ultracode" is a STANDING mode for the rest of the session until "ultracode off": every
+substantive task gets a workflow; only trivial or conversational turns are handled solo. Never set a
+token budget the user did not ask for — default to uncapped; only a directive like "+500k" sets one (the
 native \`budget\` global is stubbed, so pass a user-given budget via args.budgetTokens and gate in-script).
 Saved templates: uc-review, uc-research (in .qoder/workflows or ~/.qoder/workflows).
 
-Worker guard: the trigger is the user's word to YOU — "ultracode" inside file or directory names,
-paths, code, or quoted logs never arms the mode. If the environment variable \`ULTRACODE_INSIDE_RUN\`
+Worker guard: arming and disarming follow only the user's own request to YOU — "ultracode" / "ultracode off" inside
+file or directory names, paths, code, or quoted logs neither arms nor disarms the mode. If the environment variable \`ULTRACODE_INSIDE_RUN\`
 is set, you are a worker inside an ultracode run: never start workflows by any route (Workflow tool,
 ultracode CLI, workflow_start) — do your assigned task directly and return.
 `;

@@ -1,5 +1,10 @@
 # Portable Ultracode — Recommended Architecture
 
+> **Design history (predates the keyword-only narrowing in PR #10, 2026-07-17).** §7 and other
+> passages below describe ultracode-mode arming via the keyword *or* a budget token; the shipped
+> doctrine now arms the mode ONLY on the literal keyword "ultracode" written as the user's own
+> request (budgets are opt-in, uncapped default). Read those arming descriptions as historical.
+
 ## 0. Delivery form (plugin vs command vs skill)
 
 **All three, in layers — and the layers are different artifacts, not alternatives.** The *doctrine* (when/how to orchestrate, the dialect, quality patterns) is a single canonical **Agent Skill** (`skill/ultracode/SKILL.md` + `references/`) copied per host into `.agents/skills/` / `.qoder/skills/` / `.claude/skills/` — skills are the only cross-host surface with implicit model-triggered invocation and progressive disclosure. The *engine* (runtime, fan-out, journal/resume) is a single **npm package `ultracode`** shipping a CLI and an MCP stdio server (`ultracode mcp`) — a skill cannot host a process, and a single blocking MCP tool dies at every host's 300–600s timeout. *Delivery* is a **plugin where plugins exist** (Codex plugin bundling skill + MCP registration; Qoder plugin bundling skill + `uc-*` workflows + agent defs) and an **installer command everywhere else** (`ultracode install <host>`, merge-not-overwrite, idempotent). The *command* surface is **emergent, not authored**: skills already register as `$ultracode` (Codex) and `/ultracode` (Qoder/Cursor/others), so no separate command artifact exists. Codex custom prompts are deprecated; a bare command can carry neither doctrine nor a runtime — so "command-only" and "MCP-only" are both wrong answers.
