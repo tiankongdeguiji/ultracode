@@ -97,6 +97,9 @@ export function statusCommand(runId: string, opts: { watch?: boolean; json?: boo
         process.stdout.write(JSON.stringify({ ...m, effectiveStatus: run.effectiveStatus }, null, 2) + '\n');
       } else {
         const phases = m.phases.map((p) => `${p.title}(${p.agentsDone})`).join(' → ') || '(none)';
+        // sanitizeText per line (it flattens newlines): name, phase titles,
+        // and error are script/worker-controlled manifest fields — the same
+        // injection boundary renderEvent enforces.
         process.stdout.write(
           [
             `${m.runId}  ${run.effectiveStatus}  ${m.name}`,
@@ -104,7 +107,8 @@ export function statusCommand(runId: string, opts: { watch?: boolean; json?: boo
             `  phases: ${phases}`,
             m.error ? `  error: ${m.error}` : null,
           ]
-            .filter(Boolean)
+            .filter((l): l is string => l !== null)
+            .map((l) => sanitizeText(l))
             .join('\n') + '\n',
         );
       }
@@ -182,7 +186,9 @@ export function listCommand(opts: { all?: boolean; reap?: boolean; json?: boolea
   }
   for (const r of runs) {
     process.stdout.write(
-      `${r.runId}  ${r.effectiveStatus.padEnd(9)}  agents:${String(r.manifest.agentCount).padEnd(4)} ${r.manifest.name}  (${r.manifest.startedAt})\n`,
+      sanitizeText(
+        `${r.runId}  ${r.effectiveStatus.padEnd(9)}  agents:${String(r.manifest.agentCount).padEnd(4)} ${r.manifest.name}  (${r.manifest.startedAt})`,
+      ) + '\n',
     );
   }
   return 0;

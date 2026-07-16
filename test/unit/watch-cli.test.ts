@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { newRunId } from '../../src/store/layout.js';
 import { createRunDir } from '../../src/store/runstore.js';
 import { readManifest, writeManifest, isTerminal } from '../../src/store/manifest.js';
@@ -161,6 +164,38 @@ return 'finished'
     expect(exitCode).toBe(0);
     expect(stream.chunks).toEqual([]);
   }, 20_000);
+
+  it('observe-mode Ctrl-C detaches WITHOUT signaling the run (subprocess, real SIGINT)', async () => {
+    const SLOW = `export const meta = { name: 'slow-watch', description: 'd' }
+await agent('MOCK:delay 20000 MOCK:ok done', { label: 'sleeper' })
+return 1
+`;
+    const { root, runId, dir } = makeRun(SLOW);
+    await launchRunner(dir);
+
+    const here = dirname(fileURLToPath(import.meta.url));
+    const mainTs = join(here, '../../src/cli/main.ts');
+    const tsxLoader = createRequire(import.meta.url).resolve('tsx');
+    const watcher = spawn(process.execPath, ['--import', tsxLoader, mainTs, 'watch', runId, '--home', root, '--plain'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let err = '';
+    watcher.stderr!.setEncoding('utf8');
+    watcher.stderr!.on('data', (c: string) => (err += c));
+    // Give the watcher time to attach, then Ctrl-C it.
+    await sleep(2500);
+    watcher.kill('SIGINT');
+    const code = await new Promise<number | null>((resolve) => watcher.on('close', (c) => resolve(c)));
+
+    expect(code).toBe(130);
+    expect(err).toContain('detached (the run continues)');
+    // The load-bearing contract: the RUN survived the watcher's Ctrl-C.
+    const m = readManifest(dir)!;
+    expect(m.status).toBe('running');
+    expect(() => process.kill(m.pid, 0)).not.toThrow();
+    process.kill(m.pid, 'SIGTERM'); // cleanup
+    await waitTerminal(dir);
+  }, 30_000);
 
   it('watch of an orphaned run reports it and exits 1, in both plain and panel modes', async () => {
     const { root, runId, dir } = makeRun(HELLO);

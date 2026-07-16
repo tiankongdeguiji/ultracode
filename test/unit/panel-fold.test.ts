@@ -47,6 +47,18 @@ describe('panel fold', () => {
     expect(s.order).toEqual([0]);
   });
 
+  it('agent_completed settles the estimated flag both ways (stale interim ~ cleared, estimated total marked)', () => {
+    const s = fold(createPanelState(seed()), [
+      ev('agent_started', { seq: 0, label: 'a', backend: 'mock' }),
+      ev('agent_usage', { seq: 0, totalTokens: 50, estimated: true }), // interim estimate → ~
+      ev('agent_completed', { seq: 0, label: 'a', ok: true, totalTokens: 60, estimated: false }),
+      ev('agent_started', { seq: 1, label: 'b', backend: 'mock' }),
+      ev('agent_completed', { seq: 1, label: 'b', ok: true, totalTokens: 40, estimated: true }),
+    ]);
+    expect(s.agents.get(0)).toMatchObject({ tokens: 60, estimated: false }); // real total, no stale ~
+    expect(s.agents.get(1)).toMatchObject({ tokens: 40, estimated: true }); // estimated total keeps ~
+  });
+
   it('agent_usage is monotonic, stops after completion, and ignores unknown seqs', () => {
     const s = fold(createPanelState(seed()), [
       ev('agent_started', { seq: 0, label: 'a', backend: 'mock' }, 1),

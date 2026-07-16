@@ -267,6 +267,7 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       const row = rowFor(state, e);
       row.endedTs = num(e.ts);
       row.tokens = num(e.totalTokens) ?? row.tokens; // authoritative
+      row.estimated = e.estimated === true; // authoritative too — clears a stale interim ~
       const error = str(e.error);
       if (e.skipped === true) row.status = 'skipped';
       else if (e.cached === true || (!existed && e.ok === true && (num(e.totalTokens) ?? 0) === 0)) {

@@ -266,6 +266,25 @@ describe('AgentCallExecutor progress', () => {
     closed.length = 0;
     await new AgentCallExecutor(adapter2, {}).execute(spec(), signal);
     expect(closed).toEqual([]);
+
+    // A buildResume-backed schema repair must flag its sidecar resumedSession —
+    // this is what stops the codex rollout tail from re-ticking the prior
+    // attempt's history (silently doubled live tokens otherwise).
+    class ResumableSidecarAdapter extends SidecarAdapter {
+      override buildResume(_s: string, _p: string, req: AgentRequest): SpawnPlan | null {
+        return this.buildSpawn(req);
+      }
+    }
+    const adapter3 = new ResumableSidecarAdapter('emulated', [
+      { lines: [{ session: 's11' }, { text: '{"count": "bad"}' }, { done: true, usage: { inputTokens: 5, outputTokens: 1 } }] },
+      { lines: [{ session: 's11' }, { text: '{"count": 7}' }, { done: true, usage: { inputTokens: 5, outputTokens: 1 } }] },
+    ]);
+    sidecarOpts.length = 0;
+    const schema: JsonSchema = { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] };
+    const { onProgress: onProgress3 } = collect();
+    const out3 = await new AgentCallExecutor(adapter3, { usageTickIntervalMs: 0 }).execute(spec({ schema }), signal, onProgress3);
+    expect(out3.ok).toBe(true);
+    expect(sidecarOpts).toEqual([{ resumedSession: false }, { resumedSession: true }]);
   });
 
   it('works without an onProgress callback (no observable change)', async () => {

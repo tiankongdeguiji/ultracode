@@ -159,10 +159,11 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     stream.on?.('resize', onResize);
   }
   try {
+    const panelFolds = mode.kind === 'panel' && !opts.quiet; // plain/quiet never render PanelState
     for (;;) {
       const page = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
       offset = page.nextOffset;
-      for (const ev of page.events) foldEvent(state, ev);
+      if (panelFolds) for (const ev of page.events) foldEvent(state, ev);
       // One manifest read per tick: status and spentFloor come from the same
       // snapshot (a second read could observe a newer generation mid-frame).
       const manifest = readManifest(dir);
@@ -174,7 +175,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
         for (;;) {
           const rest = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
           offset = rest.nextOffset;
-          for (const ev of rest.events) foldEvent(state, ev);
+          if (panelFolds) for (const ev of rest.events) foldEvent(state, ev);
           if (mode.kind === 'plain' && !opts.quiet) writePlain(rest.events);
           if (!rest.hasMore) break;
         }
@@ -198,11 +199,9 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
         return { exitCode: status === 'completed' ? 0 : 1 };
       }
 
-      if (!opts.quiet) {
-        if (mode.kind === 'plain') writePlain(page.events);
-        else paint(manifest, status, Date.now(), false);
-      }
-      if (page.hasMore) continue; // catching up on a backlog — page again without sleeping
+      if (mode.kind === 'plain' && !opts.quiet) writePlain(page.events);
+      if (page.hasMore) continue; // catching up on a backlog — no repaint, no sleep
+      if (panelFolds) paint(manifest, status, Date.now(), false);
       await sleep(mode.kind === 'panel' ? PANEL_TICK_MS : PLAIN_TICK_MS);
     }
   } finally {

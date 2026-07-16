@@ -116,18 +116,19 @@ interface AgentOptions {
 Append-only `journal.jsonl`, one writer (the runner). Cache key chain, Qoder-compatible in construction:
 
 ```
-key_0 = "u1:" + sha256(scriptSourceHash + "\0" + stableStringify(args))
+key_0 = "u1:" + sha256("ultracode-seed" + "\0" + stableStringify(args) + "\0" + permission)
+# (script hash deliberately EXCLUDED from the seed — resume-after-edit must keep the unchanged prefix)
 key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0"
         + stableStringify({ agentType, isolation, model, effort, schema, backend, cwd }))
 ```
 
-(`stableStringify` = sorted-key deterministic JSON; absent fields omitted.) Records: `{t:'started', runId, engineVersion, scriptHash, argsHash}`, `{t:'agent', seq, key, status:'ok'|'error'|'skip', label, phase, backend, model?, sessionId?, totalTokens, resultRef, error?}`, `{t:'child-enter'|'child-exit', name}`.
+(`stableStringify` = sorted-key deterministic JSON; absent fields omitted.) Records: `{t:'started', runId, engineVersion, scriptHash, argsHash}`, `{t:'agent', seq, key, status:'ok'|'error'|'skip', label, phase, backend, model?, cached?, sessionId?, totalTokens, resultRef, error?}`, `{t:'child-enter'|'child-exit', name}`.
 
 **Resume** (`resumeFromRunId`): prior run must be terminal (pid dead + manifest status ∉ running). New run gets fresh runId + fresh journal; the old journal is loaded as an ordered replay queue. `nextCachedResult(key)` compares sequentially; every hit resolves that `agent()` **instantly** from `resultRef` (re-read from the old run's `agents/` dir); the **first miss sets `prefixMissed = true` and disables all later hits** — exactly the longest-unchanged-prefix contract. Determinism holds because banned entropy sources + instant cached resolution make the microtask interleaving reproducible up to the first live call; beyond that everything runs live anyway. Same script + same args ⇒ full cache hit.
 
 ### 1.5 Progress events
 
-The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens}, workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `status --watch`, `logs --follow`, and MCP long-poll all tail this file by byte offset; the MCP long-poll wakes only on *renderable* lines, so usage ticks never spin it.
+The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens,estimated?}, workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `status --watch`, `logs --follow`, and MCP long-poll all tail this file by byte offset; the MCP long-poll wakes only on *renderable* lines, so usage ticks never spin it.
 
 ---
 
@@ -266,10 +267,10 @@ There is **no long-lived daemon**. Every run is its own detached process: `daemo
 ### 4.2 CLI
 
 ```
-ultracode run <script.js | name> [--args '<json>'] [--backend id] [--model m] [--effort e]
+ultracode run <script.js | name> [--args '<json>'] [--backend id]
               [--budget 500k|+500k] [--max-concurrency N] [--permission safe|auto|danger]
-              [--cwd dir] [--foreground] [--timeout 2h] [--json]
-   # default: detach, print runId + paths; --foreground tails events until terminal, exit 0/1 mirrors run status
+              [--timeout minutes] [--detach] [--json] [--plain] [--no-color]
+   # default: FOREGROUND attach (live panel on a TTY), exit 0/1 mirrors run status; --detach prints runId + paths
 ultracode watch  <runId> [--plain] [--no-color] # live panel: phases, per-agent tokens/elapsed, budget; Ctrl-C detaches
 ultracode status <runId> [--watch] [--json]     # phases, agent table, budget, heartbeat
 ultracode logs   <runId> [--follow] [--agent seq]
@@ -312,7 +313,7 @@ script: await agent(prompt, {schema, label})
   → miss (prefix broken from here on):
       adapter.checkSchema → adapter.buildSpawn → spawn.ts (own pgid, cwd=worktree if isolation)
       stdout → ndjson splitter → adapter.createParser() → AgentEvent[]
-        → events.jsonl (agent_progress), transcript.jsonl (raw)
+        → events.jsonl (agent_usage/agent_retry/agent_model ticks), transcript.jsonl (raw)
       exit → adapter.classifyExit → retryable? (retries/stallMs budget) → respawn or fail
       structured pipeline: extract → ajv(original schema) → repair-resume ≤2 → value | WorkflowSchemaError
       usage → BudgetAccount.add → journal.append({t:'agent', key, status, totalTokens, resultRef})

@@ -83,6 +83,8 @@ type RunEventBody =
       /** resolved from a prior run's journal (prefix replay) — consumed zero tokens */
       cached?: boolean;
       totalTokens: number;
+      /** the total contains chars/4 estimates (backend omitted usage) */
+      estimated?: boolean;
       error?: string;
     }
   | { type: 'workflow_log'; message: string }
@@ -400,6 +402,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
           phase: spec.phase,
           ok: outcome.ok,
           totalTokens: outcome.usage.totalTokens,
+          estimated: outcome.usage.estimated,
           error: outcome.error,
         });
         onAgentSettled?.({
@@ -424,6 +427,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
           phase: spec.phase,
           ok: false,
           totalTokens: outcome.usage.totalTokens,
+          estimated: outcome.usage.estimated,
           error: outcome.error,
         });
         onAgentSettled?.({
@@ -450,6 +454,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         phase: spec.phase,
         ok: true,
         totalTokens: outcome.usage.totalTokens,
+        estimated: outcome.usage.estimated,
       });
       onAgentSettled?.({
         spec,
