@@ -16,6 +16,15 @@ const here = dirname(fileURLToPath(import.meta.url));
 const mainTs = join(here, '../../src/cli/main.ts');
 const tsxLoader = createRequire(import.meta.url).resolve('tsx');
 
+// Spawned MCP servers must resolve their store from cwd, not an inherited
+// $ULTRACODE_HOME (ultracodeRoot prefers the override) — else the isolated-store
+// and restart tests would read a different store than they wrote.
+function childEnv(): Record<string, string> {
+  const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+  delete env.ULTRACODE_HOME;
+  return env;
+}
+
 const HELLO = `export const meta = { name: 'mcp-hello', description: 'd', phases: [{ title: 'Greet' }] }
 phase('Greet')
 const g = await agent('MOCK:ok hi-from-mcp', { label: 'greeter' })
@@ -33,13 +42,11 @@ describe('MCP triad', () => {
   beforeAll(async () => {
     projectDir = mkdtempSync(join(tmpdir(), 'uc-mcp-'));
     client = new Client({ name: 'test-client', version: '0.0.0' });
-    const env: Record<string, string> = { ...(process.env as Record<string, string>) };
-    delete env.ULTRACODE_HOME; // isolated-store tests pass cwd; env must not override it
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env,
+      env: childEnv(),
     });
     await client.connect(transport);
   }, 30_000);
@@ -211,7 +218,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: { ...(process.env as Record<string, string>), ULTRACODE_INSIDE_RUN: '1' },
+      env: { ...childEnv(), ULTRACODE_INSIDE_RUN: '1' },
     });
     await inside.connect(transport);
     try {
@@ -303,7 +310,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: process.env as Record<string, string>,
+      env: childEnv(),
     });
     await second.connect(transport);
     try {
