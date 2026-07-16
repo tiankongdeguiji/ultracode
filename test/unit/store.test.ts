@@ -221,6 +221,24 @@ describe('recentRuns', () => {
     expect(runs.map((r) => r.runId)).toEqual(ids.slice(-DEFAULT_LIST_COUNT));
   });
 
+  it('at the exact cap boundary (10 runs) shows all with hidden 0', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < DEFAULT_LIST_COUNT; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    const { runs, hidden } = recentRuns(root, {});
+    expect(runs).toHaveLength(DEFAULT_LIST_COUNT);
+    expect(hidden).toBe(0);
+  });
+
+  it('one past the cap boundary (11 runs) shows 10 with hidden 1', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < DEFAULT_LIST_COUNT + 1; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    const { runs, hidden } = recentRuns(root, {});
+    expect(runs).toHaveLength(DEFAULT_LIST_COUNT);
+    expect(hidden).toBe(1);
+  });
+
   it('an explicit count sets the cap', () => {
     const root = tmpRoot();
     const base = Date.now();

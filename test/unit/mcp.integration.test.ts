@@ -33,11 +33,13 @@ describe('MCP triad', () => {
   beforeAll(async () => {
     projectDir = mkdtempSync(join(tmpdir(), 'uc-mcp-'));
     client = new Client({ name: 'test-client', version: '0.0.0' });
+    const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+    delete env.ULTRACODE_HOME; // isolated-store tests pass cwd; env must not override it
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: process.env as Record<string, string>,
+      env,
     });
     await client.connect(transport);
   }, 30_000);

@@ -109,7 +109,7 @@ program
   .option('--count <n>', 'max runs to show (default 10; also caps --all)')
   .option('--all', 'show every run: no recency filter, uncapped unless --count is given')
   .option('--reap', 'finalize orphaned runs first')
-  .option('--json')
+  .option('--json', 'machine-readable JSON (also capped; pass --all or --count for the full set)')
   .option('--home <dir>')
   .action(async (opts: Record<string, string | boolean>) => {
     const { listCommand } = await import('./lifecycle.js');
