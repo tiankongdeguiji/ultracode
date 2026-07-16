@@ -33,6 +33,27 @@ describe('skill source', () => {
   });
 });
 
+describe('keyword-only arming is pinned to the doctrine', () => {
+  // The whole point of this doctrine: ONLY the literal keyword "ultracode" arms
+  // ultracode mode. A budget like "+500k" sizes the fleet once armed but never
+  // arms it. No other test asserts this, so without these tripwires a regression
+  // that re-couples budget syntax to arming ("+500k arms orchestration") would
+  // pass every existing case.
+  const flat = (text: string) => text.toLowerCase().replace(/\s+/g, ' ');
+
+  it('installed trigger texts name the keyword as the ONLY trigger', () => {
+    for (const text of [AGENTS_SNIPPET, QODER_RULE]) {
+      expect(flat(text)).toContain('the keyword is the only trigger');
+    }
+  });
+
+  it('the skill gates activation on the literal keyword only', () => {
+    const skill = flat(readFileSync(join(skillSourceDir(), 'SKILL.md'), 'utf8'));
+    expect(skill).toContain('use only when the user writes the keyword "ultracode"');
+    expect(skill).toContain('only the keyword "ultracode"');
+  });
+});
+
 describe('worker anti-nesting doctrine', () => {
   // Workers see these texts (trusted-cwd codex workers load user AGENTS.md and
   // the skill catalog; qoder always_on rules load into --print workers). Each

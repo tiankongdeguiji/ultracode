@@ -14,7 +14,7 @@ export async function installCommand(
       process.stdout.write(`${a.changed ? '✓' : '·'} ${prefix}${a.detail}: ${a.path}\n`);
     }
     if (!opts.dryRun) {
-      process.stdout.write(`\nDone. Say "ultracode: <task>" in ${host} to arm orchestration (the keyword is the only trigger; append "+500k" etc. only to set a budget once armed).\n`);
+      process.stdout.write(`\nDone. Say "ultracode: <task>" in ${host} to orchestrate — the keyword is the only trigger.\n`);
     }
     return 0;
   } catch (err) {

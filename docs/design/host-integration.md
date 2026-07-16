@@ -88,6 +88,13 @@ a resumable journal, and a token budget. You never do the subtask work inline
 when a workflow is running — you design, launch, monitor, and synthesize.
 
 ## 2. Ultracode mode (standing opt-in)
+
+> **Design history (predates the keyword-only narrowing in PR #10, 2026-07-17):** the
+> shipped doctrine now arms ultracode mode ONLY on the literal keyword "ultracode" written
+> as the user's own request — a budget like "+500k", "use a workflow" / "fan out agents" /
+> "orchestrate" phrasing, and task decomposability no longer arm it. Treat the arming (and the
+> "default budget 300k") descriptions in this section as design history, not current behavior.
+
 - The keyword "ultracode" ANYWHERE in a user message is a standing opt-in: from
   that message onward, route every substantive task in this session through a
   workflow unless the user says "ultracode off" or the task is trivially small.
