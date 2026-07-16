@@ -22,6 +22,8 @@ interface ScriptedAttempt {
   exit: number;
   /** print nothing and hang (for watchdog kills) instead of exiting */
   hang?: boolean;
+  /** wait this long before exiting (after printing lines) */
+  delayMs?: number;
 }
 
 /** Plays one scripted process per spawn/resume, in queue order. Line protocol:
@@ -40,7 +42,11 @@ class ScriptedAdapter implements BackendAdapter {
   private nextPlan(): SpawnPlan {
     const a = this.queue.shift() ?? { lines: [], exit: 1 };
     const prints = a.lines.map((l) => `console.log(${JSON.stringify(JSON.stringify(l))});`).join('');
-    const tail = a.hang ? 'setTimeout(()=>{}, 10000)' : `process.exit(${a.exit})`;
+    const tail = a.hang
+      ? 'setTimeout(()=>{}, 10000)'
+      : a.delayMs
+        ? `setTimeout(()=>process.exit(${a.exit}), ${a.delayMs})`
+        : `process.exit(${a.exit})`;
     return { bin: process.execPath, argv: ['-e', `${prints}${tail}`], env: {} };
   }
   buildSpawn(_req: AgentRequest): SpawnPlan {
@@ -237,4 +243,32 @@ describe('task-retry resume', () => {
     expect(outcome.ok).toBe(true);
     expect((outcome as { value?: unknown }).value).toBe('quick');
   });
+
+  it('a mid-stream session event with a different id is inert (first session wins)', async () => {
+    const adapter = new ScriptedAdapter([
+      // a compromised worker naming a sibling's session mid-stream must not
+      // redirect the retry-resume
+      { lines: [{ session: 's1' }, { text: 'work' }, { session: 'sibling-target' }], exit: 1 },
+      { lines: [{ session: 's1' }, { text: 'resumed' }, { done: true }], exit: 0 },
+    ]);
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    expect(outcome.ok).toBe(true);
+    expect(adapter.resumeCalls.map((r) => r.sessionId)).toEqual(['s1']);
+  });
+
+  it('the fresh fallback shares the attempt deadline instead of arming a second full window', async () => {
+    const adapter = new ScriptedAdapter([
+      { lines: [{ session: 's1' }], exit: 1 }, // attempt 1 fails fast, retryably
+      { lines: [], exit: 1, delayMs: 1_200 }, // resume: zero events, dies on its own late in the budget
+      { lines: [], exit: 0, hang: true }, // fresh fallback: hangs → must be killed at the REMAINING budget
+    ]);
+    const started = Date.now();
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 2_000 }), SIGNAL);
+    const elapsed = Date.now() - started;
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain('timed out');
+    // one 2s deadline for the whole logical attempt (plus slack) — a second
+    // full window would push this past ~3.2s
+    expect(elapsed).toBeLessThan(3_000);
+  }, 15_000);
 });

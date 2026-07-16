@@ -4,7 +4,7 @@
  * unit-adjacent tests (~2-4s each).
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -44,6 +44,11 @@ async function waitTerminal(dir: string, timeoutMs = 15_000): Promise<string> {
     await sleep(100);
   }
 }
+
+const TIMEOUT_PROBE = (opts: string) => `export const meta = { name: 'timeout-probe', description: 'd' }
+try { await agent('hi', { label: 'a'${opts} }) } catch (e) { return String(e) }
+return 'no timeout'
+`;
 
 function makeRun(source: string, config: Record<string, unknown> = {}) {
   const root = mkdtempSync(join(tmpdir(), 'uc-runner-'));
@@ -164,6 +169,31 @@ describe('detached runner', () => {
       expect(status).toBe('completed');
       const output = JSON.parse(readFileSync(join(dir, 'output.json'), 'utf8'));
       expect(output.result).toEqual({ g: 'hi' });
+    }
+  }, 40_000);
+
+  it('attemptTimeoutMs is ENFORCED end-to-end on a non-mock executor, and per-call timeoutMs wins', async () => {
+    // A fake hanging claude CLI proves the runner→mux→executor plumbing
+    // actually kills attempts — not merely that an override log was written.
+    const binDir = mkdtempSync(join(tmpdir(), 'uc-fakebin-'));
+    const fake = join(binDir, 'fake-claude.sh');
+    writeFileSync(fake, '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+    const prev = process.env.ULTRACODE_CLAUDE_BIN;
+    process.env.ULTRACODE_CLAUDE_BIN = fake; // inherited by the detached runner
+    try {
+      const runLevel = makeRun(TIMEOUT_PROBE(''), { backend: 'claude', attemptTimeoutMs: 700 });
+      const perCall = makeRun(TIMEOUT_PROBE(', timeoutMs: 500'), { backend: 'claude', attemptTimeoutMs: 30_000 });
+      await launchRunner(runLevel.dir);
+      await launchRunner(perCall.dir);
+      await waitTerminal(runLevel.dir);
+      await waitTerminal(perCall.dir);
+      const out1 = JSON.parse(readFileSync(join(runLevel.dir, 'output.json'), 'utf8'));
+      expect(out1.result).toContain('attempt timed out after 700ms');
+      const out2 = JSON.parse(readFileSync(join(perCall.dir, 'output.json'), 'utf8'));
+      expect(out2.result).toContain('attempt timed out after 500ms'); // beats the 30s run level
+    } finally {
+      if (prev === undefined) delete process.env.ULTRACODE_CLAUDE_BIN;
+      else process.env.ULTRACODE_CLAUDE_BIN = prev;
     }
   }, 40_000);
 

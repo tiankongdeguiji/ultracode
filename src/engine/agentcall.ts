@@ -159,6 +159,8 @@ export class AgentCallExecutor implements AgentExecutor {
         resumeSession !== undefined
           ? this.adapter.buildResume(resumeSession, resumeContinuationPrompt(last!.exit.message), req)
           : null;
+      const attemptBudgetMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
+      const attemptStartedAt = Date.now();
       last = await this.runAttempt(
         spec,
         resumePlan ?? this.adapter.buildSpawn(req),
@@ -167,12 +169,16 @@ export class AgentCallExecutor implements AgentExecutor {
         tracker?.onStreamEvent,
         resumePlan !== null,
       );
-      // A resume that dies instantly with zero events (and not by watchdog
-      // kill) failed as a MECHANISM — e.g. the backend could not load the
-      // killed session's rollout — not as an attempt. Rerun the same attempt
-      // fresh so a broken resume never burns a task retry.
+      // A resume that dies with zero events (and not by watchdog kill) failed
+      // as a MECHANISM — e.g. the backend could not load the killed session's
+      // rollout — not as an attempt. Rerun the same attempt fresh so a broken
+      // resume never burns a task retry — but against the SAME deadline: the
+      // rerun gets only the budget the dead resume left, never a second full
+      // window (floored at 1s so it can at least report a timely failure).
       if (resumePlan !== null && !last.exit.ok && !signal.aborted && last.exit.errorKind !== 'stalled' && last.events.length === 0) {
-        last = await this.runAttempt(spec, this.adapter.buildSpawn(req), signal, attempt, tracker?.onStreamEvent, false, '-fresh');
+        const remainingMs =
+          attemptBudgetMs === undefined ? undefined : Math.max(1_000, attemptBudgetMs - (Date.now() - attemptStartedAt));
+        last = await this.runAttempt(spec, this.adapter.buildSpawn(req), signal, attempt, tracker?.onStreamEvent, false, '-fresh', remainingMs);
       }
       attemptsUsed = attempt;
       usages.push(last);
@@ -455,6 +461,9 @@ export class AgentCallExecutor implements AgentExecutor {
     /** stderr artifact suffix; distinguishes a same-attempt rerun (the fresh
      *  fallback after a dead resume) so it can't clobber the resume's stderr */
     stderrSuffix = '',
+    /** remaining budget for a same-attempt rerun — one deadline per logical
+     *  attempt, never a second full window */
+    timeoutOverrideMs?: number,
   ): Promise<AttemptResult> {
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
@@ -490,14 +499,18 @@ export class AgentCallExecutor implements AgentExecutor {
         events.push(ev);
         switch (ev.kind) {
           case 'session':
-            sessionId = ev.sessionId;
+            // First session event wins: the CLI announces its session before
+            // any model or tool output exists, so a mid-stream "session"
+            // carrying a different id (a compromised worker naming a
+            // sibling's session to hijack the retry-resume) is inert.
+            if (sessionId === undefined) sessionId = ev.sessionId;
             onStreamEvent?.(ev);
             // Display-only side channel (e.g. codex rollout tail): its events
             // feed the progress tracker only — never the attempt's event
             // list — so accounting is untouched by construction.
             if (!sidecar && onStreamEvent && this.adapter.createSidecar) {
               try {
-                sidecar = this.adapter.createSidecar(ev.sessionId, onStreamEvent, { resumedSession }) ?? undefined;
+                sidecar = this.adapter.createSidecar(sessionId, onStreamEvent, { resumedSession }) ?? undefined;
               } catch {
                 /* best-effort */
               }
@@ -566,18 +579,27 @@ export class AgentCallExecutor implements AgentExecutor {
       };
 
       // Timeouts are user-opt-in: no per-call timeoutMs and no run-level
-      // attemptTimeoutMs means the attempt runs unlimited. Past the timer
-      // range the caller asked for "effectively uncapped" — arming would
-      // overflow to an immediate fire and insta-kill the attempt.
-      const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
+      // attemptTimeoutMs means the attempt runs unlimited. Delays beyond
+      // Node's 2^31−1 ms setTimeout range are honored by re-arming toward an
+      // absolute deadline — an oversized cap is enforced, never silently
+      // disarmed, and never overflow-fired at ~1ms.
+      const timeoutMs = timeoutOverrideMs ?? spec.timeoutMs ?? this.opts.attemptTimeoutMs;
       let timedOut = false;
       let stalled = false;
-      if (timeoutMs !== undefined && timeoutMs <= MAX_TIMER_DELAY_MS) {
-        timer = setTimeout(() => {
-          timedOut = true;
-          killWithEscalation();
-        }, timeoutMs);
-        timer.unref();
+      if (timeoutMs !== undefined) {
+        const deadline = Date.now() + timeoutMs;
+        const armKill = (): void => {
+          const remaining = deadline - Date.now();
+          timer =
+            remaining <= MAX_TIMER_DELAY_MS
+              ? setTimeout(() => {
+                  timedOut = true;
+                  killWithEscalation();
+                }, Math.max(0, remaining))
+              : setTimeout(armKill, MAX_TIMER_DELAY_MS);
+          timer.unref();
+        };
+        armKill();
       }
 
       // Stall watchdog: no stream activity within stallMs → kill and retry.

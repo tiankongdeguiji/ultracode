@@ -93,7 +93,8 @@ describe('MCP triad', () => {
   it('workflow_start passes wallClockMs/attemptTimeoutMs through unclamped; omitting them leaves config bare', async () => {
     const start = (await client.callTool({
       name: 'workflow_start',
-      // 2^31 ms exceeds Node's timer range — the runner must run uncapped, not insta-stop
+      // 2^31 ms exceeds Node's single-setTimeout range — the runner must arm a
+      // chained deadline (no overflow insta-stop, no silent disarm)
       arguments: { script: HELLO, backend: 'mock', wallClockMs: 2 ** 31, attemptTimeoutMs: 90_000 },
     })) as { structuredContent?: { runId?: string; runDir?: string }; isError?: boolean };
     expect(start.isError).toBeFalsy();
@@ -116,7 +117,8 @@ describe('MCP triad', () => {
     }
     expect(status.status).toBe('completed');
     const eventLog = readFileSync(join(runDir, 'events.jsonl'), 'utf8');
-    expect(eventLog).toContain('outside timer range — running uncapped');
+    // the oversized cap is armed (chained), not fired and not disarmed-with-a-log
+    expect(eventLog).not.toContain('wall-clock cap');
     // pins the runner→executor plumbing, not just config.json persistence
     expect(eventLog).toContain('attempt timeout 90000ms (run-level override)');
 

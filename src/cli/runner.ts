@@ -128,21 +128,31 @@ export async function runnerMain(dir: string): Promise<number> {
   });
 
   // Wall-clock cap — user-opt-in: unset runs unlimited; when set it is a loud
-  // stop, never a silent one. Out-of-range values (≤0, NaN, beyond Node's
-  // 2^31−1 ms timer ceiling, where setTimeout overflows and fires immediately)
-  // run uncapped, saying so loudly.
+  // stop, never a silent one. Delays beyond Node's 2^31−1 ms setTimeout range
+  // are honored by re-arming toward an absolute deadline (an oversized cap is
+  // enforced, never overflow-fired at ~1ms); invalid values (≤0, NaN — the
+  // config file is worker-writable) run uncapped, saying so loudly.
   const wallClockMs = config.wallClockMs;
   let wallTimer: ReturnType<typeof setTimeout> | undefined;
   if (wallClockMs !== undefined) {
-    if (Number.isFinite(wallClockMs) && wallClockMs > 0 && wallClockMs <= 2 ** 31 - 1) {
-      wallTimer = setTimeout(() => {
-        events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms exceeded — stopping run` });
-        abort.abort(new Error(`wall-clock cap ${wallClockMs}ms exceeded`));
-        armHardStop('wall-clock cap');
-      }, wallClockMs);
-      wallTimer.unref();
+    if (Number.isFinite(wallClockMs) && wallClockMs > 0) {
+      const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+      const deadline = Date.now() + wallClockMs;
+      const armWallStop = (): void => {
+        const remaining = deadline - Date.now();
+        wallTimer =
+          remaining <= MAX_TIMER_DELAY_MS
+            ? setTimeout(() => {
+                events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms exceeded — stopping run` });
+                abort.abort(new Error(`wall-clock cap ${wallClockMs}ms exceeded`));
+                armHardStop('wall-clock cap');
+              }, Math.max(0, remaining))
+            : setTimeout(armWallStop, MAX_TIMER_DELAY_MS);
+        wallTimer.unref();
+      };
+      armWallStop();
     } else {
-      events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms is outside timer range — running uncapped` });
+      events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms is invalid — running uncapped` });
     }
   }
 
