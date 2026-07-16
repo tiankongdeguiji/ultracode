@@ -253,6 +253,27 @@ describe('recentRuns', () => {
     expect(shown).not.toContain(oldDone);
   });
 
+  it('hidden counts only cap-dropped runs, never filter-dropped ones', () => {
+    const root = tmpRoot();
+    const oldTs = new Date(Date.now() - 2 * DAY).toISOString();
+    for (let i = 0; i < 3; i++) makeRun(root, oldTs, 'completed'); // old terminal → filtered out
+    const base = Date.now();
+    for (let i = 0; i < 12; i++) makeRun(root, new Date(base - i * 60_000).toISOString()); // recent, active
+    const { runs, hidden } = recentRuns(root, {});
+    expect(runs).toHaveLength(DEFAULT_LIST_COUNT);
+    // 12 recent − 10 shown; the 3 old terminal runs are filtered, NOT counted in hidden
+    // (computing hidden from the unfiltered length of 15 would wrongly give 5).
+    expect(hidden).toBe(2);
+  });
+
+  it('a non-positive count is treated as unset (no slice(-0) returning everything)', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < 12; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    expect(recentRuns(root, { count: 0 }).runs).toHaveLength(DEFAULT_LIST_COUNT);
+    expect(recentRuns(root, { count: 0, all: true }).runs).toHaveLength(12);
+  });
+
   it('all with an explicit count caps within the unfiltered set', () => {
     const root = tmpRoot();
     makeRun(root, new Date(Date.now() - 2 * DAY).toISOString(), 'completed');

@@ -253,7 +253,8 @@ export function createServer(baseCwd: string): McpServer {
   server.registerTool(
     'workflow_list',
     {
-      description: 'List workflow runs in the project run store. Returns the 10 most recent by default; pass all=true for every run, or count=N.',
+      description:
+        'List workflow runs in the project run store. By default returns the 10 most recent active-or-last-24h runs, plus hidden (how many the cap omitted); pass all=true to include older finished runs, or count=N.',
       inputSchema: { cwd: z.string().optional(), all: z.boolean().optional(), count: z.number().int().positive().optional() },
     },
     async (input) => {

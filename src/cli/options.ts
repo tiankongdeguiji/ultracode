@@ -1,38 +1,29 @@
 import { isPositiveInt } from '../engine/semaphore.js';
 
-/** Strict positive integer, else null (reject — don't guess). */
-function parseMaxConcurrency(raw: string): number | null {
-  const n = Number(raw);
-  return isPositiveInt(n) ? n : null;
-}
-
 /**
- * Shared --max-concurrency guard for CLI commands: absent → ok with no value;
- * invalid → writes the canonical error to stderr and reports failure, so the
- * rule and its message can't drift between `run` and `resume`.
+ * Shared positive-integer option guard: absent → ok with no value; invalid →
+ * writes the canonical `ultracode: <flag> must be a positive integer` error to
+ * stderr and reports failure. Callers pass their own flag name, so one rule and
+ * one message shape serve every numeric CLI option and can't drift apart.
  */
-export function readMaxConcurrencyOpt(raw: string | undefined): { ok: true; value?: number } | { ok: false } {
-  if (raw === undefined) return { ok: true };
-  const n = parseMaxConcurrency(raw);
-  if (n === null) {
-    process.stderr.write('ultracode: --max-concurrency must be a positive integer\n');
-    return { ok: false };
-  }
-  return { ok: true, value: n };
-}
-
-/**
- * Shared --count guard for `list`: absent → ok with no value; invalid → writes
- * the canonical error to stderr and reports failure, mirroring readMaxConcurrencyOpt.
- */
-export function readCountOpt(raw: string | undefined): { ok: true; value?: number } | { ok: false } {
+function readPositiveIntOpt(raw: string | undefined, flag: string): { ok: true; value?: number } | { ok: false } {
   if (raw === undefined) return { ok: true };
   const n = Number(raw);
   if (!isPositiveInt(n)) {
-    process.stderr.write('ultracode: --count must be a positive integer\n');
+    process.stderr.write(`ultracode: ${flag} must be a positive integer\n`);
     return { ok: false };
   }
   return { ok: true, value: n };
+}
+
+/** `--max-concurrency` guard for `run` / `resume`. */
+export function readMaxConcurrencyOpt(raw: string | undefined): { ok: true; value?: number } | { ok: false } {
+  return readPositiveIntOpt(raw, '--max-concurrency');
+}
+
+/** `--count` guard for `list`. */
+export function readCountOpt(raw: string | undefined): { ok: true; value?: number } | { ok: false } {
+  return readPositiveIntOpt(raw, '--count');
 }
 
 /**

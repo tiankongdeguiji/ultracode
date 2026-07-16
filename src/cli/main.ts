@@ -107,7 +107,7 @@ program
   .command('list')
   .description('list runs in the run store')
   .option('--count <n>', 'max runs to show (default 10; --all shows every run)')
-  .option('--all', 'show every run: no recency filter, no count cap')
+  .option('--all', 'show every run: no recency filter, uncapped unless --count is given')
   .option('--reap', 'finalize orphaned runs first')
   .option('--json')
   .option('--home <dir>')

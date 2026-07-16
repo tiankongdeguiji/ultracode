@@ -97,6 +97,21 @@ describe('list CLI', () => {
     expect(out.chunks.join('')).not.toContain('more (use');
   });
 
+  it('--count shows exactly N newest-first with a footer for the rest', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) ids.push(makeRun(root, new Date(base - (6 - i) * 60_000).toISOString()));
+    const out = capture('stdout');
+    const code = listCommand({ home: root, count: '3' });
+    out.restore();
+    expect(code).toBe(0);
+    const lines = out.chunks.join('').trimEnd().split('\n');
+    expect(lines).toHaveLength(4); // 3 run lines + footer
+    expect(lines[0]).toContain(ids[5]); // newest first
+    expect(lines[3]).toBe('… and 3 more (use --count <n> or --all)');
+  });
+
   it('rejects a non-numeric --count with the canonical error and exit 1', () => {
     const root = tmpRoot();
     makeRun(root, new Date().toISOString());
