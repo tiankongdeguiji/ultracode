@@ -8,7 +8,7 @@ import { isTerminal } from '../store/manifest.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { attachForeground, printOutput } from './lifecycle.js';
-import { readMaxConcurrencyOpt } from './options.js';
+import { readMaxConcurrencyOpt, refuseInsideWorker } from './options.js';
 
 export interface ResumeCliOptions {
   script?: string;
@@ -20,6 +20,7 @@ export interface ResumeCliOptions {
   plain?: boolean;
   noColor?: boolean;
   home?: string;
+  allowNested?: boolean;
 }
 
 /**
@@ -29,6 +30,8 @@ export interface ResumeCliOptions {
  * processes and sessions by construction (plain files).
  */
 export async function resumeCommand(runId: string, opts: ResumeCliOptions): Promise<number> {
+  if (refuseInsideWorker('resume a run', opts.allowNested)) return 1;
+
   // Validate CLI input before touching the store — bad input fails fast even
   // when the run id is unknown.
   const mcOpt = readMaxConcurrencyOpt(opts.maxConcurrency);

@@ -32,6 +32,7 @@ program
   .option('--plain', 'line-per-event progress instead of the live panel')
   .option('--no-color', 'live panel without colors')
   .option('--home <dir>', 'run-store root (default <cwd>/.ultracode or $ULTRACODE_HOME)')
+  .option('--allow-nested', 'start even inside an ultracode worker (ULTRACODE_INSIDE_RUN set)')
   .action(async (script: string, opts: Record<string, string | boolean>) => {
     const { runCommand } = await import('./run.js');
     // commander's --no-color negates a `color` option (true by default)
@@ -86,6 +87,7 @@ program
   .option('--plain', 'line-per-event progress instead of the live panel')
   .option('--no-color', 'live panel without colors')
   .option('--home <dir>')
+  .option('--allow-nested', 'resume even inside an ultracode worker (ULTRACODE_INSIDE_RUN set)')
   .action(async (runId: string, opts: Record<string, string | boolean>) => {
     const { resumeCommand } = await import('./resume.js');
     process.exit(await resumeCommand(runId, { ...opts, noColor: opts.color === false } as never));

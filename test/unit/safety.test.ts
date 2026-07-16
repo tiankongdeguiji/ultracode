@@ -181,6 +181,149 @@ describe('silent no-op detector', () => {
   });
 });
 
+describe('CLI nesting guard (ULTRACODE_INSIDE_RUN)', () => {
+  const SCRIPT = `export const meta = { name: 't', description: 'd' }\nreturn 1`;
+
+  function withInsideRun<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = process.env.ULTRACODE_INSIDE_RUN;
+    process.env.ULTRACODE_INSIDE_RUN = '1';
+    return fn().finally(() => {
+      if (prev === undefined) delete process.env.ULTRACODE_INSIDE_RUN;
+      else process.env.ULTRACODE_INSIDE_RUN = prev;
+    });
+  }
+
+  it('run refuses inside a worker before creating any run state', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-nestguard-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
+      return true;
+    });
+    try {
+      await withInsideRun(async () => {
+        expect(await runCommand(file, { yes: true, backend: 'mock', home })).toBe(1);
+      });
+      expect(chunks.join('')).toContain('inside an ultracode worker');
+      // The refused WORKER reads this message — it must not advertise the
+      // override flag (agents follow remediation hints in errors).
+      expect(chunks.join('')).not.toContain('--allow-nested');
+      expect(existsSync(home)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('run --dry-run stays exempt (in-process mock rehearsal, no run state)', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-nestdry-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await withInsideRun(async () => {
+        expect(await runCommand(file, { yes: true, backend: 'mock', home, dryRun: true })).toBe(0);
+      });
+      expect(existsSync(home)).toBe(false);
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('run --allow-nested passes the guard (reaches source resolution, not the refusal)', async () => {
+    // No detached runner: a nonexistent workflow fails at resolution — AFTER the
+    // guard — which proves the override without spawning a process (the guard's
+    // truth table is covered directly below). Spawn-heavy checks live in
+    // *.integration.test.ts.
+    const { runCommand } = await import('../../src/cli/run.js');
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
+      return true;
+    });
+    try {
+      await withInsideRun(async () => {
+        expect(
+          await runCommand('/no/such/uc-workflow.js', {
+            yes: true,
+            backend: 'mock',
+            home: mkdtempSync(join(tmpdir(), 'uc-nestallow-')),
+            allowNested: true,
+          }),
+        ).toBe(1);
+      });
+      expect(chunks.join('')).not.toContain('inside an ultracode worker');
+      expect(chunks.join('')).toContain('cannot resolve workflow');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('resume refuses inside a worker (before touching the store)', async () => {
+    const { resumeCommand } = await import('../../src/cli/resume.js');
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
+      return true;
+    });
+    try {
+      await withInsideRun(async () => {
+        expect(await resumeCommand('wf_whatever', { home: mkdtempSync(join(tmpdir(), 'uc-nestres-')) })).toBe(1);
+      });
+      expect(chunks.join('')).toContain('inside an ultracode worker');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('resume --allow-nested passes the guard (reaches the store, not the refusal)', async () => {
+    const { resumeCommand } = await import('../../src/cli/resume.js');
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
+      return true;
+    });
+    try {
+      await withInsideRun(async () => {
+        // Unknown run → still exit 1, but via the store lookup ("no run …"),
+        // proving the override let execution past the nesting guard.
+        expect(
+          await resumeCommand('wf_nope', { home: mkdtempSync(join(tmpdir(), 'uc-nestres2-')), allowNested: true }),
+        ).toBe(1);
+      });
+      expect(chunks.join('')).not.toContain('inside an ultracode worker');
+      expect(chunks.join('')).toContain('no run wf_nope');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('refuseInsideWorker truth table: only (marker set, not allowed) refuses', async () => {
+    const { refuseInsideWorker } = await import('../../src/cli/options.js');
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const prev = process.env.ULTRACODE_INSIDE_RUN;
+    try {
+      delete process.env.ULTRACODE_INSIDE_RUN;
+      expect(refuseInsideWorker('act', undefined)).toBe(false); // not a worker
+      expect(refuseInsideWorker('act', true)).toBe(false);
+      process.env.ULTRACODE_INSIDE_RUN = '1';
+      expect(refuseInsideWorker('act', true)).toBe(false); // worker, but opted in
+      expect(refuseInsideWorker('act', undefined)).toBe(true); // worker, not opted in
+    } finally {
+      errSpy.mockRestore();
+      if (prev === undefined) delete process.env.ULTRACODE_INSIDE_RUN;
+      else process.env.ULTRACODE_INSIDE_RUN = prev;
+    }
+  });
+});
+
 describe('CLI --max-concurrency fail-fast', () => {
   const SCRIPT = `export const meta = { name: 't', description: 'd' }\nreturn 1`;
   const BAD_VALUES = ['0', '-1', '2.5', 'abc', ''];

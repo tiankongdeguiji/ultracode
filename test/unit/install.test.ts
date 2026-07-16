@@ -6,6 +6,7 @@ import {
   AGENTS_SNIPPET,
   MARKER_BEGIN,
   MARKER_END,
+  QODER_RULE,
   installForHost,
   planFor,
   skillSourceDir,
@@ -29,6 +30,36 @@ describe('skill source', () => {
     }
     // progressive-disclosure budget: body should stay well under ~5k tokens
     expect(skill.length).toBeLessThan(20_000);
+  });
+});
+
+describe('worker anti-nesting doctrine', () => {
+  // Workers see these texts (trusted-cwd codex workers load user AGENTS.md and
+  // the skill catalog; qoder always_on rules load into --print workers). Each
+  // must carry the self-disarming guard, or workers recursively launch runs —
+  // the 2026-07-16 fork-bomb was triggered by a DIRECTORY NAME containing the
+  // keyword.
+  const flat = (text: string) => text.toLowerCase().replace(/\s+/g, ' ');
+
+  it('every installed trigger text carries the ULTRACODE_INSIDE_RUN worker guard', () => {
+    for (const text of [AGENTS_SNIPPET, QODER_RULE]) {
+      expect(text).toContain('ULTRACODE_INSIDE_RUN');
+      expect(flat(text)).toContain('never start workflows');
+      expect(flat(text)).toContain('file or directory names'); // path mentions are not triggers
+    }
+    const skill = readFileSync(join(skillSourceDir(), 'SKILL.md'), 'utf8');
+    const description = skill.match(/description: (.*)\n/)?.[1] ?? '';
+    expect(description).toContain('ULTRACODE_INSIDE_RUN'); // guard in the ANNOUNCED text
+    expect(skill.split('ULTRACODE_INSIDE_RUN').length).toBeGreaterThan(2); // and in the body
+    const invoking = readFileSync(join(skillSourceDir(), 'references/invoking.md'), 'utf8');
+    expect(invoking).toContain('ULTRACODE_INSIDE_RUN');
+  });
+
+  it('qoder worker agent definitions forbid starting workflows', () => {
+    for (const agent of ['uc-verifier.md', 'uc-xhigh.md']) {
+      const text = readFileSync(join(skillSourceDir(), '../../hostpacks/qoder/agents', agent), 'utf8');
+      expect(flat(text)).toContain('never start workflows');
+    }
   });
 });
 

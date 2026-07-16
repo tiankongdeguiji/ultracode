@@ -43,6 +43,34 @@ const PERMISSION_TO_SANDBOX: Record<AgentRequest['permission'], string> = {
   danger: 'danger-full-access',
 };
 
+/**
+ * Worker isolation: hide the ultracode MCP server from every spawned worker.
+ * `codex exec` loads MCP servers from the user's config.toml AND from a trusted
+ * project's `.codex/config.toml` — including `mcp_servers.ultracode` with
+ * pre-approved workflow_start — and codex spawns MCP servers with a sanitized
+ * env, so the ULTRACODE_INSIDE_RUN marker never reaches the server's own
+ * recursion guard. Workers then recursively launch runs (the 2026-07-16
+ * fork-bomb: 1,300+ nested runs until quota exhaustion).
+ *
+ * A `-c` override is the top config layer (it beats both the user and the
+ * project config.toml). We replace the whole `ultracode` server entry with a
+ * disabled stub: `enabled=false` drops the server's tools/instructions, and the
+ * dummy `command` makes the entry a valid stdio server definition so the
+ * override is well-formed EVEN WHEN no ultracode server is registered (a bare
+ * `enabled=false` on an unknown name hard-fails codex startup with "invalid
+ * transport"). Safe to emit unconditionally: a no-op when unregistered, a
+ * kill-switch when registered — from either config layer. Live-verified on
+ * codex-cli 0.144.5 across all four cases (user/project × registered/absent).
+ * Profiles are not a bypass: codex 0.144.5 rejects a legacy `profile = …`
+ * config key outright, and a profile-v2 layer only applies with an explicit
+ * `--profile` (which this adapter never passes), so a profile-scoped server
+ * never loads into a worker — verified live: a server defined only in
+ * `<name>.config.toml` is invisible without `--profile`.
+ * Known gap: a server hand-registered under a NON-default table key is out of
+ * scope — you cannot disable-by-name a name you don't know.
+ */
+const MCP_KILL_SWITCH = ['-c', 'mcp_servers.ultracode={command="true",enabled=false}'];
+
 interface CodexItem {
   id?: string;
   type?: string;
@@ -88,6 +116,7 @@ export class CodexAdapter implements BackendAdapter {
     ];
     if (req.model) argv.push('-m', req.model);
     if (req.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(req.effort)}`);
+    argv.push(...MCP_KILL_SWITCH);
     const plan: SpawnPlan = {
       bin: this.bin,
       argv,
@@ -116,6 +145,7 @@ export class CodexAdapter implements BackendAdapter {
       PERMISSION_TO_SANDBOX[req.permission],
     ];
     if (req.model) argv.push('-m', req.model);
+    argv.push(...MCP_KILL_SWITCH);
     const plan: SpawnPlan = { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
     if (req.schema) plan.schemaTempFile = { content: JSON.stringify(req.schema) };
     argv.push('-');

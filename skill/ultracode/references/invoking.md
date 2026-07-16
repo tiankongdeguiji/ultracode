@@ -1,5 +1,11 @@
 # Invoking workflows per host
 
+**Worker guard (applies to every route below):** if the `ULTRACODE_INSIDE_RUN`
+environment variable is set, you are a worker inside an ultracode run — never
+dispatch workflows by ANY route (CLI, MCP, native tool). Do your assigned task
+directly. The routes below are for interactive hosts orchestrating on a user's
+behalf.
+
 ## Dispatch order
 
 1. **Qoder native Workflow tool** (qodercli / Qoder IDE with the tool registered): invoke it directly, or install the script to `.qoder/workflows/<name>.js` and run by name. Native resume: `resumeFromRunId: "wf_..."`. Caveats: `budget` global is stubbed (`{total:null}`) — pass `args.budgetTokens` and gate manually; no per-call `effort` (define a subagent in `.qoder/agents/` with frontmatter `effort:` and use `agentType`); never name anything `Workflow`, `workflows`, or `deep-research`.
