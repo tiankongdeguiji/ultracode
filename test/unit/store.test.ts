@@ -91,7 +91,43 @@ describe('events', () => {
     w.write({ type: 'run_completed' });
     const page3 = readEventsFrom(file, page2.nextOffset);
     expect(page3.events.map((e) => e.type)).toEqual(['run_completed']);
+    expect(page3.hasMore).toBe(false);
     w.close();
+  });
+
+  it('maxBytes pages a large backlog: complete lines only, hasMore until drained', () => {
+    const dir = tmpRoot();
+    const file = join(dir, 'events.jsonl');
+    const w = new EventWriter(file);
+    for (let i = 0; i < 50; i++) w.write({ type: 'agent_usage', seq: i, totalTokens: i });
+    w.close();
+
+    const seen: number[] = [];
+    let offset = 0;
+    let pages = 0;
+    for (;;) {
+      const page = readEventsFrom(file, offset, 256); // far smaller than the file
+      offset = page.nextOffset;
+      pages++;
+      for (const e of page.events) seen.push(e.seq as number);
+      if (!page.hasMore) break;
+    }
+    expect(pages).toBeGreaterThan(1); // it actually paged
+    expect(seen).toEqual(Array.from({ length: 50 }, (_, i) => i)); // nothing lost or torn
+  });
+
+  it('a single line larger than maxBytes cannot stall the tail (window grows to the newline)', () => {
+    const dir = tmpRoot();
+    const file = join(dir, 'events.jsonl');
+    const w = new EventWriter(file);
+    w.write({ type: 'workflow_log', message: 'x'.repeat(2000) }); // ≫ the 256-byte page below
+    w.write({ type: 'run_completed' });
+    w.close();
+
+    const page1 = readEventsFrom(file, 0, 256);
+    expect(page1.events.map((e) => e.type)).toEqual(['workflow_log', 'run_completed']);
+    expect(page1.hasMore).toBe(false);
+    expect(readEventsFrom(file, page1.nextOffset, 256).events).toEqual([]);
   });
 });
 

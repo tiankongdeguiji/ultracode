@@ -1,5 +1,7 @@
 /**
- * codex exec adapter (pinned against codex-cli 0.142.x).
+ * codex exec adapter (pinned against codex-cli 0.142.x; the exec --json event
+ * shape re-verified live on 0.144.4 — the rollout sidecar in codex-rollout.ts
+ * is verified against 0.144.4 only).
  *
  * Load-bearing quirks (verified against codex-cli 0.142.x source and live
  * exec/--output-schema behavior):
@@ -31,6 +33,7 @@ import type {
 import { parseJsonLine } from './ndjson.js';
 import { usageFromEvents } from './usage.js';
 import { checkCodexStrictSchema } from './schema-strict.js';
+import { codexUsageToPartial, createCodexRolloutSidecar } from './codex-rollout.js';
 import type { JsonSchema } from './types.js';
 import { execFile } from 'node:child_process';
 
@@ -137,22 +140,13 @@ export class CodexAdapter implements BackendAdapter {
           case 'turn.started':
             return [];
           case 'turn.completed': {
-            const u = obj.usage ?? {};
-            // OpenAI/codex report cached_input_tokens as a SUBSET of input_tokens
-            // and reasoning_output_tokens as a SUBSET of output_tokens. Subtract
-            // cached from input (it is re-added at the 0.1× discount in
-            // finalizeUsage) and drop reasoning (already in output) so neither is
-            // double-counted. (Anthropic keeps these separate — see streamjson.ts.)
-            const inputRaw = u.input_tokens ?? 0;
-            const cached = u.cached_input_tokens ?? 0;
-            const usage: Partial<NormalizedUsage> = {
-              inputTokens: Math.max(0, inputRaw - cached),
-              cachedInputTokens: cached,
-              outputTokens: u.output_tokens ?? 0,
-              reasoningTokens: 0,
-            };
+            // Subset semantics handled in codexUsageToPartial (cached ⊂ input,
+            // reasoning ⊂ output). threadCumulative: exec populates this from
+            // the SESSION's running total, so an `exec resume` attempt (schema
+            // repair) repeats every prior attempt's tokens — the executor
+            // counts only the last cumulative report per session.
             return [
-              { kind: 'usage', usage },
+              { kind: 'usage', usage: codexUsageToPartial(obj.usage ?? {}), threadCumulative: true },
               { kind: 'result', isError: false, raw: obj },
             ];
           }
@@ -248,6 +242,12 @@ export class CodexAdapter implements BackendAdapter {
       retryable: false,
       message: `codex exited ${code} without turn.failed: ${stderrTail.slice(-500)}`,
     };
+  }
+
+  /** Live usage + resolved model via the session rollout file — exec --json
+   *  itself never surfaces either (display-only; see codex-rollout.ts). */
+  createSidecar(sessionId: string, emit: (ev: AgentEvent) => void, opts?: { resumedSession?: boolean }) {
+    return createCodexRolloutSidecar(sessionId, emit, { resumedSession: opts?.resumedSession });
   }
 
   extractUsage(events: AgentEvent[]): NormalizedUsage {

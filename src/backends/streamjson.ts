@@ -28,6 +28,10 @@ const ASSISTANT_ERROR_KIND: Record<string, ErrorKind> = {
 };
 
 export function createStreamJsonParser(): { push(line: string): AgentEvent[]; end(): AgentEvent[] } {
+  // The CLI emits one assistant line PER CONTENT BLOCK of an API call (same
+  // message.id, byte-identical usage repeated) — deduped here or a text+tool_use
+  // turn would count its usage twice in interim accumulation.
+  let lastUsageMessageId: string | undefined;
   return {
     push(line: string): AgentEvent[] {
       const obj = parseJsonLine(line) as Record<string, any> | undefined;
@@ -36,7 +40,9 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
 
       switch (obj.type) {
         case 'system':
-          if (typeof obj.session_id === 'string') out.push({ kind: 'session', sessionId: obj.session_id });
+          if (typeof obj.session_id === 'string') {
+            out.push({ kind: 'session', sessionId: obj.session_id, model: typeof obj.model === 'string' ? obj.model : undefined });
+          }
           break;
         case 'assistant': {
           if (typeof obj.session_id === 'string') out.push({ kind: 'session', sessionId: obj.session_id });
@@ -45,6 +51,15 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
             for (const block of content) {
               if (block?.type === 'text' && typeof block.text === 'string') out.push({ kind: 'message', text: block.text });
               if (block?.type === 'tool_use') out.push({ kind: 'tool', name: `tool:${block.name ?? ''}`, status: 'started' });
+            }
+          }
+          // Assistant lines carry per-API-call usage (qoder omits it) —
+          // surfaced as interim ticks for live progress, never for accounting.
+          if (obj.message?.usage && typeof obj.message.usage === 'object') {
+            const messageId = typeof obj.message.id === 'string' ? obj.message.id : undefined;
+            if (messageId === undefined || messageId !== lastUsageMessageId) {
+              lastUsageMessageId = messageId;
+              out.push({ kind: 'usage', usage: usageFromResult({ usage: obj.message.usage }), interim: true });
             }
           }
           if (typeof obj.error === 'string') {

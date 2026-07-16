@@ -31,3 +31,15 @@ ultracode doctor          # verify backend availability and auth topology
 ```
 
 Then in Codex: `ultracode: review this repo for auth bugs +500k`.
+
+## Why Codex must use the MCP route
+
+Codex runs shell commands inside a bubblewrap sandbox with a fresh PID
+namespace per exec call. A `ultracode run --detach` launched there is
+SIGKILLed the moment the tool call returns (namespace teardown) — the run
+shows `orphaned` within seconds with an empty runner.log. The registered MCP
+server is a persistent process outside that sandbox, so `workflow_start` runs
+survive. Additionally, codex *workers* cannot spawn inside Codex's own
+sandbox (`~/.codex` state is read-only there and network is off) — another
+reason the shell route from within a Codex session is a trap. The skill text
+teaches the model this; this section is for humans debugging it.

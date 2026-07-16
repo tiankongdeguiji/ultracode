@@ -17,11 +17,15 @@ export function finalizeUsage(partial: Partial<NormalizedUsage>): NormalizedUsag
   };
 }
 
-/** Merge usage events (later events win per-field); zero usage if none. */
+/**
+ * Merge usage events (later events win per-field); zero usage if none.
+ * Interim (mid-run) usage events are display-only and skipped here so
+ * budget accounting stays anchored to the backend's terminal totals.
+ */
 export function usageFromEvents(events: AgentEvent[]): NormalizedUsage {
   let acc: Partial<NormalizedUsage> | undefined;
   for (const ev of events) {
-    if (ev.kind === 'usage') acc = { ...acc, ...ev.usage };
+    if (ev.kind === 'usage' && !ev.interim) acc = { ...acc, ...ev.usage };
   }
   return acc ? finalizeUsage(acc) : { ...ZERO_USAGE };
 }

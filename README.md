@@ -46,13 +46,13 @@ ultracode install codex           # skill + AGENTS.md trigger + MCP registration
 ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
 ultracode run my.workflow.js --backend codex --budget 500k
-ultracode status <runId> --watch                # long runs: add --detach above
+ultracode watch <runId>                         # live panel: phases, per-agent tokens, budget
 ultracode resume <runId> [--script edited.js]   # completed agents replay free
 ```
 
 ## Commands
 
-`run` · `status` · `logs` · `stop` · `list` · `resume` · `validate` · `lint` · `doctor` · `mode` · `install <codex|qoder|generic>` · `sync` · `mcp`
+`run` · `watch` · `status` · `logs` · `stop` · `list` · `resume` · `validate` · `lint` · `doctor` · `mode` · `install <codex|qoder|generic>` · `sync` · `mcp`
 
 ## What's proven
 

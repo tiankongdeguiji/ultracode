@@ -47,8 +47,8 @@ function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger'): A
     return ex;
   };
   return {
-    execute(spec, signal) {
-      return resolve(spec.backend).execute(spec, signal);
+    execute(spec, signal, onProgress) {
+      return resolve(spec.backend).execute(spec, signal, onProgress);
     },
   };
 }
@@ -195,8 +195,10 @@ export async function runnerMain(dir: string): Promise<number> {
     cwd: config.cwd,
     keyChain: chain,
     onEvent: (ev) => {
-      events.write(ev as never);
-      if (ev.type === 'phase_started') {
+      events.write(ev);
+      // Manifest phases mirror the PARENT workflow only: child-tagged phase
+      // events would otherwise create/credit same-titled parent entries.
+      if (ev.type === 'phase_started' && ev.childId === undefined) {
         if (!manifest.phases.some((p) => p.title === ev.title)) {
           manifest.phases.push({ title: ev.title, agentsDone: 0 });
         }
@@ -207,7 +209,7 @@ export async function runnerMain(dir: string): Promise<number> {
         // concurrent agents from an earlier phase and skipped agents would
         // otherwise inflate the final phase. Mirrors hostapi's bumpPhase (skips
         // don't count).
-        if (ev.ok && !ev.skipped && ev.phase) {
+        if (ev.childId === undefined && ev.ok && !ev.skipped && ev.phase) {
           const p = manifest.phases.find((ph) => ph.title === ev.phase);
           if (p) p.agentsDone++;
         }
@@ -217,6 +219,10 @@ export async function runnerMain(dir: string): Promise<number> {
         spentTotal = ev.spent;
         manifest.budget = { ...manifest.budget, spent: ev.spent };
       }
+      // Journal boundary records for nested workflow() calls; replay-safe
+      // (PrefixReplayCache reads only t:'agent' records).
+      if (ev.type === 'child_started') journal.append({ t: 'child-enter', name: ev.name, argsHash: ev.argsHash });
+      if (ev.type === 'child_completed') journal.append({ t: 'child-exit', name: ev.name });
     },
     onAgentSettled: (record) => {
       const agentDir = join(dir, 'agents', agentDirName(record.spec.seq, record.spec.label));
@@ -238,6 +244,7 @@ export async function runnerMain(dir: string): Promise<number> {
             usage: record.usage,
             sessionId: record.sessionId,
             backend: record.spec.backend,
+            model: record.spec.model,
             cached: record.cached ?? false,
           },
           null,
@@ -252,6 +259,7 @@ export async function runnerMain(dir: string): Promise<number> {
         label: record.spec.label,
         phase: record.spec.phase,
         backend: record.spec.backend,
+        model: record.spec.model,
         cached: record.cached,
         sessionId: record.sessionId,
         totalTokens: record.usage.totalTokens,

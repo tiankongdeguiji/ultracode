@@ -57,7 +57,7 @@ meta.ts (acorn, pure-literal meta validation, export stripping), determinism.ts 
 Demo: `ultracode validate examples/hello.workflow.js` prints phase/agent inventory; hostile constructs rejected with exact errors.
 ### M3 feat(engine): full dialect semantics on mock backend
 hostapi.ts (agent/parallel/pipeline/phase/log/console), FIFO semaphore, caps (1000 hard / --max-agents 50 soft / 4096 items), failures[] wording, fault-injecting mock backend (throw/delay/badjson/null per call), run.ts; complete semantics suite (<10s, zero network) pinning allSettled-null, pipeline drop-and-skip, stage(prev,item,i).
-Demo: `ultracode run --backend mock --foreground examples/hello.workflow.js` produces output.json with correct result/logs/failures shape.
+Demo: `ultracode run examples/hello.workflow.js --backend mock --yes` (foreground attach is the default) produces output.json with correct result/logs/failures shape.
 ### M4 feat(store): run store, detached runner, journal write-path, lifecycle CLI
 store/ (layout, atomic manifest+heartbeat, events.jsonl tail), exec/ (daemonize.ts detached runner, spawn.ts process groups + kill-tree, pids), journal.jsonl hash-chain write path (u1: keys incl. backend/effort/cwd), `run` foreground-attach default + --detach, `status --watch`, `logs --follow`, `stop`, `list --reap`; determinism-of-keys test (same script+args twice on mock → identical chains).
 Demo: Detached run survives shell exit; re-attach via status; Ctrl-C in foreground kills all process groups cleanly with partial output.json.

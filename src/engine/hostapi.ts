@@ -46,11 +46,33 @@ export const DEFAULT_SOFT_AGENT_CAP = 50;
 export const DEFAULT_LOG_CAP = 1000;
 export const MAX_TASK_RETRIES = 5;
 
-export type RunEvent =
+type RunEventBody =
   | { type: 'run_started'; name: string }
   | { type: 'phase_started'; title: string }
   | { type: 'agent_queued'; seq: number; label: string; phase?: string }
-  | { type: 'agent_started'; seq: number; label: string; phase?: string; backend: string }
+  | {
+      type: 'agent_started';
+      seq: number;
+      label: string;
+      phase?: string;
+      backend: string;
+      model?: string;
+      effort?: string;
+      agentType?: string;
+    }
+  /** throttled live token tick (cumulative per agent); display-only — budget accounting stays on agent_completed */
+  | { type: 'agent_usage'; seq: number; totalTokens: number; estimated: boolean }
+  | {
+      type: 'agent_retry';
+      seq: number;
+      label: string;
+      attempt: number;
+      maxAttempts: number;
+      kind: 'task' | 'schema-repair';
+      reason?: string;
+    }
+  /** backend-resolved model (from the stream), vs the requested one on agent_started */
+  | { type: 'agent_model'; seq: number; model: string }
   | {
       type: 'agent_completed';
       seq: number;
@@ -58,12 +80,29 @@ export type RunEvent =
       phase?: string;
       ok: boolean;
       skipped?: boolean;
+      /** resolved from a prior run's journal (prefix replay) — consumed zero tokens */
+      cached?: boolean;
       totalTokens: number;
+      /** the total contains chars/4 estimates (backend omitted usage) */
+      estimated?: boolean;
       error?: string;
     }
   | { type: 'workflow_log'; message: string }
   | { type: 'budget_tick'; spent: number }
+  /** nested workflow() boundaries, emitted by the PARENT (child.ts) — the child's own run_* events are dropped */
+  | { type: 'child_started'; childId: number; name: string; argsHash: string }
+  | { type: 'child_completed'; childId: number; name: string; ok: boolean; agentCount: number; error?: string }
+  /** written by the runner on SIGTERM, before the engine unwinds */
+  | { type: 'stop_requested' }
   | { type: 'run_completed' | 'run_failed' | 'run_stopped'; error?: string };
+
+/**
+ * Events emitted from inside a nested workflow() child carry childId/childName
+ * tags (child agents share the parent's seq space and can interleave with
+ * concurrently-running parent agents, so attribution must be per-event, not
+ * boundary-interval).
+ */
+export type RunEvent = RunEventBody & { childId?: number; childName?: string };
 
 export interface PhaseState {
   title: string;
@@ -287,7 +326,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     const cached = cacheLookup?.(spec, cacheKey);
     if (cached?.hit) {
       bumpPhase(spec.phase);
-      onEvent({ type: 'agent_completed', seq, label: spec.label, phase: spec.phase, ok: true, totalTokens: 0 });
+      onEvent({ type: 'agent_completed', seq, label: spec.label, phase: spec.phase, ok: true, cached: true, totalTokens: 0 });
       onAgentSettled?.({
         spec,
         status: 'ok',
@@ -328,8 +367,25 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         worktree = await shared.worktrees.create(shared.runId ?? 'run', seq, spec.label);
         spec.cwd = worktree.path;
       }
-      onEvent({ type: 'agent_started', seq, label: spec.label, phase: spec.phase, backend: spec.backend });
-      const outcome = await executor.execute(spec, signal);
+      onEvent({
+        type: 'agent_started',
+        seq,
+        label: spec.label,
+        phase: spec.phase,
+        backend: spec.backend,
+        model: spec.model,
+        effort: spec.effort,
+        agentType: spec.agentType,
+      });
+      const outcome = await executor.execute(spec, signal, (p) => {
+        if (p.type === 'usage') {
+          onEvent({ type: 'agent_usage', seq, totalTokens: p.usage.totalTokens, estimated: p.usage.estimated });
+        } else if (p.type === 'retry') {
+          onEvent({ type: 'agent_retry', seq, label: spec.label, attempt: p.attempt, maxAttempts: p.maxAttempts, kind: p.kind, reason: p.reason });
+        } else {
+          onEvent({ type: 'agent_model', seq, model: p.model });
+        }
+      });
       budget.add(outcome.usage.totalTokens, outcome.usage.estimated);
       onEvent({ type: 'budget_tick', spent: budget.spent() });
       state.totalToolCalls += outcome.toolCalls;
@@ -346,6 +402,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
           phase: spec.phase,
           ok: outcome.ok,
           totalTokens: outcome.usage.totalTokens,
+          estimated: outcome.usage.estimated,
           error: outcome.error,
         });
         onAgentSettled?.({
@@ -370,6 +427,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
           phase: spec.phase,
           ok: false,
           totalTokens: outcome.usage.totalTokens,
+          estimated: outcome.usage.estimated,
           error: outcome.error,
         });
         onAgentSettled?.({
@@ -396,6 +454,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         phase: spec.phase,
         ok: true,
         totalTokens: outcome.usage.totalTokens,
+        estimated: outcome.usage.estimated,
       });
       onAgentSettled?.({
         spec,
@@ -501,7 +560,13 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     // counters vanish and the parent can report an empty failures[] despite
     // failed child agents.
     for (const f of childOut.failures) state.failures.push(f);
-    for (const l of childOut.logs) pushLog(l);
+    // The child already emitted its log lines live (it shares onEvent) —
+    // merge into parent state WITHOUT re-emitting, or every line shows twice.
+    for (const l of childOut.logs) {
+      if (state.logs.length >= logCap) state.droppedLogs++;
+      else state.logs.push(l);
+    }
+    state.droppedLogs += childOut.droppedLogs;
     if (childOut.workspaces) for (const w of childOut.workspaces) state.workspaces.push(w);
     state.agentCount += childOut.agentCount;
     state.totalToolCalls += childOut.totalToolCalls;

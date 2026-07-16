@@ -31,3 +31,14 @@ export function readProcStat(pid: number): ProcStat | undefined {
   if (!Number.isInteger(pgrp) || starttime === undefined) return undefined;
   return { pgrp, starttime };
 }
+
+/**
+ * PIDs this small mean the process was born inside a fresh PID namespace —
+ * a sandbox or one-shot container whose teardown SIGKILLs everything in it.
+ * Shared by the detach-time warning (run/resume) and the orphan hint (watch).
+ */
+export const NAMESPACE_LOCAL_PID_MAX = 64;
+
+export function looksNamespaceLocal(pid: number): boolean {
+  return pid > 0 && pid <= NAMESPACE_LOCAL_PID_MAX;
+}

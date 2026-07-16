@@ -6,6 +6,7 @@ import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir, getRun, readRunArgs, readRunConfig, reapOrphans } from '../store/runstore.js';
 import { isTerminal } from '../store/manifest.js';
 import { launchRunner } from '../exec/daemonize.js';
+import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { attachForeground, printOutput } from './lifecycle.js';
 import { readMaxConcurrencyOpt } from './options.js';
 
@@ -16,6 +17,8 @@ export interface ResumeCliOptions {
   yes?: boolean;
   detach?: boolean;
   json?: boolean;
+  plain?: boolean;
+  noColor?: boolean;
   home?: string;
 }
 
@@ -101,11 +104,16 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
 
   if (opts.detach) {
     process.stdout.write(`${newId}\n`);
-    process.stderr.write(`resumed from ${runId}; monitor: ultracode status ${newId} --watch\n`);
+    if (looksNamespaceLocal(process.pid)) {
+      process.stderr.write(
+        `⚠ heuristic: this shell has a namespace-local pid (${process.pid}). If it is a TRANSIENT sandbox (agent exec jail), the detached runner dies when it exits — long-lived containers are fine. Verify liveness: ultracode status\n`,
+      );
+    }
+    process.stderr.write(`resumed from ${runId}; monitor: ultracode watch ${newId}\n`);
     return 0;
   }
   process.stderr.write(`▶ ${newId} (resumed from ${runId})\n`);
-  const { exitCode } = await attachForeground(dir, { quiet: opts.json });
+  const { exitCode } = await attachForeground(dir, { quiet: opts.json, plain: opts.plain, noColor: opts.noColor });
   if (opts.json) printOutput(dir);
   return exitCode;
 }

@@ -8,21 +8,45 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readEventsFrom, type TimestampedEvent } from '../store/events.js';
 import { isTerminal, readManifest } from '../store/manifest.js';
-import { getRun, isPidAlive, listRuns, reapOrphans } from '../store/runstore.js';
+import { getRun, listRuns, reapOrphans } from '../store/runstore.js';
 import { stopRun } from '../exec/stop.js';
 import { ultracodeRoot } from '../store/layout.js';
+import { sanitizeText } from './panel.js';
 
+/**
+ * One event → one plain line. The output reaches real TTYs unsanitized-context
+ * (`logs` on stdout, `watch/run --plain`, MCP logTail), so the assembled line
+ * is passed through sanitizeText: worker-sourced fields (labels, errors, log
+ * messages, backend model ids) must not carry live control bytes.
+ */
 export function renderEvent(ev: TimestampedEvent): string | null {
+  const line = renderEventLine(ev);
+  return line === null ? null : sanitizeText(line);
+}
+
+function renderEventLine(ev: TimestampedEvent): string | null {
   switch (ev.type) {
     case 'run_started':
       return `▶ run started: ${ev.name}`;
     case 'phase_started':
       return `── phase: ${ev.title}`;
     case 'agent_started':
-      return `   agent[${ev.seq}] ${ev.label} started (${ev.backend})`;
+      return `   agent[${ev.seq}] ${ev.label} started (${ev.backend}${ev.model ? ` · ${ev.model}` : ''})`;
+    case 'agent_retry':
+      return `   agent[${ev.seq}] ${ev.label} retry ${ev.attempt}/${ev.maxAttempts}${ev.reason ? `: ${ev.reason}` : ''}`;
     case 'agent_completed':
       if (ev.skipped) return `   agent[${ev.seq}] ${ev.label} skipped`;
+      if (ev.cached) return `   agent[${ev.seq}] ${ev.label} done (cached)`;
       return `   agent[${ev.seq}] ${ev.label} ${ev.ok ? `done (${ev.totalTokens} tok)` : `FAILED: ${ev.error ?? ''}`}`;
+    case 'agent_usage':
+    case 'agent_model':
+      // Live-tick noise for folding panels only: line consumers (logs
+      // --follow, MCP logTail) would emit ~1 line/s per running agent.
+      return null;
+    case 'child_started':
+      return `▸ child workflow: ${ev.name}`;
+    case 'child_completed':
+      return `▸ child workflow ${ev.name} ${ev.ok ? 'done' : `FAILED: ${ev.error ?? ''}`}`;
     case 'workflow_log':
       return `   log: ${ev.message}`;
     case 'budget_tick':
@@ -45,66 +69,18 @@ export interface AttachResult {
 }
 
 /**
- * Foreground attach: tail events until the manifest is terminal, mirroring
- * the run status in the exit code. First Ctrl-C sends SIGTERM to the runner
- * (explicit stop); the run store keeps everything if we die instead.
+ * Foreground attach: the live panel (or line stream) until the manifest is
+ * terminal, mirroring the run status in the exit code. First Ctrl-C sends
+ * SIGTERM to the runner (explicit stop); the run store keeps everything if we
+ * die instead. Thin delegation to panelLoop — dynamic import because watch.ts
+ * imports renderEvent from this module.
  */
 export async function attachForeground(
   dir: string,
-  opts: { quiet?: boolean; onSigint?: () => void } = {},
+  opts: { quiet?: boolean; plain?: boolean; noColor?: boolean } = {},
 ): Promise<AttachResult> {
-  const eventsFile = join(dir, 'events.jsonl');
-  let offset = 0;
-  let sigints = 0;
-
-  const sigintHandler = () => {
-    sigints++;
-    const manifest = readManifest(dir);
-    if (sigints === 1 && manifest && manifest.pid > 0 && isPidAlive(manifest.pid)) {
-      process.stderr.write('\n■ stopping run (Ctrl-C again to detach immediately)…\n');
-      try {
-        process.kill(manifest.pid, 'SIGTERM');
-      } catch {
-        /* already gone */
-      }
-    } else {
-      process.stderr.write('\n■ detached; run may still be finalizing. Re-attach: ultracode status --watch\n');
-      process.exit(130);
-    }
-  };
-  process.on('SIGINT', sigintHandler);
-
-  try {
-    for (;;) {
-      const page = readEventsFrom(eventsFile, offset);
-      offset = page.nextOffset;
-      if (!opts.quiet) {
-        for (const ev of page.events) {
-          const line = renderEvent(ev);
-          if (line) process.stderr.write(line + '\n');
-        }
-      }
-      const manifest = readManifest(dir);
-      if (manifest && isTerminal(manifest.status)) {
-        // drain remaining events
-        const rest = readEventsFrom(eventsFile, offset);
-        if (!opts.quiet) {
-          for (const ev of rest.events) {
-            const line = renderEvent(ev);
-            if (line) process.stderr.write(line + '\n');
-          }
-        }
-        return { exitCode: manifest.status === 'completed' ? 0 : 1 };
-      }
-      if (manifest && manifest.status === 'running' && !isPidAlive(manifest.pid)) {
-        process.stderr.write('✗ runner died without finalizing (orphaned). See runner.log\n');
-        return { exitCode: 1 };
-      }
-      await sleep(150);
-    }
-  } finally {
-    process.removeListener('SIGINT', sigintHandler);
-  }
+  const { panelLoop } = await import('./watch.js');
+  return panelLoop(dir, { mode: 'attach', quiet: opts.quiet, plain: opts.plain, noColor: opts.noColor });
 }
 
 export function statusCommand(runId: string, opts: { watch?: boolean; json?: boolean; home?: string }): Promise<number> {
@@ -121,6 +97,9 @@ export function statusCommand(runId: string, opts: { watch?: boolean; json?: boo
         process.stdout.write(JSON.stringify({ ...m, effectiveStatus: run.effectiveStatus }, null, 2) + '\n');
       } else {
         const phases = m.phases.map((p) => `${p.title}(${p.agentsDone})`).join(' → ') || '(none)';
+        // sanitizeText per line (it flattens newlines): name, phase titles,
+        // and error are script/worker-controlled manifest fields — the same
+        // injection boundary renderEvent enforces.
         process.stdout.write(
           [
             `${m.runId}  ${run.effectiveStatus}  ${m.name}`,
@@ -128,7 +107,8 @@ export function statusCommand(runId: string, opts: { watch?: boolean; json?: boo
             `  phases: ${phases}`,
             m.error ? `  error: ${m.error}` : null,
           ]
-            .filter(Boolean)
+            .filter((l): l is string => l !== null)
+            .map((l) => sanitizeText(l))
             .join('\n') + '\n',
         );
       }
@@ -206,7 +186,9 @@ export function listCommand(opts: { all?: boolean; reap?: boolean; json?: boolea
   }
   for (const r of runs) {
     process.stdout.write(
-      `${r.runId}  ${r.effectiveStatus.padEnd(9)}  agents:${String(r.manifest.agentCount).padEnd(4)} ${r.manifest.name}  (${r.manifest.startedAt})\n`,
+      sanitizeText(
+        `${r.runId}  ${r.effectiveStatus.padEnd(9)}  agents:${String(r.manifest.agentCount).padEnd(4)} ${r.manifest.name}  (${r.manifest.startedAt})`,
+      ) + '\n',
     );
   }
   return 0;

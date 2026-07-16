@@ -25,10 +25,13 @@ import type {
   AgentEvent,
   AgentExecutor,
   AgentOutcome,
+  AgentProgress,
   AgentRequest,
+  AgentSidecar,
   AgentSpec,
   BackendAdapter,
   ExitClass,
+  NormalizedUsage,
   SpawnPlan,
 } from '../backends/types.js';
 import { CodexAdapter } from '../backends/codex.js';
@@ -67,9 +70,12 @@ export interface AgentCallOptions {
   /** per-attempt hard timeout (default 20 minutes) */
   attemptTimeoutMs?: number;
   onToolEvent?: (spec: AgentSpec, name: string, status: 'started' | 'completed' | 'failed' | 'declined') => void;
+  /** min gap between live usage ticks per agent (0 = every change; for tests) */
+  usageTickIntervalMs?: number;
 }
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 20 * 60_000;
+export const USAGE_TICK_INTERVAL_MS = 1000;
 
 interface AttemptResult {
   exit: ExitClass;
@@ -88,7 +94,7 @@ export class AgentCallExecutor implements AgentExecutor {
     private readonly opts: AgentCallOptions = {},
   ) {}
 
-  async execute(spec: AgentSpec, signal: AbortSignal): Promise<AgentOutcome> {
+  async execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (p: AgentProgress) => void): Promise<AgentOutcome> {
     // Structured-output setup. Native adapters pre-validate the schema —
     // incompatible schemas fail deterministically server-side, so reject
     // with ZERO spawns. Emulated adapters get a prompt-contract suffix.
@@ -116,24 +122,106 @@ export class AgentCallExecutor implements AgentExecutor {
     let last: AttemptResult | undefined;
     let attemptsUsed = 0;
     const usages: AttemptResult[] = [];
+    const tracker = onProgress ? this.makeProgressTracker(spec, onProgress) : undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (signal.aborted) {
         return this.toOutcome(spec, last, usages, attemptsUsed, 'aborted');
       }
       const plan = this.adapter.buildSpawn(req);
-      last = await this.runAttempt(spec, plan, signal, attempt);
+      last = await this.runAttempt(spec, plan, signal, attempt, tracker?.onStreamEvent);
       attemptsUsed = attempt;
       usages.push(last);
+      tracker?.attemptSettled(usages);
       if (last.exit.ok) {
         if (!spec.schema) return this.toOutcome(spec, last, usages, attemptsUsed);
         // Schema repair budget is independent of task retries; a schema
         // failure after repairs is terminal (no task-retry loop).
-        return this.enforceSchema(spec, req, last, usages, signal, attemptsUsed);
+        return this.enforceSchema(spec, req, last, usages, signal, attemptsUsed, tracker);
       }
       if (!last.exit.retryable) break;
+      if (attempt < maxAttempts) {
+        onProgress?.({ type: 'retry', attempt: attempt + 1, maxAttempts, kind: 'task', reason: last.exit.message });
+      }
     }
     return this.toOutcome(spec, last, usages, attemptsUsed);
+  }
+
+  /**
+   * Live-progress bookkeeping for one execute(): sums interim usage within the
+   * current attempt (a terminal usage event replaces the sum — it is the
+   * backend's authoritative session total), adds the merged usage of settled
+   * attempts, and throttles emission. Display-only by design: budget/journal
+   * accounting reads only the final AgentOutcome.usage.
+   */
+  private makeProgressTracker(spec: AgentSpec, onProgress: (p: AgentProgress) => void) {
+    const interval = this.opts.usageTickIntervalMs ?? USAGE_TICK_INTERVAL_MS;
+    let prior: NormalizedUsage | undefined; // merged usage of settled attempts
+    let acc: Partial<NormalizedUsage> | undefined; // current attempt's running usage
+    let accIsTerminal = false;
+    let lastTickAt = 0;
+    let lastTotal = 0;
+    let modelSent = false;
+
+    const maybeTick = (force: boolean): void => {
+      const current = acc ? finalizeUsage(acc) : undefined;
+      const usage = finalizeUsage({
+        inputTokens: (prior?.inputTokens ?? 0) + (current?.inputTokens ?? 0),
+        outputTokens: (prior?.outputTokens ?? 0) + (current?.outputTokens ?? 0),
+        cachedInputTokens: (prior?.cachedInputTokens ?? 0) + (current?.cachedInputTokens ?? 0),
+        reasoningTokens: (prior?.reasoningTokens ?? 0) + (current?.reasoningTokens ?? 0),
+        estimated: prior?.estimated ?? false,
+      });
+      // Strictly increasing, even when forced: a failed attempt's chars/4
+      // estimate can undershoot interim sums already shown, and a downward
+      // "correction" is display jitter — agent_completed carries the
+      // authoritative final figure regardless.
+      if (usage.totalTokens <= lastTotal) return;
+      const now = Date.now();
+      if (!force && now - lastTickAt < interval) return;
+      lastTickAt = now;
+      lastTotal = usage.totalTokens;
+      onProgress({ type: 'usage', usage });
+    };
+
+    return {
+      onStreamEvent: (ev: AgentEvent): void => {
+        if (ev.kind === 'session' && ev.model !== undefined && !modelSent) {
+          modelSent = true;
+          onProgress({ type: 'model', model: ev.model });
+        } else if (ev.kind === 'usage') {
+          if (ev.interim && !accIsTerminal) {
+            acc = {
+              inputTokens: (acc?.inputTokens ?? 0) + (ev.usage.inputTokens ?? 0),
+              outputTokens: (acc?.outputTokens ?? 0) + (ev.usage.outputTokens ?? 0),
+              cachedInputTokens: (acc?.cachedInputTokens ?? 0) + (ev.usage.cachedInputTokens ?? 0),
+              reasoningTokens: (acc?.reasoningTokens ?? 0) + (ev.usage.reasoningTokens ?? 0),
+            };
+          } else if (!ev.interim && !ev.threadCumulative) {
+            acc = { ...ev.usage };
+            accIsTerminal = true;
+          } else if (!ev.interim) {
+            // Thread-cumulative terminal usage (codex turn.completed after
+            // `exec resume`) already contains prior attempts on this session —
+            // adding it on top of `prior` would double the shared prefix, and
+            // the strictly-increasing guard would then pin the inflated figure.
+            // Skip; attemptSettled's checkpoint (session-aware mergedUsage)
+            // lands the correct total moments later.
+            accIsTerminal = true;
+          }
+          maybeTick(false);
+        }
+      },
+      attemptSettled: (attempts: AttemptResult[]): void => {
+        prior = this.mergedUsage(spec, attempts);
+        acc = undefined;
+        accIsTerminal = false;
+        maybeTick(true); // authoritative checkpoint bypasses the throttle
+      },
+      retry: (attempt: number, maxAttempts: number, kind: 'task' | 'schema-repair', reason?: string): void => {
+        onProgress({ type: 'retry', attempt, maxAttempts, kind, reason });
+      },
+    };
   }
 
   /** Extract → validate against the ORIGINAL schema → ≤2 repair turns (resume preferred). */
@@ -144,6 +232,7 @@ export class AgentCallExecutor implements AgentExecutor {
     usages: AttemptResult[],
     signal: AbortSignal,
     attemptsUsed: number,
+    tracker?: ReturnType<AgentCallExecutor['makeProgressTracker']>,
   ): Promise<AgentOutcome> {
     const schema = spec.schema!;
     let current = first;
@@ -179,6 +268,10 @@ export class AgentCallExecutor implements AgentExecutor {
 
       if (round === SCHEMA_REPAIR_LIMIT || signal.aborted) break;
 
+      // Overall attempt ordinal (not the repair round): task retries and
+      // schema repairs share one display sequence, so attempt is always >= 2
+      // whenever an extra spawn is running.
+      tracker?.retry(attemptsUsed + round + 1, attemptsUsed + SCHEMA_REPAIR_LIMIT, 'schema-repair', lastErrors.slice(0, 3).join('; '));
       const sessionId = current.sessionId ?? first.sessionId;
       const resumePlan =
         sessionId !== undefined ? this.adapter.buildResume(sessionId, resumeRepairPrompt(lastErrors, schema), req) : null;
@@ -188,8 +281,9 @@ export class AgentCallExecutor implements AgentExecutor {
           ...req,
           prompt: freshRepairPrompt(spec.prompt, lastRaw, lastErrors, schema),
         });
-      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1);
+      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, tracker?.onStreamEvent, resumePlan !== null);
       usages.push(current);
+      tracker?.attemptSettled(usages);
       if (!current.exit.ok) {
         return {
           ok: false,
@@ -224,13 +318,34 @@ export class AgentCallExecutor implements AgentExecutor {
   }
 
   private mergedUsage(spec: AgentSpec, attempts: AttemptResult[]) {
+    // Backends that report THREAD-CUMULATIVE totals (codex turn.completed):
+    // an `exec resume` attempt's figure already contains every prior attempt
+    // on the same session, so count only the LAST cumulative report per
+    // session — summing would double-count the shared prefix.
+    const counted: AttemptResult[] = [];
+    const cumulativeIdx = new Map<string, number>();
+    for (const a of attempts) {
+      const cumulative =
+        a.sessionId !== undefined &&
+        a.events.some((e) => e.kind === 'usage' && !e.interim && e.threadCumulative === true);
+      if (cumulative) {
+        const prev = cumulativeIdx.get(a.sessionId!);
+        if (prev !== undefined) {
+          counted[prev] = a;
+          continue;
+        }
+        cumulativeIdx.set(a.sessionId!, counted.length);
+      }
+      counted.push(a);
+    }
+
     let input = 0;
     let output = 0;
     let cached = 0;
     let reasoning = 0;
     let realAny = false;
     let estimatedAny = false;
-    for (const a of attempts) {
+    for (const a of counted) {
       const u = this.adapter.extractUsage(a.events);
       if (u.totalTokens > 0) {
         realAny = true;
@@ -278,6 +393,9 @@ export class AgentCallExecutor implements AgentExecutor {
     plan: SpawnPlan,
     signal: AbortSignal,
     attempt: number,
+    onStreamEvent?: (ev: AgentEvent) => void,
+    /** the plan resumes an existing backend session (schema repair via buildResume) */
+    resumedSession = false,
   ): Promise<AttemptResult> {
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
@@ -307,12 +425,27 @@ export class AgentCallExecutor implements AgentExecutor {
     let declinedActions = 0;
     let outputChars = 0;
 
+    let sidecar: AgentSidecar | undefined;
     const consume = (evs: AgentEvent[]): void => {
       for (const ev of evs) {
         events.push(ev);
         switch (ev.kind) {
           case 'session':
             sessionId = ev.sessionId;
+            onStreamEvent?.(ev);
+            // Display-only side channel (e.g. codex rollout tail): its events
+            // feed the progress tracker only — never the attempt's event
+            // list — so accounting is untouched by construction.
+            if (!sidecar && onStreamEvent && this.adapter.createSidecar) {
+              try {
+                sidecar = this.adapter.createSidecar(ev.sessionId, onStreamEvent, { resumedSession }) ?? undefined;
+              } catch {
+                /* best-effort */
+              }
+            }
+            break;
+          case 'usage':
+            onStreamEvent?.(ev);
             break;
           case 'message':
             finalText = ev.text; // keep the LAST message (codex #19816)
@@ -464,6 +597,11 @@ export class AgentCallExecutor implements AgentExecutor {
       for (const t of escalationTimers) clearTimeout(t);
       if (onAbort) signal.removeEventListener('abort', onAbort);
       if (transcriptFd !== undefined) closeSync(transcriptFd);
+      try {
+        sidecar?.close();
+      } catch {
+        /* display-only */
+      }
       if (artifactDir) rmSync(join(artifactDir, 'pgid'), { force: true });
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }

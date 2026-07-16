@@ -19,7 +19,7 @@ export class EventWriter {
     this.fd = openSync(file, 'a');
   }
 
-  write(event: Record<string, unknown> & { type: string }): void {
+  write<T extends { type: string }>(event: T): void {
     const line = JSON.stringify({ ts: Date.now(), ...event }) + '\n';
     writeSync(this.fd, line);
   }
@@ -36,21 +36,35 @@ export class EventWriter {
 export interface EventPage {
   events: TimestampedEvent[];
   nextOffset: number;
+  /** more complete lines remain past nextOffset (only when maxBytes clipped the read) */
+  hasMore?: boolean;
 }
 
-/** Read complete JSONL lines from a byte offset; incomplete tail lines are left for the next read. */
-export function readEventsFrom(file: string, offset: number): EventPage {
+/**
+ * Read complete JSONL lines from a byte offset; incomplete tail lines are left
+ * for the next read. maxBytes bounds one read so a late attach to a large
+ * backlog pages instead of allocating the whole remainder at once.
+ */
+export function readEventsFrom(file: string, offset: number, maxBytes?: number): EventPage {
   if (!existsSync(file)) return { events: [], nextOffset: offset };
   const size = statSync(file).size;
   if (size <= offset) return { events: [], nextOffset: offset };
-
   const fd = openSync(file, 'r');
   try {
-    const buf = Buffer.alloc(size - offset);
-    readSync(fd, buf, 0, buf.length, offset);
-    const text = buf.toString('utf8');
+    let window = maxBytes !== undefined ? Math.min(size - offset, maxBytes) : size - offset;
+    let text: string;
+    for (;;) {
+      const buf = Buffer.alloc(window);
+      readSync(fd, buf, 0, window, offset);
+      text = buf.toString('utf8');
+      // A single line larger than the window must not stall the tail forever
+      // (no newline → no offset progress): grow the window until a newline
+      // lands or EOF — a genuinely torn tail then waits for the writer.
+      if (text.lastIndexOf('\n') !== -1 || offset + window >= size) break;
+      window = Math.min(size - offset, window * 2);
+    }
     const lastNewline = text.lastIndexOf('\n');
-    if (lastNewline === -1) return { events: [], nextOffset: offset };
+    if (lastNewline === -1) return { events: [], nextOffset: offset, hasMore: false };
     const complete = text.slice(0, lastNewline);
     const consumed = Buffer.byteLength(complete, 'utf8') + 1;
     const events: TimestampedEvent[] = [];
@@ -62,7 +76,9 @@ export function readEventsFrom(file: string, offset: number): EventPage {
         /* torn line — skip */
       }
     }
-    return { events, nextOffset: offset + consumed };
+    // Clip condition only (against the FINAL window — growth may have widened
+    // it past maxBytes): a torn trailing line at EOF is NOT more data.
+    return { events, nextOffset: offset + consumed, hasMore: offset + window < size };
   } finally {
     closeSync(fd);
   }

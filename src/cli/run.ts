@@ -6,6 +6,7 @@ import { executeWorkflow, validateArgsAgainstInputSchema } from '../engine/run.j
 import { defaultConcurrency } from '../engine/semaphore.js';
 import { MockExecutor } from '../backends/mock.js';
 import { parseBudget } from '../budget/parse.js';
+import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
@@ -26,6 +27,8 @@ export interface RunCliOptions {
   dryRun?: boolean;
   yes?: boolean;
   json?: boolean;
+  plain?: boolean;
+  noColor?: boolean;
   home?: string;
 }
 
@@ -181,12 +184,20 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
 
   if (opts.detach) {
     process.stdout.write(`${runId}\n`);
-    process.stderr.write(`run dir: ${dir}\nmonitor: ultracode status ${runId} --watch\n`);
+    // A namespace-local pid means THIS CLI is inside a fresh PID namespace
+    // (agent exec jail, one-shot container) — the detached runner dies with
+    // it. Warn at launch; the corpse is otherwise silent (SIGKILL, no logs).
+    if (looksNamespaceLocal(process.pid)) {
+      process.stderr.write(
+        `⚠ heuristic: this shell has a namespace-local pid (${process.pid}). If it is a TRANSIENT sandbox (agent exec jail), the detached runner dies when it exits — long-lived containers are fine. Verify liveness: ultracode status\n`,
+      );
+    }
+    process.stderr.write(`run dir: ${dir}\nmonitor: ultracode watch ${runId}\n`);
     return 0;
   }
 
   process.stderr.write(`▶ ${runId} (${dir})\n`);
-  const { exitCode } = await attachForeground(dir, { quiet: opts.json });
+  const { exitCode } = await attachForeground(dir, { quiet: opts.json, plain: opts.plain, noColor: opts.noColor });
   if (opts.json) printOutput(dir);
   return exitCode;
 }
