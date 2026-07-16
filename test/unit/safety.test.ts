@@ -287,6 +287,46 @@ describe('CLI nesting guard (ULTRACODE_INSIDE_RUN)', () => {
       spy.mockRestore();
     }
   });
+
+  it('resume --allow-nested passes the guard (reaches the store, not the refusal)', async () => {
+    const { resumeCommand } = await import('../../src/cli/resume.js');
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
+      return true;
+    });
+    try {
+      await withInsideRun(async () => {
+        // Unknown run → still exit 1, but via the store lookup ("no run …"),
+        // proving the override let execution past the nesting guard.
+        expect(
+          await resumeCommand('wf_nope', { home: mkdtempSync(join(tmpdir(), 'uc-nestres2-')), allowNested: true }),
+        ).toBe(1);
+      });
+      expect(chunks.join('')).not.toContain('inside an ultracode worker');
+      expect(chunks.join('')).toContain('no run wf_nope');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('refuseInsideWorker truth table: only (marker set, not allowed) refuses', async () => {
+    const { refuseInsideWorker } = await import('../../src/cli/options.js');
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const prev = process.env.ULTRACODE_INSIDE_RUN;
+    try {
+      delete process.env.ULTRACODE_INSIDE_RUN;
+      expect(refuseInsideWorker('act', undefined)).toBe(false); // not a worker
+      expect(refuseInsideWorker('act', true)).toBe(false);
+      process.env.ULTRACODE_INSIDE_RUN = '1';
+      expect(refuseInsideWorker('act', true)).toBe(false); // worker, but opted in
+      expect(refuseInsideWorker('act', undefined)).toBe(true); // worker, not opted in
+    } finally {
+      errSpy.mockRestore();
+      if (prev === undefined) delete process.env.ULTRACODE_INSIDE_RUN;
+      else process.env.ULTRACODE_INSIDE_RUN = prev;
+    }
+  });
 });
 
 describe('CLI --max-concurrency fail-fast', () => {

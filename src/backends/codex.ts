@@ -61,6 +61,11 @@ const PERMISSION_TO_SANDBOX: Record<AgentRequest['permission'], string> = {
  * transport"). Safe to emit unconditionally: a no-op when unregistered, a
  * kill-switch when registered — from either config layer. Live-verified on
  * codex-cli 0.144.5 across all four cases (user/project × registered/absent).
+ * Profiles are not a bypass: codex 0.144.5 rejects a legacy `profile = …`
+ * config key outright, and a profile-v2 layer only applies with an explicit
+ * `--profile` (which this adapter never passes), so a profile-scoped server
+ * never loads into a worker — verified live: a server defined only in
+ * `<name>.config.toml` is invisible without `--profile`.
  * Known gap: a server hand-registered under a NON-default table key is out of
  * scope — you cannot disable-by-name a name you don't know.
  */
