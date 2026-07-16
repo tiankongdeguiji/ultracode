@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateScript } from '../../src/cli/validate.js';
@@ -65,12 +65,54 @@ describe('plugin bundles', () => {
     expect(lock.packages?.['']?.version).toBe(pkg.version);
   });
 
-  it('the `version` npm hook regenerates and stages src/version.ts', () => {
+  it('the `version` npm hook regenerates and stages all three version files', () => {
     // scripts/ is outside eslint + the src-only typecheck, and the sync-version
-    // tests below invoke the script directly with an argv override — so this is
-    // the only guard that the npm lifecycle wiring (what runs on a real `npm
-    // version`) keeps regenerating AND staging src/version.ts.
-    expect(pkg.scripts?.version).toMatch(/sync-version\.mjs.*&&.*git add src\/version\.ts/);
+    // tests below invoke the script directly with an argv override — so this
+    // static guard plus the `npm version` integration test below are the only
+    // things pinning the npm lifecycle wiring. In no-tag mode npm stages nothing
+    // itself, so the hook must stage all three files or a plain `git commit`
+    // could record only the mirror and recreate the drift this change prevents.
+    const v = pkg.scripts?.version ?? '';
+    expect(v).toMatch(/sync-version\.mjs\b.*&&.*\bgit add\b/);
+    for (const f of ['src/version.ts', 'package.json', 'package-lock.json']) {
+      expect(v, f).toContain(f);
+    }
+  });
+
+  it('npm version --no-git-tag-version stages package.json, lock, and version.ts together', () => {
+    // Regression guard for the Codex finding: in no-tag mode npm stages nothing,
+    // so a partial stage (only the mirror) would let a plain commit reintroduce
+    // drift. Also pins that npm updates the lock BEFORE the hook runs (the staged
+    // lock must already carry the bumped version).
+    const dir = mkdtempSync(join(tmpdir(), 'uc-npmver-'));
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    mkdirSync(join(dir, 'scripts'), { recursive: true });
+    cpSync(join(root, 'scripts/semver.mjs'), join(dir, 'scripts/semver.mjs'));
+    cpSync(join(root, 'scripts/sync-version.mjs'), join(dir, 'scripts/sync-version.mjs'));
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name: 'uc-npmver-fixture', version: '1.2.3',
+      scripts: { version: 'node scripts/sync-version.mjs && git add src/version.ts package.json package-lock.json' },
+    }, null, 2) + '\n');
+    writeFileSync(join(dir, 'package-lock.json'), JSON.stringify({
+      name: 'uc-npmver-fixture', version: '1.2.3', lockfileVersion: 3, packages: { '': { version: '1.2.3' } },
+    }, null, 2) + '\n');
+    writeFileSync(join(dir, 'src/version.ts'), `${BANNER}export const VERSION = '1.2.3';\n`);
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+    git('init', '-q');
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'test');
+    git('add', '-A');
+    git('commit', '-qm', 'init');
+    execFileSync('npm', ['version', 'patch', '--no-git-tag-version'], { cwd: dir, stdio: 'pipe' });
+
+    const staged = execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: dir, encoding: 'utf8' })
+      .split('\n').filter(Boolean).sort();
+    expect(staged).toEqual(['package-lock.json', 'package.json', 'src/version.ts']);
+    const stagedLock = JSON.parse(execFileSync('git', ['show', ':package-lock.json'], { cwd: dir, encoding: 'utf8' }));
+    expect(stagedLock.version).toBe('1.2.4');
+    expect(stagedLock.packages[''].version).toBe('1.2.4');
+    expect(execFileSync('git', ['show', ':src/version.ts'], { cwd: dir, encoding: 'utf8' }))
+      .toBe(`${BANNER}export const VERSION = '1.2.4';\n`);
   });
 
   it('sync-version regenerates src/version.ts from package.json', () => {

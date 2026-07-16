@@ -4,8 +4,10 @@
 // lifecycle script during `npm version <bump>` (npm has by then already updated
 // package.json AND package-lock.json). It rewrites ONLY src/version.ts, so it is
 // not a full drift repair on its own — to re-sync every mirror after a manual
-// package.json edit, run `npm version <that-version> --allow-same-version`, which
-// updates the lockfile and triggers this script. package.json is the single
+// package.json edit, run `npm version <that-version> --allow-same-version
+// --no-git-tag-version` (the hand-edit dirties the tree, which npm's default
+// clean-tree check would reject), which updates the lockfile and triggers this
+// script. package.json is the single
 // source of truth; test/unit/dist.test.ts guards every mirror (this constant,
 // both package-lock version fields, the bundle manifests) against it.
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';

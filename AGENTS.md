@@ -15,7 +15,7 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 ## Generated Plugin Bundles
 
 - `dist/` and the `dist-codex/`/`dist-qoder/` bundles are gitignored build outputs — never commit them. `npm run build:plugins` assembles bundles from canonical sources (`skill/`, `workflows/`, `hostpacks/<host>/`); `test/unit/dist.test.ts` rebuilds them before asserting, so they never go stale.
-- Bump only via `npm version <patch|minor|major|x.y.z> --no-git-tag-version`: npm updates `package.json` + both `package-lock.json` version fields, and the `version` hook regenerates `src/version.ts`. `package.json` is the single source of truth; `dist.test.ts` guards every mirror (the `VERSION` constant, both lock fields, bundle manifests) against it. Never hand-edit a mirror; repair a hand-edited `package.json` with `npm version <that-version> --allow-same-version`. For a tagged release, drop `--no-git-tag-version` and pass `-m 'chore: bump version to %s'`.
+- Bump only via `npm version <patch|minor|major|x.y.z> --no-git-tag-version`: npm updates `package.json` + both `package-lock.json` version fields, and the `version` hook regenerates `src/version.ts`. `package.json` is the single source of truth; `dist.test.ts` guards every mirror (the `VERSION` constant, both lock fields, bundle manifests) against it. Never hand-edit a mirror; repair a hand-edited `package.json` with `npm version <that-version> --allow-same-version --no-git-tag-version` (the `--no-git-tag-version` is required — the hand-edit leaves the tree dirty, which npm's default clean-tree check would otherwise reject). For a tagged release, drop `--no-git-tag-version` and pass `-m 'chore: bump version to %s'`.
 
 ## Testing
 
