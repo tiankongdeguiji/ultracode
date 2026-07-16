@@ -57,6 +57,15 @@ describe('agent()', () => {
     expect(executor.stats.attempts).toBe(6); // 1 + 5 clamped retries
   });
 
+  it('mock rehearsals honor the per-attempt timeout semantics (per-call wins over run-level)', async () => {
+    const perCall = await run(`return agent('MOCK:delay 60000 MOCK:ok never', { timeoutMs: 120 })`);
+    expect(perCall.output.error).toContain('attempt timed out after 120ms');
+    const runLevel = await run(`return agent('MOCK:delay 60000 MOCK:ok never')`, {
+      executor: new MockExecutor({ attemptTimeoutMs: 150 }),
+    });
+    expect(runLevel.output.error).toContain('attempt timed out after 150ms');
+  });
+
   it('junk timeoutMs is dropped at intake (0 must not insta-kill; strings must not NaN the deadline)', async () => {
     class SpecCapture extends MockExecutor {
       specs: unknown[] = [];

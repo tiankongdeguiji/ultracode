@@ -288,18 +288,30 @@ describe('task-retry resume', () => {
   it('the fresh fallback shares the attempt deadline instead of arming a second full window', async () => {
     const adapter = new ScriptedAdapter([
       { lines: [{ session: 's1' }], exit: 1 }, // attempt 1 fails fast, retryably
-      { lines: [], exit: 1, delayMs: 2_500 }, // resume: zero events, dies on its own late in the budget
+      { lines: [], exit: 1, delayMs: 3_500 }, // resume: zero events, dies on its own late in the budget
       { lines: [], exit: 0, hang: true }, // fresh fallback: hangs → must be killed at the REMAINING budget
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 4_000 }), SIGNAL);
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 6_000 }), SIGNAL);
     expect(outcome.ok).toBe(false);
     // Deterministic shape assertion, no wall-clock race: the fallback's kill
-    // message carries ITS timer value — a remainder (4000 − ~2500 − overhead)
-    // if the deadline is shared, the full 4000 if a second window was armed.
+    // message carries ITS timer value — a remainder (6000 − ~3500 − overhead)
+    // if the deadline is shared, the full 6000 if a second window was armed.
     const killedAfterMs = Number(/attempt timed out after (\d+)ms/.exec(outcome.error ?? '')?.[1]);
     expect(killedAfterMs).toBeGreaterThanOrEqual(1_000); // above the synthesize-floor: a real remainder spawn ran
-    expect(killedAfterMs).toBeLessThan(4_000); // strictly less than a second full window
+    expect(killedAfterMs).toBeLessThan(6_000); // strictly less than a second full window
     expect(adapter.resumeCalls).toHaveLength(1);
     expect(adapter.spawnCalls).toBe(2); // attempt 1 + the fallback rerun
+  }, 20_000);
+
+  it('a sub-second remainder synthesizes the timeout instead of spawning a doomed fresh process', async () => {
+    const adapter = new ScriptedAdapter([
+      { lines: [{ session: 's1' }], exit: 1 }, // fails fast, retryably
+      { lines: [], exit: 1, delayMs: 1_000 }, // resume: zero events, leaves <1s of the 1.5s budget
+    ]);
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 1_500 }), SIGNAL);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toBe('attempt timed out after 1500ms'); // synthesized: names the FULL budget
+    expect(adapter.resumeCalls).toHaveLength(1);
+    expect(adapter.spawnCalls).toBe(1); // no doomed fresh spawn
   }, 15_000);
 });

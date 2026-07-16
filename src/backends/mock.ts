@@ -78,7 +78,7 @@ export class MockExecutor implements AgentExecutor {
   /** attempt counters keyed by agent seq, for MOCK:fail-then-ok */
   private readonly attemptCounts = new Map<number, number>();
 
-  constructor(private readonly opts: { latencyMs?: number } = {}) {}
+  constructor(private readonly opts: { latencyMs?: number; attemptTimeoutMs?: number } = {}) {}
 
   async execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (p: AgentProgress) => void): Promise<AgentOutcome> {
     this.stats.calls++;
@@ -89,12 +89,13 @@ export class MockExecutor implements AgentExecutor {
     try {
       const maxAttempts = spec.retries + 1;
       let lastError = 'mock failure';
+      let lastErrorKind: AgentOutcome['errorKind'] = 'unknown';
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         this.stats.attempts++;
         if (signal.aborted) {
           return this.outcome(spec, { ok: false, error: 'aborted', errorKind: 'interrupted', attempts: attempt });
         }
-        const res = await this.attempt(spec, signal);
+        const res = await this.attemptWithTimeout(spec, signal);
         // One cumulative usage tick per attempt (same figures the outcome reports).
         onProgress?.({ type: 'usage', usage: usageFor(spec) });
         if (!res.ok && attempt < maxAttempts) {
@@ -117,8 +118,9 @@ export class MockExecutor implements AgentExecutor {
           return this.outcome(spec, { ...res, attempts: attempt });
         }
         lastError = res.error ?? lastError;
+        lastErrorKind = res.errorKind ?? 'unknown';
       }
-      return this.outcome(spec, { ok: false, error: lastError, errorKind: 'unknown', attempts: maxAttempts });
+      return this.outcome(spec, { ok: false, error: lastError, errorKind: lastErrorKind, attempts: maxAttempts });
     } finally {
       this.inFlight--;
     }
@@ -138,6 +140,28 @@ export class MockExecutor implements AgentExecutor {
       toolCalls: 1,
       attempts: partial.attempts,
     };
+  }
+
+  /** Same per-attempt timeout semantics as the real executor (per-call
+   *  spec.timeoutMs wins over the run-level default) so dry-run rehearsals
+   *  stay faithful to the documented hard cap. */
+  private async attemptWithTimeout(
+    spec: AgentSpec,
+    signal: AbortSignal,
+  ): Promise<{ ok: boolean; value?: unknown; error?: string; errorKind?: AgentOutcome['errorKind'] }> {
+    const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
+    if (timeoutMs === undefined) return this.attempt(spec, signal);
+    const TIMEOUT = Symbol('timeout');
+    const winner = await Promise.race([
+      this.attempt(spec, signal),
+      sleep(timeoutMs, TIMEOUT as unknown, { signal, ref: false }).catch(() => TIMEOUT as unknown),
+    ]);
+    if (winner === TIMEOUT) {
+      return signal.aborted
+        ? { ok: false, error: 'aborted', errorKind: 'interrupted' }
+        : { ok: false, error: `attempt timed out after ${timeoutMs}ms`, errorKind: 'stalled' };
+    }
+    return winner as { ok: boolean; value?: unknown; error?: string };
   }
 
   private async attempt(

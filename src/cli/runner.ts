@@ -38,7 +38,7 @@ function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger', at
     if (!ex) {
       ex =
         backend === 'mock'
-          ? new MockExecutor()
+          ? new MockExecutor({ attemptTimeoutMs })
           : (createExecutorForBackend(backend, { artifactDir, permission, attemptTimeoutMs }) ??
             (() => {
               throw new Error(`backend '${backend}' is not implemented yet`);
