@@ -9,10 +9,8 @@ import { join } from 'node:path';
 
 export type CodexAuthMode = 'api-key-env' | 'access-token-env' | 'api-key-file' | 'chatgpt-oauth' | 'none';
 
-/** Codex's config root; an empty CODEX_HOME means unset (codex semantics). The
- *  `env` seam exists for tests — every production caller uses process.env. */
-export function codexHome(env: NodeJS.ProcessEnv = process.env): string {
-  const fromEnv = env.CODEX_HOME;
+export function codexHome(): string {
+  const fromEnv = process.env.CODEX_HOME;
   return fromEnv && fromEnv.length > 0 ? fromEnv : join(homedir(), '.codex');
 }
 

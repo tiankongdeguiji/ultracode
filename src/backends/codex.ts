@@ -34,11 +34,8 @@ import { parseJsonLine } from './ndjson.js';
 import { usageFromEvents } from './usage.js';
 import { checkCodexStrictSchema } from './schema-strict.js';
 import { codexUsageToPartial, createCodexRolloutSidecar } from './codex-rollout.js';
-import { codexHome } from './codex-auth.js';
 import type { JsonSchema } from './types.js';
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 
 const PERMISSION_TO_SANDBOX: Record<AgentRequest['permission'], string> = {
   safe: 'read-only',
@@ -47,70 +44,27 @@ const PERMISSION_TO_SANDBOX: Record<AgentRequest['permission'], string> = {
 };
 
 /**
- * Worker isolation: hide the ultracode MCP server from spawned workers.
- * In a trusted-project cwd, `codex exec` loads the user's global config.toml
- * MCP servers — including `mcp_servers.ultracode` with pre-approved
- * workflow_start — and codex spawns MCP servers with a sanitized env, so the
- * ULTRACODE_INSIDE_RUN marker never reaches the server's own recursion guard.
- * Workers then recursively launch runs (the 2026-07-16 fork-bomb: 1,300+
- * nested runs until quota exhaustion). `enabled=false` is live-verified on
- * codex-cli 0.144.5 to drop the server's tools and instructions entirely.
+ * Worker isolation: hide the ultracode MCP server from every spawned worker.
+ * `codex exec` loads MCP servers from the user's config.toml AND from a trusted
+ * project's `.codex/config.toml` — including `mcp_servers.ultracode` with
+ * pre-approved workflow_start — and codex spawns MCP servers with a sanitized
+ * env, so the ULTRACODE_INSIDE_RUN marker never reaches the server's own
+ * recursion guard. Workers then recursively launch runs (the 2026-07-16
+ * fork-bomb: 1,300+ nested runs until quota exhaustion).
+ *
+ * A `-c` override is the top config layer (it beats both the user and the
+ * project config.toml). We replace the whole `ultracode` server entry with a
+ * disabled stub: `enabled=false` drops the server's tools/instructions, and the
+ * dummy `command` makes the entry a valid stdio server definition so the
+ * override is well-formed EVEN WHEN no ultracode server is registered (a bare
+ * `enabled=false` on an unknown name hard-fails codex startup with "invalid
+ * transport"). Safe to emit unconditionally: a no-op when unregistered, a
+ * kill-switch when registered — from either config layer. Live-verified on
+ * codex-cli 0.144.5 across all four cases (user/project × registered/absent).
+ * Known gap: a server hand-registered under a NON-default table key is out of
+ * scope — you cannot disable-by-name a name you don't know.
  */
-const MCP_KILL_SWITCH = ['-c', 'mcp_servers.ultracode.enabled=false'];
-
-/** True when the user's codex config registers our MCP server. The kill-switch
- *  override is only valid TOML then — applied to an UNREGISTERED server name it
- *  hard-fails codex startup with "invalid transport" (an entry with `enabled`
- *  alone has no command). Fail-open: unreadable config → no flag (status quo). */
-export function codexConfigHasUltracodeMcp(env: NodeJS.ProcessEnv = process.env): boolean {
-  try {
-    // codexHome(): an empty CODEX_HOME means unset — resolving '' with `??`
-    // would read a CWD-RELATIVE ./config.toml, letting a repo-planted file
-    // flip the flag for an unregistered server and hard-fail every worker.
-    const toml = readFileSync(join(codexHome(env), 'config.toml'), 'utf8');
-    // Line-scan instead of a TOML dependency: recognize every real spelling of
-    // a registration for the name 'ultracode' (the installer writes the first;
-    // hand-edited configs use the others) — a missed spelling silently drops
-    // the primary fork-bomb defense. The literal name is the whole contract:
-    // a server hand-registered under another key is out of scope by design.
-    //   [mcp_servers.ultracode]            (+ subtables like [...ultracode.env])
-    //   mcp_servers.ultracode.command = …  (root-level dotted keys)
-    //   [mcp_servers] + ultracode = { … }  (inline-table / dotted member)
-    // Quoted segments accepted throughout. Multi-line-string bodies are
-    // skipped via """/''' fence tracking: a look-alike line inside a string
-    // value must not count — that false positive would aim the kill-switch at
-    // an UNREGISTERED server and hard-fail every worker. Remaining blind spot:
-    // a fence embedded inside another string on the same line.
-    const seg = (dotted: string) => dotted.split('.').map((p) => p.trim().replace(/^(["'])(.*)\1$/, '$2'));
-    let table: string[] = [];
-    let fence: '"""' | "'''" | null = null;
-    for (const raw of toml.split('\n')) {
-      if (fence) {
-        if ((raw.split(fence).length - 1) % 2 === 1) fence = null;
-        continue;
-      }
-      const line = raw.trim();
-      const header = line.match(/^\[\s*(.+?)\s*\]/);
-      if (header) {
-        table = seg(header[1]!);
-        if (table[0] === 'mcp_servers' && table[1] === 'ultracode') return true;
-        continue;
-      }
-      const key = line.match(/^([^=\s]+(?:\s*\.\s*[^=\s]+)*)\s*=/);
-      if (key) {
-        const parts = seg(key[1]!);
-        if (table.length === 0 && parts[0] === 'mcp_servers' && parts[1] === 'ultracode') return true;
-        if (table.length === 1 && table[0] === 'mcp_servers' && parts[0] === 'ultracode') return true;
-      }
-      const openDq = (raw.split('"""').length - 1) % 2 === 1;
-      const openSq = (raw.split("'''").length - 1) % 2 === 1;
-      if (openDq || openSq) fence = openDq ? '"""' : "'''";
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
+const MCP_KILL_SWITCH = ['-c', 'mcp_servers.ultracode={command="true",enabled=false}'];
 
 interface CodexItem {
   id?: string;
@@ -126,12 +80,7 @@ export class CodexAdapter implements BackendAdapter {
   readonly id = 'codex' as const;
   readonly structuredOutput = 'native' as const;
 
-  constructor(
-    private readonly bin = process.env.ULTRACODE_CODEX_BIN ?? 'codex',
-    /** append MCP_KILL_SWITCH to worker argv — pass codexConfigHasUltracodeMcp();
-     *  must stay false when [mcp_servers.ultracode] is absent (startup error). */
-    private readonly hideUltracodeMcp = false,
-  ) {}
+  constructor(private readonly bin = process.env.ULTRACODE_CODEX_BIN ?? 'codex') {}
 
   probe(): Promise<BackendProbe> {
     return new Promise((resolve) => {
@@ -162,7 +111,7 @@ export class CodexAdapter implements BackendAdapter {
     ];
     if (req.model) argv.push('-m', req.model);
     if (req.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(req.effort)}`);
-    if (this.hideUltracodeMcp) argv.push(...MCP_KILL_SWITCH);
+    argv.push(...MCP_KILL_SWITCH);
     const plan: SpawnPlan = {
       bin: this.bin,
       argv,
@@ -191,7 +140,7 @@ export class CodexAdapter implements BackendAdapter {
       PERMISSION_TO_SANDBOX[req.permission],
     ];
     if (req.model) argv.push('-m', req.model);
-    if (this.hideUltracodeMcp) argv.push(...MCP_KILL_SWITCH);
+    argv.push(...MCP_KILL_SWITCH);
     const plan: SpawnPlan = { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
     if (req.schema) plan.schemaTempFile = { content: JSON.stringify(req.schema) };
     argv.push('-');

@@ -1,8 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CodexAdapter, classifyFailureMessage, codexConfigHasUltracodeMcp } from '../../src/backends/codex.js';
+import { CodexAdapter, classifyFailureMessage } from '../../src/backends/codex.js';
 import { NdjsonSplitter } from '../../src/backends/ndjson.js';
 import type { AgentEvent, AgentRequest } from '../../src/backends/types.js';
 
@@ -24,7 +23,7 @@ function req(overrides: Partial<AgentRequest> = {}): AgentRequest {
 }
 
 describe('CodexAdapter.buildSpawn', () => {
-  it('builds the canonical argv: --json, --skip-git-repo-check, --cd, sandbox mapping, stdin prompt', () => {
+  it('builds the canonical argv: --json, --skip-git-repo-check, --cd, sandbox mapping, kill-switch, stdin prompt', () => {
     const plan = new CodexAdapter().buildSpawn(req());
     expect(plan.argv).toEqual([
       'exec',
@@ -34,6 +33,8 @@ describe('CodexAdapter.buildSpawn', () => {
       '/w',
       '--sandbox',
       'workspace-write',
+      '-c',
+      'mcp_servers.ultracode={command="true",enabled=false}', // worker isolation, always on
       '-',
     ]);
     expect(plan.stdinData).toBe('p');
@@ -67,89 +68,19 @@ describe('CodexAdapter.buildSpawn', () => {
     expect(plan.stdinData).toBe('fix the JSON');
   });
 
-  it('hideUltracodeMcp appends the MCP kill-switch on spawn AND resume; default stays clean', () => {
-    const KILL = ['-c', 'mcp_servers.ultracode.enabled=false'];
+  it('appends the MCP kill-switch on spawn AND resume, before the stdin positional', () => {
+    // Unconditional worker isolation: the override replaces the ultracode MCP
+    // entry with a disabled stub. It is valid TOML whether or not the server is
+    // registered (the dummy command makes a well-formed stdio def), so it is a
+    // no-op when absent and a kill-switch when present — see MCP_KILL_SWITCH.
+    const KILL = ['-c', 'mcp_servers.ultracode={command="true",enabled=false}'];
     for (const plan of [
-      new CodexAdapter(undefined, true).buildSpawn(req()),
-      new CodexAdapter(undefined, true).buildResume('thread-123', 'fix', req())!,
+      new CodexAdapter().buildSpawn(req()),
+      new CodexAdapter().buildResume('thread-123', 'fix', req())!,
     ]) {
       const at = plan.argv.indexOf(KILL[0]!);
       expect(plan.argv.slice(at, at + 2)).toEqual(KILL);
       expect(plan.argv.at(-1)).toBe('-'); // stdin positional stays last
-    }
-    // Unconditional emission would hard-fail codex startup ("invalid transport")
-    // on machines without [mcp_servers.ultracode] in config.toml.
-    expect(new CodexAdapter().buildSpawn(req()).argv.join(' ')).not.toContain('mcp_servers');
-    expect(new CodexAdapter().buildResume('t', 'f', req())!.argv.join(' ')).not.toContain('mcp_servers');
-  });
-});
-
-describe('codexConfigHasUltracodeMcp', () => {
-  function homeWith(config?: string): string {
-    const home = mkdtempSync(join(tmpdir(), 'uc-codexhome-'));
-    if (config !== undefined) writeFileSync(join(home, 'config.toml'), config);
-    return home;
-  }
-
-  it('detects the installer-registered server; false without it or without a config', () => {
-    expect(codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith() })).toBe(false); // no config.toml
-    expect(
-      codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith('model = "gpt-5"\n[mcp_servers.other]\ncommand = "x"\n') }),
-    ).toBe(false);
-    expect(
-      codexConfigHasUltracodeMcp({
-        CODEX_HOME: homeWith('model = "gpt-5"\n\n[mcp_servers.ultracode]\ncommand = "node"\nargs = ["main.js", "mcp"]\n'),
-      }),
-    ).toBe(true);
-  });
-
-  it('detects hand-edited TOML spellings (a missed one silently drops the kill-switch)', () => {
-    for (const config of [
-      '[ mcp_servers . ultracode ]\ncommand = "node"\n', // whitespace in header
-      '[mcp_servers."ultracode"]\ncommand = "node"\n', // quoted key
-      '["mcp_servers".ultracode]\ncommand = "node"\n', // quoted FIRST segment
-      '[mcp_servers.ultracode.env]\nFOO = "1"\n', // subtable only
-      'mcp_servers.ultracode.command = "node"\n', // root dotted keys
-      'mcp_servers.ultracode = { command = "node" }\n', // root inline table
-      '[mcp_servers]\nother = { command = "x", args = ["y"] }\nultracode = { command = "node" }\n', // member
-      '[mcp_servers]\nultracode.command = "node"\n', // dotted member
-      '[other]\ndoc = """\nnothing here\n"""\n[mcp_servers.ultracode]\ncommand = "x"\n', // after a closed string
-    ]) {
-      expect(codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith(config) })).toBe(true);
-    }
-    for (const config of [
-      '[mcp_servers.ultracoded]\ncommand = "x"\n', // name is a prefix, not ours
-      '[other_table]\nultracode = { command = "x" }\n', // right key, wrong table
-      '# [mcp_servers.ultracode] mentioned in a comment only\n',
-      // Look-alike lines inside multi-line strings must NOT count — that false
-      // positive aims the kill-switch at an unregistered server (worker DoS).
-      '[other]\ndoc = """\n[mcp_servers.ultracode]\n"""\n',
-      "[other]\ndoc = '''\nmcp_servers.ultracode.command = \"x\"\n'''\n",
-    ]) {
-      expect(codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith(config) })).toBe(false);
-    }
-  });
-
-  it('treats empty CODEX_HOME as unset — never reads a cwd-relative config.toml', () => {
-    // A repo-planted ./config.toml registering the name would otherwise force
-    // the kill-switch against an UNREGISTERED server and hard-fail every worker.
-    // $HOME is overridden to a controlled empty dir so the expectation is a
-    // hard `false` on every machine — comparing '' against {} would be a
-    // tautology wherever the real ~/.codex registers the server (dogfooding
-    // machines, exactly where the regression would bite).
-    const planted = homeWith('[mcp_servers.ultracode]\ncommand = "planted"\n');
-    const cleanHome = mkdtempSync(join(tmpdir(), 'uc-clean-home-')); // no .codex inside
-    const prevCwd = process.cwd();
-    const prevHome = process.env.HOME;
-    process.chdir(planted);
-    process.env.HOME = cleanHome; // POSIX os.homedir() honors $HOME (win32 unsupported)
-    try {
-      expect(codexConfigHasUltracodeMcp({ CODEX_HOME: '' })).toBe(false);
-      expect(codexConfigHasUltracodeMcp({})).toBe(false);
-    } finally {
-      process.chdir(prevCwd);
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
     }
   });
 });
