@@ -12,6 +12,7 @@ import { readManifest, writeManifest, isTerminal } from '../../src/store/manifes
 import { launchRunner } from '../../src/exec/daemonize.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { panelLoop, readArtifact, resolveRenderMode, watchCommand, type PanelStream } from '../../src/cli/watch.js';
+import { readEventsFrom } from '../../src/store/events.js';
 
 const HELLO = `export const meta = { name: 'hello', description: 'd', title: 'Say hi', phases: [{ title: 'Greet', detail: 'wave' }] }
 phase('Greet')
@@ -298,6 +299,22 @@ return 1
     }
     expect(code).toBe(1);
     expect(chunks.join('')).toContain('no run wf_000000000000');
+  });
+});
+
+describe('readEventsFrom hardening', () => {
+  it('a swapped-in FIFO or symlink at events.jsonl yields an empty page instead of blocking the loop', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-events-'));
+    const fifo = join(dir, 'events.jsonl');
+    const mk = spawnSync('mkfifo', [fifo]);
+    if (mk.status === 0) {
+      // Raw-mode Ctrl-C needs a live event loop — a blocking open here is fatal.
+      expect(readEventsFrom(fifo, 0)).toEqual({ events: [], nextOffset: 0 });
+    }
+    writeFileSync(join(dir, 'real.jsonl'), '{"ts":1,"type":"workflow_log","message":"m"}\n');
+    symlinkSync(join(dir, 'real.jsonl'), join(dir, 'link.jsonl'));
+    expect(readEventsFrom(join(dir, 'link.jsonl'), 0)).toEqual({ events: [], nextOffset: 0 }); // O_NOFOLLOW
+    expect(readEventsFrom(join(dir, 'real.jsonl'), 0).events).toHaveLength(1); // regular files unaffected
   });
 });
 

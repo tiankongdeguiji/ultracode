@@ -246,6 +246,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
         scroll: ui.detailScroll,
         promptExpanded: ui.promptExpanded,
         keymap: final ? undefined : detailKeymap,
+        snapToOutcome: final, // dead keys can't scroll a frozen ↓ — show the result
       });
       ui.detailScroll = Math.min(ui.detailScroll, detail.maxScroll); // self-heal on shrink/resize
       frame = detail.text;

@@ -4,7 +4,7 @@
  * offset — the substrate for `status --watch`, `logs --follow`, and the MCP
  * long-poll cursor.
  */
-import { closeSync, existsSync, openSync, readSync, statSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, writeSync } from 'node:fs';
 
 export interface TimestampedEvent {
   ts: number;
@@ -50,11 +50,21 @@ export interface EventPage {
  * backlog pages instead of allocating the whole remainder at once.
  */
 export function readEventsFrom(file: string, offset: number, maxBytes?: number): EventPage {
-  if (!existsSync(file)) return { events: [], nextOffset: offset };
-  const size = statSync(file).size;
-  if (size <= offset) return { events: [], nextOffset: offset };
-  const fd = openSync(file, 'r');
+  // The run dir is worker-writable: O_NOFOLLOW rejects a swapped-in symlink
+  // and O_NONBLOCK keeps a swapped-in FIFO from blocking the open(2) forever —
+  // a blocked reader loop cannot even service Ctrl-C (raw-mode input and JS
+  // signal handlers both need the event loop). fstat on the fd gates the rest.
+  let fd: number;
   try {
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch {
+    return { events: [], nextOffset: offset }; // absent (or refused) — nothing to read yet
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { events: [], nextOffset: offset };
+    const size = stat.size;
+    if (size <= offset) return { events: [], nextOffset: offset };
     let window = maxBytes !== undefined ? Math.min(size - offset, maxBytes) : size - offset;
     let text: string;
     for (;;) {

@@ -173,6 +173,19 @@ describe('renderDetailFrame', () => {
     expect(value).toContain('own [9999HGOTCHA');
   });
 
+  it('snapToOutcome scrolls a frozen final frame to the Outcome section (dead keys cannot)', () => {
+    const prompt = Array.from({ length: 60 }, (_, i) => `p${i + 1}`).join('\n');
+    const art = { prompt, result: { ok: true, status: 'ok', value: 'THE-FINAL-ANSWER' } };
+    const opts = { ...OPTS, rows: 16, runStatus: 'completed' as const, promptExpanded: true };
+    // Without the snap, scroll 0 shows the prompt head and hides the outcome…
+    const unsnapped = renderDetailFrame(detailState(), 1, art, opts).text;
+    expect(unsnapped).not.toContain('THE-FINAL-ANSWER');
+    // …the final frame snaps to the Outcome header instead.
+    const snapped = renderDetailFrame(detailState(), 1, art, { ...opts, snapToOutcome: true }).text;
+    expect(snapped).toContain('Outcome');
+    expect(snapped).toContain('THE-FINAL-ANSWER');
+  });
+
   it('an exact-fit final frame keeps its last body line — no spurious ↓ indicator when keys are dead', () => {
     // Reference render with room to spare: no keymap (final frame), no indicator.
     const art = { prompt: 'p', result: { ok: true, status: 'ok', value: 'done' } };

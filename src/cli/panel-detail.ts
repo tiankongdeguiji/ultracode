@@ -48,6 +48,9 @@ export interface DetailOptions extends FrameOptions {
   /** first visible body line; the renderer clamps and reports maxScroll back */
   scroll: number;
   promptExpanded: boolean;
+  /** final frozen frame: keys are dead, so scroll to the Outcome section —
+   *  a frozen ↓ hiding the result would make it unreachable forever */
+  snapToOutcome?: boolean;
 }
 
 /** Wrapped prompt lines shown while collapsed. */
@@ -219,6 +222,7 @@ export function renderDetailFrame(
   body.push(`${paint('1', 'Activity')}${row.toolCalls > 0 ? paint('2', ` · ${row.toolCalls} tool call${row.toolCalls === 1 ? '' : 's'}`) : ''}`);
   for (const l of activityLines(row, opts, paint, bodyWidth)) body.push(BODY_INDENT + l);
   body.push('');
+  const outcomeIdx = body.length;
   body.push(paint('1', 'Outcome'));
   for (const l of outcomeLines(row, art, opts, paint, bodyWidth, memo)) body.push(BODY_INDENT + l);
 
@@ -230,7 +234,7 @@ export function renderDetailFrame(
   const reserveBottom = opts.keymap !== undefined || body.length > unreserved;
   const budget = reserveBottom ? Math.max(1, unreserved - 1) : unreserved;
   const maxScroll = Math.max(0, body.length - budget);
-  const scroll = Math.min(Math.max(0, opts.scroll), maxScroll);
+  const scroll = opts.snapToOutcome ? Math.min(outcomeIdx, maxScroll) : Math.min(Math.max(0, opts.scroll), maxScroll);
   const visible = body.slice(scroll, scroll + budget);
 
   let lines = [...pinned, ...visible];

@@ -182,17 +182,27 @@ export class MockExecutor implements AgentExecutor {
       return this.interpret(delayMatch[2] ?? '', spec, signal, onProgress, tools);
     }
 
-    const toolsMatch = prompt.match(/^MOCK:tools (\d+)\s*([\s\S]*)$/);
+    // Consecutive MOCK:tools directives are peeled iteratively (a long chain
+    // must not grow a synchronous recursion stack), and the cap is ONE
+    // aggregate budget for the whole attempt — per-directive caps would let a
+    // chain emit unboundedly and starve SIGTERM of the event loop.
+    let toolsMatch = prompt.match(/^MOCK:tools (\d+)\s*([\s\S]*)$/);
     if (toolsMatch) {
-      if (tools) tools.seen = true;
-      const n = Math.min(Number(toolsMatch[1]), MOCK_TOOLS_CAP); // never Infinity/unbounded
-      for (let i = 1; i <= n; i++) {
-        if (signal.aborted) break;
-        if (tools) tools.started++;
-        onProgress?.({ type: 'tool', name: `tool:mock-${i}`, status: 'started' });
-        onProgress?.({ type: 'tool', name: `tool:mock-${i}`, status: 'completed' });
-      }
-      return this.interpret(toolsMatch[2] ?? '', spec, signal, onProgress, tools);
+      let rest = prompt;
+      let emitted = tools?.started ?? 0;
+      do {
+        if (tools) tools.seen = true;
+        const n = Math.min(Number(toolsMatch[1]), MOCK_TOOLS_CAP);
+        for (let i = 1; i <= n && emitted < MOCK_TOOLS_CAP; i++) {
+          if (signal.aborted) break;
+          emitted++;
+          if (tools) tools.started++;
+          onProgress?.({ type: 'tool', name: `tool:mock-${i}`, status: 'started' });
+          onProgress?.({ type: 'tool', name: `tool:mock-${i}`, status: 'completed' });
+        }
+        rest = toolsMatch[2] ?? '';
+      } while ((toolsMatch = rest.match(/^MOCK:tools (\d+)\s*([\s\S]*)$/)));
+      return this.interpret(rest, spec, signal, onProgress, tools);
     }
 
     const failThenOk = prompt.match(/^MOCK:fail-then-ok (\d+)\s*([\s\S]*)$/);

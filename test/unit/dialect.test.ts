@@ -267,6 +267,15 @@ await agent('MOCK:tools ${'9'.repeat(400)} MOCK:ok done', { label: 'flood' })
 return 1`);
     expect(capped.error).toBeUndefined();
     expect(capped.totalToolCalls).toBe(MOCK_TOOLS_CAP);
+
+    // The cap is one aggregate budget for the attempt, not per directive —
+    // chained directives share it (and long chains are peeled iteratively).
+    const chain = Array.from({ length: 50 }, () => `MOCK:tools ${MOCK_TOOLS_CAP}`).join(' ');
+    const { output: chained } = await run(`
+await agent('${chain} MOCK:ok done', { label: 'chained' })
+return 1`);
+    expect(chained.error).toBeUndefined();
+    expect(chained.totalToolCalls).toBe(MOCK_TOOLS_CAP);
   });
 
   it('script throw sets error and preserves partials', async () => {
