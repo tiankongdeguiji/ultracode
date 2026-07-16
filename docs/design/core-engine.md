@@ -273,7 +273,7 @@ ultracode run <script.js | name> [--args '<json>'] [--backend id]
    # default: FOREGROUND attach (live panel on a TTY), exit 0/1 mirrors run status; --detach prints runId + paths
 ultracode watch  <runId> [--plain] [--no-color] # live panel: phases, per-agent tokens/elapsed, budget; Ctrl-C detaches.
                                                 # Interactive on a TTY: ↑/↓ (j/k) select an agent, ⏎ opens its detail view
-                                                # (prompt / tool activity / outcome), esc back, q detach
+                                                # (prompt / tool activity / outcome), esc back (overview: clear selection), q detach
 ultracode status <runId> [--watch] [--json]     # phases, agent table, budget, heartbeat
 ultracode logs   <runId> [--follow] [--agent seq]
 ultracode resume <runId> [--script f] [--args j]

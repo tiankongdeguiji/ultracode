@@ -47,7 +47,7 @@ ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
 ultracode run my.workflow.js --backend codex --budget 500k
 ultracode watch <runId>                         # live panel: ↑/↓ select an agent, ⏎ opens its
-                                                # prompt/activity/outcome detail, esc back, q detach
+                                                # prompt/activity/outcome detail, esc back/clear, q detach
 ultracode resume <runId> [--script edited.js]   # completed agents replay free
 ```
 

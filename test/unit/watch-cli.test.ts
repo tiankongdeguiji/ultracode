@@ -50,8 +50,9 @@ function captureStderr(): { chunks: string[]; restore: () => void } {
   return { chunks, restore: () => spy.mockRestore() };
 }
 
-function fakeTty(): PanelStream & { chunks: string[] } {
+function fakeTty(): PanelStream & { chunks: string[]; rows: number; resize: () => void } {
   const chunks: string[] = [];
+  const emitter = new EventEmitter();
   return {
     chunks,
     isTTY: true,
@@ -61,6 +62,9 @@ function fakeTty(): PanelStream & { chunks: string[] } {
       chunks.push(chunk);
       return true;
     },
+    on: (e: 'resize', l: () => void) => emitter.on(e, l),
+    removeListener: (e: 'resize', l: () => void) => emitter.removeListener(e, l),
+    resize: () => emitter.emit('resize'),
   };
 }
 
@@ -402,6 +406,80 @@ return 1
     } finally {
       exitSpy.mockRestore();
       process.kill(pid, 'SIGTERM'); // cleanup; let the loop finish
+      await loop;
+    }
+  }, 30_000);
+
+  it('overview selection: ↑ from none selects last, clamps at both edges, esc clears', async () => {
+    const DUO = `export const meta = { name: 'duo', description: 'd' }
+await parallel([
+  () => agent('MOCK:delay 15000 MOCK:ok a', { label: 'alpha' }),
+  () => agent('MOCK:delay 15000 MOCK:ok b', { label: 'beta' }),
+])
+return 1
+`;
+    const { dir } = makeRun(DUO);
+    const { pid } = await launchRunner(dir);
+    const stream = fakeTty();
+    const stdin = fakeStdin();
+    const loop = panelLoop(dir, { mode: 'observe', noColor: true, stream, input: stdin });
+    const selectedRow = (): string | undefined =>
+      stream.chunks.at(-1)!.split('\n').find((l) => l.includes('❯'));
+    try {
+      await waitForOutput(stream.chunks, 'beta');
+      stdin.press('\x1b[A'); // ↑ with no selection → selects the LAST row
+      expect(selectedRow()).toContain('beta');
+      stdin.press('\x1b[B'); // ↓ at the bottom edge → clamped, stays put
+      expect(selectedRow()).toContain('beta');
+      stdin.press('k'); // up → alpha
+      expect(selectedRow()).toContain('alpha');
+      stdin.press('k'); // top edge → clamped
+      expect(selectedRow()).toContain('alpha');
+      stdin.press('\x1b'); // esc clears the selection entirely
+      expect(selectedRow()).toBeUndefined();
+    } finally {
+      process.kill(pid, 'SIGTERM');
+      await loop;
+    }
+  }, 30_000);
+
+  it('detail view scrolls with j/k and re-clamps within the height budget across resizes', async () => {
+    const filler = Array.from({ length: 40 }, (_, i) => `filler line ${i + 1}`).join('\n');
+    const LONG = `export const meta = { name: 'long', description: 'd' }
+await agent(${JSON.stringify('MOCK:delay 15000 MOCK:ok done\n' + filler)}, { label: 'wordy' })
+return 1
+`;
+    const { dir } = makeRun(LONG);
+    const { pid } = await launchRunner(dir);
+    const stream = fakeTty();
+    stream.rows = 20;
+    const stdin = fakeStdin();
+    const loop = panelLoop(dir, { mode: 'observe', noColor: true, stream, input: stdin });
+    const frameLines = (c: string): number => c.slice(c.indexOf('⏺')).trimEnd().split('\n').length;
+    try {
+      await waitForOutput(stream.chunks, 'wordy');
+      stdin.press('\x1b[B');
+      stdin.press('\r'); // detail
+      stdin.press('\r'); // expand the 41-line prompt → scrollable body
+      expect(stream.chunks.at(-1)).toMatch(/\n1–\d+ of \d+ ↓/);
+      stdin.press('j');
+      stdin.press('j');
+      expect(stream.chunks.at(-1)).toMatch(/\n3–\d+ of \d+ ↑ ↓/);
+      stdin.press('k');
+      expect(stream.chunks.at(-1)).toMatch(/\n2–\d+ of \d+ ↑ ↓/);
+      expect(frameLines(stream.chunks.at(-1)!)).toBeLessThanOrEqual(19);
+
+      // Shrink the terminal: resize resets the region; every subsequent frame
+      // must fit the new budget and the scroll offset re-clamps itself.
+      stream.rows = 8;
+      stream.resize();
+      await sleep(400); // a few ticks at the new geometry
+      const after = stream.chunks.findLast((c) => c.includes('⏺'))!;
+      expect(frameLines(after)).toBeLessThanOrEqual(7);
+      stdin.press('j'); // scrolling still works post-resize
+      expect(frameLines(stream.chunks.at(-1)!)).toBeLessThanOrEqual(7);
+    } finally {
+      process.kill(pid, 'SIGTERM');
       await loop;
     }
   }, 30_000);

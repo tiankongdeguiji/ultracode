@@ -76,6 +76,9 @@ return 1`);
     const evil = 'x'.repeat(300) + '\x1b[2J\x07';
     const floodExecutor: AgentExecutor = {
       execute(_spec, _signal, onProgress?: (p: AgentProgress) => void): Promise<AgentOutcome> {
+        // In-bounds hostile name: the ESC must be removed by the scrub regex
+        // itself, not as a side effect of the 80-char truncation.
+        onProgress?.({ type: 'tool', name: 'bash\x1b[2Jls', status: 'started' });
         onProgress?.({ type: 'tool', name: evil, status: 'started' });
         for (let i = 0; i < TOOL_EVENT_CAP + 50; i++) {
           onProgress?.({ type: 'tool', name: 'flood', status: 'started' });
@@ -97,7 +100,8 @@ return 1`,
     );
     const tools = ofType('agent_tool');
     expect(tools).toHaveLength(TOOL_EVENT_CAP); // cap holds
-    const name = tools[0]!.name;
+    expect(tools[0]!.name).toBe('bash [2Jls'); // scrubbed by the regex, untouched by the cap
+    const name = tools[1]!.name;
     expect(name.length).toBeLessThanOrEqual(80);
     expect(name).not.toMatch(/[\x00-\x1f]/); // control bytes never enter the stream
     expect(ofType('agent_completed')[0]).toMatchObject({ toolCalls: TOOL_EVENT_CAP + 51 }); // authority unaffected

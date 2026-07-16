@@ -69,13 +69,15 @@ export interface PanelLoopOptions {
 const ARTIFACT_READ_CAP = 64 * 1024;
 
 /**
- * Read a worker-writable artifact without following symlinks (a worker may
- * have planted one — mirror of safe-write's O_NOFOLLOW stance on the read
- * side), capped at ARTIFACT_READ_CAP. O_NONBLOCK because a planted FIFO would
- * otherwise block the open(2) forever with the event loop (and therefore
- * Ctrl-C) dead — it is a no-op for regular files, and the fstat gate below
- * rejects everything that is not one. undefined when unreadable (not yet
- * written, symlink, FIFO/device, permission) — callers retry on a later paint.
+ * Read a worker-writable artifact without following a symlink at the LEAF (a
+ * worker may have planted one — mirror of safe-write's O_NOFOLLOW stance on
+ * the read side; directory-component symlinks are the same documented
+ * out-of-scope residual as safe-write's, would need openat). Capped at
+ * ARTIFACT_READ_CAP. O_NONBLOCK because a planted FIFO would otherwise block
+ * the open(2) forever with the event loop (and therefore Ctrl-C) dead — it is
+ * a no-op for regular files, and the fstat gate below rejects everything that
+ * is not one. undefined when unreadable (not yet written, symlink,
+ * FIFO/device, permission) — callers retry on a later paint.
  */
 export function readArtifact(path: string): string | undefined {
   let fd: number | undefined;
@@ -243,7 +245,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
         ...base,
         scroll: ui.detailScroll,
         promptExpanded: ui.promptExpanded,
-        keymap: final ? undefined : DETAIL_KEYMAP,
+        keymap: final ? undefined : detailKeymap,
       });
       ui.detailScroll = Math.min(ui.detailScroll, detail.maxScroll); // self-heal on shrink/resize
       frame = detail.text;
@@ -346,7 +348,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     mode.kind === 'panel' && !opts.quiet ? attachKeys(input, onKey) : { interactive: false, detach: (): void => {} };
   const interactive = keysAtt.interactive;
   const overviewKeymap = `↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c ${opts.mode === 'attach' ? 'stop' : 'detach'}`;
-  const DETAIL_KEYMAP = 'j/k scroll · ⏎ prompt · esc back · q detach';
+  const detailKeymap = 'j/k scroll · ⏎ prompt · esc back · q detach';
 
   // A resize rewraps already-painted lines and invalidates the cursor-up
   // count — abandon the old region and paint fresh below on the next tick.
