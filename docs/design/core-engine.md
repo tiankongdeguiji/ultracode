@@ -248,7 +248,7 @@ Default root: `<project>/.ultracode/` (git-ignorable), overridable `$ULTRACODE_H
 ### 3.2 Concurrency & crash safety
 
 - **Single-writer**: only the runner process writes inside its run dir. CLI/MCP are pure readers. No locks needed for readers; `manifest.json` is atomic-swapped; `events.jsonl`/`journal.jsonl` are O_APPEND single-`write()` lines (atomic under PIPE_BUF-sized records).
-- **Liveness**: runner refreshes `heartbeatAt` every 5s. Readers report `orphaned` when `status==='running'` but pid is dead or heartbeat > 30s stale; `ultracode list` offers `--reap` to finalize orphans (`status:'orphaned', error:'runner died without finalizing'`), which also unblocks resume.
+- **Liveness**: runner refreshes `heartbeatAt` every 5s. Readers report `orphaned` only when `status==='running'` but the recorded pid is dead or recycled (a stale heartbeat alone keeps a live-but-wedged runner `running`, so `stop` can still signal it); `ultracode list` offers `--reap` to finalize orphans (`status:'orphaned', error:'runner died without finalizing'`), which also unblocks resume.
 - **runId** from `crypto.randomBytes` (host-side; the determinism ban applies to scripts, not the engine). Distinct dirs ⇒ no cross-run contention. Worktrees live at `.ultracode/worktrees/<runId>/<seq>/` on branch `ultracode/<runId>/<seq>`, branched from the default branch; removed post-run if clean, kept (path recorded in result.json) if the agent left changes.
 - **Stop**: SIGTERM to runner → runner aborts the run AbortController, sends SIGTERM to each child's **process group** (children spawned with `detached:true` + `kill(-pgid)`), waits 5s, SIGKILL, marks `stopped`, flushes partial `output.json`.
 

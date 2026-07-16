@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunId } from '../../src/store/layout.js';
 import { createRunDir } from '../../src/store/runstore.js';
-import { writeManifest, type RunManifest } from '../../src/store/manifest.js';
+import { readManifest, writeManifest, type RunManifest } from '../../src/store/manifest.js';
 import { listCommand } from '../../src/cli/lifecycle.js';
 
 function tmpRoot(): string {
@@ -122,5 +122,21 @@ describe('list CLI', () => {
     err.restore();
     expect(code).toBe(1);
     expect(err.chunks.join('')).toContain('ultracode: --count must be a positive integer');
+  });
+
+  it('rejects an invalid --count before --reap can mutate the store', () => {
+    const root = tmpRoot();
+    const runId = newRunId();
+    const dir = createRunDir(root, { runId, name: 'demo', source: 's', args: null, config: { backend: 'mock', cwd: '/p' } });
+    writeManifest(dir, { ...baseManifest(runId), pid: 999999999, status: 'running' }); // dead pid ⇒ orphaned, reapable
+    const err = capture('stderr');
+    const out = capture('stdout');
+    const code = listCommand({ home: root, reap: true, count: '0' });
+    out.restore();
+    err.restore();
+    expect(code).toBe(1);
+    expect(err.chunks.join('')).toContain('ultracode: --count must be a positive integer');
+    expect(err.chunks.join('')).not.toContain('reaped'); // reap must not have run
+    expect(readManifest(dir)!.status).toBe('running'); // manifest untouched
   });
 });

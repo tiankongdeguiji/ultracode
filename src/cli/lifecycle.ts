@@ -164,11 +164,13 @@ export async function stopCommand(runId: string, opts: { home?: string }): Promi
 
 export function listCommand(opts: { all?: boolean; reap?: boolean; json?: boolean; home?: string; count?: string }): number {
   const root = ultracodeRoot(process.cwd(), opts.home);
+  // Reject bad input before --reap mutates the store: a rejected command must
+  // not have already rewritten orphan manifests.
+  const countOpt = readCountOpt(opts.count);
+  if (!countOpt.ok) return 1;
   if (opts.reap) {
     for (const id of reapOrphans(root)) process.stderr.write(`reaped ${id}\n`);
   }
-  const countOpt = readCountOpt(opts.count);
-  if (!countOpt.ok) return 1;
   const { runs, hidden } = recentRuns(root, { all: opts.all, count: countOpt.value });
   if (opts.json) {
     process.stdout.write(
