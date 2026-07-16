@@ -96,10 +96,12 @@ const num = (v: unknown): number | undefined => (typeof v === 'number' && Number
  * strings) must not carry control bytes into the terminal: an embedded ESC
  * breaks out of the repaint protocol (cursor movement, screen clears, content
  * spoofing) and a newline breaks the line-count invariant the cursor-up math
- * depends on. Every C0/C1 byte becomes a space.
+ * depends on. Every C0/C1 byte becomes a space, as do Unicode line/paragraph
+ * separators (terminals may break lines on them) and bidi overrides
+ * (visual-reorder spoofing).
  */
 export function sanitizeText(s: string): string {
-  return s.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
+  return s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, ' ');
 }
 
 export function createPanelState(seed: PanelSeed): PanelState {
@@ -336,7 +338,11 @@ export function formatDuration(ms: number): string {
  */
 function charWidth(cp: number): number {
   return (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+    (cp >= 0x231a && cp <= 0x231b) || // ⌚⌛
+    (cp >= 0x23e9 && cp <= 0x23fa) || // media symbols ⏩…⏺ (emoji-presentation)
+    (cp >= 0x25fb && cp <= 0x25fe) || // ◻◼◽◾
     (cp >= 0x2600 && cp <= 0x27bf) || // misc symbols/dingbats — often emoji-presentation (✅⚡): assume 2, see below
+    (cp >= 0x2b1b && cp <= 0x2b1c) || cp === 0x2b50 || cp === 0x2b55 || // ⬛⬜⭐⭕
     (cp >= 0x2e80 && cp <= 0xa4cf) || // CJK radicals … Yi
     (cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
     (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs

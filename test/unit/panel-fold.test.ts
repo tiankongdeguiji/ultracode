@@ -227,6 +227,15 @@ describe('format helpers', () => {
     expect(displayWidth('⚡')).toBe(2);
     expect(displayWidth('🀄')).toBe(2); // mahjong block below U+1F300
     expect(displayWidth('✓')).toBe(2); // wcwidth says 1 — deliberately overcounted (undercount soft-wraps)
+    for (const ch of ['⌚', '⏰', '⏳', '◽', '⬛', '⭐', '⭕']) {
+      expect(displayWidth(ch)).toBe(2); // emoji-presentation gaps between the CJK ranges
+    }
+  });
+
+  it('sanitizeText also neutralizes bidi overrides and Unicode line separators', () => {
+    expect(sanitizeText('a‮gnp.exe')).toBe('a gnp.exe'); // RLO spoof
+    expect(sanitizeText('x y z')).toBe('x y z'); // LS/PS render as line breaks on some terminals
+    expect(sanitizeText('i⁦solate⁩')).toBe('i solate ');
   });
 
   it('sanitizeText strips C0/C1 control bytes (incl. ESC and newlines) to spaces', () => {

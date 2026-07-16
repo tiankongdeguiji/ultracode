@@ -49,11 +49,9 @@ export function readEventsFrom(file: string, offset: number, maxBytes?: number):
   if (!existsSync(file)) return { events: [], nextOffset: offset };
   const size = statSync(file).size;
   if (size <= offset) return { events: [], nextOffset: offset };
-  const end = maxBytes !== undefined ? Math.min(size, offset + maxBytes) : size;
-
   const fd = openSync(file, 'r');
   try {
-    let window = end - offset;
+    let window = maxBytes !== undefined ? Math.min(size - offset, maxBytes) : size - offset;
     let text: string;
     for (;;) {
       const buf = Buffer.alloc(window);
@@ -78,7 +76,9 @@ export function readEventsFrom(file: string, offset: number, maxBytes?: number):
         /* torn line — skip */
       }
     }
-    return { events, nextOffset: offset + consumed, hasMore: offset + consumed < size };
+    // Clip condition only (against the FINAL window — growth may have widened
+    // it past maxBytes): a torn trailing line at EOF is NOT more data.
+    return { events, nextOffset: offset + consumed, hasMore: offset + window < size };
   } finally {
     closeSync(fd);
   }

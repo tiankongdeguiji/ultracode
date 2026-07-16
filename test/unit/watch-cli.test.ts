@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -195,6 +195,36 @@ return 1
     expect(() => process.kill(m.pid, 0)).not.toThrow();
     process.kill(m.pid, 'SIGTERM'); // cleanup
     await waitTerminal(dir);
+  }, 30_000);
+
+  it('attach-mode first Ctrl-C SIGTERMs the REAL runner via the identity guard (graceful stop)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-attach-sigint-'));
+    const wf = join(root, 'slow.workflow.js');
+    writeFileSync(wf, `export const meta = { name: 'slow-attach', description: 'd' }
+await agent('MOCK:delay 20000 MOCK:ok done', { label: 'sleeper' })
+return 1
+`);
+    const here = dirname(fileURLToPath(import.meta.url));
+    const mainTs = join(here, '../../src/cli/main.ts');
+    const tsxLoader = createRequire(import.meta.url).resolve('tsx');
+    const child = spawn(
+      process.execPath,
+      ['--import', tsxLoader, mainTs, 'run', wf, '--home', root, '--backend', 'mock', '--yes'],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let err = '';
+    child.stderr!.setEncoding('utf8');
+    child.stderr!.on('data', (c: string) => (err += c));
+    await sleep(3000); // runner launched + attach running
+    child.kill('SIGINT'); // first Ctrl-C: must SIGTERM the runner, then follow it to 'stopped'
+    const code = await new Promise<number | null>((resolve) => child.on('close', (c) => resolve(c)));
+
+    expect(err).toContain('stopping run (Ctrl-C again to detach immediately)');
+    expect(code).toBe(1); // exit mirrors the stopped run
+    const runId = /▶ (wf_[0-9a-f]+)/.exec(err)?.[1];
+    expect(runId).toBeTruthy();
+    const m = readManifest(join(root, 'runs', runId!))!;
+    expect(m.status).toBe('stopped'); // graceful SIGTERM path, not a kill
   }, 30_000);
 
   it('watch of an orphaned run reports it and exits 1, in both plain and panel modes', async () => {

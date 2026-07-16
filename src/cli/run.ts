@@ -189,7 +189,7 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
     // it. Warn at launch; the corpse is otherwise silent (SIGKILL, no logs).
     if (looksNamespaceLocal(process.pid)) {
       process.stderr.write(
-        `⚠ this shell looks sandboxed (pid ${process.pid}): a detached runner cannot outlive a transient sandbox — prefer the MCP route or a persistent shell\n`,
+        `⚠ heuristic: this shell has a namespace-local pid (${process.pid}). If it is a TRANSIENT sandbox (agent exec jail), the detached runner dies when it exits — long-lived containers are fine. Verify liveness: ultracode status\n`,
       );
     }
     process.stderr.write(`run dir: ${dir}\nmonitor: ultracode watch ${runId}\n`);

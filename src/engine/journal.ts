@@ -2,7 +2,7 @@
  * Journal: append-only journal.jsonl with hash-chained cache keys enabling
  * longest-unchanged-prefix replay on resume.
  *
- *   key_0 = "u1:" + sha256("ultracode-seed\0" + stableStringify(args))
+ *   key_0 = "u1:" + sha256("ultracode-seed\0" + stableStringify(args) + "\0" + permission)
  *   key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0" +
  *           stableStringify({agentType, isolation, model, effort, schema, backend, cwd?}))
  *

@@ -171,6 +171,10 @@ export function createServer(baseCwd: string): McpServer {
           });
         }
 
+        // Catching up on a clipped backlog (e.g. tick-heavy pages): read the
+        // next page immediately — pacing 4 MB per 300 ms would starve clients.
+        if (page.hasMore) continue;
+
         if (progressToken !== undefined) {
           try {
             await extra.sendNotification({
