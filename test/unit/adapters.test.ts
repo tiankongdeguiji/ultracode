@@ -164,17 +164,25 @@ describe('backend factory', () => {
     // pins the load-bearing wiring line in createExecutorForBackend — if a
     // refactor drops the constructor argument, isolation vanishes silently.
     const { createExecutorForBackend } = await import('../../src/engine/agentcall.js');
-    const home = mkdtempSync(join(tmpdir(), 'uc-codexwire-'));
-    writeFileSync(join(home, 'config.toml'), '[mcp_servers.ultracode]\ncommand = "node"\n');
-    const prev = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = home;
-    try {
-      const ex = createExecutorForBackend('codex') as unknown as { adapter: BackendAdapter };
-      const plan = ex.adapter.buildSpawn({ prompt: 'p', cwd: '/w', permission: 'auto', env: {} });
-      expect(plan.argv.join(' ')).toContain('mcp_servers.ultracode.enabled=false');
-    } finally {
-      if (prev === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = prev;
-    }
+    const spawnArgvWithHome = (config?: string) => {
+      const home = mkdtempSync(join(tmpdir(), 'uc-codexwire-'));
+      if (config !== undefined) writeFileSync(join(home, 'config.toml'), config);
+      const prev = process.env.CODEX_HOME;
+      process.env.CODEX_HOME = home;
+      try {
+        const ex = createExecutorForBackend('codex') as unknown as { adapter: BackendAdapter };
+        return ex.adapter.buildSpawn({ prompt: 'p', cwd: '/w', permission: 'auto', env: {} }).argv.join(' ');
+      } finally {
+        if (prev === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = prev;
+      }
+    };
+    expect(spawnArgvWithHome('[mcp_servers.ultracode]\ncommand = "node"\n')).toContain(
+      'mcp_servers.ultracode.enabled=false',
+    );
+    // The false-positive direction is the dangerous one: emitting the override
+    // with NO registration hard-fails codex startup for every worker.
+    expect(spawnArgvWithHome('[mcp_servers.other]\ncommand = "x"\n')).not.toContain('mcp_servers');
+    expect(spawnArgvWithHome(undefined)).not.toContain('mcp_servers'); // no config.toml at all
   });
 });

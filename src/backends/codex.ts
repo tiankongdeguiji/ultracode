@@ -34,10 +34,10 @@ import { parseJsonLine } from './ndjson.js';
 import { usageFromEvents } from './usage.js';
 import { checkCodexStrictSchema } from './schema-strict.js';
 import { codexUsageToPartial, createCodexRolloutSidecar } from './codex-rollout.js';
+import { codexHome } from './codex-auth.js';
 import type { JsonSchema } from './types.js';
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const PERMISSION_TO_SANDBOX: Record<AgentRequest['permission'], string> = {
@@ -64,35 +64,47 @@ const MCP_KILL_SWITCH = ['-c', 'mcp_servers.ultracode.enabled=false'];
  *  alone has no command). Fail-open: unreadable config → no flag (status quo). */
 export function codexConfigHasUltracodeMcp(env: NodeJS.ProcessEnv = process.env): boolean {
   try {
-    // Empty CODEX_HOME means unset (codex semantics, matches codexHome() in
-    // codex-auth.ts) — `??` alone would read a CWD-RELATIVE ./config.toml,
-    // letting a repo-planted file flip the flag for an unregistered server
-    // and hard-fail every worker in the run.
-    const home = env.CODEX_HOME?.length ? env.CODEX_HOME : join(homedir(), '.codex');
-    const toml = readFileSync(join(home, 'config.toml'), 'utf8');
+    // codexHome(): an empty CODEX_HOME means unset — resolving '' with `??`
+    // would read a CWD-RELATIVE ./config.toml, letting a repo-planted file
+    // flip the flag for an unregistered server and hard-fail every worker.
+    const toml = readFileSync(join(codexHome(env), 'config.toml'), 'utf8');
     // Line-scan instead of a TOML dependency: recognize every real spelling of
     // a registration for the name 'ultracode' (the installer writes the first;
     // hand-edited configs use the others) — a missed spelling silently drops
-    // the primary fork-bomb defense. Quoted keys accepted throughout.
+    // the primary fork-bomb defense. The literal name is the whole contract:
+    // a server hand-registered under another key is out of scope by design.
     //   [mcp_servers.ultracode]            (+ subtables like [...ultracode.env])
     //   mcp_servers.ultracode.command = …  (root-level dotted keys)
     //   [mcp_servers] + ultracode = { … }  (inline-table / dotted member)
-    const KEY = /^(?:ultracode|"ultracode"|'ultracode')$/;
-    let table = '';
+    // Quoted segments accepted throughout. Multi-line-string bodies are
+    // skipped via """/''' fence tracking: a look-alike line inside a string
+    // value must not count — that false positive would aim the kill-switch at
+    // an UNREGISTERED server and hard-fail every worker. Remaining blind spot:
+    // a fence embedded inside another string on the same line.
+    const seg = (dotted: string) => dotted.split('.').map((p) => p.trim().replace(/^(["'])(.*)\1$/, '$2'));
+    let table: string[] = [];
+    let fence: '"""' | "'''" | null = null;
     for (const raw of toml.split('\n')) {
+      if (fence) {
+        if ((raw.split(fence).length - 1) % 2 === 1) fence = null;
+        continue;
+      }
       const line = raw.trim();
       const header = line.match(/^\[\s*(.+?)\s*\]/);
       if (header) {
-        table = header[1]!;
-        const parts = table.split('.').map((p) => p.trim());
-        if (parts[0] === 'mcp_servers' && parts[1] !== undefined && KEY.test(parts[1])) return true;
+        table = seg(header[1]!);
+        if (table[0] === 'mcp_servers' && table[1] === 'ultracode') return true;
         continue;
       }
       const key = line.match(/^([^=\s]+(?:\s*\.\s*[^=\s]+)*)\s*=/);
-      if (!key) continue;
-      const parts = key[1]!.split('.').map((p) => p.trim());
-      if (table === '' && parts[0] === 'mcp_servers' && parts[1] !== undefined && KEY.test(parts[1])) return true;
-      if (table === 'mcp_servers' && KEY.test(parts[0]!)) return true;
+      if (key) {
+        const parts = seg(key[1]!);
+        if (table.length === 0 && parts[0] === 'mcp_servers' && parts[1] === 'ultracode') return true;
+        if (table.length === 1 && table[0] === 'mcp_servers' && parts[0] === 'ultracode') return true;
+      }
+      const openDq = (raw.split('"""').length - 1) % 2 === 1;
+      const openSq = (raw.split("'''").length - 1) % 2 === 1;
+      if (openDq || openSq) fence = openDq ? '"""' : "'''";
     }
     return false;
   } catch {

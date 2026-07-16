@@ -107,11 +107,13 @@ describe('codexConfigHasUltracodeMcp', () => {
     for (const config of [
       '[ mcp_servers . ultracode ]\ncommand = "node"\n', // whitespace in header
       '[mcp_servers."ultracode"]\ncommand = "node"\n', // quoted key
+      '["mcp_servers".ultracode]\ncommand = "node"\n', // quoted FIRST segment
       '[mcp_servers.ultracode.env]\nFOO = "1"\n', // subtable only
       'mcp_servers.ultracode.command = "node"\n', // root dotted keys
       'mcp_servers.ultracode = { command = "node" }\n', // root inline table
       '[mcp_servers]\nother = { command = "x", args = ["y"] }\nultracode = { command = "node" }\n', // member
       '[mcp_servers]\nultracode.command = "node"\n', // dotted member
+      '[other]\ndoc = """\nnothing here\n"""\n[mcp_servers.ultracode]\ncommand = "x"\n', // after a closed string
     ]) {
       expect(codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith(config) })).toBe(true);
     }
@@ -119,6 +121,10 @@ describe('codexConfigHasUltracodeMcp', () => {
       '[mcp_servers.ultracoded]\ncommand = "x"\n', // name is a prefix, not ours
       '[other_table]\nultracode = { command = "x" }\n', // right key, wrong table
       '# [mcp_servers.ultracode] mentioned in a comment only\n',
+      // Look-alike lines inside multi-line strings must NOT count — that false
+      // positive aims the kill-switch at an unregistered server (worker DoS).
+      '[other]\ndoc = """\n[mcp_servers.ultracode]\n"""\n',
+      "[other]\ndoc = '''\nmcp_servers.ultracode.command = \"x\"\n'''\n",
     ]) {
       expect(codexConfigHasUltracodeMcp({ CODEX_HOME: homeWith(config) })).toBe(false);
     }
@@ -127,15 +133,23 @@ describe('codexConfigHasUltracodeMcp', () => {
   it('treats empty CODEX_HOME as unset — never reads a cwd-relative config.toml', () => {
     // A repo-planted ./config.toml registering the name would otherwise force
     // the kill-switch against an UNREGISTERED server and hard-fail every worker.
-    const dir = homeWith('[mcp_servers.ultracode]\ncommand = "planted"\n');
+    // $HOME is overridden to a controlled empty dir so the expectation is a
+    // hard `false` on every machine — comparing '' against {} would be a
+    // tautology wherever the real ~/.codex registers the server (dogfooding
+    // machines, exactly where the regression would bite).
+    const planted = homeWith('[mcp_servers.ultracode]\ncommand = "planted"\n');
+    const cleanHome = mkdtempSync(join(tmpdir(), 'uc-clean-home-')); // no .codex inside
     const prevCwd = process.cwd();
-    process.chdir(dir);
+    const prevHome = process.env.HOME;
+    process.chdir(planted);
+    process.env.HOME = cleanHome; // POSIX os.homedir() honors $HOME (win32 unsupported)
     try {
-      // '' must behave exactly like unset (resolve to the real ~/.codex),
-      // regardless of what the current directory contains.
-      expect(codexConfigHasUltracodeMcp({ CODEX_HOME: '' })).toBe(codexConfigHasUltracodeMcp({}));
+      expect(codexConfigHasUltracodeMcp({ CODEX_HOME: '' })).toBe(false);
+      expect(codexConfigHasUltracodeMcp({})).toBe(false);
     } finally {
       process.chdir(prevCwd);
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
     }
   });
 });

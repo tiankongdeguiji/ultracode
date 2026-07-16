@@ -7,11 +7,13 @@ import {
   MARKER_BEGIN,
   MARKER_END,
   QODER_RULE,
+  codexMcpToml,
   installForHost,
   planFor,
   skillSourceDir,
   upsertMarkerBlock,
 } from '../../src/installer/install.js';
+import { codexConfigHasUltracodeMcp } from '../../src/backends/codex.js';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'uc-install-'));
@@ -60,6 +62,14 @@ describe('worker anti-nesting doctrine', () => {
       const text = readFileSync(join(skillSourceDir(), '../../hostpacks/qoder/agents', agent), 'utf8');
       expect(flat(text)).toContain('never start workflows');
     }
+  });
+
+  it('the installer registration is recognized by the worker-isolation detector', () => {
+    // Drift insurance: if codexMcpToml's spelling and codexConfigHasUltracodeMcp
+    // ever diverge, real installs silently lose the MCP kill-switch.
+    const home = tmp();
+    writeFileSync(join(home, 'config.toml'), codexMcpToml(['/usr/bin/node', '/x/main.js', 'mcp']) + '\n');
+    expect(codexConfigHasUltracodeMcp({ CODEX_HOME: home })).toBe(true);
   });
 });
 
