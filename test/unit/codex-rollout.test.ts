@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -133,6 +133,22 @@ describe('codex rollout sidecar', () => {
     sidecar.close();
     const ticks = events.filter((e): e is Extract<AgentEvent, { kind: 'usage' }> => e.kind === 'usage');
     expect(ticks.map((t) => t.usage.inputTokens)).toEqual([100, 200]);
+  });
+
+  it('survives the rollout being deleted mid-tail (silent degradation, no throw)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'uc-codex-home-'));
+    const dir = rolloutDir(home);
+    const sid = '0199-deleted-1';
+    const file = join(dir, `rollout-2026-01-01T00-00-00-${sid}.jsonl`);
+    writeFileSync(file, turnContext('gpt-5.6-sol'));
+    const { events, emit } = collect();
+    const sidecar = createCodexRolloutSidecar(sid, emit, { home, pollMs: 20 });
+    await sleep(100);
+    expect(events).toHaveLength(1); // model emitted before deletion
+    rmSync(file);
+    await sleep(100); // ticks after deletion must not throw or emit
+    sidecar.close();
+    expect(events).toHaveLength(1);
   });
 
   it('missing session degrades silently', async () => {

@@ -424,8 +424,38 @@ interface Section {
   firstSeq: number;
 }
 
-function rowsOf(state: PanelState): AgentRow[] {
-  return state.order.map((seq) => state.agents.get(seq)!).filter(Boolean);
+/**
+ * One pass over state.order per frame: rows bucketed by (childId, phase) with
+ * first-seen seqs — phaseLines/buildSections/footerLine read buckets instead
+ * of rescanning all rows per section (O(agents), not O(sections × agents)).
+ */
+interface FrameIndex {
+  ordered: AgentRow[];
+  buckets: Map<string, AgentRow[]>;
+  firstSeqByKey: Map<string, number>;
+  firstSeqByChild: Map<number, number>;
+}
+
+const groupKey = (childId: number | undefined, phase: string | undefined): string =>
+  `${childId ?? ''}\u0000${phase ?? ''}`;
+
+function indexRows(state: PanelState): FrameIndex {
+  const idx: FrameIndex = { ordered: [], buckets: new Map(), firstSeqByKey: new Map(), firstSeqByChild: new Map() };
+  for (const seq of state.order) {
+    const row = state.agents.get(seq);
+    if (!row) continue;
+    idx.ordered.push(row);
+    const key = groupKey(row.childId, row.phase);
+    let bucket = idx.buckets.get(key);
+    if (!bucket) {
+      bucket = [];
+      idx.buckets.set(key, bucket);
+      idx.firstSeqByKey.set(key, row.seq);
+    }
+    bucket.push(row);
+    if (row.childId !== undefined && !idx.firstSeqByChild.has(row.childId)) idx.firstSeqByChild.set(row.childId, row.seq);
+  }
+  return idx;
 }
 
 function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: Paint): string {
@@ -478,12 +508,12 @@ function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: 
   return `${indent}⎿ ${glyph} ${label}${meta ? ` ${meta}` : ''}`.trimEnd();
 }
 
-function sectionRows(state: PanelState, childId: number | undefined, phase: string | undefined): AgentRow[] {
-  return rowsOf(state).filter((r) => r.childId === childId && r.phase === phase);
+function sectionRows(idx: FrameIndex, childId: number | undefined, phase: string | undefined): AgentRow[] {
+  return idx.buckets.get(groupKey(childId, phase)) ?? [];
 }
 
 function phaseLines(
-  state: PanelState,
+  idx: FrameIndex,
   phase: PhaseGroup | undefined,
   childId: number | undefined,
   indent: string,
@@ -491,7 +521,7 @@ function phaseLines(
   paint: Paint,
   level: number,
 ): string[] {
-  const members = sectionRows(state, childId, phase?.title);
+  const members = sectionRows(idx, childId, phase?.title);
   const lines: string[] = [];
   if (phase) {
     const running = !isTerminal(opts.runStatus) && members.some((r) => r.status === 'running');
@@ -527,22 +557,24 @@ function phaseLines(
   return lines;
 }
 
-function buildSections(state: PanelState): Section[] {
-  const rows = rowsOf(state);
-  const firstSeq = (pred: (r: AgentRow) => boolean): number => {
-    const hit = rows.find(pred);
-    return hit ? hit.seq : Number.POSITIVE_INFINITY;
-  };
+function buildSections(state: PanelState, idx: FrameIndex): Section[] {
   const sections: Section[] = [];
+  const seqOf = (childId: number | undefined, phase: string | undefined): number =>
+    idx.firstSeqByKey.get(groupKey(childId, phase)) ?? Number.POSITIVE_INFINITY;
   // Implicit no-phase parent group (only when it has rows).
-  if (rows.some((r) => r.childId === undefined && r.phase === undefined)) {
-    sections.push({ kind: 'phase', firstSeq: firstSeq((r) => r.childId === undefined && r.phase === undefined) });
+  if (idx.buckets.has(groupKey(undefined, undefined))) {
+    sections.push({ kind: 'phase', firstSeq: seqOf(undefined, undefined) });
   }
   for (const phase of state.phases.filter((p) => p.childId === undefined)) {
-    sections.push({ kind: 'phase', phase, firstSeq: firstSeq((r) => r.childId === undefined && r.phase === phase.title) });
+    sections.push({ kind: 'phase', phase, firstSeq: seqOf(undefined, phase.title) });
   }
   for (const child of state.children) {
-    sections.push({ kind: 'child', child, childId: child.childId, firstSeq: firstSeq((r) => r.childId === child.childId) });
+    sections.push({
+      kind: 'child',
+      child,
+      childId: child.childId,
+      firstSeq: idx.firstSeqByChild.get(child.childId) ?? Number.POSITIVE_INFINITY,
+    });
   }
   // Chronological by first agent; empty sections keep their declared order at
   // the bottom (upcoming seeded phases render below active work). Stable sort.
@@ -552,20 +584,20 @@ function buildSections(state: PanelState): Section[] {
     .map((x) => x.s);
 }
 
-function childLines(state: PanelState, child: ChildGroup, opts: FrameOptions, paint: Paint, level: number): string[] {
+function childLines(state: PanelState, idx: FrameIndex, child: ChildGroup, opts: FrameOptions, paint: Paint, level: number): string[] {
   const glyph = child.done ? (child.ok ? paint('32', '▸') : paint('31', '▸')) : paint('36', '▸');
   const lines = [`  ${glyph} ${child.name} ${paint('2', '(child)')}`];
   const childPhases = state.phases.filter((p) => p.childId === child.childId);
-  lines.push(...phaseLines(state, undefined, child.childId, '    ', opts, paint, level));
+  lines.push(...phaseLines(idx, undefined, child.childId, '    ', opts, paint, level));
   for (const phase of childPhases) {
-    lines.push(...phaseLines(state, phase, child.childId, '    ', opts, paint, level));
+    lines.push(...phaseLines(idx, phase, child.childId, '    ', opts, paint, level));
   }
   return lines;
 }
 
-function footerLine(state: PanelState, opts: FrameOptions, paint: Paint): string {
+function footerLine(state: PanelState, idx: FrameIndex, opts: FrameOptions, paint: Paint): string {
   const final = isTerminal(opts.runStatus);
-  const rows = rowsOf(state);
+  const rows = idx.ordered;
   const settled = rows.filter((r) => SETTLED.has(r.status)).length;
   const running = rows.filter((r) => r.status === 'running');
   const queued = rows.filter((r) => r.status === 'queued').length;
@@ -622,18 +654,19 @@ export function renderFrame(state: PanelState, opts: FrameOptions): string {
   const rowsBudget = Math.max(1, opts.rows - 1);
   const paint: Paint = opts.color ? (code, s) => `\x1b[${code}m${s}\x1b[0m` : (_code, s) => s;
 
-  const sections = buildSections(state); // loop-invariant across collapse levels
+  const idx = indexRows(state); // one pass; loop-invariant across collapse levels
+  const sections = buildSections(state, idx);
   let lines: string[] = [];
   for (let level = 0; level <= 2; level++) {
     lines = headerLines(state, opts, paint);
     for (const section of sections) {
       if (section.kind === 'child' && section.child) {
-        lines.push(...childLines(state, section.child, opts, paint, level));
+        lines.push(...childLines(state, idx, section.child, opts, paint, level));
       } else {
-        lines.push(...phaseLines(state, section.phase, undefined, '  ', opts, paint, level));
+        lines.push(...phaseLines(idx, section.phase, undefined, '  ', opts, paint, level));
       }
     }
-    lines.push(footerLine(state, opts, paint));
+    lines.push(footerLine(state, idx, opts, paint));
     if (lines.length <= rowsBudget) break;
   }
   if (lines.length > rowsBudget) {

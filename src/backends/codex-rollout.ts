@@ -13,9 +13,10 @@
  * versions) silently disables the sidecar — verified against codex-cli
  * 0.144.4 output and the recorder source (rollout/src/recorder.rs).
  */
-import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { readEventsFrom } from '../store/events.js';
 import type { AgentEvent, AgentSidecar, NormalizedUsage } from './types.js';
 
 /**
@@ -36,6 +37,7 @@ export function codexUsageToPartial(u: Record<string, unknown>): Partial<Normali
 }
 
 const DISCOVERY_TIMEOUT_MS = 30_000;
+const ROLLOUT_PAGE_BYTES = 1024 * 1024;
 /** Fallback only (the executor passes resumedSession explicitly): a rollout
  *  last written this long before the sidecar started is not this attempt's. */
 const RESUMED_SESSION_AGE_MS = 30_000;
@@ -50,7 +52,6 @@ export function createCodexRolloutSidecar(
   const startedAt = Date.now();
   let file: string | undefined;
   let offset = 0;
-  let carry = '';
   let lastModel: string | undefined;
 
   const discover = (): void => {
@@ -81,28 +82,15 @@ export function createCodexRolloutSidecar(
 
   const drain = (): void => {
     if (!file) return;
-    const size = statSync(file).size;
-    if (size <= offset) return;
-    const fd = openSync(file, 'r');
-    try {
-      const buf = Buffer.alloc(size - offset);
-      readSync(fd, buf, 0, buf.length, offset);
-      offset = size;
-      carry += buf.toString('utf8');
-    } finally {
-      closeSync(fd);
-    }
-    const lines = carry.split('\n');
-    carry = lines.pop() ?? '';
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let rec: { type?: string; payload?: Record<string, unknown> };
-      try {
-        rec = JSON.parse(line) as typeof rec;
-      } catch {
-        continue; // torn/foreign line
-      }
-      const p = rec.payload;
+    // readEventsFrom is shape-agnostic offset tailing: it advances only past
+    // the last complete newline (multi-byte sequences straddling a read
+    // boundary are re-read next tick, never decoded torn), skips unparseable
+    // lines, and bounds each read — all the boundary handling a hand-rolled
+    // carry buffer gets wrong.
+    const page = readEventsFrom(file, offset, ROLLOUT_PAGE_BYTES);
+    offset = page.nextOffset;
+    for (const rec of page.events) {
+      const p = (rec as { payload?: Record<string, unknown> }).payload;
       if (!p) continue;
       if (rec.type === 'turn_context' && typeof p.model === 'string' && p.model !== lastModel) {
         lastModel = p.model;

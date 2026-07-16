@@ -172,6 +172,21 @@ describe('panel frame', () => {
     }
   });
 
+  it('a child workflow with NAMED phases renders its phase headers inside the ▸ group', () => {
+    const s = createPanelState({ runName: 'p', budgetTotal: null, startedAtMs: 0 });
+    foldEvent(s, ev('child_started', { childId: 0, name: 'sub' }, 1));
+    foldEvent(s, ev('phase_started', { title: 'Scan', childId: 0, childName: 'sub' }, 2));
+    foldEvent(s, ev('agent_started', { seq: 0, label: 'c-scan', phase: 'Scan', backend: 'mock', childId: 0, childName: 'sub' }, 3));
+    foldEvent(s, ev('agent_completed', { seq: 0, label: 'c-scan', phase: 'Scan', ok: true, totalTokens: 10, childId: 0, childName: 'sub' }, 4));
+    foldEvent(s, ev('child_completed', { childId: 0, name: 'sub', ok: true, agentCount: 1 }, 5));
+    const frame = renderFrame(s, { ...FRAME_OPTS, runStatus: 'completed', nowMs: 5 });
+    const lines = frame.split('\n');
+    const childIdx = lines.findIndex((l) => l.includes('▸ sub (child)'));
+    expect(childIdx).toBeGreaterThan(-1);
+    expect(lines[childIdx + 1]).toContain('Scan (1/1)'); // named child phase, indented inside the group
+    expect(lines[childIdx + 2]).toContain('✓ c-scan');
+  });
+
   it('hostile control bytes in events cannot reach the frame', () => {
     const s = createPanelState({ runName: 'inj', budgetTotal: null, startedAtMs: 0 });
     foldEvent(s, ev('agent_started', { seq: 0, label: 'l\x1b[10A\x1b[2J', backend: 'mock', model: 'm\x9b1J' }, 1));
