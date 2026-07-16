@@ -62,10 +62,15 @@ describe('CodexAdapter.buildSpawn', () => {
     expect(plan.schemaTempFile?.content).toBe('{"type":"object"}');
   });
 
-  it('buildResume re-attaches cwd/sandbox and targets the thread id', () => {
+  it('buildResume targets the thread id; sandbox via -c (exec resume has no --cd/--sandbox on 0.144.5)', () => {
     const plan = new CodexAdapter().buildResume('thread-123', 'fix the JSON', req())!;
     expect(plan.argv.slice(0, 3)).toEqual(['exec', 'resume', 'thread-123']);
     expect(plan.stdinData).toBe('fix the JSON');
+    expect(plan.argv).not.toContain('--cd'); // usage error on exec resume
+    expect(plan.argv).not.toContain('--sandbox');
+    expect(plan.argv.join(' ')).toContain('sandbox_mode="workspace-write"');
+    const withEffort = new CodexAdapter().buildResume('thread-123', 'fix', req({ effort: 'low' }))!;
+    expect(withEffort.argv.join(' ')).toContain('model_reasoning_effort="low"');
   });
 
   it('appends the MCP kill-switch as the LAST -c, right before the stdin positional, even alongside other -c flags', () => {
@@ -73,13 +78,12 @@ describe('CodexAdapter.buildSpawn', () => {
     // entry with a disabled stub. It is valid TOML whether or not the server is
     // registered (the dummy command makes a well-formed stdio def), so it is a
     // no-op when absent and a kill-switch when present — see MCP_KILL_SWITCH.
-    // `effort` adds its own `-c model_reasoning_effort`, so this pins the
-    // kill-switch as the FINAL flag (a security control that must stay on) —
-    // not merely "some -c is present". buildResume takes no effort, but model
-    // + the trailing stdin positional exercise the same tail invariant.
+    // `effort` adds its own `-c model_reasoning_effort` (on spawn AND resume),
+    // so this pins the kill-switch as the FINAL flag (a security control that
+    // must stay on) — not merely "some -c is present".
     const TAIL = ['-c', 'mcp_servers.ultracode={command="true",enabled=false}', '-'];
     expect(new CodexAdapter().buildSpawn(req({ model: 'm', effort: 'low' })).argv.slice(-3)).toEqual(TAIL);
-    expect(new CodexAdapter().buildResume('thread-123', 'fix', req({ model: 'm' }))!.argv.slice(-3)).toEqual(TAIL);
+    expect(new CodexAdapter().buildResume('thread-123', 'fix', req({ model: 'm', effort: 'low' }))!.argv.slice(-3)).toEqual(TAIL);
   });
 });
 

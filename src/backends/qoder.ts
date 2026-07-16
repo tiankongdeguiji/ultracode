@@ -72,7 +72,22 @@ export class QoderAdapter implements BackendAdapter {
   }
 
   buildResume(sessionId: string, followupPrompt: string, req: AgentRequest): SpawnPlan {
-    const argv = ['--print', '--output-format', 'stream-json', '-r', sessionId, '-w', req.cwd];
+    // Same pinned --permission-mode (and model/agent) as buildSpawn: without
+    // them the resumed leg would drift to settings defaults instead of the
+    // permission the run was started with.
+    const argv = [
+      '--print',
+      '--output-format',
+      'stream-json',
+      '--permission-mode',
+      PERMISSION_MODE[req.permission],
+      '-r',
+      sessionId,
+      '-w',
+      req.cwd,
+    ];
+    if (req.model) argv.push('--model', req.model);
+    if (req.agentType) argv.push('--agent', req.agentType);
     if (req.schema) argv.push('--json-schema', JSON.stringify(req.schema));
     return { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
   }

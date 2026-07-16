@@ -55,7 +55,19 @@ export class ClaudeAdapter implements BackendAdapter {
   }
 
   buildResume(sessionId: string, followupPrompt: string, req: AgentRequest): SpawnPlan {
-    const argv = ['-p', '--output-format', 'stream-json', '--verbose', '--resume', sessionId];
+    // Same pinned --permission-mode as buildSpawn: without it the resumed leg
+    // would drift to CLI/user/project settings defaults — a repo-supplied
+    // .claude/settings.json could escalate a 'safe' worker on its retry.
+    const argv = [
+      '-p',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--permission-mode',
+      PERMISSION_MODE[req.permission],
+      '--resume',
+      sessionId,
+    ];
     if (req.model) argv.push('--model', req.model);
     if (req.schema) argv.push('--json-schema', JSON.stringify(req.schema));
     return { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
