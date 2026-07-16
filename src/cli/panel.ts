@@ -77,30 +77,19 @@ export interface PanelState {
   sawRunStarted: boolean;
 }
 
-/** Loose field view over a TimestampedEvent; every use site guards its own fields. */
+/**
+ * Loose field view over a TimestampedEvent. events.jsonl lives in the
+ * worker-writable run dir, so NOTHING here is trusted: every field is
+ * `unknown` and every use site goes through str()/num() — a malformed line
+ * (label: {}, seq: "x") must degrade, never crash the attach.
+ */
 interface Ev {
-  ts: number;
   type: string;
-  name?: string;
-  title?: string;
-  seq?: number;
-  label?: string;
-  phase?: string;
-  backend?: string;
-  model?: string;
-  ok?: boolean;
-  skipped?: boolean;
-  cached?: boolean;
-  totalTokens?: number;
-  estimated?: boolean;
-  attempt?: number;
-  maxAttempts?: number;
-  message?: string;
-  spent?: number;
-  error?: string;
-  childId?: number;
-  childName?: string;
+  [key: string]: unknown;
 }
+
+const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
 
 /**
  * Untrusted text (labels, errors, backend-reported model ids, log lines, meta
@@ -159,26 +148,29 @@ function ensureChild(state: PanelState, childId: number, name: string): ChildGro
 }
 
 function rowFor(state: PanelState, e: Ev): AgentRow {
-  const seq = e.seq ?? -1;
+  const seq = num(e.seq) ?? -1;
+  const label = str(e.label);
+  const phase = str(e.phase);
+  const childName = str(e.childName);
   let row = state.agents.get(seq);
   if (!row) {
     row = {
       seq,
-      label: e.label ? sanitizeText(e.label) : `#${seq}`,
-      phase: e.phase === undefined ? undefined : sanitizeText(e.phase),
-      childId: e.childId ?? state.inferredChild?.childId,
+      label: label ? sanitizeText(label) : `#${seq}`,
+      phase: phase === undefined ? undefined : sanitizeText(phase),
+      childId: num(e.childId) ?? state.inferredChild?.childId,
       status: 'queued',
       tokens: 0,
       estimated: false,
       attempt: 1,
     };
-    if (row.childId !== undefined && e.childName) ensureChild(state, row.childId, sanitizeText(e.childName));
+    if (row.childId !== undefined && childName) ensureChild(state, row.childId, sanitizeText(childName));
     state.agents.set(seq, row);
     state.order.push(seq);
   }
-  if (e.label) row.label = sanitizeText(e.label);
-  if (e.phase) {
-    row.phase = sanitizeText(e.phase);
+  if (label) row.label = sanitizeText(label);
+  if (phase) {
+    row.phase = sanitizeText(phase);
     ensurePhase(state, row.phase, row.childId).started = true;
   }
   return row;
@@ -196,7 +188,7 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       }
       // Old-stream inference: a second untagged run_started is a nested child.
       const childId = -(++state.inferredChildCount);
-      state.inferredChild = ensureChild(state, childId, sanitizeText(e.name ?? '(child)'));
+      state.inferredChild = ensureChild(state, childId, sanitizeText(str(e.name) ?? '(child)'));
       return;
     }
     case 'run_completed':
@@ -212,21 +204,25 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       return;
     }
     case 'child_started': {
-      if (e.childId !== undefined) ensureChild(state, e.childId, sanitizeText(e.name ?? '(child)'));
+      const cid = num(e.childId);
+      if (cid !== undefined) ensureChild(state, cid, sanitizeText(str(e.name) ?? '(child)'));
       return;
     }
     case 'child_completed': {
-      if (e.childId === undefined) return;
-      const c = ensureChild(state, e.childId, sanitizeText(e.name ?? '(child)'));
+      const cid = num(e.childId);
+      if (cid === undefined) return;
+      const c = ensureChild(state, cid, sanitizeText(str(e.name) ?? '(child)'));
       c.done = true;
       c.ok = e.ok === true;
       return;
     }
     case 'phase_started': {
-      if (typeof e.title !== 'string') return;
-      const childId = e.childId ?? state.inferredChild?.childId;
-      if (childId !== undefined && e.childName) ensureChild(state, childId, sanitizeText(e.childName));
-      ensurePhase(state, sanitizeText(e.title), childId).started = true;
+      const title = str(e.title);
+      if (title === undefined) return;
+      const childId = num(e.childId) ?? state.inferredChild?.childId;
+      const childName = str(e.childName);
+      if (childId !== undefined && childName) ensureChild(state, childId, sanitizeText(childName));
+      ensurePhase(state, sanitizeText(title), childId).started = true;
       return;
     }
     case 'agent_queued': {
@@ -236,55 +232,62 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
     case 'agent_started': {
       const row = rowFor(state, e);
       row.status = 'running';
-      row.startedTs = e.ts;
-      if (e.backend) row.backend = sanitizeText(e.backend);
-      if (e.model) row.model = sanitizeText(e.model);
+      row.startedTs = num(e.ts);
+      const backend = str(e.backend);
+      const model = str(e.model);
+      if (backend) row.backend = sanitizeText(backend);
+      if (model) row.model = sanitizeText(model);
       return;
     }
     case 'agent_retry': {
-      const row = state.agents.get(e.seq ?? -1);
+      const row = state.agents.get(num(e.seq) ?? -1);
       if (!row) return;
+      const attempt = num(e.attempt);
       // max: a schema-repair notice must never roll a displayed attempt back
-      if (typeof e.attempt === 'number') row.attempt = Math.max(row.attempt, e.attempt);
+      if (attempt !== undefined) row.attempt = Math.max(row.attempt, attempt);
       if (row.status === 'queued') row.status = 'running';
       return;
     }
     case 'agent_usage': {
-      const row = state.agents.get(e.seq ?? -1);
+      const row = state.agents.get(num(e.seq) ?? -1);
       if (!row || row.endedTs !== undefined) return;
       // Monotonic guard: ticks race the completion event in one fold batch.
-      row.tokens = Math.max(row.tokens, e.totalTokens ?? 0);
+      row.tokens = Math.max(row.tokens, num(e.totalTokens) ?? 0);
       if (e.estimated === true) row.estimated = true;
       return;
     }
     case 'agent_model': {
-      const row = state.agents.get(e.seq ?? -1);
-      if (row && typeof e.model === 'string') row.model = sanitizeText(e.model);
+      const row = state.agents.get(num(e.seq) ?? -1);
+      const model = str(e.model);
+      if (row && model !== undefined) row.model = sanitizeText(model);
       return;
     }
     case 'agent_completed': {
-      const existed = state.agents.has(e.seq ?? -1);
+      const existed = state.agents.has(num(e.seq) ?? -1);
       const row = rowFor(state, e);
-      row.endedTs = e.ts;
-      row.tokens = e.totalTokens ?? row.tokens; // authoritative
+      row.endedTs = num(e.ts);
+      row.tokens = num(e.totalTokens) ?? row.tokens; // authoritative
+      const error = str(e.error);
       if (e.skipped === true) row.status = 'skipped';
-      else if (e.cached === true || (!existed && e.ok === true && (e.totalTokens ?? 0) === 0)) {
+      else if (e.cached === true || (!existed && e.ok === true && (num(e.totalTokens) ?? 0) === 0)) {
         // Explicit flag on new streams; old streams: a lone zero-token ok
         // completion (no queued/started) is a prefix-replay hit.
         row.status = 'cached';
       } else if (e.ok === true) row.status = 'ok';
       else {
         row.status = 'failed';
-        row.error = e.error === undefined ? undefined : sanitizeText(e.error);
+        row.error = error === undefined ? undefined : sanitizeText(error);
       }
       return;
     }
     case 'workflow_log': {
-      if (typeof e.message === 'string') state.narrator.push(`· ${sanitizeText(e.message)}`);
+      const message = str(e.message);
+      if (message !== undefined) state.narrator.push(`· ${sanitizeText(message)}`);
       return;
     }
     case 'budget_tick': {
-      if (typeof e.spent === 'number') state.spentTokens = Math.max(state.spentTokens, e.spent);
+      const spent = num(e.spent);
+      if (spent !== undefined) state.spentTokens = Math.max(state.spentTokens, spent);
       return;
     }
     case 'stop_requested': {
@@ -599,10 +602,10 @@ function headerLines(state: PanelState, opts: FrameOptions, paint: Paint): strin
  * done rows → collapse terminal phases to headers → hard-truncate with notice.
  */
 export function renderFrame(state: PanelState, opts: FrameOptions): string {
-  const cols = Math.max(20, opts.cols);
-  // Floor 3 = header + truncation notice + one tail line: even a 4-row
-  // terminal gets a frame that fits (never taller than the screen).
-  const rowsBudget = Math.max(3, opts.rows - 1);
+  // Honor the REAL geometry, however small: a floor above the actual terminal
+  // size would soft-wrap/scroll and corrupt the repaint's cursor-up count.
+  const cols = Math.max(1, opts.cols);
+  const rowsBudget = Math.max(1, opts.rows - 1);
   const paint: Paint = opts.color ? (code, s) => `\x1b[${code}m${s}\x1b[0m` : (_code, s) => s;
 
   const sections = buildSections(state); // loop-invariant across collapse levels
@@ -620,9 +623,13 @@ export function renderFrame(state: PanelState, opts: FrameOptions): string {
     if (lines.length <= rowsBudget) break;
   }
   if (lines.length > rowsBudget) {
-    // Last resort: keep the header and the most recent tail (incl. footer).
-    const tail = lines.slice(lines.length - (rowsBudget - 2));
-    lines = [lines[0]!, paint('2', `  … ${lines.length - tail.length - 1} lines hidden (terminal too small)`), ...tail];
+    if (rowsBudget >= 3) {
+      // Last resort: keep the header and the most recent tail (incl. footer).
+      const tail = lines.slice(lines.length - (rowsBudget - 2));
+      lines = [lines[0]!, paint('2', `  … ${lines.length - tail.length - 1} lines hidden (terminal too small)`), ...tail];
+    } else {
+      lines = lines.slice(lines.length - rowsBudget); // 1-2 rows: newest lines only
+    }
   }
   // Overlong lines would soft-wrap and break the repaint's cursor-up count
   // (measured in display cells — wide glyphs count 2). Truncating through SGR

@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readEventsFrom } from '../store/events.js';
 import { isTerminal, readManifest, type RunStatus } from '../store/manifest.js';
-import { getRun, isPidAlive, liveStatus } from '../store/runstore.js';
+import { getRun, isRunnerAlive, liveStatus } from '../store/runstore.js';
 import { ultracodeRoot } from '../store/layout.js';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { LiveRegion } from './live-region.js';
@@ -27,6 +27,9 @@ import {
 const PANEL_TICK_MS = 125; // 8fps spinner + sub-second elapsed
 const PLAIN_TICK_MS = 150; // the historical attach cadence
 const NARRATOR_BACKFILL = 50;
+/** Bound per-tick backlog reads: a late attach to a long run pages through
+ *  events.jsonl instead of allocating/parsing the whole remainder at once. */
+const EVENT_PAGE_BYTES = 4 * 1024 * 1024;
 
 export interface PanelStream {
   write(chunk: string): boolean;
@@ -97,7 +100,9 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
       process.exit(130); // LiveRegion's exit hook restores the cursor
     }
     const manifest = readManifest(dir);
-    if (sigints === 1 && manifest && manifest.pid > 0 && isPidAlive(manifest.pid)) {
+    // isRunnerAlive, not bare isPidAlive: a recycled PID must never be
+    // SIGTERMed — the kernel start-time binds the manifest to the real runner.
+    if (sigints === 1 && manifest && manifest.pid > 0 && isRunnerAlive(manifest)) {
       const msg = '■ stopping run (Ctrl-C again to detach immediately)…';
       if (mode.kind === 'panel' && !opts.quiet) notices.push(`· ${msg}`);
       else stream.write(`\n${msg}\n`);
@@ -154,7 +159,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
   }
   try {
     for (;;) {
-      const page = readEventsFrom(eventsFile, offset);
+      const page = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
       offset = page.nextOffset;
       for (const ev of page.events) foldEvent(state, ev);
       // One manifest read per tick: status and spentFloor come from the same
@@ -163,9 +168,15 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
       const status: RunStatus = manifest ? liveStatus(manifest) : 'running';
 
       if (manifest && isTerminal(status)) {
-        const rest = readEventsFrom(eventsFile, offset);
-        offset = rest.nextOffset;
-        for (const ev of rest.events) foldEvent(state, ev);
+        if (mode.kind === 'plain' && !opts.quiet) writePlain(page.events);
+        // Drain the remainder in bounded pages too.
+        for (;;) {
+          const rest = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
+          offset = rest.nextOffset;
+          for (const ev of rest.events) foldEvent(state, ev);
+          if (mode.kind === 'plain' && !opts.quiet) writePlain(rest.events);
+          if (!rest.hasMore) break;
+        }
         // A namespace-local pid (1-64) means the runner was born inside a fresh
         // PID namespace — a transient sandbox (agent exec jail, one-shot
         // container) that SIGKILLs everything in it when the launcher returns.
@@ -175,7 +186,6 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
             : undefined;
         if (!opts.quiet) {
           if (mode.kind === 'plain') {
-            writePlain([...page.events, ...rest.events]);
             if (status === 'orphaned') stream.write('✗ runner died without finalizing (orphaned). See runner.log\n');
             if (sandboxHint) stream.write(`⚠ ${sandboxHint}\n`);
           } else {
@@ -191,6 +201,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
         if (mode.kind === 'plain') writePlain(page.events);
         else paint(manifest, status, Date.now(), false);
       }
+      if (page.hasMore) continue; // catching up on a backlog — page again without sleeping
       await sleep(mode.kind === 'panel' ? PANEL_TICK_MS : PLAIN_TICK_MS);
     }
   } finally {

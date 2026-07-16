@@ -91,7 +91,29 @@ describe('events', () => {
     w.write({ type: 'run_completed' });
     const page3 = readEventsFrom(file, page2.nextOffset);
     expect(page3.events.map((e) => e.type)).toEqual(['run_completed']);
+    expect(page3.hasMore).toBe(false);
     w.close();
+  });
+
+  it('maxBytes pages a large backlog: complete lines only, hasMore until drained', () => {
+    const dir = tmpRoot();
+    const file = join(dir, 'events.jsonl');
+    const w = new EventWriter(file);
+    for (let i = 0; i < 50; i++) w.write({ type: 'agent_usage', seq: i, totalTokens: i });
+    w.close();
+
+    const seen: number[] = [];
+    let offset = 0;
+    let pages = 0;
+    for (;;) {
+      const page = readEventsFrom(file, offset, 256); // far smaller than the file
+      offset = page.nextOffset;
+      pages++;
+      for (const e of page.events) seen.push(e.seq as number);
+      if (!page.hasMore) break;
+    }
+    expect(pages).toBeGreaterThan(1); // it actually paged
+    expect(seen).toEqual(Array.from({ length: 50 }, (_, i) => i)); // nothing lost or torn
   });
 });
 

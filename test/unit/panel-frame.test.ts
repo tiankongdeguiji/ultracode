@@ -160,10 +160,15 @@ describe('panel frame', () => {
     }
   });
 
-  it('fits terminals as small as 4 rows (frame never taller than the screen)', () => {
-    for (const rows of [4, 5, 6]) {
+  it('honors real geometry down to 1×2: never taller or wider than the screen', () => {
+    for (const rows of [2, 3, 4, 5, 6]) {
       const lines = renderFrame(richState(), { ...FRAME_OPTS, rows }).split('\n');
-      expect(lines.length).toBeLessThanOrEqual(Math.max(3, rows - 1));
+      expect(lines.length).toBeLessThanOrEqual(Math.max(1, rows - 1));
+    }
+    for (const cols of [1, 8, 19]) {
+      for (const line of renderFrame(richState(), { ...FRAME_OPTS, cols }).split('\n')) {
+        expect(displayWidth(line)).toBeLessThanOrEqual(cols);
+      }
     }
   });
 

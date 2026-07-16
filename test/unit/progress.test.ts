@@ -213,9 +213,15 @@ describe('AgentCallExecutor progress', () => {
       true,
     );
     const schema: JsonSchema = { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] };
-    const out1 = await new AgentCallExecutor(sameSession, { usageTickIntervalMs: 0 }).execute(spec({ schema }), signal);
+    const { events: prog, onProgress } = collect();
+    const out1 = await new AgentCallExecutor(sameSession, { usageTickIntervalMs: 0 }).execute(spec({ schema }), signal, onProgress);
     expect(out1.ok).toBe(true);
     expect(out1.usage.totalTokens).toBe(150);
+    // Display plane must agree: a cumulative terminal report never stacks on
+    // top of `prior` (100 + 150 = 250 would stick via the monotonic guard).
+    const ticks = tokens(prog);
+    expect(Math.max(...ticks)).toBe(150);
+    expect(ticks.at(-1)).toBe(150);
 
     // Task retries spawn FRESH sessions: cumulative flags on distinct sessions sum.
     const distinctSessions = new CumulativeAdapter(

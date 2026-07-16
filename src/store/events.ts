@@ -36,17 +36,24 @@ export class EventWriter {
 export interface EventPage {
   events: TimestampedEvent[];
   nextOffset: number;
+  /** more complete lines remain past nextOffset (only when maxBytes clipped the read) */
+  hasMore?: boolean;
 }
 
-/** Read complete JSONL lines from a byte offset; incomplete tail lines are left for the next read. */
-export function readEventsFrom(file: string, offset: number): EventPage {
+/**
+ * Read complete JSONL lines from a byte offset; incomplete tail lines are left
+ * for the next read. maxBytes bounds one read so a late attach to a large
+ * backlog pages instead of allocating the whole remainder at once.
+ */
+export function readEventsFrom(file: string, offset: number, maxBytes?: number): EventPage {
   if (!existsSync(file)) return { events: [], nextOffset: offset };
   const size = statSync(file).size;
   if (size <= offset) return { events: [], nextOffset: offset };
+  const end = maxBytes !== undefined ? Math.min(size, offset + maxBytes) : size;
 
   const fd = openSync(file, 'r');
   try {
-    const buf = Buffer.alloc(size - offset);
+    const buf = Buffer.alloc(end - offset);
     readSync(fd, buf, 0, buf.length, offset);
     const text = buf.toString('utf8');
     const lastNewline = text.lastIndexOf('\n');
@@ -62,7 +69,7 @@ export function readEventsFrom(file: string, offset: number): EventPage {
         /* torn line — skip */
       }
     }
-    return { events, nextOffset: offset + consumed };
+    return { events, nextOffset: offset + consumed, hasMore: offset + consumed < size };
   } finally {
     closeSync(fd);
   }

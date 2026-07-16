@@ -197,8 +197,16 @@ export class AgentCallExecutor implements AgentExecutor {
               cachedInputTokens: (acc?.cachedInputTokens ?? 0) + (ev.usage.cachedInputTokens ?? 0),
               reasoningTokens: (acc?.reasoningTokens ?? 0) + (ev.usage.reasoningTokens ?? 0),
             };
-          } else if (!ev.interim) {
+          } else if (!ev.interim && !ev.threadCumulative) {
             acc = { ...ev.usage };
+            accIsTerminal = true;
+          } else if (!ev.interim) {
+            // Thread-cumulative terminal usage (codex turn.completed after
+            // `exec resume`) already contains prior attempts on this session —
+            // adding it on top of `prior` would double the shared prefix, and
+            // the strictly-increasing guard would then pin the inflated figure.
+            // Skip; attemptSettled's checkpoint (session-aware mergedUsage)
+            // lands the correct total moments later.
             accIsTerminal = true;
           }
           maybeTick(false);

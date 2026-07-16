@@ -139,6 +139,29 @@ describe('panel fold', () => {
     expect(takeNarratorLines(s)).toEqual([]);
   });
 
+  it('malformed events from the worker-writable store degrade instead of crashing the attach', () => {
+    const s = createPanelState(seed());
+    const garbage: TimestampedEvent[] = [
+      ev('agent_started', { seq: 'x', label: {}, backend: 42, model: [] }),
+      ev('agent_queued', { seq: 0, label: 7, phase: { evil: true } }),
+      ev('agent_usage', { seq: 0, totalTokens: 'lots', estimated: 'yes' }),
+      ev('agent_retry', { seq: 0, attempt: '2' }),
+      ev('agent_completed', { seq: 0, ok: true, totalTokens: null }),
+      ev('phase_started', { title: 5 }),
+      ev('child_started', { childId: 'zero', name: 9 }),
+      ev('workflow_log', { message: { nested: true } }),
+      ev('budget_tick', { spent: 'NaN' }),
+      ev('agent_completed', {}), // no seq at all
+      { ts: 'later', type: 'agent_started', seq: 1, label: 'ok-row' } as unknown as TimestampedEvent,
+    ];
+    for (const g of garbage) foldEvent(s, g); // must not throw
+    expect(s.agents.get(0)).toMatchObject({ label: '#0', tokens: 0, status: 'ok' });
+    expect(s.agents.get(1)).toMatchObject({ label: 'ok-row', startedTs: undefined }); // non-number ts dropped
+    expect(s.phases).toEqual([]); // numeric title rejected
+    expect(takeNarratorLines(s)).toEqual([]);
+    expect(s.spentTokens).toBe(0);
+  });
+
   it('merges event phases into seeded ones by title and appends unseeded phases', () => {
     const s = fold(createPanelState(seed({ phases: [{ title: 'A', detail: 'da' }, { title: 'B' }] })), [
       ev('phase_started', { title: 'A' }),
