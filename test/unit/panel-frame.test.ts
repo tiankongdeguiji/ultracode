@@ -212,13 +212,19 @@ describe('panel frame', () => {
     expect(withSel).toContain('❯ ✓ repo-mapper');
     expect(withSel).not.toContain('… +1 done');
     // Level 2 (small terminal): the fully-settled Explore phase collapses to
-    // its header unless the selection lives inside it. (The last-resort
-    // hard truncation on even smaller terminals is selection-blind by design.)
+    // its header unless the selection lives inside it.
     const small = renderFrame(richState(), { ...FRAME_OPTS, rows: 16, selectedSeq: 0 });
     expect(small).toContain('❯ ✓ repo-mapper');
     expect(small.split('\n').length).toBeLessThanOrEqual(15);
     const noSel = renderFrame(richState(), { ...FRAME_OPTS, rows: 16 });
     expect(noSel).not.toContain('repo-mapper'); // without selection the phase folds to its header
+    // Last-resort hard truncation (terminal too small even after level 2):
+    // the selected line replaces a tail line rather than vanishing — an
+    // invisible ❯ would leave the arrows steering a row the user cannot see.
+    const truncated = renderFrame(richState(), { ...FRAME_OPTS, rows: 8, selectedSeq: 0 });
+    expect(truncated).toContain('lines hidden (terminal too small)');
+    expect(truncated).toContain('❯ ✓ repo-mapper');
+    expect(truncated.split('\n').length).toBeLessThanOrEqual(7);
   });
 
   it('selection also survives the queued-overflow fold', () => {

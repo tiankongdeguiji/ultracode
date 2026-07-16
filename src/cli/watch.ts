@@ -205,17 +205,6 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     if (!row) return art;
     const agentDir = join(dir, 'agents', agentDirName(row.seq, row.label));
     const settled = row.endedTs !== undefined || final;
-    if (settled && !promptFinalized.has(seq)) {
-      // The settle-time write is authoritative — one re-read replaces anything
-      // torn/empty the 8fps poll may have caught mid-write during the run.
-      promptFinalized.add(seq);
-      art.prompt = readArtifact(join(agentDir, 'prompt.md')) ?? art.prompt;
-    } else if (art.prompt === undefined || art.prompt.length === 0) {
-      // Live: cache only a non-empty read — an empty string is most likely the
-      // O_TRUNC window of the runner's non-atomic early write, so keep retrying.
-      const p = readArtifact(join(agentDir, 'prompt.md'));
-      if (p !== undefined) art.prompt = p;
-    }
     if (art.result === undefined && settled) {
       const raw = readArtifact(join(agentDir, 'result.json'));
       if (raw !== undefined) {
@@ -230,6 +219,20 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
           /* else: torn write — retry next paint */
         }
       }
+    }
+    if (art.result !== undefined && !promptFinalized.has(seq)) {
+      // The settle-time prompt.md write is authoritative, but agent_completed
+      // is emitted BEFORE the settle handler rewrites the artifacts — gating on
+      // result.json (written AFTER prompt.md in the same handler) proves the
+      // rewrite finished, so this one re-read replaces anything torn/partial
+      // the 8fps live poll may have cached mid-write.
+      promptFinalized.add(seq);
+      art.prompt = readArtifact(join(agentDir, 'prompt.md')) ?? art.prompt;
+    } else if (art.prompt === undefined || art.prompt.length === 0) {
+      // Cache only a non-empty read — an empty string is most likely the
+      // O_TRUNC window of the runner's non-atomic write, so keep retrying.
+      const p = readArtifact(join(agentDir, 'prompt.md'));
+      if (p !== undefined) art.prompt = p;
     }
     return art;
   };

@@ -529,12 +529,19 @@ return 1
     const agentDir = join(dir, 'agents', '0000-big');
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(join(agentDir, 'prompt.md'), ''); // torn early write: zero bytes
+    const partialDir = join(dir, 'agents', '0001-partial');
+    mkdirSync(partialDir, { recursive: true });
+    writeFileSync(join(partialDir, 'prompt.md'), 'PARTIAL-TORN'); // non-empty torn early write
     appendFileSync(
       join(dir, 'events.jsonl'),
       '{"ts":1,"type":"agent_started","seq":0,"label":"big","backend":"mock"}\n' +
-        `{"ts":2,"type":"agent_completed","seq":0,"label":"big","ok":true,"totalTokens":10,"toolCalls":0}\n`,
+        '{"ts":2,"type":"agent_completed","seq":0,"label":"big","ok":true,"totalTokens":10,"toolCalls":0}\n' +
+        '{"ts":3,"type":"agent_started","seq":1,"label":"partial","backend":"mock"}\n' +
+        '{"ts":4,"type":"agent_completed","seq":1,"label":"partial","ok":true,"totalTokens":5,"toolCalls":0}\n',
     );
     writeFileSync(join(agentDir, 'result.json'), JSON.stringify({ ok: true, status: 'ok', value: 'HEAD-MARKER-' + 'x'.repeat(80 * 1024) }));
+    // NOTE: no result.json for seq 1 yet — completion folded, artifacts not rewritten
+    // (the runner emits agent_completed BEFORE onAgentSettled rewrites the files).
 
     const stream = fakeTty();
     const stdin = fakeStdin();
@@ -554,6 +561,17 @@ return 1
       // …wait: settle re-read happens once; the empty file was read BEFORE we wrote.
       // The guard treats '' as unreadable, so the next paint picks up the real content.
       await waitForOutput(stream.chunks, 'the real prompt');
+
+      // Non-empty torn prompt: completion is folded but result.json is absent,
+      // so the finalize re-read must NOT have fired yet — the torn text shows…
+      stdin.press('\x1b'); // back to overview
+      stdin.press('\x1b[B'); // seq 0 → seq 1
+      stdin.press('\r');
+      await waitForOutput(stream.chunks, 'PARTIAL-TORN');
+      // …until the settle handler lands its writes (prompt.md BEFORE result.json):
+      writeFileSync(join(partialDir, 'prompt.md'), 'FULL-PROMPT-AFTER-SETTLE');
+      writeFileSync(join(partialDir, 'result.json'), JSON.stringify({ ok: true, status: 'ok', value: 'small' }));
+      await waitForOutput(stream.chunks, 'FULL-PROMPT-AFTER-SETTLE'); // result-gated re-read replaced the torn cache
     } finally {
       const m2 = readManifest(dir)!;
       writeManifest(dir, { ...m2, status: 'stopped', endedAt: new Date().toISOString() });

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { executeWorkflow, type ExecuteOptions } from '../../src/engine/run.js';
-import { MockExecutor } from '../../src/backends/mock.js';
+import { MOCK_TOOLS_CAP, MockExecutor } from '../../src/backends/mock.js';
 
 const META = `export const meta = { name: 'test', description: 'dialect semantics test' }\n`;
 
@@ -252,13 +252,21 @@ return { r }`);
     expect(output.error).toBeUndefined();
   });
 
-  it('MOCK:tools makes totalToolCalls exact (including zero)', async () => {
+  it('MOCK:tools makes totalToolCalls exact (including zero) and caps runaway counts', async () => {
     const { output } = await run(`
 const a = await agent('MOCK:tools 4 MOCK:ok done', { label: 'busy' })
 const b = await agent('MOCK:tools 0 MOCK:ok done', { label: 'idle' })
 return { a, b }`);
     expect(output.error).toBeUndefined();
     expect(output.totalToolCalls).toBe(4); // 4 + explicit 0 — not the historical 1-per-agent default
+
+    // A directive large enough to parse as Infinity must not wedge the runner
+    // in an unbounded synchronous loop — it clamps to MOCK_TOOLS_CAP.
+    const { output: capped } = await run(`
+await agent('MOCK:tools ${'9'.repeat(400)} MOCK:ok done', { label: 'flood' })
+return 1`);
+    expect(capped.error).toBeUndefined();
+    expect(capped.totalToolCalls).toBe(MOCK_TOOLS_CAP);
   });
 
   it('script throw sets error and preserves partials', async () => {

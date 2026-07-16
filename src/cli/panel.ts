@@ -751,6 +751,10 @@ export function renderFrame(state: PanelState, opts: FrameOptions): string {
     if (rowsBudget >= 3) {
       // Last resort: keep the header and the most recent tail (incl. footer).
       const tail = lines.slice(lines.length - (rowsBudget - 2));
+      // The selection must survive even here — an invisible ❯ would leave the
+      // arrow keys steering a row the user cannot see.
+      const selected = opts.selectedSeq !== undefined ? lines.find((l) => l.includes('❯')) : undefined;
+      if (selected !== undefined && !tail.includes(selected)) tail[0] = selected;
       lines = [lines[0]!, paint('2', `  … ${lines.length - tail.length - 1} lines hidden (terminal too small)`), ...tail];
     } else {
       lines = lines.slice(lines.length - rowsBudget); // 1-2 rows: newest lines only

@@ -11,6 +11,7 @@
  *   MOCK:tools <n> <rest...>   → emit n synthetic tool progress pairs
  *                                (tool:mock-i started+completed), then process
  *                                rest; outcome.toolCalls reflects the count
+ *                                (n capped at MOCK_TOOLS_CAP, abortable)
  *   MOCK:badjson               → succeed with a value that violates any schema
  *                                expecting different keys ({"unexpected": true})
  *   anything else              → succeed with "mock response: <prompt head>"
@@ -24,6 +25,10 @@ export interface MockStats {
   attempts: number;
   maxConcurrent: number;
 }
+
+/** Ceiling on MOCK:tools emissions: an over-large (or Infinity-parsing) count
+ *  must never wedge the runner in a synchronous loop that SIGTERM cannot enter. */
+export const MOCK_TOOLS_CAP = 1000;
 
 /** Minimal valid instance for a JSON Schema (dry-run stubs). */
 export function stubFromSchema(schema: Record<string, unknown>): unknown {
@@ -180,8 +185,9 @@ export class MockExecutor implements AgentExecutor {
     const toolsMatch = prompt.match(/^MOCK:tools (\d+)\s*([\s\S]*)$/);
     if (toolsMatch) {
       if (tools) tools.seen = true;
-      const n = Number(toolsMatch[1]);
+      const n = Math.min(Number(toolsMatch[1]), MOCK_TOOLS_CAP); // never Infinity/unbounded
       for (let i = 1; i <= n; i++) {
+        if (signal.aborted) break;
         if (tools) tools.started++;
         onProgress?.({ type: 'tool', name: `tool:mock-${i}`, status: 'started' });
         onProgress?.({ type: 'tool', name: `tool:mock-${i}`, status: 'completed' });

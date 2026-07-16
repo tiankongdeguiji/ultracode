@@ -201,14 +201,15 @@ export function renderDetailFrame(
   body.push(paint('1', 'Outcome'));
   for (const l of outcomeLines(row, art, opts, paint, bodyWidth)) body.push(BODY_INDENT + l);
 
-  // One bottom line merges the scroll indicator and the keymap; it exists
-  // whenever either does, and its row is budgeted before windowing the body.
-  const bodyBudget = Math.max(1, rowsBudget - pinned.length - 1);
-  const maxScroll = Math.max(0, body.length - bodyBudget);
-  const needIndicator = maxScroll > 0;
-  const reserveBottom = needIndicator || opts.keymap !== undefined;
-  const budget = reserveBottom ? bodyBudget : Math.max(1, rowsBudget - pinned.length);
-  const scroll = Math.min(Math.max(0, opts.scroll), Math.max(0, body.length - budget));
+  // One bottom line merges the scroll indicator and the keymap. Decide whether
+  // it exists against the FULL unreserved capacity first — reserving it up
+  // front would hide an exact-fit body's last line behind a pointless ↓ on
+  // final frames, where the keys that could reveal it are already dead.
+  const unreserved = Math.max(1, rowsBudget - pinned.length);
+  const reserveBottom = opts.keymap !== undefined || body.length > unreserved;
+  const budget = reserveBottom ? Math.max(1, unreserved - 1) : unreserved;
+  const maxScroll = Math.max(0, body.length - budget);
+  const scroll = Math.min(Math.max(0, opts.scroll), maxScroll);
   const visible = body.slice(scroll, scroll + budget);
 
   let lines = [...pinned, ...visible];
@@ -226,5 +227,5 @@ export function renderDetailFrame(
   // the budget floors above can overshoot — hard-clamp so an oversized frame
   // never scrolls the screen and desyncs the repaint's cursor-up count.
   if (lines.length > rowsBudget) lines = lines.slice(0, rowsBudget);
-  return { text: lines.map((l) => fitLine(l, cols)).join('\n'), maxScroll: Math.max(0, body.length - budget) };
+  return { text: lines.map((l) => fitLine(l, cols)).join('\n'), maxScroll };
 }

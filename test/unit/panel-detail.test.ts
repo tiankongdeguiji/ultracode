@@ -165,6 +165,19 @@ describe('renderDetailFrame', () => {
     expect(value).toContain('own [9999HGOTCHA');
   });
 
+  it('an exact-fit final frame keeps its last body line — no spurious ↓ indicator when keys are dead', () => {
+    // Reference render with room to spare: no keymap (final frame), no indicator.
+    const art = { prompt: 'p', result: { ok: true, status: 'ok', value: 'done' } };
+    const full = renderDetailFrame(detailState(), 1, art, { ...OPTS, runStatus: 'completed', rows: 40 }).text;
+    expect(full).not.toMatch(/of \d+/);
+    const lineCount = full.split('\n').length;
+    // Exact fit: rowsBudget == lineCount. Reserving the bottom row up front
+    // would swallow the last body line behind an unscrollable '… of N ↓'.
+    const exact = renderDetailFrame(detailState(), 1, art, { ...OPTS, runStatus: 'completed', rows: lineCount + 1 });
+    expect(exact.text).toBe(full);
+    expect(exact.maxScroll).toBe(0);
+  });
+
   it('never exceeds rows-1 even on degenerate terminals (pinned + body + bottom overshoot is clamped)', () => {
     const prompt = Array.from({ length: 30 }, (_, i) => `p${i + 1}`).join('\n');
     for (const rows of [2, 3, 4, 5, 6]) {
