@@ -68,20 +68,18 @@ describe('CodexAdapter.buildSpawn', () => {
     expect(plan.stdinData).toBe('fix the JSON');
   });
 
-  it('appends the MCP kill-switch on spawn AND resume, before the stdin positional', () => {
+  it('appends the MCP kill-switch as the LAST -c, right before the stdin positional, even alongside other -c flags', () => {
     // Unconditional worker isolation: the override replaces the ultracode MCP
     // entry with a disabled stub. It is valid TOML whether or not the server is
     // registered (the dummy command makes a well-formed stdio def), so it is a
     // no-op when absent and a kill-switch when present — see MCP_KILL_SWITCH.
-    const KILL = ['-c', 'mcp_servers.ultracode={command="true",enabled=false}'];
-    for (const plan of [
-      new CodexAdapter().buildSpawn(req()),
-      new CodexAdapter().buildResume('thread-123', 'fix', req())!,
-    ]) {
-      const at = plan.argv.indexOf(KILL[0]!);
-      expect(plan.argv.slice(at, at + 2)).toEqual(KILL);
-      expect(plan.argv.at(-1)).toBe('-'); // stdin positional stays last
-    }
+    // `effort` adds its own `-c model_reasoning_effort`, so this pins the
+    // kill-switch as the FINAL flag (a security control that must stay on) —
+    // not merely "some -c is present". buildResume takes no effort, but model
+    // + the trailing stdin positional exercise the same tail invariant.
+    const TAIL = ['-c', 'mcp_servers.ultracode={command="true",enabled=false}', '-'];
+    expect(new CodexAdapter().buildSpawn(req({ model: 'm', effort: 'low' })).argv.slice(-3)).toEqual(TAIL);
+    expect(new CodexAdapter().buildResume('thread-123', 'fix', req({ model: 'm' }))!.argv.slice(-3)).toEqual(TAIL);
   });
 });
 
