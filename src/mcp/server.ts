@@ -80,6 +80,12 @@ export function createServer(baseCwd: string): McpServer {
       // (which sets ULTRACODE_INSIDE_RUN) must not launch fresh detached runs —
       // that would fan out past the parent's budget/caps. Use in-script
       // workflow() for nested orchestration (it shares the parent's caps/budget).
+      // KNOWN LIMIT: codex spawns config-registered MCP servers with a sanitized
+      // env, so this marker never reaches a server a codex worker spawned itself
+      // (live-verified on 0.144.5 — the 2026-07-16 fork-bomb rode exactly that).
+      // The primary defense for codex workers is the spawn-time kill-switch in
+      // the adapter (MCP_KILL_SWITCH, src/backends/codex.ts); this guard remains
+      // for hosts that propagate env to MCP servers.
       if (process.env.ULTRACODE_INSIDE_RUN) {
         return fail('workflow_start refused: already inside an ultracode run (recursion guard). Use in-script workflow() for nesting.');
       }

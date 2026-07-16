@@ -23,7 +23,7 @@ function req(overrides: Partial<AgentRequest> = {}): AgentRequest {
 }
 
 describe('CodexAdapter.buildSpawn', () => {
-  it('builds the canonical argv: --json, --skip-git-repo-check, --cd, sandbox mapping, stdin prompt', () => {
+  it('builds the canonical argv: --json, --skip-git-repo-check, --cd, sandbox mapping, kill-switch, stdin prompt', () => {
     const plan = new CodexAdapter().buildSpawn(req());
     expect(plan.argv).toEqual([
       'exec',
@@ -33,6 +33,8 @@ describe('CodexAdapter.buildSpawn', () => {
       '/w',
       '--sandbox',
       'workspace-write',
+      '-c',
+      'mcp_servers.ultracode={command="true",enabled=false}', // worker isolation, always on
       '-',
     ]);
     expect(plan.stdinData).toBe('p');
@@ -64,6 +66,20 @@ describe('CodexAdapter.buildSpawn', () => {
     const plan = new CodexAdapter().buildResume('thread-123', 'fix the JSON', req())!;
     expect(plan.argv.slice(0, 3)).toEqual(['exec', 'resume', 'thread-123']);
     expect(plan.stdinData).toBe('fix the JSON');
+  });
+
+  it('appends the MCP kill-switch as the LAST -c, right before the stdin positional, even alongside other -c flags', () => {
+    // Unconditional worker isolation: the override replaces the ultracode MCP
+    // entry with a disabled stub. It is valid TOML whether or not the server is
+    // registered (the dummy command makes a well-formed stdio def), so it is a
+    // no-op when absent and a kill-switch when present — see MCP_KILL_SWITCH.
+    // `effort` adds its own `-c model_reasoning_effort`, so this pins the
+    // kill-switch as the FINAL flag (a security control that must stay on) —
+    // not merely "some -c is present". buildResume takes no effort, but model
+    // + the trailing stdin positional exercise the same tail invariant.
+    const TAIL = ['-c', 'mcp_servers.ultracode={command="true",enabled=false}', '-'];
+    expect(new CodexAdapter().buildSpawn(req({ model: 'm', effort: 'low' })).argv.slice(-3)).toEqual(TAIL);
+    expect(new CodexAdapter().buildResume('thread-123', 'fix', req({ model: 'm' }))!.argv.slice(-3)).toEqual(TAIL);
   });
 });
 

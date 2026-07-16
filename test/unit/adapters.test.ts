@@ -157,4 +157,13 @@ describe('backend factory', () => {
     }
     expect(createExecutorForBackend('nonesuch')).toBeNull();
   });
+
+  it('wires the codex MCP kill-switch through createExecutorForBackend (the fork-bomb defense)', async () => {
+    // Pins the load-bearing wiring: if a refactor drops the adapter's kill-switch
+    // from the factory's codex path, worker isolation vanishes silently.
+    const { createExecutorForBackend } = await import('../../src/engine/agentcall.js');
+    const ex = createExecutorForBackend('codex') as unknown as { adapter: BackendAdapter };
+    const argv = ex.adapter.buildSpawn({ prompt: 'p', cwd: '/w', permission: 'auto', env: {} }).argv;
+    expect(argv.join(' ')).toContain('mcp_servers.ultracode={command="true",enabled=false}');
+  });
 });
