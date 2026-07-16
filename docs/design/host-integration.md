@@ -1,5 +1,13 @@
 # Ultracode Host-Integration Architecture (per-host delivery surfaces)
 
+> **Design history (predates the keyword-only narrowing in PR #10, 2026-07-17).** Throughout this
+> document (§2, §2.3, the Qoder rule at §5, etc.), the current-tense descriptions of what *arms*
+> ultracode mode — the keyword, a budget like "+500k", "use a workflow" / "fan out" phrasing,
+> `.ultracode/mode`, task decomposability — and the "default budget 300k" reflect an earlier design.
+> The shipped doctrine now arms the mode ONLY on the literal keyword "ultracode" written as the
+> user's own request; budgets are opt-in (uncapped default). Read the arming/budget prose below as
+> historical, not current behavior.
+
 ## 0. The one-line answer to "plugin? command? skill?"
 
 **All three, in distinct layers — and the layering is the design:**
@@ -88,13 +96,6 @@ a resumable journal, and a token budget. You never do the subtask work inline
 when a workflow is running — you design, launch, monitor, and synthesize.
 
 ## 2. Ultracode mode (standing opt-in)
-
-> **Design history (predates the keyword-only narrowing in PR #10, 2026-07-17):** the
-> shipped doctrine now arms ultracode mode ONLY on the literal keyword "ultracode" written
-> as the user's own request — a budget like "+500k", "use a workflow" / "fan out agents" /
-> "orchestrate" phrasing, and task decomposability no longer arm it. Treat the arming (and the
-> "default budget 300k") descriptions in this section as design history, not current behavior.
-
 - The keyword "ultracode" ANYWHERE in a user message is a standing opt-in: from
   that message onward, route every substantive task in this session through a
   workflow unless the user says "ultracode off" or the task is trivially small.
