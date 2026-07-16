@@ -4,6 +4,7 @@ import {
   displayWidth,
   foldEvent,
   renderFrame,
+  selectableSeqs,
   spinnerFrame,
   type PanelState,
 } from '../../src/cli/panel.js';
@@ -227,6 +228,18 @@ describe('panel frame', () => {
     const frame = renderFrame(s, { ...FRAME_OPTS, nowMs: 10_000, selectedSeq: 7 });
     expect(frame).toContain('❯ ◌ q7');
     expect(frame).toContain('… +2 queued'); // one fewer hidden — the selected row escaped the fold
+  });
+
+  it('selectableSeqs traverses in on-screen section order, not raw seq order', () => {
+    // Interleaved phases: Z owns seqs 0 and 2, A owns seq 1 — on screen the Z
+    // section renders first (its firstSeq is 0), so ↓ must visit 0, 2, then 1.
+    const s = createPanelState({ runName: 'o', budgetTotal: null, startedAtMs: 0 });
+    foldEvent(s, ev('agent_started', { seq: 0, label: 'z0', phase: 'Z', backend: 'mock' }, 1));
+    foldEvent(s, ev('agent_started', { seq: 1, label: 'a1', phase: 'A', backend: 'mock' }, 2));
+    foldEvent(s, ev('agent_started', { seq: 2, label: 'z2', phase: 'Z', backend: 'mock' }, 3));
+    expect(selectableSeqs(s)).toEqual([0, 2, 1]);
+    // And the rich fixture (phases + child + trailing phase) stays in render order.
+    expect(selectableSeqs(richState())).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
   });
 
   it('keymap renders as the last line and counts toward the height budget', () => {

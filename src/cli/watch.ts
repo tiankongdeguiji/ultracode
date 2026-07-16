@@ -71,18 +71,22 @@ const ARTIFACT_READ_CAP = 64 * 1024;
 /**
  * Read a worker-writable artifact without following symlinks (a worker may
  * have planted one — mirror of safe-write's O_NOFOLLOW stance on the read
- * side), capped at ARTIFACT_READ_CAP. undefined when unreadable (not yet
- * written, symlink, permission) — callers retry on a later paint.
+ * side), capped at ARTIFACT_READ_CAP. O_NONBLOCK because a planted FIFO would
+ * otherwise block the open(2) forever with the event loop (and therefore
+ * Ctrl-C) dead — it is a no-op for regular files, and the fstat gate below
+ * rejects everything that is not one. undefined when unreadable (not yet
+ * written, symlink, FIFO/device, permission) — callers retry on a later paint.
  */
-function readArtifact(path: string): string | undefined {
+export function readArtifact(path: string): string | undefined {
   let fd: number | undefined;
   try {
-    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    const size = fstatSync(fd).size;
-    const len = Math.min(size, ARTIFACT_READ_CAP);
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return undefined;
+    const len = Math.min(stat.size, ARTIFACT_READ_CAP);
     const buf = Buffer.alloc(len);
     readSync(fd, buf, 0, len, 0);
-    return size > ARTIFACT_READ_CAP ? buf.toString('utf8') + '\n… truncated' : buf.toString('utf8');
+    return stat.size > ARTIFACT_READ_CAP ? buf.toString('utf8') + '\n… truncated' : buf.toString('utf8');
   } catch {
     return undefined;
   } finally {
@@ -188,6 +192,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
   let lastStatus: RunStatus = 'running';
 
   /** Lazy per-agent artifact reads, cached once readable; result.json only after settle. */
+  const promptFinalized = new Set<number>();
   const artifactsFor = (seq: number, final: boolean): AgentArtifacts => {
     let art = artifacts.get(seq);
     if (!art) {
@@ -197,14 +202,30 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     const row = state.agents.get(seq);
     if (!row) return art;
     const agentDir = join(dir, 'agents', agentDirName(row.seq, row.label));
-    if (art.prompt === undefined) art.prompt = readArtifact(join(agentDir, 'prompt.md'));
-    if (art.result === undefined && (row.endedTs !== undefined || final)) {
+    const settled = row.endedTs !== undefined || final;
+    if (settled && !promptFinalized.has(seq)) {
+      // The settle-time write is authoritative — one re-read replaces anything
+      // torn/empty the 8fps poll may have caught mid-write during the run.
+      promptFinalized.add(seq);
+      art.prompt = readArtifact(join(agentDir, 'prompt.md')) ?? art.prompt;
+    } else if (art.prompt === undefined || art.prompt.length === 0) {
+      // Live: cache only a non-empty read — an empty string is most likely the
+      // O_TRUNC window of the runner's non-atomic early write, so keep retrying.
+      const p = readArtifact(join(agentDir, 'prompt.md'));
+      if (p !== undefined) art.prompt = p;
+    }
+    if (art.result === undefined && settled) {
       const raw = readArtifact(join(agentDir, 'result.json'));
       if (raw !== undefined) {
         try {
           art.result = JSON.parse(raw) as unknown;
         } catch {
-          /* torn write — retry next paint */
+          if (raw.endsWith('… truncated')) {
+            // Capped read of an oversized result.json can never parse — show
+            // the head as text instead of retrying (and re-reading 64KB) forever.
+            art.result = { value: raw };
+          }
+          /* else: torn write — retry next paint */
         }
       }
     }
@@ -259,7 +280,9 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     process.exit(130); // keys' exit backstop restores cooked mode; LiveRegion's restores the cursor
   };
 
+  let suspended = false;
   const onSigCont = (): void => {
+    suspended = false;
     keysAtt = attachKeys(input, onKey);
     stream.write('\x1b[?25l'); // re-hide the cursor (inverse of the suspend hand-back)
     region.reset();
@@ -267,6 +290,11 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
   };
 
   const suspend = (): void => {
+    // Re-entrancy guard: two ctrl-z bytes in one chunk would otherwise arm two
+    // once-listeners — after SIGCONT both would attachKeys and every key
+    // would dispatch twice from then on.
+    if (suspended) return;
+    suspended = true;
     // Hand the terminal back to the shell: cooked mode, visible cursor, and
     // the painted region left behind in scrollback.
     keysAtt.detach();

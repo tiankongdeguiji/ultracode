@@ -288,7 +288,9 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       const status = str(e.status) as ToolStatus | undefined;
       if (name === undefined || status === undefined || !TOOL_STATUSES.has(status)) return;
       row.lastActivityTs = num(e.ts) ?? row.lastActivityTs;
-      const clean = sanitizeText(name);
+      // Emission bounds names to 80 chars, but events.jsonl is worker-writable —
+      // re-cap at the fold so a crafted line can't bloat the recentTools ring.
+      const clean = truncateToWidth(sanitizeText(name), 120);
       if (status === 'started') {
         // Count starts only — the same predicate the engine uses for
         // AgentOutcome.toolCalls, so live and final counts agree.

@@ -128,7 +128,7 @@ key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0"
 
 ### 1.5 Progress events
 
-The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_tool {seq,name,status:'started'|'completed'|'failed'|'declined'}` (unthrottled discrete tool-call tick, display-only — name sanitized + capped at 80 chars at emission, ≤5000 events per dispatch; feeds the panel's live count and detail-view activity feed), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens,estimated?,toolCalls?}` (`toolCalls` is the authoritative started-tool count; absent on skip/cached and on pre-0.2 streams), `workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `logs --follow`, and MCP long-poll all tail this file by byte offset (`status --watch` polls manifest.json instead); the MCP long-poll wakes only on *renderable* lines, so usage and tool ticks never spin it.
+The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair',reason?}, agent_model {seq,model}` (backend-resolved), `agent_tool {seq,name,status:'started'|'completed'|'failed'|'declined'}` (unthrottled discrete tool-call tick, display-only — name sanitized + capped at 80 chars at emission, ≤5000 events per dispatch; feeds the panel's live count and detail-view activity feed), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens,estimated?,toolCalls?,error?}` (`toolCalls` is the authoritative started-tool count; absent on skip/cached and on streams from engines predating `agent_tool`), `workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `logs --follow`, and MCP long-poll all tail this file by byte offset (`status --watch` polls manifest.json instead); the MCP long-poll wakes only on *renderable* lines, so usage and tool ticks never spin it.
 
 ---
 
@@ -159,7 +159,7 @@ export type AgentEvent =
   | { kind:'notice';   message: string };                    // benign (e.g. codex "Reconnecting… n/5")
 
 export type ErrorKind = 'auth'|'schema-rejected'|'max-turns'|'budget'|'rate-limit'
-  |'structured-output-retries'|'interrupted'|'infra'|'unknown';
+  |'structured-output-retries'|'interrupted'|'stalled'|'infra'|'unknown';
 
 export interface ExitClass { ok: boolean; errorKind?: ErrorKind; retryable: boolean; message: string; }
 
@@ -315,7 +315,7 @@ script: await agent(prompt, {schema, label})
   → miss (prefix broken from here on):
       adapter.checkSchema → adapter.buildSpawn → spawn.ts (own pgid, cwd=worktree if isolation)
       stdout → ndjson splitter → adapter.createParser() → AgentEvent[]
-        → events.jsonl (agent_usage/agent_retry/agent_model ticks), transcript.jsonl (raw)
+        → events.jsonl (agent_usage/agent_retry/agent_model/agent_tool ticks), transcript.jsonl (raw)
       exit → adapter.classifyExit → retryable? (retries/stallMs budget) → respawn or fail
       structured pipeline: extract → ajv(original schema) → repair-resume ≤2 → value | WorkflowSchemaError
       usage → BudgetAccount.add → journal.append({t:'agent', key, status, totalTokens, resultRef})

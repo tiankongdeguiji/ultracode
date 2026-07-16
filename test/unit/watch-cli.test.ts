@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { appendFileSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,7 @@ import { createRunDir } from '../../src/store/runstore.js';
 import { readManifest, writeManifest, isTerminal } from '../../src/store/manifest.js';
 import { launchRunner } from '../../src/exec/daemonize.js';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { panelLoop, resolveRenderMode, watchCommand, type PanelStream } from '../../src/cli/watch.js';
+import { panelLoop, readArtifact, resolveRenderMode, watchCommand, type PanelStream } from '../../src/cli/watch.js';
 
 const HELLO = `export const meta = { name: 'hello', description: 'd', title: 'Say hi', phases: [{ title: 'Greet', detail: 'wave' }] }
 phase('Greet')
@@ -68,6 +68,7 @@ function fakeTty(): PanelStream & { chunks: string[] } {
 function fakeStdin(isTTY = true) {
   const emitter = new EventEmitter();
   const s = {
+    emitter,
     isTTY,
     rawCalls: [] as boolean[],
     setRawMode(m: boolean) {
@@ -296,6 +297,32 @@ return 1
   });
 });
 
+describe('readArtifact', () => {
+  it('reads regular files, returns undefined for missing paths, and caps oversized content', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-artifact-'));
+    writeFileSync(join(dir, 'prompt.md'), 'hello');
+    expect(readArtifact(join(dir, 'prompt.md'))).toBe('hello');
+    expect(readArtifact(join(dir, 'absent.md'))).toBeUndefined();
+    writeFileSync(join(dir, 'big.md'), 'x'.repeat(65 * 1024));
+    const big = readArtifact(join(dir, 'big.md'))!;
+    expect(big.length).toBeLessThan(66 * 1024);
+    expect(big.endsWith('… truncated')).toBe(true);
+  });
+
+  it('refuses worker-planted symlinks and never blocks on a planted FIFO', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-artifact-'));
+    writeFileSync(join(dir, 'secret'), 'leak');
+    symlinkSync(join(dir, 'secret'), join(dir, 'link.md'));
+    expect(readArtifact(join(dir, 'link.md'))).toBeUndefined(); // O_NOFOLLOW
+    const fifo = join(dir, 'fifo.md');
+    const mk = spawnSync('mkfifo', [fifo]);
+    if (mk.status === 0) {
+      // O_NONBLOCK + fstat gate: returns immediately instead of hanging open(2)
+      expect(readArtifact(fifo)).toBeUndefined();
+    }
+  });
+});
+
 describe('interactive panel', () => {
   const BUSY = `export const meta = { name: 'busy', description: 'd', phases: [{ title: 'Work' }] }
 phase('Work')
@@ -317,11 +344,13 @@ return 1
     expect(stream.chunks.at(-1)).toContain('❯');
 
     stdin.press('\r'); // ⏎ opens the detail view
-    const detail = stream.chunks.at(-1)!;
-    expect(detail).toContain('Prompt · 1 line'); // prompt.md readable while RUNNING (early write)
+    expect(stream.chunks.at(-1)).toContain('Outcome'); // detail layout is up immediately…
+    // …while artifact/tool data may lag a fold tick or two — poll, don't race.
+    await waitForOutput(stream.chunks, 'Prompt · 1 line'); // prompt.md readable while RUNNING (early write)
+    await waitForOutput(stream.chunks, 'tool:mock-2');
+    await waitForOutput(stream.chunks, '2 tool calls');
+    const detail = stream.chunks.findLast((c) => c.includes('tool:mock-2'))!;
     expect(detail).toContain('MOCK:tools 2 MOCK:delay 15000');
-    expect(detail).toContain('2 tool calls');
-    expect(detail).toContain('tool:mock-2');
     expect(detail).toContain('Still running…');
     expect(detail).toContain('j/k scroll');
 
@@ -333,8 +362,7 @@ return 1
     process.kill(pid, 'SIGTERM');
     const { exitCode } = await loop;
     expect(exitCode).toBe(1);
-    const final = stream.chunks.at(-2)!; // last frame write (before the cursor restore)
-    expect(final).toContain('Outcome'); // frozen in the detail view the user was reading
+    const final = stream.chunks.findLast((c) => c.includes('Outcome'))!; // the frozen final frame
     expect(final).toContain('failed: aborted'); // the stop settled the in-flight agent
     expect(final).not.toContain('j/k scroll'); // keys are dead on the final frame
     expect(stdin.rawCalls[0]).toBe(true);
@@ -374,6 +402,83 @@ return 1
     } finally {
       exitSpy.mockRestore();
       process.kill(pid, 'SIGTERM'); // cleanup; let the loop finish
+      await loop;
+    }
+  }, 30_000);
+
+  it('ctrl-z suspends once (double byte guarded), SIGCONT re-arms exactly one key listener', async () => {
+    const { dir } = makeRun(BUSY);
+    const { pid } = await launchRunner(dir);
+    const stream = fakeTty();
+    const stdin = fakeStdin();
+    const realKill = process.kill.bind(process);
+    const tstops: number[] = [];
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((target: number, sig?: string | number) => {
+      if (sig === 'SIGTSTP') {
+        tstops.push(target);
+        return true; // swallow — actually stopping would freeze the test runner
+      }
+      return realKill(target, sig as NodeJS.Signals);
+    });
+    const loop = panelLoop(dir, { mode: 'observe', noColor: true, stream, input: stdin });
+    try {
+      await waitForOutput(stream.chunks, 'worker');
+      stdin.press('\x1a\x1a'); // two ctrl-z in ONE chunk — must suspend once
+      expect(tstops).toEqual([process.pid]);
+      expect(stdin.rawCalls).toEqual([true, false]); // cooked mode handed back to the shell
+      expect(stream.chunks).toContain('\x1b[?25h'); // cursor visible for the shell
+
+      process.emit('SIGCONT'); // resume: raw mode + cursor re-hidden + repaint
+      expect(stdin.rawCalls).toEqual([true, false, true]);
+      expect(stdin.emitter.listenerCount('data')).toBe(1); // exactly one handler — keys never double-dispatch
+      stdin.press('\x1b[B');
+      expect(stream.chunks.at(-1)).toContain('❯'); // keys live again after resume
+    } finally {
+      killSpy.mockRestore();
+      process.kill(pid, 'SIGTERM');
+      await loop;
+    }
+  }, 30_000);
+
+  it('a truncated oversized result.json renders its head instead of finalizing forever; a torn empty prompt.md is retried', async () => {
+    // Fabricated live run (manifest pid = this process): no real runner, so the
+    // test controls exactly what is on disk when.
+    const root = mkdtempSync(join(tmpdir(), 'uc-artifacts-'));
+    const runId = newRunId();
+    const dir = createRunDir(root, { runId, name: 'arts', source: 'export const meta = { name: "arts", description: "d" }\nreturn 1\n', args: null, config: { backend: 'mock', cwd: root } });
+    const m = readManifest(dir)!;
+    writeManifest(dir, { ...m, status: 'running', pid: process.pid, pidStart: undefined });
+    const agentDir = join(dir, 'agents', '0000-big');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'prompt.md'), ''); // torn early write: zero bytes
+    appendFileSync(
+      join(dir, 'events.jsonl'),
+      '{"ts":1,"type":"agent_started","seq":0,"label":"big","backend":"mock"}\n' +
+        `{"ts":2,"type":"agent_completed","seq":0,"label":"big","ok":true,"totalTokens":10,"toolCalls":0}\n`,
+    );
+    writeFileSync(join(agentDir, 'result.json'), JSON.stringify({ ok: true, status: 'ok', value: 'HEAD-MARKER-' + 'x'.repeat(80 * 1024) }));
+
+    const stream = fakeTty();
+    const stdin = fakeStdin();
+    const loop = panelLoop(dir, { mode: 'observe', noColor: true, stream, input: stdin });
+    try {
+      await waitForOutput(stream.chunks, 'big');
+      stdin.press('\x1b[B');
+      stdin.press('\r');
+      // Oversized result.json: capped read cannot parse — the head must render,
+      // not '(finalizing…)'. (The '… truncated' tail lives thousands of virtual
+      // lines down; the visible window shows the head.)
+      await waitForOutput(stream.chunks, 'HEAD-MARKER-');
+      const detail = stream.chunks.findLast((c) => c.includes('Outcome'))!;
+      expect(detail).not.toContain('(finalizing…)');
+      // Settled row: the empty torn prompt was replaced by the settle-time re-read…
+      writeFileSync(join(agentDir, 'prompt.md'), 'the real prompt');
+      // …wait: settle re-read happens once; the empty file was read BEFORE we wrote.
+      // The guard treats '' as unreadable, so the next paint picks up the real content.
+      await waitForOutput(stream.chunks, 'the real prompt');
+    } finally {
+      const m2 = readManifest(dir)!;
+      writeManifest(dir, { ...m2, status: 'stopped', endedAt: new Date().toISOString() });
       await loop;
     }
   }, 30_000);

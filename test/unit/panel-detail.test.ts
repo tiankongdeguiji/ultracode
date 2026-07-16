@@ -165,6 +165,16 @@ describe('renderDetailFrame', () => {
     expect(value).toContain('own [9999HGOTCHA');
   });
 
+  it('never exceeds rows-1 even on degenerate terminals (pinned + body + bottom overshoot is clamped)', () => {
+    const prompt = Array.from({ length: 30 }, (_, i) => `p${i + 1}`).join('\n');
+    for (const rows of [2, 3, 4, 5, 6]) {
+      for (const runStatus of ['running', 'orphaned'] as const) {
+        const { text } = renderDetailFrame(detailState(), 0, { prompt }, { ...OPTS, rows, runStatus, keymap: 'j/k scroll' });
+        expect(text.split('\n').length).toBeLessThanOrEqual(Math.max(1, rows - 1));
+      }
+    }
+  });
+
   it('unknown seq yields a placeholder frame instead of throwing', () => {
     const r = renderDetailFrame(detailState(), 42, {}, OPTS);
     expect(r.text).toContain('agent #42 not found');

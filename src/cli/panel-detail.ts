@@ -211,7 +211,7 @@ export function renderDetailFrame(
   const scroll = Math.min(Math.max(0, opts.scroll), Math.max(0, body.length - budget));
   const visible = body.slice(scroll, scroll + budget);
 
-  const lines = [...pinned, ...visible];
+  let lines = [...pinned, ...visible];
   if (reserveBottom) {
     const bottom: string[] = [];
     if (body.length > visible.length) {
@@ -222,5 +222,9 @@ export function renderDetailFrame(
     if (opts.keymap !== undefined) bottom.push(opts.keymap);
     lines.push(paint('2', bottom.join(' · ')));
   }
+  // Degenerate terminals (rowsBudget smaller than pinned + 1 body + 1 bottom):
+  // the budget floors above can overshoot — hard-clamp so an oversized frame
+  // never scrolls the screen and desyncs the repaint's cursor-up count.
+  if (lines.length > rowsBudget) lines = lines.slice(0, rowsBudget);
   return { text: lines.map((l) => fitLine(l, cols)).join('\n'), maxScroll: Math.max(0, body.length - budget) };
 }

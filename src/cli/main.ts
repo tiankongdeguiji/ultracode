@@ -42,7 +42,10 @@ program
 program
   .command('watch')
   .argument('<runId>')
-  .description('live progress panel: phases, per-agent tokens/elapsed, budget (Ctrl-C detaches, never stops the run)')
+  .description(
+    'live progress panel: phases, per-agent tokens/elapsed, budget (Ctrl-C detaches, never stops the run). ' +
+      'Interactive on a TTY: up/down or j/k select an agent, enter opens its prompt/activity/outcome detail, esc back, q detach',
+  )
   .option('--plain', 'line-per-event output instead of the panel')
   .option('--no-color', 'panel without colors')
   .option('--home <dir>')

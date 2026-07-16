@@ -1,11 +1,11 @@
 /**
  * Keyboard input for the interactive panel: a pure byte→key parser plus a thin
  * raw-mode wrapper over a stdin-shaped stream. The parser is stateless and
- * timer-free — real TTYs deliver escape sequences atomically in one data
- * chunk, so a lone ESC at the end of a chunk IS the esc key (a split sequence
- * degrades to a harmless esc). Raw mode suppresses terminal signal generation:
- * Ctrl-C arrives as byte 0x03 and MUST be routed to the caller's SIGINT
- * semantics, which is why ctrl keys are first-class here.
+ * timer-free — TTYs deliver an escape sequence in one data chunk in practice,
+ * so a lone ESC at the end of a chunk is treated as the esc key (a sequence
+ * split across chunks degrades to a harmless esc). Raw mode suppresses
+ * terminal signal generation: Ctrl-C arrives as byte 0x03 and MUST be routed
+ * to the caller's SIGINT semantics, which is why ctrl keys are first-class.
  */
 
 export type Key =
@@ -96,7 +96,7 @@ export function parseKeys(chunk: Buffer | string): Key[] {
 /**
  * Enable raw mode on `input` and dispatch parsed keys to `onKey`. Returns a
  * no-op attachment ({ interactive: false }) when the input cannot do raw mode
- * (pipe, CI, /dev/null) — callers branch interactivity on this flag. An
+ * (pipe, CI, /dev/null) — callers branch interactivity on this flag. A
  * process-exit backstop restores cooked mode even when a handler calls
  * process.exit() directly (mirrors LiveRegion's cursor restore).
  */
