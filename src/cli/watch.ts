@@ -15,7 +15,7 @@
 import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { readEventsFrom } from '../store/events.js';
+import { EVENT_PAGE_BYTES, readEventsFrom } from '../store/events.js';
 import { isTerminal, readManifest, type RunStatus } from '../store/manifest.js';
 import { getRun, isRunnerAlive, liveStatus } from '../store/runstore.js';
 import { agentDirName, ultracodeRoot } from '../store/layout.js';
@@ -37,9 +37,6 @@ import {
 const PANEL_TICK_MS = 125; // 8fps spinner + sub-second elapsed
 const PLAIN_TICK_MS = 150; // the historical attach cadence
 const NARRATOR_BACKFILL = 50;
-/** Bound per-tick backlog reads: a late attach to a long run pages through
- *  events.jsonl instead of allocating/parsing the whole remainder at once. */
-const EVENT_PAGE_BYTES = 4 * 1024 * 1024;
 
 export interface PanelStream {
   write(chunk: string): boolean;

@@ -13,8 +13,11 @@ import {
   formatDuration,
   formatTokens,
   headerLines,
+  isInterruptedRow,
+  rowGlyph,
   sanitizeText,
   spinnerFrame,
+  truncateToWidth,
   type AgentRow,
   type FrameOptions,
   type Paint,
@@ -28,6 +31,17 @@ export interface AgentArtifacts {
   prompt?: string;
   /** parsed agents/<dir>/result.json — written at settle; untrusted shape */
   result?: unknown;
+  /** renderDetailFrame's wrap memo — rewrapping a 64KB artifact at 8fps just
+   *  to redraw the spinner is pure churn. Keyed by inputs; callers never touch it. */
+  wrapMemo?: WrapMemo;
+}
+
+interface WrapMemo {
+  width: number;
+  promptFor?: string;
+  promptLines?: string[];
+  valueFor?: unknown;
+  valueLines?: string[];
 }
 
 export interface DetailOptions extends FrameOptions {
@@ -72,27 +86,8 @@ export function wrapToWidth(text: string, width: number): string[] {
   return out;
 }
 
-function statusGlyph(row: AgentRow, opts: DetailOptions, paint: Paint): string {
-  const lost = isTerminal(opts.runStatus) && (row.status === 'running' || row.status === 'queued');
-  if (lost) return row.status === 'running' ? paint('33', '✗') : paint('2', '⊘');
-  switch (row.status) {
-    case 'running':
-      return row.attempt >= 2 ? paint('33', '↻') : paint('36', spinnerFrame(opts.nowMs));
-    case 'ok':
-      return paint('32', '✓');
-    case 'failed':
-      return paint('31', '✗');
-    case 'queued':
-      return paint('2', '◌');
-    case 'skipped':
-      return paint('2', '⊘');
-    default:
-      return paint('2', '⟳'); // cached
-  }
-}
-
 function statusLine(row: AgentRow, opts: DetailOptions, paint: Paint): string {
-  const lost = isTerminal(opts.runStatus) && (row.status === 'running' || row.status === 'queued');
+  const lost = isInterruptedRow(row, opts.runStatus);
   const parts: string[] = [];
   if (row.tokens > 0) parts.push(`${row.estimated ? '~' : ''}${formatTokens(row.tokens)} tok`);
   if (row.toolCalls > 0) parts.push(`${row.toolCalls} tool${row.toolCalls === 1 ? '' : 's'}`);
@@ -109,7 +104,7 @@ function statusLine(row: AgentRow, opts: DetailOptions, paint: Paint): string {
   else if (row.status === 'skipped') parts.push(paint('2', 'skipped'));
   else if (row.status === 'cached') parts.push(paint('2', 'cached'));
   const meta = parts.join(paint('2', ' · '));
-  return `${statusGlyph(row, opts, paint)} ${paint('1', row.label)}${meta ? `   ${meta}` : ''}`;
+  return `${rowGlyph(row, opts, paint)} ${paint('1', row.label)}${meta ? `   ${meta}` : ''}`;
 }
 
 const TOOL_GLYPH_CODE: Record<Exclude<ToolStatus, 'started'>, [string, string]> = {
@@ -118,7 +113,7 @@ const TOOL_GLYPH_CODE: Record<Exclude<ToolStatus, 'started'>, [string, string]> 
   declined: ['2', '⊘'],
 };
 
-function activityLines(row: AgentRow, opts: DetailOptions, paint: Paint): string[] {
+function activityLines(row: AgentRow, opts: DetailOptions, paint: Paint, width: number): string[] {
   if (row.recentTools.length === 0) {
     return [paint('2', row.toolCalls > 0 ? '(earlier calls scrolled off)' : '(no tool calls yet)')];
   }
@@ -130,11 +125,19 @@ function activityLines(row: AgentRow, opts: DetailOptions, paint: Paint): string
           ? paint('36', spinnerFrame(opts.nowMs))
           : paint('2', '◌')
         : paint(...TOOL_GLYPH_CODE[t.status]);
-    return `${glyph} ${t.name}`;
+    // Truncate here so fitLine never has to drop the glyph's color on overflow.
+    return `${glyph} ${truncateToWidth(t.name, Math.max(1, width - 2))}`;
   });
 }
 
-function outcomeLines(row: AgentRow, art: AgentArtifacts, opts: DetailOptions, paint: Paint, width: number): string[] {
+function outcomeLines(
+  row: AgentRow,
+  art: AgentArtifacts,
+  opts: DetailOptions,
+  paint: Paint,
+  width: number,
+  memo: WrapMemo,
+): string[] {
   if (row.endedTs === undefined && !isTerminal(opts.runStatus)) {
     return [paint('2', 'Still running…')];
   }
@@ -150,9 +153,17 @@ function outcomeLines(row: AgentRow, art: AgentArtifacts, opts: DetailOptions, p
   if (res === undefined || typeof res !== 'object') {
     return [paint('2', '(finalizing…)')]; // result.json not readable yet — caller retries next paint
   }
-  const value = res.value;
-  const text = typeof value === 'string' ? value : value === undefined ? 'null' : JSON.stringify(value, null, 2);
-  return wrapToWidth(text, width);
+  // Memoized on the parsed result's identity: stringify+wrap of a large value
+  // is pure and its inputs only change when the artifact cache replaces `res`.
+  if (memo.valueFor !== res || memo.valueLines === undefined) {
+    const value = res.value;
+    memo.valueFor = res;
+    memo.valueLines = wrapToWidth(
+      typeof value === 'string' ? value : value === undefined ? 'null' : JSON.stringify(value, null, 2),
+      width,
+    );
+  }
+  return memo.valueLines;
 }
 
 /**
@@ -179,8 +190,18 @@ export function renderDetailFrame(
   const pinned = [...headerLines(state, opts, paint), statusLine(row, opts, paint)];
   const bodyWidth = cols - BODY_INDENT.length;
 
+  // Wrap memo: resize starts a fresh one (width key); artifact replacement
+  // invalidates per input identity below.
+  const memo: WrapMemo = art.wrapMemo?.width === bodyWidth ? art.wrapMemo : (art.wrapMemo = { width: bodyWidth });
   const body: string[] = [];
-  const promptLines = art.prompt === undefined ? undefined : wrapToWidth(art.prompt, bodyWidth);
+  let promptLines: string[] | undefined;
+  if (art.prompt !== undefined) {
+    if (memo.promptFor !== art.prompt || memo.promptLines === undefined) {
+      memo.promptFor = art.prompt;
+      memo.promptLines = wrapToWidth(art.prompt, bodyWidth);
+    }
+    promptLines = memo.promptLines;
+  }
   const promptCount = promptLines === undefined ? '' : paint('2', ` · ${promptLines.length} line${promptLines.length === 1 ? '' : 's'}`);
   body.push(`${paint('1', 'Prompt')}${promptCount}`);
   if (promptLines === undefined) {
@@ -196,10 +217,10 @@ export function renderDetailFrame(
   }
   body.push('');
   body.push(`${paint('1', 'Activity')}${row.toolCalls > 0 ? paint('2', ` · ${row.toolCalls} tool call${row.toolCalls === 1 ? '' : 's'}`) : ''}`);
-  for (const l of activityLines(row, opts, paint)) body.push(BODY_INDENT + l);
+  for (const l of activityLines(row, opts, paint, bodyWidth)) body.push(BODY_INDENT + l);
   body.push('');
   body.push(paint('1', 'Outcome'));
-  for (const l of outcomeLines(row, art, opts, paint, bodyWidth)) body.push(BODY_INDENT + l);
+  for (const l of outcomeLines(row, art, opts, paint, bodyWidth, memo)) body.push(BODY_INDENT + l);
 
   // One bottom line merges the scroll indicator and the keymap. Decide whether
   // it exists against the FULL unreserved capacity first — reserving it up

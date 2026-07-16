@@ -111,6 +111,14 @@ describe('renderDetailFrame', () => {
     expect(asJson).toContain('  {\n    "findings": [');
   });
 
+  it('a failed row without an event error falls back to result.json error', () => {
+    const s = detailState();
+    foldEvent(s, ev('agent_started', { seq: 9, label: 'quiet-fail', phase: 'Review', backend: 'claude' }, 1000));
+    foldEvent(s, ev('agent_completed', { seq: 9, label: 'quiet-fail', ok: false, totalTokens: 1 }, 2000)); // no error field
+    const { text } = renderDetailFrame(s, 9, { result: { ok: false, status: 'error', error: 'error-from-result-json' } }, OPTS);
+    expect(text).toContain('failed: error-from-result-json');
+  });
+
   it('failed agents show the error in the outcome; running rows on terminal frames read interrupted', () => {
     const failed = render(2, { result: { ok: false, status: 'error', error: 'schema mismatch' } });
     expect(failed).toContain('✗ review legacy   900 tok · 3 tools · 40s · failed');

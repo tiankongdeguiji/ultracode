@@ -26,12 +26,15 @@ describe('parseKeys', () => {
     expect(parseKeys('\x1b\x1b[A')).toEqual([{ type: 'esc' }, { type: 'up' }]);
   });
 
-  it('unknown CSI sequences are consumed whole and never leak as chars', () => {
+  it('unknown CSI/SS3 sequences are consumed whole and never leak as chars', () => {
     expect(parseKeys('\x1b[C')).toEqual([]); // right arrow — unmapped
     expect(parseKeys('\x1b[1;5D')).toEqual([]); // ctrl-left with params
     expect(parseKeys('\x1b[<35;10;7M')).toEqual([]); // SGR mouse report
     expect(parseKeys('\x1b[200~pasted\x1b[201~')).toEqual('pasted'.split('').map((ch) => ({ type: 'char', ch })));
     expect(parseKeys('\x1b[')).toEqual([]); // partial CSI at chunk end — dropped
+    expect(parseKeys('\x1bOC')).toEqual([]); // unmapped SS3 — consumed, 'C' never leaks
+    expect(parseKeys('\x1bO')).toEqual([]); // split SS3 at chunk end — dropped
+    expect(parseKeys('\x1bOCq')).toEqual([{ type: 'char', ch: 'q' }]); // parsing resumes after it
   });
 
   it('printable ASCII becomes char keys; other control bytes are ignored', () => {

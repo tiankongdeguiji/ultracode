@@ -6,7 +6,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { readEventsFrom, type TimestampedEvent } from '../store/events.js';
+import { EVENT_PAGE_BYTES, readEventsFrom, type TimestampedEvent } from '../store/events.js';
 import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, listRuns, reapOrphans } from '../store/runstore.js';
 import { stopRun } from '../exec/stop.js';
@@ -135,12 +135,16 @@ export async function logsCommand(
   const eventsFile = join(run.dir, 'events.jsonl');
   let offset = 0;
   for (;;) {
-    const page = readEventsFrom(eventsFile, offset);
+    // Bounded pages, like watch and the MCP long-poll: agent_tool made the
+    // stream high-volume, so a first read of a big run must not allocate the
+    // whole backlog at once.
+    const page = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
     offset = page.nextOffset;
     for (const ev of page.events) {
       const line = renderEvent(ev);
       if (line) process.stdout.write(line + '\n');
     }
+    if (page.hasMore) continue; // still draining the backlog
     const manifest = readManifest(run.dir);
     if (!opts.follow || (manifest && isTerminal(manifest.status))) return 0;
     await sleep(300);

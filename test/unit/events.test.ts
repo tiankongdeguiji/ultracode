@@ -79,6 +79,9 @@ return 1`);
         // In-bounds hostile name: the ESC must be removed by the scrub regex
         // itself, not as a side effect of the 80-char truncation.
         onProgress?.({ type: 'tool', name: 'bash\x1b[2Jls', status: 'started' });
+        // The exact cap boundary: 80 chars pass through; 81 get the ellipsis cut.
+        onProgress?.({ type: 'tool', name: 'a'.repeat(80), status: 'started' });
+        onProgress?.({ type: 'tool', name: 'b'.repeat(81), status: 'started' });
         onProgress?.({ type: 'tool', name: evil, status: 'started' });
         for (let i = 0; i < TOOL_EVENT_CAP + 50; i++) {
           onProgress?.({ type: 'tool', name: 'flood', status: 'started' });
@@ -101,7 +104,9 @@ return 1`,
     const tools = ofType('agent_tool');
     expect(tools).toHaveLength(TOOL_EVENT_CAP); // cap holds
     expect(tools[0]!.name).toBe('bash [2Jls'); // scrubbed by the regex, untouched by the cap
-    const name = tools[1]!.name;
+    expect(tools[1]!.name).toBe('a'.repeat(80)); // exactly at the cap — untouched
+    expect(tools[2]!.name).toBe('b'.repeat(79) + '…'); // one past — truncated to 80 with ellipsis
+    const name = tools[3]!.name;
     expect(name.length).toBeLessThanOrEqual(80);
     expect(name).not.toMatch(/[\x00-\x1f]/); // control bytes never enter the stream
     expect(ofType('agent_completed')[0]).toMatchObject({ toolCalls: TOOL_EVENT_CAP + 51 }); // authority unaffected

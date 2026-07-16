@@ -512,26 +512,39 @@ function indexRows(state: PanelState): FrameIndex {
   return idx;
 }
 
+/**
+ * A terminal frame must not fake liveness: rows the run left behind (runner
+ * died, run stopped) render as interrupted, never as spinning. Shared by the
+ * overview and the detail view so the two can never disagree.
+ */
+export function isInterruptedRow(row: AgentRow, runStatus: RunStatus): boolean {
+  return isTerminal(runStatus) && (row.status === 'running' || row.status === 'queued');
+}
+
+/** Status → glyph mapping, the single source of truth for both renderers. */
+export function rowGlyph(row: AgentRow, opts: Pick<FrameOptions, 'nowMs' | 'runStatus'>, paint: Paint): string {
+  if (isInterruptedRow(row, opts.runStatus)) {
+    return row.status === 'running' ? paint('33', '✗') : paint('2', '⊘');
+  }
+  switch (row.status) {
+    case 'running':
+      return row.attempt >= 2 ? paint('33', '↻') : paint('36', spinnerFrame(opts.nowMs));
+    case 'ok':
+      return paint('32', '✓');
+    case 'failed':
+      return paint('31', '✗');
+    case 'queued':
+      return paint('2', '◌');
+    case 'skipped':
+      return paint('2', '⊘');
+    default:
+      return paint('2', '⟳'); // cached
+  }
+}
+
 function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: Paint): string {
-  // A terminal frame must not fake liveness: rows the run left behind
-  // (runner died, run stopped) render as interrupted, never as spinning.
-  const lost = isTerminal(opts.runStatus) && (row.status === 'running' || row.status === 'queued');
-  const spin = row.attempt >= 2 ? paint('33', '↻') : paint('36', spinnerFrame(opts.nowMs));
-  const glyph = lost
-    ? row.status === 'running'
-      ? paint('33', '✗')
-      : paint('2', '⊘')
-    : row.status === 'running'
-      ? spin
-      : row.status === 'ok'
-        ? paint('32', '✓')
-        : row.status === 'failed'
-          ? paint('31', '✗')
-          : row.status === 'queued'
-            ? paint('2', '◌')
-            : row.status === 'skipped'
-              ? paint('2', '⊘')
-              : paint('2', '⟳'); // cached
+  const lost = isInterruptedRow(row, opts.runStatus);
+  const glyph = rowGlyph(row, opts, paint);
   const truncated = truncateToWidth(row.label, LABEL_WIDTH);
   const label = truncated + ' '.repeat(Math.max(0, LABEL_WIDTH - displayWidth(truncated)));
   const parts: string[] = [];
@@ -752,8 +765,13 @@ export function renderFrame(state: PanelState, opts: FrameOptions): string {
       // Last resort: keep the header and the most recent tail (incl. footer).
       const tail = lines.slice(lines.length - (rowsBudget - 2));
       // The selection must survive even here — an invisible ❯ would leave the
-      // arrow keys steering a row the user cannot see.
-      const selected = opts.selectedSeq !== undefined ? lines.find((l) => l.includes('❯')) : undefined;
+      // arrow keys steering a row the user cannot see. The marker is only ever
+      // the connector (first visible glyph); a label CONTAINING ❯ never starts
+      // the trimmed line, so decoys cannot shadow the real selected row.
+      const selected =
+        opts.selectedSeq !== undefined
+          ? lines.find((l) => l.replace(ANSI_RE, '').trimStart().startsWith('❯'))
+          : undefined;
       if (selected !== undefined && !tail.includes(selected)) tail[0] = selected;
       lines = [lines[0]!, paint('2', `  … ${lines.length - tail.length - 1} lines hidden (terminal too small)`), ...tail];
     } else {

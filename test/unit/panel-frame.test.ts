@@ -225,6 +225,14 @@ describe('panel frame', () => {
     expect(truncated).toContain('lines hidden (terminal too small)');
     expect(truncated).toContain('❯ ✓ repo-mapper');
     expect(truncated.split('\n').length).toBeLessThanOrEqual(7);
+    // A label CONTAINING ❯ must not shadow the real selection (the marker is
+    // detected at the connector position, not by substring).
+    const withDecoy = richState();
+    foldEvent(withDecoy, ev('agent_completed', { seq: 20, label: 'decoy❯label', phase: 'Explore', ok: true, totalTokens: 1 }, 500));
+    const decoyFrame = renderFrame(withDecoy, { ...FRAME_OPTS, rows: 8, selectedSeq: 6 });
+    const marked = decoyFrame.split('\n').filter((l) => l.trimStart().startsWith('❯'));
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).toContain('review cli'); // seq 6 — the real selection survives
   });
 
   it('selection also survives the queued-overflow fold', () => {

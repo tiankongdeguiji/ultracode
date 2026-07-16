@@ -33,6 +33,10 @@ export class EventWriter {
   }
 }
 
+/** Standard page size for tailing readers: bounds one read so a late attach to
+ *  a large backlog pages instead of allocating the whole remainder at once. */
+export const EVENT_PAGE_BYTES = 4 * 1024 * 1024;
+
 export interface EventPage {
   events: TimestampedEvent[];
   nextOffset: number;
