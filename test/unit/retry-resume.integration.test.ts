@@ -69,7 +69,8 @@ class ScriptedAdapter implements BackendAdapter {
           return [{ kind: 'usage', usage: obj.usage as never, threadCumulative: obj.cumulative === true }];
         }
         if (obj.done) return [{ kind: 'result', isError: false }];
-        return [];
+        // unrecognized lines become notices, like the real codex parser
+        return [{ kind: 'notice', message: JSON.stringify(obj) }];
       },
       end: (): AgentEvent[] => [],
     };
@@ -149,11 +150,27 @@ describe('task-retry resume', () => {
     expect(adapter.spawnCalls).toBe(2);
   });
 
-  it('a resume that dies with zero events reruns the attempt fresh instead of burning the retry', async () => {
+  it('a resume that dies without reattaching reruns the attempt fresh instead of burning the retry', async () => {
     const adapter = new ScriptedAdapter([
       { lines: [{ session: 's1' }], exit: 1 }, // attempt 1 (spawn) fails retryably
       { lines: [], exit: 1 }, // attempt 2 resume: reattach failure, zero events
       { lines: [{ text: 'ok fresh' }, { done: true }], exit: 0 }, // attempt 2 fresh fallback
+    ]);
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    expect(outcome.ok).toBe(true);
+    expect((outcome as { value?: unknown }).value).toBe('ok fresh');
+    expect(outcome.attempts).toBe(2);
+    expect(adapter.resumeCalls).toHaveLength(1);
+    expect(adapter.spawnCalls).toBe(2);
+  });
+
+  it('a resume that prints only a diagnostic line (no session event) still falls back fresh', async () => {
+    const adapter = new ScriptedAdapter([
+      { lines: [{ session: 's1' }], exit: 1 },
+      // reattach failure with stderr-style chatter on stdout: becomes a
+      // notice event, but no session event → still a mechanism failure
+      { lines: [{ diagnostic: 'error: session not found' }], exit: 1 },
+      { lines: [{ text: 'ok fresh' }, { done: true }], exit: 0 },
     ]);
     const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
@@ -259,16 +276,17 @@ describe('task-retry resume', () => {
   it('the fresh fallback shares the attempt deadline instead of arming a second full window', async () => {
     const adapter = new ScriptedAdapter([
       { lines: [{ session: 's1' }], exit: 1 }, // attempt 1 fails fast, retryably
-      { lines: [], exit: 1, delayMs: 1_200 }, // resume: zero events, dies on its own late in the budget
+      { lines: [], exit: 1, delayMs: 2_500 }, // resume: zero events, dies on its own late in the budget
       { lines: [], exit: 0, hang: true }, // fresh fallback: hangs → must be killed at the REMAINING budget
     ]);
     const started = Date.now();
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 2_000 }), SIGNAL);
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 4_000 }), SIGNAL);
     const elapsed = Date.now() - started;
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toContain('timed out');
-    // one 2s deadline for the whole logical attempt (plus slack) — a second
-    // full window would push this past ~3.2s
-    expect(elapsed).toBeLessThan(3_000);
+    // one 4s deadline for the whole logical attempt: expected ~4.2-4.7s incl.
+    // spawn overhead; a second full window would land at ~6.6s+. The 5.5s
+    // threshold leaves ~1s of jitter margin on both sides.
+    expect(elapsed).toBeLessThan(5_500);
   }, 15_000);
 });

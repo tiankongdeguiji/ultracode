@@ -21,6 +21,7 @@ import {
 } from '../backends/structured.js';
 import { validateWithSchema } from './ajv.js';
 import { spawnAgentProcess, TailBuffer } from '../exec/spawn.js';
+import { chainedTimeout } from '../exec/timers.js';
 import type {
   AgentEvent,
   AgentExecutor,
@@ -75,9 +76,6 @@ export interface AgentCallOptions {
 }
 
 export const USAGE_TICK_INTERVAL_MS = 1000;
-/** Longest delay Node's setTimeout honors (2^31−1 ms); a larger value overflows
- *  and fires immediately, so callers treat anything beyond it as "no timer". */
-const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 /** Session ids arrive on the worker's own stdout stream — validate the shape
  *  before one re-enters an argv, where a forged leading-dash "id" would parse
@@ -161,24 +159,25 @@ export class AgentCallExecutor implements AgentExecutor {
           : null;
       const attemptBudgetMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
       const attemptStartedAt = Date.now();
-      last = await this.runAttempt(
-        spec,
-        resumePlan ?? this.adapter.buildSpawn(req),
-        signal,
-        attempt,
-        tracker?.onStreamEvent,
-        resumePlan !== null,
-      );
-      // A resume that dies with zero events (and not by watchdog kill) failed
-      // as a MECHANISM — e.g. the backend could not load the killed session's
-      // rollout — not as an attempt. Rerun the same attempt fresh so a broken
-      // resume never burns a task retry — but against the SAME deadline: the
-      // rerun gets only the budget the dead resume left, never a second full
-      // window (floored at 1s so it can at least report a timely failure).
-      if (resumePlan !== null && !last.exit.ok && !signal.aborted && last.exit.errorKind !== 'stalled' && last.events.length === 0) {
+      last = await this.runAttempt(spec, resumePlan ?? this.adapter.buildSpawn(req), signal, attempt, {
+        onStreamEvent: tracker?.onStreamEvent,
+        resumedSession: resumePlan !== null,
+      });
+      // A resume that dies without ever REATTACHING (no session event — e.g.
+      // the backend could not load the killed session's rollout, whatever
+      // diagnostics it printed) failed as a MECHANISM, not as an attempt.
+      // Rerun the same attempt fresh so a broken resume never burns a task
+      // retry — but against the SAME deadline: the rerun gets only the budget
+      // the dead resume left, never a second full window (floored at 1s so it
+      // can at least report a timely failure). Watchdog kills are excluded.
+      if (resumePlan !== null && !last.exit.ok && !signal.aborted && last.exit.errorKind !== 'stalled' && last.sessionId === undefined) {
         const remainingMs =
           attemptBudgetMs === undefined ? undefined : Math.max(1_000, attemptBudgetMs - (Date.now() - attemptStartedAt));
-        last = await this.runAttempt(spec, this.adapter.buildSpawn(req), signal, attempt, tracker?.onStreamEvent, false, '-fresh', remainingMs);
+        last = await this.runAttempt(spec, this.adapter.buildSpawn(req), signal, attempt, {
+          onStreamEvent: tracker?.onStreamEvent,
+          stderrSuffix: '-fresh',
+          timeoutOverrideMs: remainingMs,
+        });
       }
       attemptsUsed = attempt;
       usages.push(last);
@@ -331,7 +330,10 @@ export class AgentCallExecutor implements AgentExecutor {
           ...req,
           prompt: freshRepairPrompt(spec.prompt, lastRaw, lastErrors, schema),
         });
-      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, tracker?.onStreamEvent, resumePlan !== null);
+      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, {
+        onStreamEvent: tracker?.onStreamEvent,
+        resumedSession: resumePlan !== null,
+      });
       usages.push(current);
       tracker?.attemptSettled(usages);
       if (!current.exit.ok) {
@@ -455,16 +457,19 @@ export class AgentCallExecutor implements AgentExecutor {
     plan: SpawnPlan,
     signal: AbortSignal,
     attempt: number,
-    onStreamEvent?: (ev: AgentEvent) => void,
-    /** the plan resumes an existing backend session (task retry or schema repair via buildResume) */
-    resumedSession = false,
-    /** stderr artifact suffix; distinguishes a same-attempt rerun (the fresh
-     *  fallback after a dead resume) so it can't clobber the resume's stderr */
-    stderrSuffix = '',
-    /** remaining budget for a same-attempt rerun — one deadline per logical
-     *  attempt, never a second full window */
-    timeoutOverrideMs?: number,
+    opts: {
+      onStreamEvent?: (ev: AgentEvent) => void;
+      /** the plan resumes an existing backend session (task retry or schema repair via buildResume) */
+      resumedSession?: boolean;
+      /** stderr artifact suffix; distinguishes a same-attempt rerun (the fresh
+       *  fallback after a dead resume) so it can't clobber the resume's stderr */
+      stderrSuffix?: string;
+      /** remaining budget for a same-attempt rerun — one deadline per logical
+       *  attempt, never a second full window */
+      timeoutOverrideMs?: number;
+    } = {},
   ): Promise<AttemptResult> {
+    const { onStreamEvent, resumedSession = false, stderrSuffix = '', timeoutOverrideMs } = opts;
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
     const transcriptFile = artifactDir ? join(artifactDir, 'transcript.jsonl') : undefined;
@@ -541,7 +546,7 @@ export class AgentCallExecutor implements AgentExecutor {
     };
 
     let transcriptFd: number | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timer: { clear(): void } | undefined;
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     let onAbort: (() => void) | undefined;
     // Delayed SIGKILL escalations scheduled after a SIGTERM. Tracked so `finally`
@@ -579,27 +584,17 @@ export class AgentCallExecutor implements AgentExecutor {
       };
 
       // Timeouts are user-opt-in: no per-call timeoutMs and no run-level
-      // attemptTimeoutMs means the attempt runs unlimited. Delays beyond
-      // Node's 2^31−1 ms setTimeout range are honored by re-arming toward an
-      // absolute deadline — an oversized cap is enforced, never silently
-      // disarmed, and never overflow-fired at ~1ms.
+      // attemptTimeoutMs means the attempt runs unlimited. chainedTimeout
+      // honors oversized caps past the setTimeout range — enforced, never
+      // silently disarmed, never overflow-fired at ~1ms.
       const timeoutMs = timeoutOverrideMs ?? spec.timeoutMs ?? this.opts.attemptTimeoutMs;
       let timedOut = false;
       let stalled = false;
       if (timeoutMs !== undefined) {
-        const deadline = Date.now() + timeoutMs;
-        const armKill = (): void => {
-          const remaining = deadline - Date.now();
-          timer =
-            remaining <= MAX_TIMER_DELAY_MS
-              ? setTimeout(() => {
-                  timedOut = true;
-                  killWithEscalation();
-                }, Math.max(0, remaining))
-              : setTimeout(armKill, MAX_TIMER_DELAY_MS);
-          timer.unref();
-        };
-        armKill();
+        timer = chainedTimeout(timeoutMs, () => {
+          timedOut = true;
+          killWithEscalation();
+        });
       }
 
       // Stall watchdog: no stream activity within stallMs → kill and retry.
@@ -679,7 +674,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // Runs on both success and the spawn-error path — the error path is
       // retryable, so leaking the interval/timer/abort-listener would compound
       // across retries.
-      if (timer) clearTimeout(timer);
+      timer?.clear();
       if (stallTimer) clearInterval(stallTimer);
       for (const t of escalationTimers) clearTimeout(t);
       if (onAbort) signal.removeEventListener('abort', onAbort);

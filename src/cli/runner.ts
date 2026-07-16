@@ -17,6 +17,7 @@ import { agentDirName } from '../store/layout.js';
 import { MockExecutor } from '../backends/mock.js';
 import { createExecutorForBackend } from '../engine/agentcall.js';
 import { readProcStat } from '../exec/procinfo.js';
+import { chainedTimeout } from '../exec/timers.js';
 import { Semaphore, defaultConcurrency, isPositiveInt } from '../engine/semaphore.js';
 import { BudgetAccount } from '../budget/account.js';
 import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
@@ -128,29 +129,19 @@ export async function runnerMain(dir: string): Promise<number> {
   });
 
   // Wall-clock cap — user-opt-in: unset runs unlimited; when set it is a loud
-  // stop, never a silent one. Delays beyond Node's 2^31−1 ms setTimeout range
-  // are honored by re-arming toward an absolute deadline (an oversized cap is
-  // enforced, never overflow-fired at ~1ms); invalid values (≤0, NaN — the
-  // config file is worker-writable) run uncapped, saying so loudly.
+  // stop, never a silent one. chainedTimeout honors oversized caps past the
+  // setTimeout range; invalid values (≤0, NaN, fractional — the config file
+  // is worker-writable; same predicate as attemptTimeoutMs below) run
+  // uncapped, saying so loudly.
   const wallClockMs = config.wallClockMs;
-  let wallTimer: ReturnType<typeof setTimeout> | undefined;
+  let wallTimer: { clear(): void } | undefined;
   if (wallClockMs !== undefined) {
-    if (Number.isFinite(wallClockMs) && wallClockMs > 0) {
-      const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
-      const deadline = Date.now() + wallClockMs;
-      const armWallStop = (): void => {
-        const remaining = deadline - Date.now();
-        wallTimer =
-          remaining <= MAX_TIMER_DELAY_MS
-            ? setTimeout(() => {
-                events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms exceeded — stopping run` });
-                abort.abort(new Error(`wall-clock cap ${wallClockMs}ms exceeded`));
-                armHardStop('wall-clock cap');
-              }, Math.max(0, remaining))
-            : setTimeout(armWallStop, MAX_TIMER_DELAY_MS);
-        wallTimer.unref();
-      };
-      armWallStop();
+    if (isPositiveInt(wallClockMs)) {
+      wallTimer = chainedTimeout(wallClockMs, () => {
+        events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms exceeded — stopping run` });
+        abort.abort(new Error(`wall-clock cap ${wallClockMs}ms exceeded`));
+        armHardStop('wall-clock cap');
+      });
     } else {
       events.write({ type: 'workflow_log', message: `wall-clock cap ${wallClockMs}ms is invalid — running uncapped` });
     }
@@ -197,17 +188,27 @@ export async function runnerMain(dir: string): Promise<number> {
   if (repoRoot) shared.worktrees = createWorktreeManager(repoRoot, worktreesRootFor(dir));
 
   // Same worker-writable-config caution as maxConcurrency above: junk in
-  // attemptTimeoutMs falls back to the executor's 20-minute default. Applied
-  // loudly so the override is observable in events.jsonl.
+  // attemptTimeoutMs falls back to unlimited (timeouts are opt-in; per-call
+  // timeoutMs still applies). Applied loudly so the override is observable
+  // in events.jsonl.
   const attemptTimeoutMs =
     config.attemptTimeoutMs !== undefined && isPositiveInt(config.attemptTimeoutMs) ? config.attemptTimeoutMs : undefined;
   if (attemptTimeoutMs !== undefined) {
     events.write({ type: 'workflow_log', message: `attempt timeout ${attemptTimeoutMs}ms (run-level override)` });
   }
+  // `permission` crosses the same worker-writable boundary: junk fails CLOSED
+  // to 'safe'. (A forged-but-VALID 'danger' is the documented run-store trust
+  // follow-up — a validator cannot tell it from a legitimate one.)
+  const permission =
+    config.permission === undefined
+      ? 'auto'
+      : (['safe', 'auto', 'danger'] as readonly string[]).includes(config.permission)
+        ? config.permission
+        : 'safe';
 
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
-    executor: makeExecutorMux(dir, config.permission ?? 'auto', attemptTimeoutMs),
+    executor: makeExecutorMux(dir, permission, attemptTimeoutMs),
     cacheLookup: replay?.lookup,
     args,
     budgetAccount,
@@ -299,7 +300,7 @@ export async function runnerMain(dir: string): Promise<number> {
   });
 
   clearInterval(heartbeat);
-  if (wallTimer) clearTimeout(wallTimer);
+  wallTimer?.clear();
   if (hardStopTimer) clearTimeout(hardStopTimer); // workflow unwound on its own
   if (replay) {
     events.write({
