@@ -37,6 +37,12 @@ export class EventWriter {
  *  a large backlog pages instead of allocating the whole remainder at once. */
 export const EVENT_PAGE_BYTES = 4 * 1024 * 1024;
 
+/** Ceiling on the newline-hunting window growth, as a multiple of the caller's
+ *  page size. A single unterminated line larger than this is not a torn tail —
+ *  it is a worker-written pathology, and re-allocating the growing remainder
+ *  on every tick to rescan it would be the exact DoS paging exists to stop. */
+const MAX_LINE_GROWTH_FACTOR = 4;
+
 export interface EventPage {
   events: TimestampedEvent[];
   nextOffset: number;
@@ -75,6 +81,13 @@ export function readEventsFrom(file: string, offset: number, maxBytes?: number):
       // (no newline → no offset progress): grow the window until a newline
       // lands or EOF — a genuinely torn tail then waits for the writer.
       if (text.lastIndexOf('\n') !== -1 || offset + window >= size) break;
+      if (maxBytes !== undefined && window >= maxBytes * MAX_LINE_GROWTH_FACTOR) {
+        // Skip past the over-long unterminated line in bounded steps instead
+        // of re-reading an ever-growing remainder. Resuming mid-line is fine:
+        // the fragment up to the next newline fails JSON.parse and is dropped
+        // by the torn-line skip below, exactly like any other garbage line.
+        return { events: [], nextOffset: offset + window, hasMore: offset + window < size };
+      }
       window = Math.min(size - offset, window * 2);
     }
     const lastNewline = text.lastIndexOf('\n');

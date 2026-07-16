@@ -173,6 +173,38 @@ describe('renderDetailFrame', () => {
     expect(value).toContain('own [9999HGOTCHA');
   });
 
+  it('covers the remaining reachable states: skipped, cached, never-started, null value, ✗/⊘ tool glyphs', () => {
+    const s = detailState();
+    foldEvent(s, ev('agent_completed', { seq: 20, label: 'skipper', phase: 'Review', ok: true, skipped: true, totalTokens: 0 }, 1000));
+    foldEvent(s, ev('agent_completed', { seq: 21, label: 'replayed', phase: 'Review', ok: true, cached: true, totalTokens: 0 }, 1100));
+    foldEvent(s, ev('agent_queued', { seq: 22, label: 'waiting', phase: 'Review' }, 1200));
+    foldEvent(s, ev('agent_started', { seq: 23, label: 'mixed-tools', phase: 'Review', backend: 'claude' }, 1300));
+    foldEvent(s, ev('agent_tool', { seq: 23, name: 'bash:boom', status: 'started' }, 1400));
+    foldEvent(s, ev('agent_tool', { seq: 23, name: 'bash:boom', status: 'failed' }, 1500));
+    foldEvent(s, ev('agent_tool', { seq: 23, name: 'web:nope', status: 'started' }, 1600));
+    foldEvent(s, ev('agent_tool', { seq: 23, name: 'web:nope', status: 'declined' }, 1700));
+
+    const skipped = renderDetailFrame(s, 20, {}, OPTS).text;
+    expect(skipped).toContain('⊘ skipper');
+    expect(skipped).toContain('Outcome\n  skipped');
+
+    const cached = renderDetailFrame(s, 21, { result: { ok: true, status: 'ok', value: 'from cache' } }, OPTS).text;
+    expect(cached).toContain('⟳ replayed');
+    expect(cached).toContain('cached');
+    expect(cached).toContain('Outcome\n  from cache');
+
+    const neverStarted = renderDetailFrame(s, 22, {}, { ...OPTS, runStatus: 'stopped' }).text;
+    expect(neverStarted).toContain('⊘ waiting');
+    expect(neverStarted).toContain('never started');
+
+    const nullValue = renderDetailFrame(s, 21, { result: { ok: true, status: 'ok' } }, OPTS).text;
+    expect(nullValue).toContain('Outcome\n  null'); // result without a value renders as null, not (finalizing…)
+
+    const glyphs = renderDetailFrame(s, 23, {}, OPTS).text;
+    expect(glyphs).toContain('✗ bash:boom');
+    expect(glyphs).toContain('⊘ web:nope');
+  });
+
   it('snapToOutcome scrolls a frozen final frame to the Outcome section (dead keys cannot)', () => {
     const prompt = Array.from({ length: 60 }, (_, i) => `p${i + 1}`).join('\n');
     const art = { prompt, result: { ok: true, status: 'ok', value: 'THE-FINAL-ANSWER' } };

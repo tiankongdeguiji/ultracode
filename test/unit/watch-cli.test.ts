@@ -490,9 +490,14 @@ return 1
       // must fit the new budget and the scroll offset re-clamps itself.
       stream.rows = 8;
       stream.resize();
-      await sleep(400); // a few ticks at the new geometry
-      const after = stream.chunks.findLast((c) => c.includes('⏺'))!;
-      expect(frameLines(after)).toBeLessThanOrEqual(7);
+      // Poll for the first frame at the new geometry (no wall-clock coupling).
+      const deadline = Date.now() + 5000;
+      for (;;) {
+        const f = stream.chunks.findLast((c) => c.includes('⏺'));
+        if (f && frameLines(f) <= 7) break;
+        if (Date.now() > deadline) throw new Error('never repainted within the shrunken budget');
+        await sleep(50);
+      }
       stdin.press('j'); // scrolling still works post-resize
       expect(frameLines(stream.chunks.at(-1)!)).toBeLessThanOrEqual(7);
     } finally {

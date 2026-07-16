@@ -373,13 +373,15 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
 
       if (manifest && isTerminal(status)) {
         if (mode.kind === 'plain' && !opts.quiet) writePlain(page.events);
-        // Drain the remainder in bounded pages too.
+        // Drain the remainder in bounded pages too (yielding per page — the
+        // final drain of a big run must not freeze the loop either).
         for (;;) {
           const rest = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
           offset = rest.nextOffset;
           if (panelFolds) for (const ev of rest.events) foldEvent(state, ev);
           if (mode.kind === 'plain' && !opts.quiet) writePlain(rest.events);
           if (!rest.hasMore) break;
+          await sleep(0);
         }
         // A namespace-local pid means the runner was born inside a fresh
         // PID namespace — a transient sandbox (agent exec jail, one-shot
@@ -405,7 +407,13 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
       }
 
       if (mode.kind === 'plain' && !opts.quiet) writePlain(page.events);
-      if (page.hasMore) continue; // catching up on a backlog — no repaint, no sleep
+      if (page.hasMore) {
+        // Catching up on a backlog: no repaint, no full tick — but yield the
+        // event loop each page, or raw-mode keys (including the 0x03 that IS
+        // Ctrl-C here) starve for the whole drain.
+        await sleep(0);
+        continue;
+      }
       if (panelFolds) paint(manifest, status, Date.now(), false);
       await sleep(mode.kind === 'panel' ? PANEL_TICK_MS : PLAIN_TICK_MS);
     }

@@ -116,18 +116,46 @@ describe('events', () => {
     expect(seen).toEqual(Array.from({ length: 50 }, (_, i) => i)); // nothing lost or torn
   });
 
-  it('a single line larger than maxBytes cannot stall the tail (window grows to the newline)', () => {
+  it('a line moderately larger than maxBytes is recovered by window growth (up to 4×)', () => {
     const dir = tmpRoot();
     const file = join(dir, 'events.jsonl');
     const w = new EventWriter(file);
-    w.write({ type: 'workflow_log', message: 'x'.repeat(2000) }); // ≫ the 256-byte page below
+    w.write({ type: 'workflow_log', message: 'x'.repeat(400) }); // > 256-byte page, < 4× cap
     w.write({ type: 'run_completed' });
     w.close();
 
     const page1 = readEventsFrom(file, 0, 256);
     expect(page1.events.map((e) => e.type)).toEqual(['workflow_log', 'run_completed']);
     expect(page1.hasMore).toBe(false);
-    expect(readEventsFrom(file, page1.nextOffset, 256).events).toEqual([]);
+  });
+
+  it('a pathological unterminated line past the growth cap is skipped in bounded steps, and the tail self-heals', () => {
+    const dir = tmpRoot();
+    const file = join(dir, 'events.jsonl');
+    const w = new EventWriter(file);
+    // One line ≫ 4×256: growth stops at the cap and the reader advances past
+    // it instead of re-allocating the whole remainder on every tick (a
+    // worker-writable file must not be able to force that).
+    w.write({ type: 'workflow_log', message: 'x'.repeat(4000) });
+    w.write({ type: 'run_completed' });
+    w.close();
+
+    const page1 = readEventsFrom(file, 0, 256);
+    expect(page1.events).toEqual([]); // the oversized event is dropped, like any garbage line
+    expect(page1.nextOffset).toBe(1024); // …but the offset ADVANCES (bounded step, no stall)
+    expect(page1.hasMore).toBe(true);
+
+    // Keep paging: every call makes progress and the stream recovers.
+    const seen: string[] = [];
+    let offset = page1.nextOffset;
+    for (let i = 0; i < 40; i++) {
+      const p = readEventsFrom(file, offset, 256);
+      expect(p.nextOffset).toBeGreaterThanOrEqual(offset);
+      seen.push(...p.events.map((e) => e.type));
+      if (!p.hasMore && p.nextOffset === offset) break;
+      offset = p.nextOffset;
+    }
+    expect(seen).toContain('run_completed'); // the event after the monster line survives
   });
 });
 
