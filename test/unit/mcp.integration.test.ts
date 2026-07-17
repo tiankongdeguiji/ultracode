@@ -3,7 +3,8 @@
  * launches real detached runners on the mock backend. No network.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -206,6 +207,157 @@ describe('MCP triad', () => {
     expect(status.logTail).toEqual([]);
     expect(status.nextEventOffset).toBeGreaterThan(0); // ticks consumed, never re-served
     expect(elapsed).toBeGreaterThanOrEqual(900); // waited to deadline instead of waking on ticks
+  }, 20_000);
+
+  // Fabricated live run (same pattern as the ticks-only test): manifest pid
+  // points at an alive process (this one unless overridden) so liveStatus
+  // stays 'running' until the test flips status or the pid dies.
+  function fabricateRun(
+    runId: string,
+    events: string,
+    proc: { pid: number; pidStart?: number } = { pid: process.pid, pidStart: readProcStat(process.pid)?.starttime },
+  ): { dir: string; manifest: Record<string, unknown> } {
+    const dir = join(projectDir, '.ultracode', 'runs', runId);
+    mkdirSync(dir, { recursive: true });
+    const now = new Date().toISOString();
+    const manifest = {
+      runId,
+      name: 'fabricated',
+      status: 'running',
+      pid: proc.pid,
+      pidStart: proc.pidStart,
+      startedAt: now,
+      heartbeatAt: now,
+      phases: [],
+      agentCount: 0,
+      budget: { total: null, spent: 0 },
+      backendDefault: 'mock',
+      engineVersion: '0.0.0',
+    };
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify(manifest));
+    writeFileSync(join(dir, 'events.jsonl'), events);
+    return { dir, manifest };
+  }
+
+  // The server re-reads manifest.json every tick — flips must be atomic
+  // (tmp+rename, like the real writeManifest) or a read can land mid-truncate.
+  function flipStatus(dir: string, manifest: Record<string, unknown>, status: string): void {
+    writeFileSync(join(dir, 'manifest.json.tmp'), JSON.stringify({ ...manifest, status, endedAt: new Date().toISOString() }));
+    renameSync(join(dir, 'manifest.json.tmp'), join(dir, 'manifest.json'));
+  }
+
+  const logLines = (n: number, prefix = 'line'): string =>
+    Array.from({ length: n }, (_, i) => JSON.stringify({ ts: i + 1, type: 'workflow_log', message: `${prefix}${i + 1}` }) + '\n').join('');
+
+  it("quiet monitor (until='terminal') is not woken by renderable log lines; the deadline response rolls them up", async () => {
+    const runId = 'wf_quietlines01';
+    fabricateRun(runId, logLines(2, 'quiet-'));
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const elapsed = Date.now() - t0;
+    const status = s.structuredContent!;
+    expect(elapsed).toBeGreaterThanOrEqual(900); // renderable lines exist, but only terminal wakes it
+    expect(status.terminal).toBe(false);
+    expect(status.logTail).toEqual(['   log: quiet-1', '   log: quiet-2']); // rolled up, not woken on
+    expect(status.nextEventOffset).toBeGreaterThan(0); // cursor advance == content delivered
+  }, 20_000);
+
+  it("activity mode (default) still wakes on renderable lines", async () => {
+    const runId = 'wf_activewake01';
+    fabricateRun(runId, logLines(2, 'active-'));
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, waitSeconds: 10, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(Date.now() - t0).toBeLessThan(5_000); // woke on the lines, not the 10s deadline
+    expect(status.terminal).toBe(false);
+    expect(status.logTail).toEqual(['   log: active-1', '   log: active-2']);
+  }, 20_000);
+
+  it('quiet monitor wakes mid-hold on the terminal flip and delivers the rolled-up 40-line tail', async () => {
+    const runId = 'wf_quietwake001';
+    const { dir, manifest } = fabricateRun(runId, logLines(45));
+
+    const pending = client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 15, sinceEventOffset: 0 },
+    }) as Promise<{ structuredContent?: Record<string, any> }>;
+    const t0 = Date.now();
+    await new Promise((r) => setTimeout(r, 700));
+    flipStatus(dir, manifest, 'completed');
+
+    const status = (await pending).structuredContent!;
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(10_000); // woke on the flip, not the 15s deadline
+    expect(status.terminal).toBe(true);
+    expect(status.status).toBe('completed');
+    expect(status.next).toContain('workflow_result');
+    expect(status.logTail).toHaveLength(40); // rolling cap
+    expect(status.logTail[39]).toBe('   log: line45'); // the tail is the newest lines, oldest rolled off
+  }, 20_000);
+
+  it('quiet monitor wakes when the runner process dies mid-hold (orphan detection)', async () => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 800)'], { stdio: 'ignore' });
+    const runId = 'wf_quietorphan1';
+    fabricateRun(runId, '', { pid: child.pid!, pidStart: readProcStat(child.pid!)?.starttime });
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 15 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(Date.now() - t0).toBeLessThan(10_000); // dead pid flips the run terminal within a tick
+    expect(status.status).toBe('orphaned');
+    expect(status.terminal).toBe(true);
+  }, 20_000);
+
+  it('quiet holds emit no progress notifications inside the first 10s throttle window', async () => {
+    const runId = 'wf_quietprog001';
+    fabricateRun(runId, '');
+    let notifications = 0;
+    await client.callTool(
+      { name: 'workflow_status', arguments: { runId, until: 'terminal', waitSeconds: 1 } },
+      undefined,
+      { onprogress: () => void notifications++ },
+    );
+    expect(notifications).toBe(0); // was ~3/s before throttling
+  }, 20_000);
+
+  it('explicit waitSeconds up to 3600 is accepted (no 50s clamp); beyond schema max is rejected', async () => {
+    const runId = 'wf_quietsched01';
+    const { dir, manifest } = fabricateRun(runId, '');
+    flipStatus(dir, manifest, 'completed');
+
+    const t0 = Date.now();
+    const ok = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 3600 },
+    })) as { structuredContent?: Record<string, any>; isError?: boolean };
+    expect(ok.isError).toBeFalsy();
+    expect(ok.structuredContent!.terminal).toBe(true); // terminal returns immediately regardless of hold size
+    expect(Date.now() - t0).toBeLessThan(5_000);
+
+    // Depending on SDK version the schema violation surfaces as a tool error
+    // result or a protocol-level rejection (see the count:0 precedent below).
+    let rejected = false;
+    try {
+      const over = (await client.callTool({
+        name: 'workflow_status',
+        arguments: { runId, waitSeconds: 3601 },
+      })) as { isError?: boolean };
+      rejected = Boolean(over.isError);
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
   }, 20_000);
 
   it('workflow_result on a running workflow errors with guidance; stop terminates it', async () => {

@@ -19,8 +19,14 @@ the installer writes these directly into your Codex config:
 
 - An **AGENTS.md** trigger snippet — standing "ultracode mode", armed only by the keyword "ultracode".
 - An **MCP server** registration (`~/.codex/config.toml` `[mcp_servers.ultracode]` block) pointing at `ultracode mcp`
-  (`tool_timeout_sec = 90`, `default_tools_approval_mode = "approve"` — headless Codex auto-rejects
-  MCP calls otherwise).
+  (`tool_timeout_sec = 3600`, `default_tools_approval_mode = "approve"` — headless Codex auto-rejects
+  MCP calls otherwise). The 3600s timeout is the **quiet-monitor hold budget**: Codex never extends
+  tool timeouts on progress notifications (verified against codex-rs 0.144.5 — it does not set rmcp's
+  `reset_timeout_on_progress`) and does not poll MCP Tasks, so the only zero-token way to babysit a
+  long run is one blocking `workflow_status {until: "terminal", waitSeconds: 3300}` call per ~55 min.
+  While it holds, the model spends nothing; interrupting it is harmless (the run is detached — re-poll).
+  Installs made before this default re-run `ultracode install codex` to update the managed block
+  (older blocks pinned `tool_timeout_sec = 90`, which kills any hold at 90s).
 
 ## Manual install (until marketplace)
 

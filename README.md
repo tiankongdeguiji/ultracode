@@ -7,7 +7,7 @@ Portable **ultracode** — dynamic multi-agent workflow orchestration — for co
 | Layer | Artifact | Why |
 |---|---|---|
 | **Doctrine** | An Agent Skill (`skill/ultracode/`) | The only cross-host surface with implicit model-triggered invocation and progressive disclosure. Teaches the model *when* to orchestrate, the workflow dialect, and the quality patterns (adversarial verify, judge panel, loop-until-dry, completeness critic). |
-| **Engine** | This npm package: CLI (`ultracode run/...`) + MCP server (`ultracode mcp`) | A skill can't host a process. A single blocking MCP call dies at every host's 300–600s tool timeout, so the MCP surface is a `workflow_start` / `workflow_status` (long-poll) / `workflow_result` triad over a durable on-disk run store. |
+| **Engine** | This npm package: CLI (`ultracode run/...`) + MCP server (`ultracode mcp`) | A skill can't host a process, and no host extends MCP tool timeouts on progress, so the MCP surface is a `workflow_start` / `workflow_status` / `workflow_result` triad over a durable on-disk run store. `workflow_status until="terminal"` is the quiet monitor — one long hold that parks the host until the run ends (the codex hostpack raises `tool_timeout_sec` to 3600, so a hold covers ~55 min for ~1 turn/hour). |
 | **Delivery** | Plugin where plugins exist (Codex, Qoder); `ultracode install <host>` everywhere else | Plugins bundle the skill + MCP registration + templates in one install. |
 | **Command** | Emergent — skills auto-register as `$ultracode` / `/ultracode` | No separate command artifact needed. |
 

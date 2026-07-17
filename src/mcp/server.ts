@@ -3,9 +3,14 @@
  * workflow_result / workflow_stop / workflow_list triad(+2).
  *
  * Design constraints (source-verified across Codex/Qoder/Gemini hosts):
- *  - No host extends tool timeouts on progress → every call returns fast;
- *    workflow_status long-polls but clamps at 50s (under every default:
- *    60s legacy Codex, 300s current Codex, 600s Qoder/Gemini).
+ *  - No host extends tool timeouts on progress (codex 0.144.5 never sets
+ *    rmcp's reset_timeout_on_progress) and none polls MCP Tasks, so the only
+ *    background monitor a host can have is one long blocking call under its
+ *    tool timeout: workflow_status until='terminal' holds silently for an
+ *    explicit waitSeconds ≤3600 (codex hostpack writes tool_timeout_sec=3600;
+ *    stock codex defaults 300s, Qoder/Gemini 600s — doctrine keeps holds
+ *    ≥60s under the host budget). A client that times out anyway never
+ *    cancels server-side; the abandoned hold just runs out and is dropped.
  *  - NEVER declare MCP Tasks taskSupport ('required' hard-breaks Qoder
  *    client-side; no target host polls Tasks).
  *  - Runs execute in detached runner processes over the on-disk store, so
@@ -28,14 +33,20 @@ import { ultracodeRoot } from '../store/layout.js';
 import { renderEvent } from '../cli/lifecycle.js';
 import { readFileSync, existsSync } from 'node:fs';
 
+// Codex injects only the first 512 chars of server instructions — keep under.
 const INSTRUCTIONS =
   'Dynamic multi-agent workflow orchestration. workflow_start returns a runId in <1s and the run ' +
-  'survives this server. Poll workflow_status (long-poll ≤50s; pass nextEventOffset back) until ' +
-  'status is terminal, then call workflow_result. A timed-out poll is harmless — re-poll the same ' +
-  'runId. Author scripts per the ultracode skill dialect (export const meta + agent/parallel/pipeline).';
+  'survives this server. Park on workflow_status until="terminal" — wakes only when the run ends, ' +
+  'rolling the last 40 log lines into each response; set waitSeconds ≥60s under your MCP tool timeout ' +
+  '(codex hostpack: 3600 → pass 3300). A timed-out poll is harmless — re-poll the same runId; when ' +
+  'terminal call workflow_result. Author scripts per the ultracode skill dialect (export const meta ' +
+  '+ agent/parallel/pipeline).';
 
-const MAX_WAIT_SECONDS = 50;
+/** Explicit waitSeconds ceiling — sized to the codex hostpack's tool_timeout_sec=3600; doctrine keeps holds ≥60s under the host's actual timeout. */
+const MAX_WAIT_SECONDS = 3600;
 const DEFAULT_WAIT_SECONDS = 25;
+/** Progress notifications reach only host log files (no host renders them or extends timeouts) — throttle so an hour-long hold doesn't append 3 lines/s there. */
+const PROGRESS_INTERVAL_MS = 10_000;
 
 function ok(structured: Record<string, unknown>) {
   return {
@@ -121,7 +132,7 @@ export function createServer(baseCwd: string): McpServer {
           runId: result.runId,
           name: result.name,
           runDir: result.dir,
-          monitor: `call workflow_status with runId=${result.runId}; poll until terminal`,
+          monitor: `call workflow_status with runId=${result.runId}, until='terminal', waitSeconds ≥60s under your MCP tool timeout; re-call until terminal`,
         });
       } catch (err) {
         return fail((err as Error).message);
@@ -133,23 +144,35 @@ export function createServer(baseCwd: string): McpServer {
     'workflow_status',
     {
       description:
-        'Run status with long-poll: returns immediately when new events exist past sinceEventOffset or ' +
-        'the run is terminal, else waits up to waitSeconds (≤50). Pass nextEventOffset from the previous ' +
-        'call to receive only fresh log lines. Timed-out polls are harmless — call again.',
+        'Run status long-poll. until="terminal" is the quiet monitor: wakes only when the run ends ' +
+        '(or after waitSeconds — re-issue the same call), rolling the last 40 log lines into each ' +
+        'response instead of waking on them, so a long hold costs one cheap turn. Set waitSeconds ' +
+        '≥60s under your host MCP tool timeout (codex hostpack config 3600 → pass 3300; stock codex ' +
+        '300; qoder/gemini 600); if holds die client-side after ~N seconds your config pins a lower ' +
+        'timeout — use waitSeconds under N and re-run `ultracode install codex`. Default ' +
+        'until="activity" returns as soon as new log lines exist past sinceEventOffset — pass ' +
+        'nextEventOffset back to receive only fresh lines. Timed-out polls are harmless — call again.',
       inputSchema: {
         runId: z.string(),
-        waitSeconds: z.number().min(0).max(600).optional(),
+        until: z.enum(['activity', 'terminal']).optional(),
+        waitSeconds: z.number().min(0).max(MAX_WAIT_SECONDS).optional(),
         sinceEventOffset: z.number().int().min(0).optional(),
         cwd: z.string().optional(),
       },
     },
     async (input, extra) => {
       const root = rootFor(input.cwd);
+      const quiet = input.until === 'terminal';
       const wait = Math.min(input.waitSeconds ?? DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS) * 1000;
       const deadline = Date.now() + wait;
       let offset = input.sinceEventOffset ?? 0;
       const progressToken = (extra as { _meta?: { progressToken?: string | number } })._meta?.progressToken;
       let ticks = 0;
+      let progressAt = Date.now();
+      // Rolling tail: quiet holds roll renderable lines up instead of waking
+      // on them; every response carries the last 40, so the cursor invariant
+      // (offset advanced == content delivered) holds in both modes.
+      const tail: string[] = [];
 
       for (;;) {
         const run = getRun(root, input.runId);
@@ -163,11 +186,19 @@ export function createServer(baseCwd: string): McpServer {
         // Wake on RENDERABLE lines, not raw events: agent_usage ticks arrive
         // ~1/s per running agent and render null — waking on them would return
         // empty logTails in a tight loop, burning the polling host's tokens.
-        const logTail = page.events
+        const fresh = page.events
           .map((e: TimestampedEvent) => renderEvent(e))
           .filter((l): l is string => l !== null);
+        tail.push(...fresh);
+        if (tail.length > 40) tail.splice(0, tail.length - 40);
 
-        if (logTail.length > 0 || terminal || Date.now() >= deadline) {
+        // A terminal quiet wake first drains the (now finite) backlog so
+        // logTail is the run's real tail and nextEventOffset reaches EOF —
+        // returning mid-backlog would serve the HEAD of the log as the tail.
+        if (quiet && terminal && page.hasMore) continue;
+
+        const wake = quiet ? terminal : fresh.length > 0 || terminal;
+        if (wake || Date.now() >= deadline || extra.signal.aborted) {
           const m = run.manifest;
           return ok({
             runId: input.runId,
@@ -175,7 +206,7 @@ export function createServer(baseCwd: string): McpServer {
             phases: m.phases,
             agentCount: m.agentCount,
             budget: m.budget,
-            logTail: logTail.slice(-40),
+            logTail: tail.slice(-40),
             nextEventOffset: offset,
             terminal,
             ...(terminal ? { next: `call workflow_result with runId=${input.runId}` } : {}),
@@ -186,7 +217,8 @@ export function createServer(baseCwd: string): McpServer {
         // next page immediately — pacing 4 MB per 300 ms would starve clients.
         if (page.hasMore) continue;
 
-        if (progressToken !== undefined) {
+        if (progressToken !== undefined && Date.now() - progressAt >= PROGRESS_INTERVAL_MS) {
+          progressAt = Date.now();
           try {
             await extra.sendNotification({
               method: 'notifications/progress',
@@ -196,7 +228,10 @@ export function createServer(baseCwd: string): McpServer {
             /* progress is best-effort */
           }
         }
-        await sleep(300);
+        // Quiet holds have no sub-second wake source (terminal flip and
+        // deadline only) — a wider idle tick cuts syscall churn 3× over a
+        // 55-minute park at imperceptible extra latency.
+        await sleep(quiet ? 1_000 : 300);
       }
     },
   );

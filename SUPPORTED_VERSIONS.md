@@ -15,10 +15,16 @@ tests before trusting a new parser path.
 
 ## MCP hosts
 
-The MCP triad is version-agnostic by design: `workflow_status` long-polls ≤50s,
-under every host's tool timeout (60s legacy Codex, 300s current Codex, 600s
-Qoder/Gemini). Never declares `taskSupport` (a `required` declaration breaks
-Qoder clients).
+The MCP triad is version-agnostic by design: `workflow_status` long-polls under
+the host's tool timeout — explicit `waitSeconds` honored up to 3600s (default
+25s). The quiet monitor (`until = "terminal"`) parks silently for the whole
+hold; the codex hostpack writes `tool_timeout_sec = 3600` so one hold covers
+~55 min (stock codex defaults 300s, Qoder/Gemini 600s — doctrine keeps holds
+≥60s under the host budget). Verified against codex-rs **0.144.5**: progress
+notifications never extend a tool timeout (rmcp's `reset_timeout_on_progress`
+is never set) and a client-side timeout never cancels the request server-side.
+Never declares `taskSupport` (a `required` declaration breaks Qoder clients;
+codex pins protocol 2025-06-18 and rejects all `tasks/*`).
 
 ## Platform
 
