@@ -65,14 +65,14 @@ ultracode watch <runId>
 ```text
 ⏺ audit-routes   running · 6m05s
   ⏺ Find (1/1)
-    ⎿ ✓ #1                       12.4k tok · 18s · gpt-5-codex
+    ⎿ ✓ #1                       12.4k tok · 18s · model-name
   ⠧ Audit (12/14)
     ⎿ … +9 done (1.37m tok)
-    ⎿ ✓ src/routes/billing.ts    148.7k tok · 3m02s · gpt-5-codex
-    ⎿ ✓ src/routes/webhooks.ts   132.1k tok · 2m48s · gpt-5-codex
-    ⎿ ✓ src/routes/uploads.ts    121.9k tok · 2m35s · gpt-5-codex
-    ⎿ ⠧ src/routes/auth.ts       96.3k tok · 2m41s · gpt-5-codex
-    ⎿ ⠧ src/routes/admin.ts      88.9k tok · 2m37s · gpt-5-codex
+    ⎿ ✓ src/routes/billing.ts    148.7k tok · 3m02s · model-name
+    ⎿ ✓ src/routes/webhooks.ts   132.1k tok · 2m48s · model-name
+    ⎿ ✓ src/routes/uploads.ts    121.9k tok · 2m35s · model-name
+    ⎿ ⠧ src/routes/auth.ts       96.3k tok · 2m41s · model-name
+    ⎿ ⠧ src/routes/admin.ts      88.9k tok · 2m37s · model-name
 agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
 ```
