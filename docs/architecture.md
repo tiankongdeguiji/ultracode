@@ -17,6 +17,10 @@ On **Qoder**, the native Workflow tool ships the same engine already — the pac
 
 In: engine (sandbox, dialect, journal/resume, budget, watchdogs), 5 backends (mock/codex/qoder/claude/gemini), CLI, MCP triad, codex+qoder+generic installers, worktree isolation, one-level nested workflows. Deferred: Windows, cursor/copilot/opencode/amp adapters, npm publish + marketplace repos (internal-first), MCP Tasks (unsupported by target hosts). Per-cut rationale: `docs/design/judge.md` (MILESTONES / V1 CUTS).
 
+## What's proven
+
+End-to-end on real backends: the `uc-review` workflow (3 dimension finders → per-finding adversarial verification → synthesis) run on **Codex** against `examples/sample-repo` found both planted auth bugs — with constructed exploit inputs as evidence — plus a real unplanted one (`examples/parity-demo-output.json`, 12 agents). A typed-schema workflow verified on **Claude**. Codex drove the full `workflow_start → status → result` MCP loop. 200+ offline tests (mock backend + golden fixtures) cover the dialect contract, sandbox bans, journal determinism, resume, structured-output, safety rails, all five adapters, worktree isolation, nested workflows, and the exec-layer hardening (O_NOFOLLOW writers, pgid kill-guard, resume path confinement).
+
 ## Related reading
 
 - `docs/design/host-integration.md` — fuller per-host delivery detail (design history).

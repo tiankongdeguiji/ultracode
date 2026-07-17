@@ -67,8 +67,24 @@ ultracode install codex           # skill + AGENTS.md trigger + MCP registration
 ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
 ultracode run my.workflow.js --backend codex    # foreground live panel; --detach to background
-ultracode watch <runId>                         # re-attach from another shell
 ultracode resume <runId> [--script edited.js]   # completed agents replay free
+ultracode watch <runId>                         # re-attach the live panel from another shell:
+```
+
+```text
+· 3/3 extraction agents completed
+⏺ uc-nsys-l20-vs-rtx-pro-5000   running · 58m22s
+  ⏺ Extract (3/3) — Independently extract both reports and a direct comparison
+    ⎿ ✓ l20-forensics            575.2k tok · 22m30s · gpt-5.6-sol
+    ⎿ ✓ rtx-forensics            655.1k tok · 26m42s · gpt-5.6-sol
+    ⎿ ✓ direct-comparison        1.17m tok · 26m25s · gpt-5.6-sol
+  ⠧ Challenge (2/3) — Challenge GPU, host-pipeline, and comparability hypotheses
+    ⎿ ✓ gpu-skeptic              462.7k tok · 15m19s · gpt-5.6-sol
+    ⎿ ⠧ host-skeptic             1.13m tok · 31m40s · gpt-5.6-sol
+    ⎿ ✓ comparability-skeptic    679.4k tok · 22m11s · gpt-5.6-sol
+  ⏺ Synthesize — Build and critique an evidence-ranked conclusion
+agents 5/6 · 1 running | tokens 4.67m | elapsed 58m22s
+↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
 ```
 
 ## Commands
@@ -90,17 +106,9 @@ ultracode resume <runId> [--script edited.js]   # completed agents replay free
 | | `sync` | mirror canonical `.ultracode/workflows` into `.claude/` and `.qoder/` copies |
 | | `mcp` | stdio MCP server: `workflow_start` / `workflow_status` / `workflow_result` (+ stop/list) |
 
-## What's proven
-
-End-to-end on real backends: the `uc-review` workflow (3 dimension finders → per-finding adversarial verification → synthesis) run on **Codex** against `examples/sample-repo` found both planted auth bugs — with constructed exploit inputs as evidence — plus a real unplanted one (`examples/parity-demo-output.json`, 12 agents). A typed-schema workflow verified on **Claude**. Codex drove the full `workflow_start → status → result` MCP loop. 200+ offline tests (mock backend + golden fixtures) cover the dialect contract, sandbox bans, journal determinism, resume, structured-output, safety rails, all five adapters, worktree isolation, nested workflows, and the exec-layer hardening (O_NOFOLLOW writers, pgid kill-guard, resume path confinement).
-
-## Security
-
-Workflow scripts are **trusted input** — model-authored and user-reviewed before running; the `node:vm` sandbox is a capability-scoping and determinism device, **not** a hostile-code boundary, and MCP `workflow_start` runs scripts with no interactive gate — do not run scripts you haven't read. Every agent is a subprocess governed by the host CLI's own sandbox; `--permission danger` deliberately removes it. The run store is worker-writable and `resume` re-executes its inputs with no review gate — treat resuming an untrusted run as running it. Full analysis: `docs/threat-model.md`.
-
 ## Docs
 
-- `docs/architecture.md` — why skill + engine + plugin are layered, the Qoder native-engine strategy, and v1 scope.
+- `docs/architecture.md` — why skill + engine + plugin are layered, the Qoder native-engine strategy, v1 scope, and what's proven end-to-end.
 - `docs/threat-model.md` — trust model, sandbox honesty, concurrency & auth, the worker-writable run store.
 - `skill/ultracode/references/dialect.md` — the full workflow dialect reference; `portability.md` beside it covers the cross-engine subset.
 - `docs/design/judge.md` — design history: the synthesized architecture + milestone plan (3 architects + judge), grounded in source-level research (the Claude Code ultracode mechanism, Codex/Qoder CLI internals, MCP long-running-tool constraints, JS-sandbox tradeoffs).
