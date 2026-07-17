@@ -26,15 +26,17 @@ describe('plugin bundles', () => {
 
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
-  it('codex bundle: valid manifest + README + skill present', () => {
+  it('codex bundle: valid manifest + README + skill + license present', () => {
     const manifest = JSON.parse(readFileSync(join(root, 'dist-codex/.codex-plugin/plugin.json'), 'utf8'));
     expect(manifest.name).toBe('ultracode');
     expect(manifest.version).toBe(pkg.version);
     expect(existsSync(join(root, 'dist-codex/README.md'))).toBe(true);
     expect(existsSync(join(root, 'dist-codex/skills/ultracode/SKILL.md'))).toBe(true);
+    // The manifest declares a license, so the standalone bundle must carry the text.
+    expect(readFileSync(join(root, 'dist-codex/LICENSE'), 'utf8')).toMatch(/Apache License/);
   });
 
-  it('qoder bundle: manifest + README + skill + templates + agent defs', () => {
+  it('qoder bundle: manifest + README + skill + templates + agent defs + license', () => {
     const manifest = JSON.parse(readFileSync(join(root, 'dist-qoder/.qoder-plugin/plugin.json'), 'utf8'));
     expect(manifest.name).toBe('ultracode');
     expect(manifest.version).toBe(pkg.version);
@@ -48,6 +50,7 @@ describe('plugin bundles', () => {
     ]) {
       expect(existsSync(join(root, f)), f).toBe(true);
     }
+    expect(readFileSync(join(root, 'dist-qoder/LICENSE'), 'utf8')).toMatch(/Apache License/);
   });
 
   it('engine VERSION constant matches package.json', () => {
