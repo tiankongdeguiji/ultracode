@@ -459,6 +459,32 @@ describe('MCP triad', () => {
     expect(line.endsWith('…')).toBe(true);
   }, 20_000);
 
+  it('the rolling tail evicts oldest-first across ticks (multi-tick accumulation)', async () => {
+    const runId = 'wf_tailroll0001';
+    const { dir, manifest } = fabricateRun(runId, '');
+    const batch = (from: number, n: number) =>
+      Array.from({ length: n }, (_, i) => JSON.stringify({ ts: from + i, type: 'workflow_log', message: `line${from + i}` }) + '\n').join('');
+
+    const pending = client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 15, sinceEventOffset: 0 },
+    }) as Promise<{ structuredContent?: Record<string, any> }>;
+    // Two sub-cap batches on separate 1s quiet ticks: neither alone trims, so
+    // only the cross-tick eviction path can hold the 40-line bound.
+    await new Promise((r) => setTimeout(r, 500));
+    appendFileSync(join(dir, 'events.jsonl'), batch(1, 30));
+    await new Promise((r) => setTimeout(r, 2_000));
+    appendFileSync(join(dir, 'events.jsonl'), batch(31, 30));
+    await new Promise((r) => setTimeout(r, 1_500));
+    flipStatus(dir, manifest, 'completed');
+
+    const status = (await pending).structuredContent!;
+    expect(status.terminal).toBe(true);
+    expect(status.logTail).toHaveLength(40); // 60 accrued → oldest 20 evicted
+    expect(status.logTail[0]).toBe('   log: line21');
+    expect(status.logTail[39]).toBe('   log: line60');
+  }, 30_000);
+
   it('a fifth concurrent hold preempts the oldest; live holds keep parking', async () => {
     const runId = 'wf_holdcap00001';
     const { dir, manifest } = fabricateRun(runId, '');

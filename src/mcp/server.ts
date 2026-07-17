@@ -199,16 +199,11 @@ export function createServer(baseCwd: string): McpServer {
       const holds = activeHolds.get(input.runId) ?? [];
       holds.push(hold);
       activeHolds.set(input.runId, holds);
-      if (holds.length > MAX_HOLDS_PER_RUN) holds.shift()!.preempted = true;
-      try {
-        return await runStatusHold();
-      } finally {
-        const i = holds.indexOf(hold);
-        if (i !== -1) holds.splice(i, 1);
-        if (holds.length === 0) activeHolds.delete(input.runId);
-      }
-
-      async function runStatusHold() {
+      // Mark, don't remove: a preempted hold stays counted until its finally
+      // runs, keeping the cap hard, and the finally below never operates on
+      // an array it was evicted from.
+      const live = holds.filter((h) => !h.preempted);
+      if (live.length > MAX_HOLDS_PER_RUN) live[0]!.preempted = true;
       let offset = input.sinceEventOffset ?? 0;
       const progressToken = (extra as { _meta?: { progressToken?: string | number } })._meta?.progressToken;
       let ticks = 0;
@@ -219,119 +214,130 @@ export function createServer(baseCwd: string): McpServer {
       // full log always lives in the run store / workflow_result.
       const tail: string[] = [];
 
-      for (;;) {
-        const run = getRun(root, input.runId);
-        if (!run) return fail(`no run ${input.runId} under ${root}`);
-        const eventsFile = join(run.dir, 'events.jsonl');
-        // Bounded read: a first poll against a long-running backlog must not
-        // allocate/parse the whole file (clients page via nextEventOffset).
-        const page = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
-        offset = page.nextOffset; // consume even null-rendered pages so ticks are never re-read
-        const terminal = isTerminal(run.effectiveStatus);
-        // A wedged-but-ALIVE runner never flips terminal (liveStatus is
-        // PID-based by design; see runstore.ts) — without this, a quiet hold
-        // would park the full waitSeconds on a wedged run and the doctrine
-        // would re-park it forever. Stale heartbeat wakes the hold instead.
-        const stale = !terminal && Date.now() - Date.parse(run.manifest.heartbeatAt) > HEARTBEAT_STALE_MS;
-        // Wake on RENDERABLE lines, not raw events: agent_usage ticks arrive
-        // ~1/s per running agent and render null — waking on them would return
-        // empty logTails in a tight loop, burning the polling host's tokens.
-        const fresh = page.events
-          .map((e: TimestampedEvent) => renderEvent(e))
-          .filter((l): l is string => l !== null);
-        // Bounded append: only the last TAIL_LINES lines can survive, so never
-        // spread the raw page (a dense 4 MB page holds ~80k renderable lines —
-        // enough to overflow V8's argument limit) and cap each stored line.
-        const keep = fresh.slice(-TAIL_LINES).map((l) => (l.length > TAIL_LINE_CHARS ? `${l.slice(0, TAIL_LINE_CHARS)}…` : l));
-        if (keep.length === TAIL_LINES) tail.length = 0;
-        tail.push(...keep);
-        if (tail.length > TAIL_LINES) tail.splice(0, tail.length - TAIL_LINES);
-        const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
+      try {
+        for (;;) {
+          const run = getRun(root, input.runId);
+          if (!run) return fail(`no run ${input.runId} under ${root}`);
+          // Hoisted exit test: every path below (including the jump/drain
+          // continues) must stay bounded by the deadline, client aborts, and
+          // admission-cap preemption — a worker appending ≥4 MiB per parse
+          // could otherwise re-fire the jump forever on its own log.
+          const bail = Date.now() >= deadline || extra.signal.aborted || hold.preempted;
+          const eventsFile = join(run.dir, 'events.jsonl');
+          // Bounded read: a first poll against a long-running backlog must not
+          // allocate/parse the whole file (clients page via nextEventOffset).
+          const page = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
+          offset = page.nextOffset; // consume even null-rendered pages so ticks are never re-read
+          const terminal = isTerminal(run.effectiveStatus);
+          // A wedged-but-ALIVE runner never flips terminal (liveStatus is
+          // PID-based by design; see runstore.ts) — without this, a quiet hold
+          // would park the full waitSeconds on a wedged run and the doctrine
+          // would re-park it forever. Stale heartbeat wakes the hold instead.
+          const stale = !terminal && Date.now() - Date.parse(run.manifest.heartbeatAt) > HEARTBEAT_STALE_MS;
+          // Wake on RENDERABLE lines, not raw events: agent_usage ticks arrive
+          // ~1/s per running agent and render null — waking on them would return
+          // empty logTails in a tight loop, burning the polling host's tokens.
+          const fresh = page.events
+            .map((e: TimestampedEvent) => renderEvent(e))
+            .filter((l): l is string => l !== null);
+          // Bounded append: only the last TAIL_LINES lines can survive, so never
+          // spread the raw page (a dense 4 MB page holds ~80k renderable lines —
+          // enough to overflow V8's argument limit) and cap each stored line.
+          const keep = fresh.slice(-TAIL_LINES).map((l) => (l.length > TAIL_LINE_CHARS ? `${l.slice(0, TAIL_LINE_CHARS)}…` : l));
+          tail.push(...keep);
+          if (tail.length > TAIL_LINES) tail.splice(0, tail.length - TAIL_LINES);
+          const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
 
-        // A terminal-mode hold never wakes on history, so a backlog holds no
-        // information beyond its final window (up to the last TAIL_LINES
-        // renderable lines) — jump there instead of paging: parsing a
-        // multi-MB backlog synchronously would block this single-threaded
-        // stdio server, whether attaching late to a running run or waking on
-        // an already-terminal one. On terminal wakes this also puts the
-        // cursor at EOF so logTail is the run's REAL tail, never its head.
-        // phase mode must scan (boundaries live in the backlog); activity
-        // mode returns page-by-page. (A mid-line landing is fine — the torn
-        // fragment fails to parse and drops like any malformed line. lstat,
-        // not stat: events.jsonl sits in a worker-writable dir and this
-        // server is unsandboxed — never follow a swapped-in symlink; a
-        // non-regular-file entry falls back to the O_NOFOLLOW-guarded read.)
-        if (input.until === 'terminal' && page.hasMore) {
-          try {
-            const st = lstatSync(eventsFile);
-            if (st.isFile()) {
-              // The window must equal the page size the next read covers, or
-              // the jump would land outside what that read can serve.
-              const jump = Math.max(page.nextOffset, st.size - EVENT_PAGE_BYTES);
-              if (jump > page.nextOffset) tail.length = 0;
-              offset = jump;
+          // A terminal-mode hold never wakes on history, so a backlog holds no
+          // information beyond its final window (up to the last TAIL_LINES
+          // renderable lines) — jump there instead of paging: parsing a
+          // multi-MB backlog synchronously would block this single-threaded
+          // stdio server, whether attaching late to a running run or waking on
+          // an already-terminal one. On terminal wakes this also puts the
+          // cursor at EOF so logTail is the run's REAL tail, never its head.
+          // phase mode must scan (boundaries live in the backlog); activity
+          // mode returns page-by-page. (A mid-line landing is fine — the torn
+          // fragment fails to parse and drops like any malformed line. lstat,
+          // not stat: events.jsonl sits in a worker-writable dir and this
+          // server is unsandboxed — never follow a swapped-in symlink; a
+          // non-regular-file entry falls back to the O_NOFOLLOW-guarded read.)
+          if (!bail && input.until === 'terminal' && page.hasMore) {
+            try {
+              const st = lstatSync(eventsFile);
+              if (st.isFile()) {
+                // The window must equal the page size the next read covers, or
+                // the jump would land outside what that read can serve.
+                const jump = Math.max(page.nextOffset, st.size - EVENT_PAGE_BYTES);
+                if (jump > page.nextOffset) tail.length = 0;
+                offset = jump;
+              }
+            } catch {
+              /* fall back to plain paging */
             }
-          } catch {
-            /* fall back to plain paging */
+            await sleep(0); // same event-loop yield as the drain below — the fallback paths degrade to multi-page parsing
+            continue;
           }
-          await sleep(0); // same event-loop yield as the drain below — the fallback paths degrade to multi-page parsing
-          continue;
-        }
 
-        const wake = quiet ? terminal || phaseHit || stale : fresh.length > 0 || terminal || stale;
-        if (wake || Date.now() >= deadline || extra.signal.aborted || hold.preempted) {
-          const m = run.manifest;
-          return ok({
-            runId: input.runId,
-            status: run.effectiveStatus,
-            phases: m.phases,
-            agentCount: m.agentCount,
-            budget: m.budget,
-            logTail: tail,
-            nextEventOffset: offset,
-            terminal,
-            ...(stale ? { stale: true } : {}),
-            ...(terminal
-              ? { next: `call workflow_result with runId=${input.runId}` }
-              : stale
-                ? { next: `runner heartbeat is stale (>${HEARTBEAT_STALE_MS / 1000}s) — the run may be wedged; diagnose (ultracode status/logs) or workflow_stop instead of re-parking` }
-                : quiet
-                  ? {
-                      next: `re-issue this hold with sinceEventOffset: ${offset} and park silently — failures wake this monitor; filler updates, refresh polls, and run-store tailing waste turns`,
-                      ...(wait < SHORT_HOLD_NUDGE_MS
-                        ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (3300 where `ultracode install codex` pinned 3600)' }
-                        : {}),
-                    }
-                  : {}),
-          });
-        }
-
-        // Catching up on a clipped backlog (e.g. tick-heavy pages): read the
-        // next page immediately — pacing 4 MB per 300 ms would starve clients.
-        // But yield between the synchronous 4 MB parses (watch.ts does the
-        // same): a long backlog must not starve the event loop, or sibling
-        // MCP calls and cancellations stall behind this one.
-        if (page.hasMore) {
-          await sleep(0);
-          continue;
-        }
-
-        if (!quiet && progressToken !== undefined && Date.now() - progressAt >= PROGRESS_INTERVAL_MS) {
-          progressAt = Date.now();
-          try {
-            await extra.sendNotification({
-              method: 'notifications/progress',
-              params: { progressToken, progress: ++ticks, message: `waiting: ${run.effectiveStatus}, ${run.manifest.agentCount} agents so far` },
+          const wake = quiet ? terminal || phaseHit || stale : fresh.length > 0 || terminal || stale;
+          if (wake || bail) {
+            const m = run.manifest;
+            return ok({
+              runId: input.runId,
+              status: run.effectiveStatus,
+              phases: m.phases,
+              agentCount: m.agentCount,
+              budget: m.budget,
+              logTail: tail,
+              nextEventOffset: offset,
+              terminal,
+              ...(stale ? { stale: true } : {}),
+              ...(terminal
+                ? { next: `call workflow_result with runId=${input.runId}` }
+                : stale
+                  ? { next: `runner heartbeat is stale (>${HEARTBEAT_STALE_MS / 1000}s) — the run may be wedged; diagnose (ultracode status/logs) or workflow_stop instead of re-parking` }
+                  : quiet
+                    ? {
+                        next: `re-issue this hold with sinceEventOffset: ${offset} and park silently — failures wake this monitor; filler updates, refresh polls, and run-store tailing waste turns`,
+                        ...(wait < SHORT_HOLD_NUDGE_MS
+                          ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (3300 where `ultracode install codex` pinned 3600)' }
+                          : {}),
+                      }
+                    : {}),
             });
-          } catch {
-            /* progress is best-effort */
           }
+
+          // Catching up on a clipped backlog (e.g. tick-heavy pages): read the
+          // next page immediately — pacing 4 MB per 300 ms would starve clients.
+          // But yield between the synchronous 4 MB parses (watch.ts does the
+          // same): a long backlog must not starve the event loop, or sibling
+          // MCP calls and cancellations stall behind this one.
+          if (!bail && page.hasMore) {
+            await sleep(0);
+            continue;
+          }
+
+          if (!quiet && progressToken !== undefined && Date.now() - progressAt >= PROGRESS_INTERVAL_MS) {
+            progressAt = Date.now();
+            try {
+              await extra.sendNotification({
+                method: 'notifications/progress',
+                params: { progressToken, progress: ++ticks, message: `waiting: ${run.effectiveStatus}, ${run.manifest.agentCount} agents so far` },
+              });
+            } catch {
+              /* progress is best-effort */
+            }
+          }
+          // Quiet holds have no sub-second wake source (terminal flip and
+          // deadline only) — a wider idle tick cuts syscall churn 3× over a
+          // 55-minute park at imperceptible extra latency.
+          await sleep(quiet ? 1_000 : 300);
         }
-        // Quiet holds have no sub-second wake source (terminal flip and
-        // deadline only) — a wider idle tick cuts syscall churn 3× over a
-        // 55-minute park at imperceptible extra latency.
-        await sleep(quiet ? 1_000 : 300);
-      }
+      } finally {
+        const i = holds.indexOf(hold);
+        if (i !== -1) holds.splice(i, 1);
+        // Identity-guarded: never drop a successor array that replaced this
+        // one under the key while this hold was finishing.
+        if (holds.length === 0 && activeHolds.get(input.runId) === holds) activeHolds.delete(input.runId);
       }
     },
   );

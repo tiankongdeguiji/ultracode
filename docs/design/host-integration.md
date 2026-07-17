@@ -309,7 +309,9 @@ workflow_result({ run_id })
       artifacts:{ output_path, journal_path } }       // error if not terminal
 workflow_cancel({ run_id, reason? })
 ```
-Run state persisted under `~/.ultracode/runs/<run_id>/{manifest.json, journal.jsonl, output.json}` (survives host restarts and Codex's silent orphaning). Server emits `notifications/progress` during any blocking window (free UX on Qoder/Gemini; Codex just logs). **No `execution.taskSupport` declaration at all** (`required` breaks Qoder client-side; `optional` buys nothing today). Server `instructions` field ≤512 chars, self-contained (Codex injects first 512).
+> Design sketch — field names and shapes here predate the shipped surface; the authoritative contract is core-engine.md §4.3 and `src/mcp/server.ts`.
+
+Run state persisted under `~/.ultracode/runs/<run_id>/{manifest.json, journal.jsonl, output.json}` (survives host restarts and Codex's silent orphaning). Activity-mode waits emit `notifications/progress`, throttled to one per 10s (free UX on Qoder/Gemini; Codex just logs); quiet parks emit none. **No `execution.taskSupport` declaration at all** (`required` breaks Qoder client-side; `optional` buys nothing today). Server `instructions` field ≤512 chars, self-contained (Codex injects first 512).
 
 ---
 
