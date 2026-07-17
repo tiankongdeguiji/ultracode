@@ -56,6 +56,39 @@ describe('agent()', () => {
     expect(output.error).toContain('failed: always');
     expect(executor.stats.attempts).toBe(6); // 1 + 5 clamped retries
   });
+
+  it('mock rehearsals honor the per-attempt timeout semantics (per-call wins over run-level)', async () => {
+    const perCall = await run(`return agent('MOCK:delay 60000 MOCK:ok never', { timeoutMs: 120 })`);
+    expect(perCall.output.error).toContain('attempt timed out after 120ms');
+    const runLevel = await run(`return agent('MOCK:delay 60000 MOCK:ok never')`, {
+      executor: new MockExecutor({ attemptTimeoutMs: 150 }),
+    });
+    expect(runLevel.output.error).toContain('attempt timed out after 150ms');
+    // oversized caps are honored on the mock too (chainedTimeout, no
+    // sleep-overflow insta-fire) — parity with the real executor
+    const oversized = await run(`return agent('MOCK:ok fine', { timeoutMs: 2147483648 })`);
+    expect(oversized.output.result).toBe('fine');
+  });
+
+  it('junk timeoutMs is dropped at intake (0 must not insta-kill; strings must not NaN the deadline)', async () => {
+    class SpecCapture extends MockExecutor {
+      specs: unknown[] = [];
+      override execute(spec: never, signal: never, onProgress?: never) {
+        this.specs.push(spec);
+        return super.execute(spec, signal, onProgress);
+      }
+    }
+    const executor = new SpecCapture();
+    const { output } = await run(
+      `const a = await agent('MOCK:ok one', { timeoutMs: 0 })
+const b = await agent('MOCK:ok two', { timeoutMs: '30m' })
+const c = await agent('MOCK:ok three', { timeoutMs: 1500 })
+return [a, b, c]`,
+      { executor },
+    );
+    expect(output.result).toEqual(['one', 'two', 'three']);
+    expect(executor.specs.map((s) => (s as { timeoutMs?: number }).timeoutMs)).toEqual([undefined, undefined, 1500]);
+  });
 });
 
 describe('parallel()', () => {

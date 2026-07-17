@@ -17,6 +17,7 @@
  *   anything else              → succeed with "mock response: <prompt head>"
  */
 import { setTimeout as sleep } from 'node:timers/promises';
+import { chainedTimeout } from '../exec/timers.js';
 import { validateWithSchema } from '../engine/ajv.js';
 import type { AgentExecutor, AgentOutcome, AgentProgress, AgentSpec, NormalizedUsage } from './types.js';
 
@@ -86,7 +87,7 @@ export class MockExecutor implements AgentExecutor {
   /** attempt counters keyed by agent seq, for MOCK:fail-then-ok */
   private readonly attemptCounts = new Map<number, number>();
 
-  constructor(private readonly opts: { latencyMs?: number } = {}) {}
+  constructor(private readonly opts: { latencyMs?: number; attemptTimeoutMs?: number } = {}) {}
 
   async execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (p: AgentProgress) => void): Promise<AgentOutcome> {
     this.stats.calls++;
@@ -100,12 +101,13 @@ export class MockExecutor implements AgentExecutor {
     try {
       const maxAttempts = spec.retries + 1;
       let lastError = 'mock failure';
+      let lastErrorKind: AgentOutcome['errorKind'] = 'unknown';
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         this.stats.attempts++;
         if (signal.aborted) {
           return this.outcome(spec, { ok: false, error: 'aborted', errorKind: 'interrupted', attempts: attempt }, tools);
         }
-        const res = await this.attempt(spec, signal, onProgress, tools);
+        const res = await this.attemptWithTimeout(spec, signal, onProgress, tools);
         // One cumulative usage tick per attempt (same figures the outcome reports).
         onProgress?.({ type: 'usage', usage: usageFor(spec) });
         if (!res.ok && attempt < maxAttempts) {
@@ -132,8 +134,9 @@ export class MockExecutor implements AgentExecutor {
           return this.outcome(spec, { ...res, attempts: attempt }, tools);
         }
         lastError = res.error ?? lastError;
+        lastErrorKind = res.errorKind ?? 'unknown';
       }
-      return this.outcome(spec, { ok: false, error: lastError, errorKind: 'unknown', attempts: maxAttempts }, tools);
+      return this.outcome(spec, { ok: false, error: lastError, errorKind: lastErrorKind, attempts: maxAttempts }, tools);
     } finally {
       this.inFlight--;
     }
@@ -156,6 +159,46 @@ export class MockExecutor implements AgentExecutor {
       toolCalls: tools?.seen ? tools.started : 1,
       attempts: partial.attempts,
     };
+  }
+
+  /** Same per-attempt timeout semantics as the real executor (per-call
+   *  spec.timeoutMs wins over the run-level default) so dry-run rehearsals
+   *  stay faithful to the documented hard cap — including oversized caps:
+   *  chainedTimeout, not a raw sleep, which would overflow-fire at ~1ms.
+   *  The attempt runs on a per-call controller so the race loser is
+   *  cancelled either way (no ref'd stray delays, no listener build-up on
+   *  the shared run signal). */
+  private async attemptWithTimeout(
+    spec: AgentSpec,
+    signal: AbortSignal,
+    onProgress?: (p: AgentProgress) => void,
+    tools?: { started: number; seen: boolean },
+  ): Promise<{ ok: boolean; value?: unknown; error?: string; errorKind?: AgentOutcome['errorKind'] }> {
+    const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
+    if (timeoutMs === undefined) return this.attempt(spec, signal, onProgress, tools);
+    const inner = new AbortController();
+    const onAbort = (): void => inner.abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    let timer: { clear(): void } | undefined;
+    try {
+      const TIMEOUT = Symbol('timeout');
+      const winner = await Promise.race([
+        this.attempt(spec, inner.signal, onProgress, tools),
+        new Promise<symbol>((resolve) => {
+          timer = chainedTimeout(timeoutMs, () => resolve(TIMEOUT));
+        }),
+      ]);
+      if (winner === TIMEOUT) {
+        return signal.aborted
+          ? { ok: false, error: 'aborted', errorKind: 'interrupted' }
+          : { ok: false, error: `attempt timed out after ${timeoutMs}ms`, errorKind: 'stalled' };
+      }
+      return winner as { ok: boolean; value?: unknown; error?: string };
+    } finally {
+      timer?.clear();
+      signal.removeEventListener('abort', onAbort);
+      inner.abort();
+    }
   }
 
   private async attempt(

@@ -21,6 +21,7 @@ import {
 } from '../backends/structured.js';
 import { validateWithSchema } from './ajv.js';
 import { spawnAgentProcess, TailBuffer } from '../exec/spawn.js';
+import { chainedTimeout } from '../exec/timers.js';
 import type {
   AgentEvent,
   AgentExecutor,
@@ -67,14 +68,31 @@ export interface AgentCallOptions {
   artifactDir?: (spec: AgentSpec) => string;
   /** default permission for spawned workers; 'auto' = workspace-write */
   permission?: AgentRequest['permission'];
-  /** per-attempt hard timeout (default 20 minutes) */
+  /** per-attempt hard timeout; unset = unlimited (timeouts are user-opt-in) */
   attemptTimeoutMs?: number;
   /** min gap between live usage ticks per agent (0 = every change; for tests) */
   usageTickIntervalMs?: number;
 }
 
-export const DEFAULT_ATTEMPT_TIMEOUT_MS = 20 * 60_000;
 export const USAGE_TICK_INTERVAL_MS = 1000;
+
+/** Session ids arrive on the worker's own stdout stream — validate the shape
+ *  before one re-enters an argv, where a forged leading-dash "id" would parse
+ *  as a flag on the resume command line. */
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+export function resumableSessionId(id: string | undefined): string | undefined {
+  return id !== undefined && SESSION_ID_RE.test(id) ? id : undefined;
+}
+
+/** Follow-up prompt for a task retry that resumes the interrupted session —
+ *  the session already holds the original prompt and all prior tool progress. */
+export function resumeContinuationPrompt(reason: string): string {
+  return (
+    `The previous attempt was interrupted (${reason}). ` +
+    'Your earlier progress in this conversation and any files you already wrote still exist. ' +
+    'Continue the original task from where you left off — do not start over — and return the final result.'
+  );
+}
 
 interface AttemptResult {
   exit: ExitClass;
@@ -127,8 +145,52 @@ export class AgentCallExecutor implements AgentExecutor {
       if (signal.aborted) {
         return this.toOutcome(spec, last, usages, attemptsUsed, 'aborted');
       }
-      const plan = this.adapter.buildSpawn(req);
-      last = await this.runAttempt(spec, plan, signal, attempt, tracker?.onStreamEvent);
+      // A task retry RESUMES the failed attempt's backend session when the
+      // adapter supports it: the session already holds the prompt and every
+      // tool result, so a timed-out attempt continues from its progress
+      // instead of re-deriving 20 minutes of work from scratch. Fresh spawn
+      // when the failed attempt surfaced no (valid) session id or the
+      // adapter cannot resume.
+      const resumeSession = last !== undefined ? resumableSessionId(last.sessionId) : undefined;
+      const resumePlan =
+        resumeSession !== undefined
+          ? this.adapter.buildResume(resumeSession, resumeContinuationPrompt(last!.exit.message), req)
+          : null;
+      const attemptBudgetMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
+      const attemptStartedAt = Date.now();
+      last = await this.runAttempt(spec, resumePlan ?? this.adapter.buildSpawn(req), signal, attempt, {
+        onStreamEvent: tracker?.onStreamEvent,
+        resumedSession: resumePlan !== null,
+      });
+      // A resume that dies without ever REATTACHING (no session event — e.g.
+      // the backend could not load the killed session's rollout, whatever
+      // diagnostics it printed) failed as a MECHANISM, not as an attempt.
+      // Rerun the same attempt fresh so a broken resume never burns a task
+      // retry — but strictly within the SAME deadline: the rerun gets exactly
+      // the budget the dead resume left, never a second full window. With no
+      // budget left the attempt is out of time either way — synthesize the
+      // timeout instead of borrowing time the caller never granted.
+      // Watchdog kills are excluded.
+      if (resumePlan !== null && !last.exit.ok && !signal.aborted && last.exit.errorKind !== 'stalled' && last.sessionId === undefined) {
+        const remainingMs = attemptBudgetMs === undefined ? undefined : attemptBudgetMs - (Date.now() - attemptStartedAt);
+        // A sub-second remainder cannot cover CLI startup — synthesize the
+        // timeout instead of spawning a doomed process into SIGTERM churn.
+        // (The dead resume's AttemptResult is replaced by the rerun on the
+        // spawn path — deliberate: with no session event it carries ~zero
+        // usage/toolCalls, and estimating it would fabricate tokens.)
+        if (remainingMs !== undefined && remainingMs < 1_000) {
+          last = {
+            ...last,
+            exit: { ok: false, errorKind: 'stalled', retryable: true, message: `attempt timed out after ${attemptBudgetMs}ms` },
+          };
+        } else {
+          last = await this.runAttempt(spec, this.adapter.buildSpawn(req), signal, attempt, {
+            onStreamEvent: tracker?.onStreamEvent,
+            stderrSuffix: '-fresh',
+            timeoutOverrideMs: remainingMs,
+          });
+        }
+      }
       attemptsUsed = attempt;
       usages.push(last);
       tracker?.attemptSettled(usages);
@@ -273,7 +335,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // schema repairs share one display sequence, so attempt is always >= 2
       // whenever an extra spawn is running.
       tracker?.retry(attemptsUsed + round + 1, attemptsUsed + SCHEMA_REPAIR_LIMIT, 'schema-repair', lastErrors.slice(0, 3).join('; '));
-      const sessionId = current.sessionId ?? first.sessionId;
+      const sessionId = resumableSessionId(current.sessionId) ?? resumableSessionId(first.sessionId);
       const resumePlan =
         sessionId !== undefined ? this.adapter.buildResume(sessionId, resumeRepairPrompt(lastErrors, schema), req) : null;
       const plan =
@@ -282,7 +344,10 @@ export class AgentCallExecutor implements AgentExecutor {
           ...req,
           prompt: freshRepairPrompt(spec.prompt, lastRaw, lastErrors, schema),
         });
-      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, tracker?.onStreamEvent, resumePlan !== null);
+      current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, {
+        onStreamEvent: tracker?.onStreamEvent,
+        resumedSession: resumePlan !== null,
+      });
       usages.push(current);
       tracker?.attemptSettled(usages);
       if (!current.exit.ok) {
@@ -323,22 +388,30 @@ export class AgentCallExecutor implements AgentExecutor {
     // an `exec resume` attempt's figure already contains every prior attempt
     // on the same session, so count only the LAST cumulative report per
     // session — summing would double-count the shared prefix.
-    const counted: AttemptResult[] = [];
+    const isCumulative = (a: AttemptResult): boolean =>
+      a.sessionId !== undefined &&
+      a.events.some((e) => e.kind === 'usage' && !e.interim && e.threadCumulative === true);
+    // A session's LAST cumulative report also covers every EARLIER attempt on
+    // that session that died before reporting anything (a timed-out attempt
+    // later resumed) — estimating those would double-count. Attempts AFTER it
+    // are not covered and must still be estimated, so track the position.
+    const lastCumulativeAt = new Map<string, number>();
+    attempts.forEach((a, i) => {
+      if (isCumulative(a)) lastCumulativeAt.set(a.sessionId!, i);
+    });
+    const counted: { a: AttemptResult; at: number }[] = [];
     const cumulativeIdx = new Map<string, number>();
-    for (const a of attempts) {
-      const cumulative =
-        a.sessionId !== undefined &&
-        a.events.some((e) => e.kind === 'usage' && !e.interim && e.threadCumulative === true);
-      if (cumulative) {
+    attempts.forEach((a, at) => {
+      if (isCumulative(a)) {
         const prev = cumulativeIdx.get(a.sessionId!);
         if (prev !== undefined) {
-          counted[prev] = a;
-          continue;
+          counted[prev] = { a, at };
+          return;
         }
         cumulativeIdx.set(a.sessionId!, counted.length);
       }
-      counted.push(a);
-    }
+      counted.push({ a, at });
+    });
 
     let input = 0;
     let output = 0;
@@ -346,7 +419,7 @@ export class AgentCallExecutor implements AgentExecutor {
     let reasoning = 0;
     let realAny = false;
     let estimatedAny = false;
-    for (const a of counted) {
+    for (const { a, at } of counted) {
       const u = this.adapter.extractUsage(a.events);
       if (u.totalTokens > 0) {
         realAny = true;
@@ -354,6 +427,10 @@ export class AgentCallExecutor implements AgentExecutor {
         output += u.outputTokens;
         cached += u.cachedInputTokens;
         reasoning += u.reasoningTokens;
+      } else if (a.sessionId !== undefined && (lastCumulativeAt.get(a.sessionId) ?? -1) > at) {
+        // Reported nothing (killed before turn.completed), but a LATER resume
+        // on the same session reported the thread total — already counted.
+        continue;
       } else {
         // This attempt reported no usage — estimate it (its prompt + its own
         // output) rather than dropping it, so a failed attempt or schema-repair
@@ -394,10 +471,19 @@ export class AgentCallExecutor implements AgentExecutor {
     plan: SpawnPlan,
     signal: AbortSignal,
     attempt: number,
-    onStreamEvent?: (ev: AgentEvent) => void,
-    /** the plan resumes an existing backend session (schema repair via buildResume) */
-    resumedSession = false,
+    opts: {
+      onStreamEvent?: (ev: AgentEvent) => void;
+      /** the plan resumes an existing backend session (task retry or schema repair via buildResume) */
+      resumedSession?: boolean;
+      /** stderr artifact suffix; distinguishes a same-attempt rerun (the fresh
+       *  fallback after a dead resume) so it can't clobber the resume's stderr */
+      stderrSuffix?: string;
+      /** remaining budget for a same-attempt rerun — one deadline per logical
+       *  attempt, never a second full window */
+      timeoutOverrideMs?: number;
+    } = {},
   ): Promise<AttemptResult> {
+    const { onStreamEvent, resumedSession = false, stderrSuffix = '', timeoutOverrideMs } = opts;
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
     const transcriptFile = artifactDir ? join(artifactDir, 'transcript.jsonl') : undefined;
@@ -432,14 +518,18 @@ export class AgentCallExecutor implements AgentExecutor {
         events.push(ev);
         switch (ev.kind) {
           case 'session':
-            sessionId = ev.sessionId;
+            // First session event wins: the CLI announces its session before
+            // any model or tool output exists, so a mid-stream "session"
+            // carrying a different id (a compromised worker naming a
+            // sibling's session to hijack the retry-resume) is inert.
+            if (sessionId === undefined) sessionId = ev.sessionId;
             onStreamEvent?.(ev);
             // Display-only side channel (e.g. codex rollout tail): its events
             // feed the progress tracker only — never the attempt's event
             // list — so accounting is untouched by construction.
             if (!sidecar && onStreamEvent && this.adapter.createSidecar) {
               try {
-                sidecar = this.adapter.createSidecar(ev.sessionId, onStreamEvent, { resumedSession }) ?? undefined;
+                sidecar = this.adapter.createSidecar(sessionId, onStreamEvent, { resumedSession }) ?? undefined;
               } catch {
                 /* best-effort */
               }
@@ -470,7 +560,7 @@ export class AgentCallExecutor implements AgentExecutor {
     };
 
     let transcriptFd: number | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timer: { clear(): void } | undefined;
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     let onAbort: (() => void) | undefined;
     // Delayed SIGKILL escalations scheduled after a SIGTERM. Tracked so `finally`
@@ -507,14 +597,19 @@ export class AgentCallExecutor implements AgentExecutor {
         escalationTimers.push(setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref());
       };
 
-      const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
+      // Timeouts are user-opt-in: no per-call timeoutMs and no run-level
+      // attemptTimeoutMs means the attempt runs unlimited. chainedTimeout
+      // honors oversized caps past the setTimeout range — enforced, never
+      // silently disarmed, never overflow-fired at ~1ms.
+      const timeoutMs = timeoutOverrideMs ?? spec.timeoutMs ?? this.opts.attemptTimeoutMs;
       let timedOut = false;
       let stalled = false;
-      timer = setTimeout(() => {
-        timedOut = true;
-        killWithEscalation();
-      }, timeoutMs);
-      timer.unref();
+      if (timeoutMs !== undefined) {
+        timer = chainedTimeout(timeoutMs, () => {
+          timedOut = true;
+          killWithEscalation();
+        });
+      }
 
       // Stall watchdog: no stream activity within stallMs → kill and retry.
       let lastActivityAt = Date.now();
@@ -556,7 +651,7 @@ export class AgentCallExecutor implements AgentExecutor {
       consume(parser.end());
 
       if (artifactDir) {
-        writeFileNoFollow(join(artifactDir, `stderr.attempt${attempt}.log`), stderrTail.text);
+        writeFileNoFollow(join(artifactDir, `stderr.attempt${attempt}${stderrSuffix}.log`), stderrTail.text);
       }
 
       let exit = this.adapter.classifyExit(code, sig, events, stderrTail.text);
@@ -593,7 +688,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // Runs on both success and the spawn-error path — the error path is
       // retryable, so leaking the interval/timer/abort-listener would compound
       // across retries.
-      if (timer) clearTimeout(timer);
+      timer?.clear();
       if (stallTimer) clearInterval(stallTimer);
       for (const t of escalationTimers) clearTimeout(t);
       if (onAbort) signal.removeEventListener('abort', onAbort);

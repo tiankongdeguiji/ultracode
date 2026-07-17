@@ -117,6 +117,15 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
   if (!mcOpt.ok) return 1;
   const maxConcurrencyOpt = mcOpt.value;
 
+  // Same fail-fast for an explicit --timeout: an operator who asked for a cap
+  // must never silently get an uncapped run (NaN would store as null). 0 =
+  // unlimited, matching the MCP clear-the-cap semantic.
+  const timeoutMin = opts.timeout === undefined ? undefined : Number(opts.timeout);
+  if (timeoutMin !== undefined && (!Number.isFinite(timeoutMin) || timeoutMin < 0)) {
+    process.stderr.write(`ultracode: --timeout must be a non-negative number of minutes\n`);
+    return 1;
+  }
+
   // Dry run: rehearse on the mock backend in-process — free, instant, and
   // exercises the identical dialect semantics (schema validation included).
   if (opts.dryRun) {
@@ -177,7 +186,7 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
       maxConcurrency,
       budgetTotal,
       permission,
-      wallClockMs: opts.timeout ? Number(opts.timeout) * 60_000 : undefined,
+      wallClockMs: timeoutMin === undefined || timeoutMin === 0 ? undefined : Math.round(timeoutMin * 60_000),
     },
   });
 

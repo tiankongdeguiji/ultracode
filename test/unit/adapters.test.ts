@@ -79,6 +79,12 @@ describe('ClaudeAdapter', () => {
     expect(a.buildSpawn(req({ permission: 'safe' })).argv).toContain('default');
     expect(a.buildSpawn(req({ permission: 'danger' })).argv).toContain('bypassPermissions');
   });
+
+  it('resume pins the SAME permission-mode as spawn (settings defaults must not govern the retry leg)', () => {
+    const argv = a.buildResume('sid', 'continue', req({ permission: 'safe' }))!.argv;
+    expect(argv).toEqual(expect.arrayContaining(['--permission-mode', 'default']));
+    expect(a.buildResume('sid', 'continue', req({ permission: 'danger' }))!.argv).toContain('bypassPermissions');
+  });
 });
 
 describe('QoderAdapter', () => {
@@ -105,6 +111,11 @@ describe('QoderAdapter', () => {
     expect(plan.argv).toContain('--print');
     expect(plan.argv).toContain('--json-schema');
     expect(plan.argv).toEqual(expect.arrayContaining(['--agent', 'uc-xhigh', '-w', '/w']));
+  });
+
+  it('resume pins the SAME permission-mode/model/agent as spawn', () => {
+    const argv = a.buildResume('sid', 'continue', req({ permission: 'safe', model: 'm1', agentType: 'uc-xhigh' }))!.argv;
+    expect(argv).toEqual(expect.arrayContaining(['-r', 'sid', '--permission-mode', 'dont_ask', '--model', 'm1', '--agent', 'uc-xhigh']));
   });
 });
 

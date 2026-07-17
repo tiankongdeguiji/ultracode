@@ -123,7 +123,7 @@ ultracode/
 ```
 ultracode run <file> [--args '<json>'] [--backend codex|mock] [--model <m>]
               [--sandbox read-only|workspace-write] [--budget 500k] [--max-agents 50]
-              [--concurrency N] [--per-agent-timeout 20m] [--wall-clock 60m]
+              [--concurrency N] [--per-agent-timeout 20m] [--wall-clock 60m]   # timeouts: opt-in since 0.1.4 (unlimited by default)
               [--dry-run] [--yes] [--run-dir .ultracode/runs]
 ultracode parse <file>          # meta + static agent-call inventory, no execution
 ultracode doctor [--live]       # env/auth/version preflight; --live burns ~1 cent on probes
@@ -156,7 +156,7 @@ ultracode install --qoder|--codex [--user]   # copies skill/pack files, never ov
 - The nasty variant of this risk — MCP host timing out and Codex silently dropping the call while our server keeps spending money — is *deferred along with the MCP server*. When v2 adds the triad, runs get a heartbeat lease: no `workflow_status` poll for 10 min → auto-pause (kill workers, journal intact, resumable).
 
 **(d) Runaway cost.**
-- Layered hard caps, all on by default: `--max-agents 50`, `--budget` (token target; agent() throws "Workflow budget exceeded" at ≤0), `--wall-clock 60m`, `--per-agent-timeout 20m`, concurrency semaphore. `+500k`-style directives in the user's prompt are translated by the SKILL into `--budget 500k` (doctrine text tells the model to do this).
+- Layered hard caps, all on by default: `--max-agents 50`, `--budget` (token target; agent() throws "Workflow budget exceeded" at ≤0), `--wall-clock 60m`, `--per-agent-timeout 20m`, concurrency semaphore. `+500k`-style directives in the user's prompt are translated by the SKILL into `--budget 500k` (doctrine text tells the model to do this). *(Superseded: budgets since 0.1.x and timeouts since 0.1.4 are user-opt-in — no defaults.)*
 - **No silent caps**: every cap trip goes to failures[] and the final report ("stopped: budget 500k exhausted after 412k spent, 3 pipeline items unprocessed").
 - `--dry-run` = free rehearsal; skill doctrine instructs the model to dry-run before any workflow expected to exceed 10 agents.
 - Live cost line on stderr every agent completion: `[7/23 agents] 148k tokens (~$0.41)`.

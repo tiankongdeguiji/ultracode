@@ -61,7 +61,8 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Launch a workflow (fire-and-forget; returns runId in <1s). Provide script (inline dialect text) ' +
         'or scriptPath, or resumeFromRunId to resume a terminal run (completed agents replay free). ' +
-        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend (REQUIRED for a fresh start) is one of mock|codex|qoder|claude|gemini — mock returns fabricated stubs (rehearsal only), so pass a real backend for real work.',
+        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend (REQUIRED for a fresh start) is one of mock|codex|qoder|claude|gemini — mock returns fabricated stubs (rehearsal only), so pass a real backend for real work. ' +
+        'wallClockMs (run wall-clock cap) and attemptTimeoutMs (per-attempt agent timeout; per-call opts.timeoutMs still wins) are unclamped and default to UNLIMITED — pass them ONLY when the user explicitly asked for a time limit, and never invent one. On resume an omitted cap inherits the prior run\'s value; pass 0 to clear an inherited cap back to unlimited.',
       inputSchema: {
         script: z.string().optional(),
         scriptPath: z.string().optional(),
@@ -71,6 +72,8 @@ export function createServer(baseCwd: string): McpServer {
         maxAgents: z.number().int().positive().optional(),
         maxConcurrency: z.number().int().positive().optional(),
         permission: z.enum(['safe', 'auto', 'danger']).optional(),
+        wallClockMs: z.number().int().nonnegative().optional(),
+        attemptTimeoutMs: z.number().int().nonnegative().optional(),
         resumeFromRunId: z.string().optional(),
         cwd: z.string().optional(),
       },
@@ -109,6 +112,8 @@ export function createServer(baseCwd: string): McpServer {
           maxAgents: input.maxAgents,
           maxConcurrency: input.maxConcurrency,
           permission: input.permission,
+          wallClockMs: input.wallClockMs,
+          attemptTimeoutMs: input.attemptTimeoutMs,
           resumeFromRunId: input.resumeFromRunId,
           cwd: input.cwd ?? baseCwd,
         });

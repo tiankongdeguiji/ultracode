@@ -218,6 +218,27 @@ describe('CLI nesting guard (ULTRACODE_INSIDE_RUN)', () => {
     }
   });
 
+  it('run rejects a malformed --timeout before creating any run state', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-badtimeout-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(file, SCRIPT);
+    const home = join(dir, 'store');
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((c) => {
+      chunks.push(String(c));
+      return true;
+    });
+    try {
+      // an operator who asked for a cap must never silently get an uncapped run
+      expect(await runCommand(file, { yes: true, backend: 'mock', home, timeout: 'nope' })).toBe(1);
+      expect(chunks.join('')).toContain('--timeout must be a non-negative number of minutes');
+      expect(existsSync(home)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('run --dry-run stays exempt (in-process mock rehearsal, no run state)', async () => {
     const { runCommand } = await import('../../src/cli/run.js');
     const dir = mkdtempSync(join(tmpdir(), 'uc-nestdry-'));

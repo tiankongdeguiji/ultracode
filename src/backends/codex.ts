@@ -131,7 +131,10 @@ export class CodexAdapter implements BackendAdapter {
     return plan;
   }
 
-  /** --output-schema is a global flag: it re-attaches on resume repair turns. */
+  /** --output-schema is a global flag: it re-attaches on resume repair turns.
+   *  `exec resume` accepts no --cd/--sandbox (usage error, live-verified on
+   *  0.144.5): the workspace is the process cwd (spawnAgentProcess sets it)
+   *  and the sandbox rides a `-c sandbox_mode=...` config override instead. */
   buildResume(sessionId: string, followupPrompt: string, req: AgentRequest): SpawnPlan | null {
     const argv = [
       'exec',
@@ -139,12 +142,11 @@ export class CodexAdapter implements BackendAdapter {
       sessionId,
       '--json',
       '--skip-git-repo-check',
-      '--cd',
-      req.cwd,
-      '--sandbox',
-      PERMISSION_TO_SANDBOX[req.permission],
+      '-c',
+      `sandbox_mode=${JSON.stringify(PERMISSION_TO_SANDBOX[req.permission])}`,
     ];
     if (req.model) argv.push('-m', req.model);
+    if (req.effort) argv.push('-c', `model_reasoning_effort=${JSON.stringify(req.effort)}`);
     argv.push(...MCP_KILL_SWITCH);
     const plan: SpawnPlan = { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
     if (req.schema) plan.schemaTempFile = { content: JSON.stringify(req.schema) };
