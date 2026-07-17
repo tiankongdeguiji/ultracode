@@ -18,7 +18,7 @@ import type {
  * Scripted fake adapter (pattern from schema.test.ts): each spawn "runs"
  * `node -e` printing pre-scripted NDJSON — real subprocesses, hermetic.
  * Line grammar: {"session","model"} | {"iu": usage} interim | {"text"} |
- * {"done": true, "usage"?} terminal usage + result.
+ * {"tool","status"?} tool tick | {"done": true, "usage"?} terminal usage + result.
  */
 class FakeAdapter implements BackendAdapter {
   readonly id = 'mock' as const;
@@ -56,6 +56,9 @@ class FakeAdapter implements BackendAdapter {
           return [{ kind: 'session', sessionId: obj.session, model: obj.model as string | undefined }];
         }
         if (obj.iu) return [{ kind: 'usage', usage: obj.iu as object, interim: true }];
+        if (typeof obj.tool === 'string') {
+          return [{ kind: 'tool', name: obj.tool, status: (obj.status ?? 'started') as 'started' }];
+        }
         if (typeof obj.text === 'string') return [{ kind: 'message', text: obj.text }];
         if (obj.done) {
           const out: AgentEvent[] = [];
@@ -285,6 +288,40 @@ describe('AgentCallExecutor progress', () => {
     const out3 = await new AgentCallExecutor(adapter3, { usageTickIntervalMs: 0 }).execute(spec({ schema }), signal, onProgress3);
     expect(out3.ok).toBe(true);
     expect(sidecarOpts).toEqual([{ resumedSession: false }, { resumedSession: true }]);
+  });
+
+  it('forwards tool lifecycle events as tool progress and counts starts across attempts', async () => {
+    const adapter = new FakeAdapter('native', [
+      {
+        lines: [
+          { tool: 'bash:ls', status: 'started' },
+          { tool: 'bash:ls', status: 'completed' },
+        ],
+        exit: 1,
+      },
+      {
+        lines: [
+          { tool: 'read:file', status: 'started' },
+          { tool: 'web:q', status: 'started' },
+          { tool: 'web:q', status: 'declined' },
+          { text: 'ok' },
+          { done: true, usage: { inputTokens: 10, outputTokens: 2 } },
+        ],
+      },
+    ]);
+    const exec = new AgentCallExecutor(adapter, { usageTickIntervalMs: 0 });
+    const { events, onProgress } = collect();
+    const outcome = await exec.execute(spec({ retries: 1 }), signal, onProgress);
+    expect(outcome.ok).toBe(true);
+    expect(events.filter((p) => p.type === 'tool')).toEqual([
+      { type: 'tool', name: 'bash:ls', status: 'started' },
+      { type: 'tool', name: 'bash:ls', status: 'completed' },
+      { type: 'tool', name: 'read:file', status: 'started' },
+      { type: 'tool', name: 'web:q', status: 'started' },
+      { type: 'tool', name: 'web:q', status: 'declined' },
+    ]);
+    // started ticks only, summed across both attempts — the figure the fold reconciles to
+    expect(outcome.toolCalls).toBe(3);
   });
 
   it('works without an onProgress callback (no observable change)', async () => {

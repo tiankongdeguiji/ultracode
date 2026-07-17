@@ -88,7 +88,9 @@ export interface AgentOutcome {
 export type AgentProgress =
   | { type: 'usage'; usage: NormalizedUsage }
   | { type: 'retry'; attempt: number; maxAttempts: number; kind: 'task' | 'schema-repair'; reason?: string }
-  | { type: 'model'; model: string };
+  | { type: 'model'; model: string }
+  /** discrete tool-call lifecycle tick; the authoritative count is AgentOutcome.toolCalls at settle */
+  | { type: 'tool'; name: string; status: 'started' | 'completed' | 'failed' | 'declined' };
 
 export interface AgentExecutor {
   execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (p: AgentProgress) => void): Promise<AgentOutcome>;

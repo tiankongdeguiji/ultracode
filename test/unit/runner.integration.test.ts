@@ -16,7 +16,7 @@ import { readJournal } from '../../src/engine/journal.js';
 
 const HELLO = `export const meta = { name: 'hello', description: 'd', phases: [{ title: 'Greet' }] }
 phase('Greet')
-const g = await agent('MOCK:ok hi', { label: 'greeter' })
+const g = await agent('MOCK:tools 2 MOCK:ok hi', { label: 'greeter' })
 log('greeting received')
 return { g }
 `;
@@ -79,7 +79,16 @@ describe('detached runner', () => {
 
     const resultJson = JSON.parse(readFileSync(join(dir, 'agents/0000-greeter/result.json'), 'utf8'));
     expect(resultJson.value).toBe('hi');
-    expect(readFileSync(join(dir, 'agents/0000-greeter/prompt.md'), 'utf8')).toBe('MOCK:ok hi');
+    expect(readFileSync(join(dir, 'agents/0000-greeter/prompt.md'), 'utf8')).toBe('MOCK:tools 2 MOCK:ok hi');
+
+    // Live tool ticks land in events.jsonl with the writer's envelope ts.
+    const toolEvents = readFileSync(join(dir, 'events.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l.includes('"agent_tool"'))
+      .map((l) => JSON.parse(l));
+    expect(toolEvents).toHaveLength(4); // 2 tools × started+completed
+    expect(toolEvents[0]).toMatchObject({ type: 'agent_tool', seq: 0, name: 'tool:mock-1', status: 'started' });
+    for (const t of toolEvents) expect(typeof t.ts).toBe('number');
 
     const run = getRun(root, runId)!;
     expect(run.effectiveStatus).toBe('completed');
@@ -119,6 +128,10 @@ describe('detached runner', () => {
       if (Date.now() > deadline) throw new Error('agent never started');
       await sleep(100);
     }
+
+    // The prompt is on disk while the agent is still running (early write) —
+    // the panel's detail view depends on this.
+    expect(readFileSync(join(dir, 'agents/0000-sleeper/prompt.md'), 'utf8')).toContain('MOCK:delay 15000');
 
     process.kill(pid, 'SIGTERM');
     const status = await waitTerminal(dir, 10_000);

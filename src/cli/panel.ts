@@ -9,6 +9,11 @@ import { isTerminal, type RunStatus } from '../store/manifest.js';
 
 export type AgentRowStatus = 'queued' | 'running' | 'ok' | 'failed' | 'skipped' | 'cached';
 
+export type ToolStatus = 'started' | 'completed' | 'failed' | 'declined';
+
+/** recentTools ring size — enough for an at-a-glance activity feed */
+export const RECENT_TOOLS_CAP = 5;
+
 export interface AgentRow {
   seq: number;
   label: string;
@@ -21,6 +26,12 @@ export interface AgentRow {
   /** live cumulative tokens (agent_usage ticks); authoritative once completed */
   tokens: number;
   estimated: boolean;
+  /** live tool-call count (agent_tool started ticks); agent_completed.toolCalls is authoritative */
+  toolCalls: number;
+  /** last RECENT_TOOLS_CAP tool calls, oldest → newest */
+  recentTools: { name: string; status: ToolStatus }[];
+  /** envelope ts of the last tool/usage/retry event — the "idle" clock */
+  lastActivityTs?: number;
   /** >= 2 while the executor retries (agent_retry) */
   attempt: number;
   startedTs?: number;
@@ -90,6 +101,8 @@ interface Ev {
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+
+const TOOL_STATUSES: ReadonlySet<string> = new Set(['started', 'completed', 'failed', 'declined']);
 
 /**
  * Untrusted text (labels, errors, backend-reported model ids, log lines, meta
@@ -164,6 +177,8 @@ function rowFor(state: PanelState, e: Ev): AgentRow {
       status: 'queued',
       tokens: 0,
       estimated: false,
+      toolCalls: 0,
+      recentTools: [],
       attempt: 1,
     };
     if (row.childId !== undefined && childName) ensureChild(state, row.childId, sanitizeText(childName));
@@ -248,6 +263,7 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       // max: a schema-repair notice must never roll a displayed attempt back
       if (attempt !== undefined) row.attempt = Math.max(row.attempt, attempt);
       if (row.status === 'queued') row.status = 'running';
+      row.lastActivityTs = num(e.ts) ?? row.lastActivityTs;
       return;
     }
     case 'agent_usage': {
@@ -256,6 +272,7 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       // Monotonic guard: ticks race the completion event in one fold batch.
       row.tokens = Math.max(row.tokens, num(e.totalTokens) ?? 0);
       if (e.estimated === true) row.estimated = true;
+      row.lastActivityTs = num(e.ts) ?? row.lastActivityTs;
       return;
     }
     case 'agent_model': {
@@ -264,12 +281,44 @@ export function foldEvent(state: PanelState, raw: TimestampedEvent): void {
       if (row && model !== undefined) row.model = sanitizeText(model);
       return;
     }
+    case 'agent_tool': {
+      const row = state.agents.get(num(e.seq) ?? -1);
+      if (!row || row.endedTs !== undefined) return; // ticks race completion in one fold batch
+      const name = str(e.name);
+      const status = str(e.status) as ToolStatus | undefined;
+      if (name === undefined || status === undefined || !TOOL_STATUSES.has(status)) return;
+      row.lastActivityTs = num(e.ts) ?? row.lastActivityTs;
+      // Emission bounds names to 80 chars, but events.jsonl is worker-writable —
+      // re-cap at the fold so a crafted line can't bloat the recentTools ring.
+      const clean = truncateToWidth(sanitizeText(name), 120);
+      if (status === 'started') {
+        // Count starts only — the same predicate the engine uses for
+        // AgentOutcome.toolCalls, so live and final counts agree.
+        row.toolCalls++;
+        row.recentTools.push({ name: clean, status });
+      } else {
+        // Lifecycle upgrade: flip the newest matching 'started' entry in place.
+        let upgraded = false;
+        for (let i = row.recentTools.length - 1; i >= 0; i--) {
+          const t = row.recentTools[i]!;
+          if (t.name === clean && t.status === 'started') {
+            t.status = status;
+            upgraded = true;
+            break;
+          }
+        }
+        if (!upgraded) row.recentTools.push({ name: clean, status });
+      }
+      if (row.recentTools.length > RECENT_TOOLS_CAP) row.recentTools.shift();
+      return;
+    }
     case 'agent_completed': {
       const existed = state.agents.has(num(e.seq) ?? -1);
       const row = rowFor(state, e);
       row.endedTs = num(e.ts);
       row.tokens = num(e.totalTokens) ?? row.tokens; // authoritative
       row.estimated = e.estimated === true; // authoritative too — clears a stale interim ~
+      row.toolCalls = num(e.toolCalls) ?? row.toolCalls; // authoritative; old streams keep the live count
       const error = str(e.error);
       if (e.skipped === true) row.status = 'skipped';
       else if (e.cached === true || (!existed && e.ok === true && (num(e.totalTokens) ?? 0) === 0)) {
@@ -399,6 +448,11 @@ export interface FrameOptions {
   runStatus: RunStatus;
   /** manifest.budget.spent — may lead the folded budget_tick after a torn tail */
   spentFloor?: number;
+  /** interactive selection: this row renders a ❯ marker and is exempt from
+   *  collapse hiding. Absent → output is byte-identical to pre-selection frames. */
+  selectedSeq?: number;
+  /** dim keybinding footer appended after the status footer (interactive panels only) */
+  keymap?: string;
 }
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -411,7 +465,7 @@ export function spinnerFrame(nowMs: number): string {
   return SPINNER_FRAMES[Math.floor(nowMs / 100) % SPINNER_FRAMES.length]!;
 }
 
-type Paint = (code: string, s: string) => string;
+export type Paint = (code: string, s: string) => string;
 
 const SETTLED: ReadonlySet<AgentRowStatus> = new Set(['ok', 'failed', 'skipped', 'cached']);
 const DONE_LIKE: ReadonlySet<AgentRowStatus> = new Set(['ok', 'cached', 'skipped']);
@@ -458,26 +512,39 @@ function indexRows(state: PanelState): FrameIndex {
   return idx;
 }
 
+/**
+ * A terminal frame must not fake liveness: rows the run left behind (runner
+ * died, run stopped) render as interrupted, never as spinning. Shared by the
+ * overview and the detail view so the two can never disagree.
+ */
+export function isInterruptedRow(row: AgentRow, runStatus: RunStatus): boolean {
+  return isTerminal(runStatus) && (row.status === 'running' || row.status === 'queued');
+}
+
+/** Status → glyph mapping, the single source of truth for both renderers. */
+export function rowGlyph(row: AgentRow, opts: Pick<FrameOptions, 'nowMs' | 'runStatus'>, paint: Paint): string {
+  if (isInterruptedRow(row, opts.runStatus)) {
+    return row.status === 'running' ? paint('33', '✗') : paint('2', '⊘');
+  }
+  switch (row.status) {
+    case 'running':
+      return row.attempt >= 2 ? paint('33', '↻') : paint('36', spinnerFrame(opts.nowMs));
+    case 'ok':
+      return paint('32', '✓');
+    case 'failed':
+      return paint('31', '✗');
+    case 'queued':
+      return paint('2', '◌');
+    case 'skipped':
+      return paint('2', '⊘');
+    default:
+      return paint('2', '⟳'); // cached
+  }
+}
+
 function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: Paint): string {
-  // A terminal frame must not fake liveness: rows the run left behind
-  // (runner died, run stopped) render as interrupted, never as spinning.
-  const lost = isTerminal(opts.runStatus) && (row.status === 'running' || row.status === 'queued');
-  const spin = row.attempt >= 2 ? paint('33', '↻') : paint('36', spinnerFrame(opts.nowMs));
-  const glyph = lost
-    ? row.status === 'running'
-      ? paint('33', '✗')
-      : paint('2', '⊘')
-    : row.status === 'running'
-      ? spin
-      : row.status === 'ok'
-        ? paint('32', '✓')
-        : row.status === 'failed'
-          ? paint('31', '✗')
-          : row.status === 'queued'
-            ? paint('2', '◌')
-            : row.status === 'skipped'
-              ? paint('2', '⊘')
-              : paint('2', '⟳'); // cached
+  const lost = isInterruptedRow(row, opts.runStatus);
+  const glyph = rowGlyph(row, opts, paint);
   const truncated = truncateToWidth(row.label, LABEL_WIDTH);
   const label = truncated + ' '.repeat(Math.max(0, LABEL_WIDTH - displayWidth(truncated)));
   const parts: string[] = [];
@@ -505,11 +572,32 @@ function agentRowLine(row: AgentRow, indent: string, opts: FrameOptions, paint: 
     if (row.status === 'running' && row.attempt >= 2) parts.push(paint('33', `attempt ${row.attempt}`));
   }
   const meta = parts.join(paint('2', ' · '));
+  if (opts.selectedSeq === row.seq) {
+    return `${indent}${paint('36;1', '❯')} ${glyph} ${paint('1', truncated)}${' '.repeat(Math.max(0, LABEL_WIDTH - displayWidth(truncated)))}${meta ? ` ${meta}` : ''}`.trimEnd();
+  }
   return `${indent}⎿ ${glyph} ${label}${meta ? ` ${meta}` : ''}`.trimEnd();
 }
 
 function sectionRows(idx: FrameIndex, childId: number | undefined, phase: string | undefined): AgentRow[] {
   return idx.buckets.get(groupKey(childId, phase)) ?? [];
+}
+
+/** Seqs in on-screen order (section order → bucket row order) — the ↑/↓ traversal list. */
+export function selectableSeqs(state: PanelState): number[] {
+  const idx = indexRows(state);
+  const seqs: number[] = [];
+  for (const section of buildSections(state, idx)) {
+    if (section.kind === 'child' && section.child) {
+      const cid = section.child.childId;
+      for (const row of sectionRows(idx, cid, undefined)) seqs.push(row.seq);
+      for (const phase of state.phases.filter((p) => p.childId === cid)) {
+        for (const row of sectionRows(idx, cid, phase.title)) seqs.push(row.seq);
+      }
+    } else {
+      for (const row of sectionRows(idx, undefined, section.phase?.title)) seqs.push(row.seq);
+    }
+  }
+  return seqs;
 }
 
 function phaseLines(
@@ -532,20 +620,22 @@ function phaseLines(
     const title = phase.started ? phase.title : paint('2', phase.title);
     lines.push(`${indent}${glyph} ${title}${count}${detail}`);
   }
-  if (level >= 2 && members.length > 0 && members.every((r) => SETTLED.has(r.status))) {
+  const hasSelection = opts.selectedSeq !== undefined && members.some((r) => r.seq === opts.selectedSeq);
+  if (level >= 2 && members.length > 0 && members.every((r) => SETTLED.has(r.status)) && !hasSelection) {
     return lines; // fully-terminal phase collapses to its header under pressure
   }
   const rowIndent = phase ? `${indent}  ` : indent;
   const visibleDone = level >= 1 ? 0 : VISIBLE_DONE_PER_PHASE;
   const doneRows = members.filter((r) => DONE_LIKE.has(r.status));
-  const hiddenDone = doneRows.slice(0, Math.max(0, doneRows.length - visibleDone));
+  // The selected row never folds away — collapse pressure escalates around it.
+  const hiddenDone = doneRows.slice(0, Math.max(0, doneRows.length - visibleDone)).filter((r) => r.seq !== opts.selectedSeq);
   const hiddenSet = new Set(hiddenDone.map((r) => r.seq));
   if (hiddenDone.length > 0) {
     const tok = hiddenDone.reduce((n, r) => n + r.tokens, 0);
     lines.push(paint('2', `${rowIndent}⎿ … +${hiddenDone.length} done${tok > 0 ? ` (${formatTokens(tok)} tok)` : ''}`));
   }
   const queuedRows = members.filter((r) => r.status === 'queued');
-  const hiddenQueued = queuedRows.slice(VISIBLE_QUEUED_PER_PHASE);
+  const hiddenQueued = queuedRows.slice(VISIBLE_QUEUED_PER_PHASE).filter((r) => r.seq !== opts.selectedSeq);
   for (const row of members) {
     if (hiddenSet.has(row.seq)) continue;
     if (hiddenQueued.includes(row)) continue;
@@ -620,7 +710,7 @@ function footerLine(state: PanelState, idx: FrameIndex, opts: FrameOptions, pain
   return paint('2', `${parts.join(' · ')} | ${tokens} | ${elapsed}`);
 }
 
-function headerLines(state: PanelState, opts: FrameOptions, paint: Paint): string[] {
+export function headerLines(state: PanelState, opts: FrameOptions, paint: Paint): string[] {
   const statusText =
     state.stopRequested && opts.runStatus === 'running' ? 'stopping…' : opts.runStatus;
   const statusColor =
@@ -667,26 +757,39 @@ export function renderFrame(state: PanelState, opts: FrameOptions): string {
       }
     }
     lines.push(footerLine(state, idx, opts, paint));
+    if (opts.keymap !== undefined) lines.push(paint('2', opts.keymap));
     if (lines.length <= rowsBudget) break;
   }
   if (lines.length > rowsBudget) {
     if (rowsBudget >= 3) {
       // Last resort: keep the header and the most recent tail (incl. footer).
       const tail = lines.slice(lines.length - (rowsBudget - 2));
+      // The selection must survive even here — an invisible ❯ would leave the
+      // arrow keys steering a row the user cannot see. The marker is only ever
+      // the connector (first visible glyph); a label CONTAINING ❯ never starts
+      // the trimmed line, so decoys cannot shadow the real selected row.
+      const selected =
+        opts.selectedSeq !== undefined
+          ? lines.find((l) => l.replace(ANSI_RE, '').trimStart().startsWith('❯'))
+          : undefined;
+      if (selected !== undefined && !tail.includes(selected)) tail[0] = selected;
       lines = [lines[0]!, paint('2', `  … ${lines.length - tail.length - 1} lines hidden (terminal too small)`), ...tail];
     } else {
       lines = lines.slice(lines.length - rowsBudget); // 1-2 rows: newest lines only
     }
   }
-  // Overlong lines would soft-wrap and break the repaint's cursor-up count
-  // (measured in display cells — wide glyphs count 2). Truncating through SGR
-  // codes could cut a reset and bleed color, so an overlong colored line drops
-  // its color instead (rare: long error text).
-  const fit = (l: string): string => {
-    const plain = l.replace(ANSI_RE, '');
-    return displayWidth(plain) <= cols ? l : truncateToWidth(plain, cols);
-  };
-  return lines.map(fit).join('\n');
+  return lines.map((l) => fitLine(l, cols)).join('\n');
+}
+
+/**
+ * Truncate one rendered line to cols, measured in display cells (wide glyphs
+ * count 2) — overlong lines would soft-wrap and break the repaint's cursor-up
+ * count. Truncating through SGR codes could cut a reset and bleed color, so an
+ * overlong colored line drops its color instead (rare: long error text).
+ */
+export function fitLine(l: string, cols: number): string {
+  const plain = l.replace(ANSI_RE, '');
+  return displayWidth(plain) <= cols ? l : truncateToWidth(plain, cols);
 }
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
