@@ -54,21 +54,24 @@ That's most of the surface — the rest is `parallel()`, `log()`, `args`, `budge
 
 ## Quick start
 
+Set up once, then orchestrate from inside your coding agent — the intended daily path:
+
 ```bash
 npm install && npm run build && npm link   # build, then link a global `ultracode`
 ultracode doctor                  # which backends are available + auth modes
 ultracode install codex           # skill + AGENTS.md trigger + MCP registration
+```
 
-# the keyword path — inside Codex (or Qoder, Gemini CLI, Claude Code):
-#   "ultracode: review this repo for auth bugs +500k"
-#   the word arms the mode; "+500k" is an optional budget — omit it to run uncapped
+Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
 
-# or drive the engine directly:
-ultracode validate my.workflow.js
-ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
-ultracode run my.workflow.js --backend codex    # foreground live panel; --detach to background
-ultracode resume <runId> [--script edited.js]   # completed agents replay free
-ultracode watch <runId>                         # re-attach the live panel from another shell:
+```text
+"ultracode: review this repo for auth bugs +500k"
+```
+
+The word arms the mode: your agent authors a workflow, starts it over MCP (`workflow_start`), and collects the result across turns (`workflow_status` / `workflow_result`). `+500k` is an optional budget — omit it to run uncapped. Follow the fleet from any shell (the runId is in the agent's reply, or `ultracode list`):
+
+```bash
+ultracode watch <runId>
 ```
 
 ```text
@@ -85,6 +88,17 @@ ultracode watch <runId>                         # re-attach the live panel from 
   ⏺ Synthesize — Build and critique an evidence-ranked conclusion
 agents 5/6 · 1 running | tokens 4.67m | elapsed 58m22s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
+```
+
+## Driving the engine directly
+
+The skill normally does this for you; the same surface is there for authoring and debugging workflows by hand:
+
+```bash
+ultracode validate my.workflow.js
+ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
+ultracode run my.workflow.js --backend codex    # foreground live panel; --detach to background
+ultracode resume <runId> [--script edited.js]   # completed agents replay free
 ```
 
 ## Commands
