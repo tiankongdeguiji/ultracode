@@ -75,18 +75,17 @@ ultracode watch <runId>
 ```
 
 ```text
-· 3/3 extraction agents completed
-⏺ uc-nsys-l20-vs-rtx-pro-5000   running · 58m22s
-  ⏺ Extract (3/3) — Independently extract both reports and a direct comparison
-    ⎿ ✓ l20-forensics            575.2k tok · 22m30s · gpt-5.6-sol
-    ⎿ ✓ rtx-forensics            655.1k tok · 26m42s · gpt-5.6-sol
-    ⎿ ✓ direct-comparison        1.17m tok · 26m25s · gpt-5.6-sol
-  ⠧ Challenge (2/3) — Challenge GPU, host-pipeline, and comparability hypotheses
-    ⎿ ✓ gpu-skeptic              462.7k tok · 15m19s · gpt-5.6-sol
-    ⎿ ⠧ host-skeptic             1.13m tok · 31m40s · gpt-5.6-sol
-    ⎿ ✓ comparability-skeptic    679.4k tok · 22m11s · gpt-5.6-sol
-  ⏺ Synthesize — Build and critique an evidence-ranked conclusion
-agents 5/6 · 1 running | tokens 4.67m | elapsed 58m22s
+⏺ audit-routes   running · 6m05s
+  ⏺ Find (1/1)
+    ⎿ ✓ #1                       12.4k tok · 18s · gpt-5-codex
+  ⠧ Audit (12/14)
+    ⎿ … +9 done (1.37m tok)
+    ⎿ ✓ src/routes/billing.ts    148.7k tok · 3m02s · gpt-5-codex
+    ⎿ ✓ src/routes/webhooks.ts   132.1k tok · 2m48s · gpt-5-codex
+    ⎿ ✓ src/routes/uploads.ts    121.9k tok · 2m35s · gpt-5-codex
+    ⎿ ⠧ src/routes/auth.ts       96.3k tok · 2m41s · gpt-5-codex
+    ⎿ ⠧ src/routes/admin.ts      88.9k tok · 2m37s · gpt-5-codex
+agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
 ```
 
