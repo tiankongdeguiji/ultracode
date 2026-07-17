@@ -8,7 +8,7 @@
 
 **Say the word, get an agent fleet.** 可移植的 **ultracode**——动态多 agent 工作流编排——为那些原生不支持它的编码 agent 而生：OpenAI Codex CLI、Qoder、Gemini CLI 等等。它基于 Claude Code Workflow 方言，因此同一份 `*.workflow.js` 脚本能在 Claude Code（原生）、Qoder（原生）以及本引擎上运行。
 
-*Linux 与 macOS · 尚未发布到 npm——需从源码构建。*
+*Linux 与 macOS · 需从源码构建。*
 
 在你的编码 agent 里输入 `ultracode`，它便不再困守于单一上下文：**skill** 负责编写一份确定性的 JS 工作流；**引擎** 把每个 `agent()` 当作子进程来运行。
 

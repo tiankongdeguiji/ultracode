@@ -8,7 +8,7 @@
 
 **Say the word, get an agent fleet.** Portable **ultracode** — dynamic multi-agent workflow orchestration — for coding agents that don't ship it natively: OpenAI Codex CLI, Qoder, Gemini CLI, and friends. Faithful to the Claude Code Workflow dialect, so the same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine.
 
-*Linux & macOS · not on npm yet — build from source.*
+*Linux & macOS · build from source.*
 
 Type `ultracode` in your coding agent and it stops working in one context: the **skill** authors a deterministic JS workflow; the **engine** runs each `agent()` as a subprocess.
 
