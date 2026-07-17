@@ -266,6 +266,7 @@ describe('MCP triad', () => {
     expect(status.nextEventOffset).toBeGreaterThan(0); // cursor advance == content delivered
     expect(status.hint).toContain('waitSeconds'); // sub-240s quiet holds get the in-band nudge
     expect(status.next).toContain('silently'); // in-band counter to host commentary mandates
+    expect(status.next).toContain(`sinceEventOffset: ${status.nextEventOffset}`); // concrete cursor to re-issue with
   }, 20_000);
 
   it("until='phase' ignores log lines but wakes on a phase boundary appended mid-hold", async () => {

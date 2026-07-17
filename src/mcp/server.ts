@@ -218,7 +218,7 @@ export function createServer(baseCwd: string): McpServer {
               ? { next: `call workflow_result with runId=${input.runId}` }
               : quiet
                 ? {
-                    next: 're-issue this hold and park silently — failures wake this monitor; filler updates, refresh polls, and run-store tailing waste turns',
+                    next: `re-issue this hold with sinceEventOffset: ${offset} and park silently — failures wake this monitor; filler updates, refresh polls, and run-store tailing waste turns`,
                     ...(wait < SHORT_HOLD_NUDGE_MS
                       ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (codex hostpack pins 3600 → pass 3300)' }
                       : {}),
