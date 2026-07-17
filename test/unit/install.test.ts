@@ -7,6 +7,7 @@ import {
   MARKER_BEGIN,
   MARKER_END,
   QODER_RULE,
+  codexMcpToml,
   installForHost,
   planFor,
   skillSourceDir,
@@ -16,6 +17,41 @@ import {
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'uc-install-'));
 }
+
+describe('codex MCP registration', () => {
+  it('writes the quiet-monitor hold budget and headless pre-approval', () => {
+    const block = codexMcpToml(['/usr/bin/node', '/x/main.js', 'mcp']);
+    expect(block).toContain('[mcp_servers.ultracode]');
+    expect(block).toContain('command = "/usr/bin/node"');
+    expect(block).toContain('args = ["/x/main.js","mcp"]');
+    // 3600 is the quiet monitor's hold ceiling (workflow_status until='terminal',
+    // doctrine waitSeconds=3300) — codex never extends tool timeouts on progress.
+    expect(block).toContain('tool_timeout_sec = 3600');
+    expect(block).toContain('default_tools_approval_mode = "approve"');
+  });
+
+  it('installForHost replaces a stale pre-quiet-monitor block (tool_timeout_sec = 90) instead of appending', () => {
+    const home = tmp();
+    const cmd = ['/usr/bin/node', '/x/main.js', 'mcp'];
+    const configPath = join(home, '.codex/config.toml');
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    writeFileSync(
+      configPath,
+      'sandbox_mode = "read-only"\n\n' + codexMcpToml(cmd).replace('tool_timeout_sec = 3600', 'tool_timeout_sec = 90') + '\n',
+    );
+
+    const actions = installForHost('codex', { userHome: home, mcpCommand: cmd });
+    const config = readFileSync(configPath, 'utf8');
+    expect(config).toContain('sandbox_mode = "read-only"'); // user content outside the markers untouched
+    expect(config).toContain('tool_timeout_sec = 3600');
+    expect(config).not.toContain('tool_timeout_sec = 90');
+    expect(config.match(/\[mcp_servers\.ultracode\]/g)).toHaveLength(1); // replaced in place, not appended
+    expect(actions.find((a) => a.path === configPath)?.changed).toBe(true);
+
+    const again = installForHost('codex', { userHome: home, mcpCommand: cmd });
+    expect(again.find((a) => a.path === configPath)?.changed).toBe(false); // idempotent once current
+  });
+});
 
 describe('skill source', () => {
   it('packaged skill exists with valid frontmatter and references', () => {
