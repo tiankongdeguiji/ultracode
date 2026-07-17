@@ -43,12 +43,10 @@ ultracode engine: sandboxed script + scheduler + journal
 ### 驱动舰队的引擎
 
 * **一套方言，三个引擎**——同一份 `*.workflow.js` 可以在 Claude Code（原生）、Qoder（原生）和 ultracode 引擎上运行。`ultracode lint` 用于确保脚本位于跨引擎可移植子集内，`ultracode sync` 则会将工作流同步到 `.claude/workflows/` 和 `.qoder/workflows/`。
-* **真实 agent，而不是模拟调用**——在四个真实后端（`codex`、`qoder`、`claude`、`gemini`）中，每个 `agent()` 都会启动一个真实的编码 agent 子进程。第五个后端 `mock` 是进程内测试替身，用于支持免费的 `--dry-run` 演练。
 * **基于 journal 的续跑**——确定性脚本结合哈希链式 journal，使 `ultracode resume <runId>` 可以直接重放最长的、未发生变化且已成功执行的 `agent()` 调用前缀，再继续运行剩余部分。即使脚本已经修改，也可以从第一处差异开始重新执行。
 * **实时运行面板**——前台运行时会直接显示面板，`ultracode watch` 也可以从任意 shell 重新接入。面板会展示每个 agent 的 token 数和耗时；使用方向键选中 agent 后，可以查看它的 prompt、当前活动和最终结果。在 `watch` 中按 Ctrl-C 只会退出查看，不会停止工作流。
 * **预算与超时可按需启用**——默认不设置任何上限；未配置即不限制。`--budget 500k` 会在任务派发时强制执行：达到上限后不再启动新的 agent。超时限制采用相同的控制方式。
 * **结构化输出容错**——为 `agent()` 提供 `JSON Schema` 后，引擎会返回经过校验的对象。若模型输出不符合 schema，最多会自动进行两次修复重试，之后才将该调用判定为失败。
-* **MCP 控制面**——`workflow_start`、`workflow_status` 和 `workflow_result` 共同管理位于 `.ultracode/runs/` 的共享运行记录。`workflow_start` 会在一秒内返回 `runId`，使受沙箱限制的宿主也能跨轮次发起无需持续值守的工作流。
 
 ## 快速上手
 

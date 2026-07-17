@@ -43,12 +43,10 @@ One agent, one context window, one linear transcript — that's the ceiling. `ul
 ### The engine that runs it
 
 - **One dialect, three engines** — the same `*.workflow.js` text runs on Claude Code (native), Qoder (native), and this engine; `ultracode lint` keeps it in the portable subset, and `ultracode sync` mirrors workflows into `.claude/workflows/` and `.qoder/workflows/`.
-- **Real agents, not simulations** — on the four real backends (`codex`, `qoder`, `claude`, `gemini`) every `agent()` is a real coding-agent subprocess; the fifth, `mock`, is an in-process test double that powers those free `--dry-run` rehearsals.
 - **Journal-based resume** — deterministic scripts plus a hash-chained journal let `ultracode resume <runId>` replay the longest unchanged, successful prefix of `agent()` calls for free, then run the rest live — even after a script edit (the first divergence ends the cached prefix).
 - **Live fleet panel** — foreground runs show it, and `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail (in `watch`, Ctrl-C detaches and never stops the run).
 - **Opt-in budgets and timeouts** — no default caps (unset = unlimited); `--budget 500k` is enforced at the dispatch gate — no new agent starts past the ceiling — and timeouts work the same way.
 - **Structured output that survives sloppy models** — give `agent()` a `JSON Schema` and it returns a validated object; non-conforming replies get up to two schema-repair retries before counting as a failure.
-- **MCP control plane** — the `workflow_start` / `workflow_status` / `workflow_result` triad drives the shared run store at `.ultracode/runs/`, and `workflow_start` hands back a `runId` in under a second, so sandboxed hosts orchestrate fire-and-forget across turns.
 
 ## Quick start
 
