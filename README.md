@@ -34,10 +34,10 @@ One agent, one context window, one linear transcript — that's the ceiling. `ul
 ### What the fleet buys you
 
 - **Divide and conquer** — typing the keyword `ultracode` arms a skill (doctrine) that has *your* agent break a big task into a workflow of small `agent()` calls, each a subprocess with its own fresh context.
-- **Fan out, bounded** — one task spreads across many sub-agents: dozens by default (soft cap `50`), up to a hard ceiling of `1000` per run, up to 10 at a time (`min(10, max(2, cores-2))`) — concurrency and the soft cap yours via `--max-concurrency` and `--max-agents`.
-- **Nothing floods your session** — only a sub-agent's final value (a structured object, or its last message) comes back; its full transcript — every tool call, file read, streamed token — stays in its run dir and never flows back.
+- **Fan out, bounded** — one task spreads across many sub-agents: up to `50` by default (the soft cap), a hard ceiling of `1000` per run, up to 10 at a time (`min(10, max(2, cores-2))`) — concurrency and the soft cap yours via `--max-concurrency` and `--max-agents`.
+- **Nothing floods your session** — only a sub-agent's final value (a structured object, or its last message) comes back; its transcript — every tool call, file read, streamed token — stays in its run dir and never flows back.
 - **Cross-check by construction** — `parallel()` and `pipeline()` are first-class, and the doctrine teaches quality patterns: adversarial verify (independent skeptics prompted to refute, majority kills a finding), judge panels, perspective-diverse review, loop-until-dry. The shipped `uc-review` workflow runs parallel finders → adversarial verification → synthesis.
-- **Kick it off, walk away** — each run is its own detached OS process (no daemon), so it keeps executing even if the launching CLI, the MCP server, or the host agent dies; watch, stop, or resume it from any shell.
+- **Kick it off, walk away** — each run is its own detached OS process (no daemon), so it keeps going after the launching CLI or MCP server exits; watch, stop, or resume it from any shell.
 - **Reusable assets, not one-shots** — workflows are plain deterministic JS: read them, rehearse them free with `--dry-run`, keep them in `.ultracode/workflows/`, and nest one inside another with `workflow()` (one level deep).
 
 ### The engine that runs it
