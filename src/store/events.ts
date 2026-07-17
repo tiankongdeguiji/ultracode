@@ -4,7 +4,7 @@
  * offset — the substrate for `status --watch`, `logs --follow`, and the MCP
  * long-poll cursor.
  */
-import { closeSync, existsSync, openSync, readSync, statSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, writeSync } from 'node:fs';
 
 export interface TimestampedEvent {
   ts: number;
@@ -33,6 +33,16 @@ export class EventWriter {
   }
 }
 
+/** Standard page size for tailing readers: bounds one read so a late attach to
+ *  a large backlog pages instead of allocating the whole remainder at once. */
+export const EVENT_PAGE_BYTES = 4 * 1024 * 1024;
+
+/** Ceiling on the newline-hunting window growth, as a multiple of the caller's
+ *  page size. A single unterminated line larger than this is not a torn tail —
+ *  it is a worker-written pathology, and re-allocating the growing remainder
+ *  on every tick to rescan it would be the exact DoS paging exists to stop. */
+const MAX_LINE_GROWTH_FACTOR = 4;
+
 export interface EventPage {
   events: TimestampedEvent[];
   nextOffset: number;
@@ -46,11 +56,21 @@ export interface EventPage {
  * backlog pages instead of allocating the whole remainder at once.
  */
 export function readEventsFrom(file: string, offset: number, maxBytes?: number): EventPage {
-  if (!existsSync(file)) return { events: [], nextOffset: offset };
-  const size = statSync(file).size;
-  if (size <= offset) return { events: [], nextOffset: offset };
-  const fd = openSync(file, 'r');
+  // The run dir is worker-writable: O_NOFOLLOW rejects a swapped-in symlink
+  // and O_NONBLOCK keeps a swapped-in FIFO from blocking the open(2) forever —
+  // a blocked reader loop cannot even service Ctrl-C (raw-mode input and JS
+  // signal handlers both need the event loop). fstat on the fd gates the rest.
+  let fd: number;
   try {
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch {
+    return { events: [], nextOffset: offset }; // absent (or refused) — nothing to read yet
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { events: [], nextOffset: offset };
+    const size = stat.size;
+    if (size <= offset) return { events: [], nextOffset: offset };
     let window = maxBytes !== undefined ? Math.min(size - offset, maxBytes) : size - offset;
     let text: string;
     for (;;) {
@@ -61,17 +81,38 @@ export function readEventsFrom(file: string, offset: number, maxBytes?: number):
       // (no newline → no offset progress): grow the window until a newline
       // lands or EOF — a genuinely torn tail then waits for the writer.
       if (text.lastIndexOf('\n') !== -1 || offset + window >= size) break;
+      if (maxBytes !== undefined && window >= maxBytes * MAX_LINE_GROWTH_FACTOR) {
+        // Skip past the over-long unterminated line in bounded steps instead
+        // of re-reading an ever-growing remainder. Resuming mid-line is fine:
+        // the fragment up to the next newline fails JSON.parse and is dropped
+        // by the torn-line skip below, exactly like any other garbage line.
+        return { events: [], nextOffset: offset + window, hasMore: offset + window < size };
+      }
       window = Math.min(size - offset, window * 2);
     }
     const lastNewline = text.lastIndexOf('\n');
-    if (lastNewline === -1) return { events: [], nextOffset: offset, hasMore: false };
+    if (lastNewline === -1) {
+      // Unterminated suffix at EOF. A small one is a torn tail — wait for the
+      // writer. One past the growth cap is the same pathology as above and no
+      // writer will ever finish it: discard to EOF, or the tail loop re-decodes
+      // up to the whole suffix on every tick forever.
+      if (maxBytes !== undefined && window >= maxBytes * MAX_LINE_GROWTH_FACTOR) {
+        return { events: [], nextOffset: offset + window, hasMore: offset + window < size };
+      }
+      return { events: [], nextOffset: offset, hasMore: false };
+    }
     const complete = text.slice(0, lastNewline);
     const consumed = Buffer.byteLength(complete, 'utf8') + 1;
     const events: TimestampedEvent[] = [];
     for (const line of complete.split('\n')) {
       if (!line.trim()) continue;
       try {
-        events.push(JSON.parse(line) as TimestampedEvent);
+        const parsed: unknown = JSON.parse(line);
+        // The envelope itself is untrusted: a valid `null` or `42` line would
+        // pass JSON.parse and crash every consumer that dereferences .type.
+        if (typeof parsed === 'object' && parsed !== null && typeof (parsed as { type?: unknown }).type === 'string') {
+          events.push(parsed as TimestampedEvent);
+        }
       } catch {
         /* torn line — skip */
       }

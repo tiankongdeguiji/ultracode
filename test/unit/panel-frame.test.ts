@@ -4,6 +4,7 @@ import {
   displayWidth,
   foldEvent,
   renderFrame,
+  selectableSeqs,
   spinnerFrame,
   type PanelState,
 } from '../../src/cli/panel.js';
@@ -185,6 +186,86 @@ describe('panel frame', () => {
     expect(childIdx).toBeGreaterThan(-1);
     expect(lines[childIdx + 1]).toContain('Scan (1/1)'); // named child phase, indented inside the group
     expect(lines[childIdx + 2]).toContain('✓ c-scan');
+  });
+
+  it('selectedSeq marks the row with ❯ (bold cyan in color mode) without shifting other lines', () => {
+    const base = renderFrame(richState(), FRAME_OPTS).split('\n');
+    const selected = renderFrame(richState(), { ...FRAME_OPTS, selectedSeq: 6 }).split('\n');
+    expect(selected).toHaveLength(base.length);
+    const idx = base.findIndex((l) => l.includes('review cli'));
+    expect(selected[idx]).toBe(base[idx]!.replace('⎿', '❯')); // marker only — spacing identical
+    for (let i = 0; i < base.length; i++) {
+      if (i !== idx) expect(selected[i]).toBe(base[i]);
+    }
+    const colored = renderFrame(richState(), { ...FRAME_OPTS, color: true, selectedSeq: 6 });
+    expect(colored).toContain('\x1b[36;1m❯\x1b[0m');
+    expect(colored).toContain('\x1b[1mreview cli'); // bold label
+  });
+
+  it('the selected row is exempt from collapse folding at every level', () => {
+    // Level 0: repo-mapper (seq 0) folds into "+1 done" by default…
+    const base = renderFrame(richState(), FRAME_OPTS);
+    expect(base).toContain('… +1 done');
+    expect(base).not.toContain('repo-mapper');
+    // …but stays visible while selected (and the fold notice disappears with it).
+    const withSel = renderFrame(richState(), { ...FRAME_OPTS, selectedSeq: 0 });
+    expect(withSel).toContain('❯ ✓ repo-mapper');
+    expect(withSel).not.toContain('… +1 done');
+    // Level 2 (small terminal): the fully-settled Explore phase collapses to
+    // its header unless the selection lives inside it.
+    const small = renderFrame(richState(), { ...FRAME_OPTS, rows: 16, selectedSeq: 0 });
+    expect(small).toContain('❯ ✓ repo-mapper');
+    expect(small.split('\n').length).toBeLessThanOrEqual(15);
+    const noSel = renderFrame(richState(), { ...FRAME_OPTS, rows: 16 });
+    expect(noSel).not.toContain('repo-mapper'); // without selection the phase folds to its header
+    // Last-resort hard truncation (terminal too small even after level 2):
+    // the selected line replaces a tail line rather than vanishing — an
+    // invisible ❯ would leave the arrows steering a row the user cannot see.
+    const truncated = renderFrame(richState(), { ...FRAME_OPTS, rows: 8, selectedSeq: 0 });
+    expect(truncated).toContain('lines hidden (terminal too small)');
+    expect(truncated).toContain('❯ ✓ repo-mapper');
+    expect(truncated.split('\n').length).toBeLessThanOrEqual(7);
+    // A label CONTAINING ❯ must not shadow the real selection (the marker is
+    // detected at the connector position, not by substring).
+    const withDecoy = richState();
+    foldEvent(withDecoy, ev('agent_completed', { seq: 20, label: 'decoy❯label', phase: 'Explore', ok: true, totalTokens: 1 }, 500));
+    const decoyFrame = renderFrame(withDecoy, { ...FRAME_OPTS, rows: 8, selectedSeq: 6 });
+    const marked = decoyFrame.split('\n').filter((l) => l.trimStart().startsWith('❯'));
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).toContain('review cli'); // seq 6 — the real selection survives
+  });
+
+  it('selection also survives the queued-overflow fold', () => {
+    const s = createPanelState({ runName: 'q', budgetTotal: null, startedAtMs: 0 });
+    foldEvent(s, ev('phase_started', { title: 'P' }));
+    for (let i = 0; i < 8; i++) foldEvent(s, ev('agent_queued', { seq: i, label: `q${i}`, phase: 'P' }, i));
+    const frame = renderFrame(s, { ...FRAME_OPTS, nowMs: 10_000, selectedSeq: 7 });
+    expect(frame).toContain('❯ ◌ q7');
+    expect(frame).toContain('… +2 queued'); // one fewer hidden — the selected row escaped the fold
+  });
+
+  it('selectableSeqs traverses in on-screen section order, not raw seq order', () => {
+    // Interleaved phases: Z owns seqs 0 and 2, A owns seq 1 — on screen the Z
+    // section renders first (its firstSeq is 0), so ↓ must visit 0, 2, then 1.
+    const s = createPanelState({ runName: 'o', budgetTotal: null, startedAtMs: 0 });
+    foldEvent(s, ev('agent_started', { seq: 0, label: 'z0', phase: 'Z', backend: 'mock' }, 1));
+    foldEvent(s, ev('agent_started', { seq: 1, label: 'a1', phase: 'A', backend: 'mock' }, 2));
+    foldEvent(s, ev('agent_started', { seq: 2, label: 'z2', phase: 'Z', backend: 'mock' }, 3));
+    expect(selectableSeqs(s)).toEqual([0, 2, 1]);
+    // And the rich fixture (phases + child + trailing phase) stays in render order.
+    expect(selectableSeqs(richState())).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+  });
+
+  it('keymap renders as the last line and counts toward the height budget', () => {
+    const keymap = '↑/↓ select · ⏎ details · q detach';
+    const frame = renderFrame(richState(), { ...FRAME_OPTS, keymap });
+    expect(frame.split('\n').at(-1)).toBe(keymap);
+    for (const rows of [4, 6, 12]) {
+      const lines = renderFrame(richState(), { ...FRAME_OPTS, rows, keymap }).split('\n');
+      expect(lines.length).toBeLessThanOrEqual(Math.max(1, rows - 1));
+    }
+    const colored = renderFrame(richState(), { ...FRAME_OPTS, color: true, keymap });
+    expect(colored).toContain(`\x1b[2m${keymap}\x1b[0m`);
   });
 
   it('hostile control bytes in events cannot reach the frame', () => {

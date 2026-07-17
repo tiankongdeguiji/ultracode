@@ -126,7 +126,9 @@ describe('MCP triad', () => {
     writeFileSync(
       join(dir, 'events.jsonl'),
       '{"ts":1,"type":"agent_usage","seq":0,"totalTokens":100,"estimated":false}\n' +
-        '{"ts":2,"type":"agent_usage","seq":0,"totalTokens":200,"estimated":false}\n',
+        '{"ts":2,"type":"agent_usage","seq":0,"totalTokens":200,"estimated":false}\n' +
+        '{"ts":3,"type":"agent_tool","seq":0,"name":"bash:ls","status":"started"}\n' +
+        '{"ts":4,"type":"agent_tool","seq":0,"name":"bash:ls","status":"completed"}\n',
     );
 
     const t0 = Date.now();

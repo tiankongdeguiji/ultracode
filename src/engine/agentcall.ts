@@ -69,7 +69,6 @@ export interface AgentCallOptions {
   permission?: AgentRequest['permission'];
   /** per-attempt hard timeout (default 20 minutes) */
   attemptTimeoutMs?: number;
-  onToolEvent?: (spec: AgentSpec, name: string, status: 'started' | 'completed' | 'failed' | 'declined') => void;
   /** min gap between live usage ticks per agent (0 = every change; for tests) */
   usageTickIntervalMs?: number;
 }
@@ -189,6 +188,8 @@ export class AgentCallExecutor implements AgentExecutor {
         if (ev.kind === 'session' && ev.model !== undefined && !modelSent) {
           modelSent = true;
           onProgress({ type: 'model', model: ev.model });
+        } else if (ev.kind === 'tool') {
+          onProgress({ type: 'tool', name: ev.name, status: ev.status });
         } else if (ev.kind === 'usage') {
           if (ev.interim && !accIsTerminal) {
             acc = {
@@ -460,7 +461,7 @@ export class AgentCallExecutor implements AgentExecutor {
           case 'tool':
             if (ev.status === 'started') toolCalls++;
             if (ev.status === 'declined') declinedActions++;
-            this.opts.onToolEvent?.(spec, ev.name, ev.status);
+            onStreamEvent?.(ev);
             break;
           default:
             break;

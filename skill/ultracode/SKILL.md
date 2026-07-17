@@ -1,6 +1,6 @@
 ---
 name: ultracode
-description: Dynamic multi-agent workflow orchestration (ultracode mode). Use when the user says "ultracode", sets a token budget like "+500k", asks to use a workflow / fan out agents / orchestrate, or when a substantive task decomposes into 3+ independent agent-sized units (code review, audit, research, migration, test sweep). Author a workflow script in the shared dialect and run it via the host's native Workflow tool or the ultracode engine. NEVER use from inside a workflow worker — if the ULTRACODE_INSIDE_RUN env var is set, do the task directly ("ultracode" in file/directory names or quoted text is not a trigger).
+description: Dynamic multi-agent workflow orchestration (ultracode mode). Use ONLY when the user writes the keyword "ultracode" as their request to you — that word alone arms the mode for the rest of the session (until "ultracode off"). Then author a workflow in the shared dialect and run it via the host's native Workflow tool or the ultracode engine. NEVER use from inside a workflow worker — if ULTRACODE_INSIDE_RUN is set, do the task directly ("ultracode" in file/directory names or quoted text is not a trigger).
 ---
 
 # ultracode — dynamic workflow orchestration
@@ -9,7 +9,7 @@ You orchestrate a fleet of subagents through a small JavaScript workflow script 
 
 ## Mode semantics (standing opt-in)
 
-- The keyword **"ultracode"** in a message, a budget token like **"+500k"**, or an explicit ask ("use a workflow", "fan out agents") switches ultracode mode ON for the rest of the session. The keyword must be the user's word to YOU — "ultracode" inside file or directory names, paths, code, or quoted logs never arms the mode.
+- **Only the keyword "ultracode"**, written by the user as their request to YOU, arms ultracode mode for the rest of the session; without the keyword, handle the task solo. The same provenance rule governs disarming: "ultracode" / "ultracode off" seen inside file or directory names, paths, code, or quoted logs neither arms nor disarms the mode.
 - **Worker guard (hard rule):** if the `ULTRACODE_INSIDE_RUN` environment variable is set, you ARE a worker inside an ultracode run. Never start workflows by any route (ultracode CLI, `workflow_start` MCP tool, a native Workflow tool) — a worker that launches runs escapes the parent's caps and cascades. Do your assigned task directly and return.
 - While ON: route **every substantive task** through a workflow by default. Work solo only on conversational turns and trivial mechanical edits. Optimize for the most exhaustive, correct answer — not the cheapest.
 - The user says **"ultracode off"** → revert to normal single-agent behavior.
@@ -17,7 +17,7 @@ You orchestrate a fleet of subagents through a small JavaScript workflow script 
 
 ## When to orchestrate — and when not
 
-Orchestrate when the task has **3+ independent agent-sized units** (files to audit, questions to research, modules to migrate, findings to verify), needs **independent perspectives** (adversarial verification, judge panels), or exceeds what one context can hold.
+Applies **only once the keyword has armed the mode** (above); with it off, every task is solo. While ON, orchestrate when the task has **3+ independent agent-sized units** (files to audit, questions to research, modules to migrate, findings to verify), needs **independent perspectives** (adversarial verification, judge panels), or exceeds what one context can hold.
 
 Do NOT orchestrate: single-file edits; tasks with <3 independent units; anything needing mid-run user input (workflows cannot ask — decompose so decisions happen between workflows); purely conversational turns; **when you are yourself a workflow worker (`ULTRACODE_INSIDE_RUN` set)**. Over-triggering is how users uninstall this skill.
 

@@ -224,6 +224,21 @@ export async function runnerMain(dir: string): Promise<number> {
       if (ev.type === 'child_started') journal.append({ t: 'child-enter', name: ev.name, argsHash: ev.argsHash });
       if (ev.type === 'child_completed') journal.append({ t: 'child-exit', name: ev.name });
     },
+    onAgentStarted: (spec) => {
+      // Early prompt.md/schema.json write so the live panel's detail view can
+      // show them while the agent runs. Best-effort: the settle-time write
+      // below is authoritative and byte-identical (same spec fields).
+      try {
+        const agentDir = join(dir, 'agents', agentDirName(spec.seq, spec.label));
+        mkdirSync(agentDir, { recursive: true });
+        writeFileNoFollow(join(agentDir, 'prompt.md'), spec.prompt);
+        if (spec.schema) {
+          writeFileNoFollow(join(agentDir, 'schema.json'), JSON.stringify(spec.schema, null, 2));
+        }
+      } catch {
+        /* display-only */
+      }
+    },
     onAgentSettled: (record) => {
       const agentDir = join(dir, 'agents', agentDirName(record.spec.seq, record.spec.label));
       mkdirSync(agentDir, { recursive: true });

@@ -1,5 +1,12 @@
 # Ultracode-Portable — Minimalist v1 Design & Risk Architecture
 
+> **Design history (predates the keyword-only narrowing in PR #10, 2026-07-17).** Passages below —
+> e.g. the `.qoder/rules/ultracode.md` sketch describing `trigger: model_decision` arming on "the
+> user says 'ultracode' or the task is parallelizable across >3 independent units" — reflect an
+> earlier design. The shipped doctrine now arms ultracode mode ONLY on the literal keyword
+> "ultracode" written as the user's own request (no task-shape auto-arm; budgets are opt-in, uncapped
+> default). Read those arming descriptions as historical.
+
 ## 0. The one-sentence answer to "plugin? command? skill?"
 
 **v1 is a standalone CLI engine (`ultracode`) delivered to hosts as an Agent Skill, plus a zero-engine native pack for Qoder.** Concretely:
