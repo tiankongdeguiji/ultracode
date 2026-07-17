@@ -44,10 +44,11 @@ ultracode doctor                  # which backends are available + auth modes
 
 ### Use with your coding agent
 
-The intended daily path — install the skill and MCP registration into the host:
+The intended daily path — install the skill and the host wiring:
 
 ```bash
 ultracode install codex           # skill + AGENTS.md trigger + MCP registration
+                                  # other hosts: `install qoder` · `install generic`
 ```
 
 Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
@@ -56,14 +57,14 @@ Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
 "ultracode: review this repo for auth bugs +500k"
 ```
 
-The word arms the mode: your agent authors a workflow, starts it over MCP (`workflow_start`), and collects the result across turns (`workflow_status` / `workflow_result`). `+500k` is an optional budget — omit it to run uncapped. Follow the fleet from any shell (the runId is in the agent's reply, or `ultracode list`):
+The word arms the mode: your agent authors a workflow and drives it over MCP (`workflow_start` → `workflow_status` → `workflow_result`); on Qoder it uses the native Workflow tool instead. `workflow_start` has no confirmation gate — ask the agent to show the workflow before running it (`docs/threat-model.md`). `+500k` is an optional budget — omit it to run uncapped. Follow engine runs from any shell (the runId is in the agent's reply, or `ultracode list`):
 
 ```bash
 ultracode watch <runId>
 ```
 
 ```text
-⏺ audit-routes   running · 6m05s
+⏺ uc-audit-routes   running · 6m05s
   ⏺ Find (1/1)
     ⎿ ✓ #1                       12.4k tok · 18s · model-name
   ⠧ Audit (12/14)
@@ -82,7 +83,7 @@ agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 The skill normally does this for you; the same surface is there for authoring and debugging workflows by hand. A workflow is a small deterministic JS script:
 
 ```js
-export const meta = { name: 'audit-routes', description: 'Audit route handlers for missing auth', phases: [{ title: 'Find' }, { title: 'Audit' }] }
+export const meta = { name: 'uc-audit-routes', description: 'Audit route handlers for missing auth', phases: [{ title: 'Find' }, { title: 'Audit' }] }
 
 phase('Find')
 const { files } = await agent('List every route file under src/. Return JSON.', {

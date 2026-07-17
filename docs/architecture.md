@@ -8,7 +8,7 @@ Current-state description of the shipped v0.1.x layering; the rationale and desi
 |---|---|---|
 | **Doctrine** | An Agent Skill (`skill/ultracode/`) | The only cross-host surface with implicit model-triggered invocation and progressive disclosure. Teaches the model *when* to orchestrate, the workflow dialect, and the quality patterns (adversarial verify, judge panel, loop-until-dry, completeness critic). |
 | **Engine** | This npm package: CLI (`ultracode run/...`) + MCP server (`ultracode mcp`) | A skill can't host a process. A single blocking MCP call dies at every host's 300–600s tool timeout, so the MCP surface is a `workflow_start` / `workflow_status` (long-poll) / `workflow_result` triad (plus `workflow_stop` / `workflow_list`) over a durable on-disk run store. |
-| **Delivery** | Plugin where plugins exist (Codex, Qoder); `ultracode install <host>` everywhere else | Plugins bundle the skill + MCP registration + templates in one install. |
+| **Delivery** | Plugin where plugins exist (Codex, Qoder); `ultracode install <host>` everywhere else | Bundles carry the doctrine (Codex: skill only; Qoder adds the `uc-*` templates + agent defs); the installer writes the host wiring — the AGENTS.md trigger snippet and, for codex user scope, MCP registration. |
 | **Command** | Emergent — skills auto-register as `$ultracode` / `/ultracode` | No separate command artifact needed. |
 
 On **Qoder**, the native Workflow tool ships the same engine already — the pack rides it (skill + rule + `uc-*` templates) instead of replacing it.
