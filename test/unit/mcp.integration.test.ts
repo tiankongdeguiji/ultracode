@@ -207,6 +207,16 @@ describe('MCP triad', () => {
     };
     expect(capped.structuredContent!.runs).toHaveLength(2);
     expect(capped.structuredContent!.hidden).toBe(10);
+
+    // count's zod guard (z.number().int().positive()) must reject non-positive input.
+    let rejected = false;
+    try {
+      const bad = (await client.callTool({ name: 'workflow_list', arguments: { cwd: isolated, count: 0 } })) as { isError?: boolean };
+      rejected = bad.isError === true;
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
   }, 20_000);
 
   it('refuses workflow_start and workflow_stop from inside a run (recursion / confused-deputy guard)', async () => {

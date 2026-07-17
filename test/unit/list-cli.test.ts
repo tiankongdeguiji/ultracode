@@ -85,6 +85,33 @@ describe('list CLI', () => {
     expect(JSON.parse(out.chunks.join(''))).toHaveLength(10);
   });
 
+  it('--all --count caps and the footer omits the redundant --all hint', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < 12; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    const out = capture('stdout');
+    const code = listCommand({ home: root, all: true, count: '2' });
+    out.restore();
+    expect(code).toBe(0);
+    const lines = out.chunks.join('').trimEnd().split('\n');
+    expect(lines).toHaveLength(3); // 2 runs + footer
+    expect(lines[2]).toBe('… and 10 more (use --count <n>)'); // no redundant "or --all"
+  });
+
+  it('--json honors --all (full set) and --count (capped)', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < 12; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    const all = capture('stdout');
+    listCommand({ home: root, json: true, all: true });
+    all.restore();
+    expect(JSON.parse(all.chunks.join(''))).toHaveLength(12);
+    const capped = capture('stdout');
+    listCommand({ home: root, json: true, count: '4' });
+    capped.restore();
+    expect(JSON.parse(capped.chunks.join(''))).toHaveLength(4);
+  });
+
   it('--all shows every run with no footer', () => {
     const root = tmpRoot();
     const base = Date.now();

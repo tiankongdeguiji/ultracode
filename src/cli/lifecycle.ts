@@ -194,7 +194,11 @@ export function listCommand(opts: { all?: boolean; reap?: boolean; json?: boolea
       ) + '\n',
     );
   }
-  if (hidden > 0) process.stdout.write(`… and ${hidden} more (use --count <n> or --all)\n`);
+  if (hidden > 0) {
+    // Under --all the recency filter is already off, so only raising --count reveals more.
+    const more = opts.all ? '--count <n>' : '--count <n> or --all';
+    process.stdout.write(`… and ${hidden} more (use ${more})\n`);
+  }
   return 0;
 }
 
