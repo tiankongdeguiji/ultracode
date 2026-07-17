@@ -2,6 +2,6 @@
   "name": "ultracode",
   "description": "Dynamic multi-agent workflow orchestration (ultracode) for Codex: skill + MCP workflow engine",
   "author": "ultracode",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "keywords": ["workflow", "orchestration", "multi-agent", "ultracode", "subagents"]
 }

@@ -1,72 +1,136 @@
 # ultracode
 
-Portable **ultracode** — dynamic multi-agent workflow orchestration — for coding agents that don't ship it natively: OpenAI Codex CLI, Qoder, Gemini CLI, and friends. Faithful to the Claude Code Workflow dialect, so the same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine.
+[![ci](https://github.com/tiankongdeguiji/ultracode/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tiankongdeguiji/ultracode/actions/workflows/ci.yml)
+[![license](https://img.shields.io/github/license/tiankongdeguiji/ultracode)](LICENSE)
+[![stars](https://img.shields.io/github/stars/tiankongdeguiji/ultracode)](https://github.com/tiankongdeguiji/ultracode/stargazers)
 
-## Plugin, command, or skill? All three — layered
+**Say the word, get a fleet.** Portable **ultracode** — dynamic multi-agent workflow orchestration — for coding agents that don't ship it natively: OpenAI Codex CLI, Qoder, Gemini CLI, and friends. Faithful to the Claude Code Workflow dialect, so the same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine.
 
-| Layer | Artifact | Why |
-|---|---|---|
-| **Doctrine** | An Agent Skill (`skill/ultracode/`) | The only cross-host surface with implicit model-triggered invocation and progressive disclosure. Teaches the model *when* to orchestrate, the workflow dialect, and the quality patterns (adversarial verify, judge panel, loop-until-dry, completeness critic). |
-| **Engine** | This npm package: CLI (`ultracode run/...`) + MCP server (`ultracode mcp`) | A skill can't host a process. A single blocking MCP call dies at every host's 300–600s tool timeout, so the MCP surface is a `workflow_start` / `workflow_status` (long-poll) / `workflow_result` triad over a durable on-disk run store. |
-| **Delivery** | Plugin where plugins exist (Codex, Qoder); `ultracode install <host>` everywhere else | Plugins bundle the skill + MCP registration + templates in one install. |
-| **Command** | Emergent — skills auto-register as `$ultracode` / `/ultracode` | No separate command artifact needed. |
+*Linux & macOS · not on npm yet — build from source.*
 
-On **Qoder**, the native Workflow tool ships the same engine already — the pack rides it (skill + rule + `uc-*` templates) instead of replacing it.
+Type the keyword `ultracode` in your coding agent and it stops doing everything in one context: the **skill** (doctrine) teaches it to author a small deterministic JS workflow — `agent()` calls are the only side effects — and hand it to the **engine** (this npm package: CLI + MCP server), which fans each `agent()` out as a real coding-agent subprocess. **Delivery** is a plugin where plugins exist and `ultracode install <host>` everywhere else; on Qoder the pack rides the native Workflow tool instead of replacing it. Watch the fleet live, stop it, resume it, get one structured result back. Full layering: `docs/architecture.md`.
 
-## The dialect (shared with Claude Code and Qoder)
-
-```js
-export const meta = { name: 'audit-routes', description: 'Audit route handlers', phases: [{ title: 'Find' }, { title: 'Audit' }] }
-phase('Find')
-const found = await agent('List every route file.', { schema: { type: 'object', properties: { files: { type: 'array', items: { type: 'string' } } }, required: ['files'], additionalProperties: false } })
-phase('Audit')
-const audits = await pipeline(found.files, f => agent(`Audit ${f} for missing auth checks.`, { label: f }))
-return { audits: audits.filter(Boolean) }
+```text
+"ultracode: audit src/ for auth bugs"      <- the keyword arms the skill
+    |
+    v
+your agent authors audit.workflow.js      <- deterministic JS; agent() is
+    |                                         the only side-effect channel
+    v   ultracode run ...   or   MCP workflow_start
+ultracode engine: sandboxed script + scheduler + journal
+    |
+    +--> codex worker   +--> claude worker   +--> gemini worker   ...
+    |        real coding-agent subprocesses, fanned out concurrently
+    v
+.ultracode/runs/<id>/ --> watch | status | logs | stop | resume
 ```
 
-`agent()`, `parallel()` (barrier, throw→null), `pipeline()` (no inter-stage barrier), `phase()`, `log()`, `args`, `budget`, one-level `workflow()` nesting. Deterministic by construction: `Date.now()` / `Math.random()` / no-arg `new Date()` throw, enabling hash-chained journal resume (`ultracode resume <runId>`).
+## Why ultracode
 
-## Threat model (blunt version)
-
-Workflow scripts are **trusted input** — model-authored and user-reviewed before running (`ultracode run` prints the plan and asks; `--dry-run` rehearses on a mock backend). The `node:vm` sandbox — frozen intrinsics, banned entropy, no fs/net/shell/require, host globals re-wrapped so `.constructor` can't directly reach the host `Function` — is a capability-scoping and determinism device, **not** a hostile-code boundary. Values the host hands back (Promises, timer handles, JSON-parsed results) still expose host-realm constructors, and node:vm cannot preempt a synchronous loop that runs after an `await` (a hung run is killed externally via `ultracode stop`, which SIGKILLs the runner). A genuinely malicious script can therefore escape or hang the runner; true isolation would need a separate OS process (future work). Note `workflow_start` over MCP runs scripts with **no interactive gate**, so only feed it scripts you authored/reviewed. The only sanctioned side-effect channel is `agent()`, and every agent is a subprocess governed by the host CLI's own sandbox. Spawned workers default to `workspace-write` and the engine never passes `--yolo` / `danger-full-access` **below the `danger` tier** — `--permission danger` deliberately removes the worker sandbox (Codex `danger-full-access`, Gemini `--yolo`, Claude/Qoder bypass modes). Do not run workflow scripts you haven't read.
-
-Fan-out concurrency is user-controlled: the default is `min(10, max(2, cores - 2))`, the `ULTRACODE_MAX_CONCURRENCY` env var overrides the default, and an explicit `--max-concurrency` (CLI) or `maxConcurrency` (MCP `workflow_start`) wins over both. The engine never adjusts concurrency based on backend auth; `ultracode doctor` reports each backend's auth mode. The chosen value is stored in the run's config at creation, so a resume inherits it unless overridden explicitly (`resume --max-concurrency` or MCP `maxConcurrency`). Codex: `CODEX_API_KEY` is the parallel-safe auth (ChatGPT-plan OAuth shares one rotating refresh token across workers). Qoder: `QODER_PERSONAL_ACCESS_TOKEN` is stateless and parallel-safe.
-
-Worker-writable run store: the run store (`.ultracode/runs/**`) lives inside the workspace, so a prompt-injected agent that processes hostile repo content runs as the same user and *can* write there. Artifact writes are `O_NOFOLLOW` (no symlink redirect), other backends' credentials are scrubbed from each worker's env, and forced-stop kill targets are bound to the recorded process's kernel start-time (Linux) so a recycled/forged PID isn't signaled. These raise the bar but are **not** a boundary against a same-user attacker: PID start-times are public and unavailable off Linux (best-effort there), and **`resume` re-executes `script.js`/`config.json` from that worker-writable dir with no review gate** — so a poisoned prior run can influence a later resume (including its `permission`). Treat resuming an untrusted run as running its inputs. Two known replay caveats: a `pipeline()` whose later-stage dispatch order depends on completion timing can lose its cache prefix on resume, and fallback token estimates (no-usage backends) are approximate. Full isolation (control-plane outside the workspace, a separate-process sandbox, authenticated signaling) is future work.
+- **One dialect, three engines** — the same script text runs on Claude Code (native), Qoder (native), and this engine; `ultracode lint` checks it stays in the portable subset.
+- **Real agents, not simulations** — on the four real backends (codex, qoder, claude, gemini) every `agent()` is a coding-agent subprocess; the fifth, mock, is an in-process test double that powers `--dry-run` rehearsals for zero tokens.
+- **Journal-based resume** — deterministic scripts + a hash-chained journal mean `ultracode resume <runId>` replays the longest unchanged, successful prefix of `agent()` calls free and runs the rest live — including after a script edit (the first divergence ends the cached prefix).
+- **Live fleet panel** — foreground runs show it; `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail. In `watch`, Ctrl-C detaches and never stops the run (in an attached foreground run it stops the fleet).
+- **Opt-in budgets and timeouts** — no default caps. Pass `--budget 500k` and the engine enforces it at the dispatch gate: no new agent starts past the ceiling. Timeouts are the same deal — unlimited unless you set one.
+- **Structured output that survives sloppy models** — give `agent()` a JSON Schema and it returns a validated object; non-conforming replies get up to two schema-repair round-trips before counting as a failure.
+- **Detached, durable runs** — the runner outlives your session; state lives in `.ultracode/runs/`. Over MCP, the `workflow_start` / `workflow_status` / `workflow_result` triad drives the same run store, so sandboxed hosts orchestrate fire-and-forget across turns.
 
 ## Quick start
 
 ```bash
-npm install && npm run build      # or: npm link  for a global `ultracode`
+npm install && npm run build && npm link   # build, then link a global `ultracode`
 ultracode doctor                  # which backends are available + auth modes
-ultracode install codex           # skill + AGENTS.md trigger + MCP registration
-# then in Codex:  "ultracode: review this repo for auth bugs +500k"
+```
 
-# or drive it directly:
+### Use with your coding agent
+
+The intended daily path — install the skill and the host wiring:
+
+```bash
+ultracode install codex           # skill + AGENTS.md trigger + MCP registration
+                                  # other hosts: `install qoder` · `install generic`
+```
+
+Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
+
+```text
+"ultracode: review this repo for auth bugs +500k"
+```
+
+The word arms the mode: your agent authors a workflow and runs it — Qoder and Claude Code natively via their Workflow tools; Codex over MCP (`workflow_start` → `workflow_status` → `workflow_result`, wired by `install codex`); hosts without MCP registration (`install generic` copies only the skill + trigger) fall back to driving the `ultracode` CLI, or register `ultracode mcp` with the host yourself. `workflow_start` has no confirmation gate — ask the agent to show the workflow before running it (`docs/threat-model.md`). `+500k` is an optional budget — omit it to run uncapped. Follow engine runs from any shell (the runId is in the agent's reply, or `ultracode list`):
+
+```bash
+ultracode watch <runId>
+```
+
+```text
+⏺ uc-audit-routes   running · 6m05s
+  ⏺ Find (1/1)
+    ⎿ ✓ #1                       12.4k tok · 18s · model-name
+  ⠧ Audit (12/14)
+    ⎿ … +9 done (1.37m tok)
+    ⎿ ✓ src/routes/billing.ts    148.7k tok · 3m02s · model-name
+    ⎿ ✓ src/routes/webhooks.ts   132.1k tok · 2m48s · model-name
+    ⎿ ✓ src/routes/uploads.ts    121.9k tok · 2m35s · model-name
+    ⎿ ⠧ src/routes/auth.ts       96.3k tok · 2m41s · model-name
+    ⎿ ⠧ src/routes/admin.ts      88.9k tok · 2m37s · model-name
+agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
+↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
+```
+
+### Driving the engine directly
+
+The skill normally does this for you; the same surface is there for authoring and debugging workflows by hand. A workflow is a small deterministic JS script:
+
+```js
+export const meta = { name: 'uc-audit-routes', description: 'Audit route handlers for missing auth', phases: [{ title: 'Find' }, { title: 'Audit' }] }
+
+phase('Find')
+const { files } = await agent('List every route file under src/. Return JSON.', {
+  schema: { type: 'object', properties: { files: { type: 'array', items: { type: 'string' } } }, required: ['files'] },
+})
+
+phase('Audit')
+const audits = await pipeline(files, (f) => agent(`Audit ${f} for missing auth checks. Be self-contained.`, { label: f }))
+return { audits: audits.filter(Boolean) }
+```
+
+That's most of the surface — the rest is `parallel()`, `log()`, `args`, `budget`, and one level of `workflow()` nesting. Entropy is banned (`Date.now()` / `Math.random()` throw), so every run can replay — full dialect reference in `skill/ultracode/references/dialect.md`.
+
+```bash
 ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
-ultracode run my.workflow.js --backend codex --budget 500k
-                                                # ^ foreground run already shows the live panel;
-                                                #   `watch` re-attaches from another shell (or after --detach)
-ultracode watch <runId>                         # live panel: ↑/↓ select an agent, ⏎ opens its
-                                                # prompt/activity/outcome detail, esc back/clear, q detach
-ultracode resume <runId> [--script edited.js]   # completed agents replay free
+ultracode run my.workflow.js --backend codex    # foreground live panel; --detach to background
+ultracode resume <runId> [--script edited.js]   # unchanged journal prefix replays free
 ```
 
 ## Commands
 
-`run` · `watch` · `status` · `logs` · `stop` · `list` · `resume` · `validate` · `lint` · `doctor` · `mode` · `install <codex|qoder|generic>` · `sync` · `mcp`
+| | Command | What it does |
+|---|---|---|
+| author | `validate <script>` | check the meta block, dialect constraints, and compilability |
+| | `lint <script>` | cross-engine portability check (Claude Code / Qoder native / ultracode) |
+| run | `run <script>` | run a workflow: live panel in the foreground, `--detach` to background, `--dry-run` for a free mock rehearsal |
+| | `resume <runId>` | the unchanged, successful journal prefix replays free (also with `--script edited.js`); the rest runs live |
+| | `stop <runId>` | stop a running workflow (SIGTERM → 7s → SIGKILL) |
+| observe | `watch <runId>` | live panel: phases, per-agent tokens/elapsed; ↑/↓ select an agent, ⏎ opens its detail, q detaches |
+| | `status <runId>` | show run status: phases, agents, budget (`--watch` polls until terminal) |
+| | `logs <runId>` | print run events (`--follow` tails) |
+| | `list` | recent runs in the run store (`--all` for every run) |
+| integrate | `install <codex\|qoder\|generic>` | skill + host trigger (AGENTS.md snippet / Qoder rule); codex user-scope also registers the MCP server |
+| | `doctor` | probe backends: availability, versions, auth topology |
+| | `mode [on\|off]` | read or set the standing ultracode-mode marker (`.ultracode/mode`) |
+| | `sync` | mirror canonical `.ultracode/workflows` into `.claude/` and `.qoder/` copies |
+| | `mcp` | stdio MCP server: `workflow_start` / `workflow_status` / `workflow_result` (+ stop/list) |
 
-## What's proven
+## Docs
 
-End-to-end on real backends: the `uc-review` workflow (3 dimension finders → per-finding adversarial verification → synthesis) run on **Codex** against `examples/sample-repo` found both planted auth bugs — with constructed exploit inputs as evidence — plus a real unplanted one (`examples/parity-demo-output.json`, 12 agents). A typed-schema workflow verified on **Claude**. Codex drove the full `workflow_start → status → result` MCP loop. 200+ offline tests (mock backend + golden fixtures) cover the dialect contract, sandbox bans, journal determinism, resume, structured-output, safety rails, all five adapters, worktree isolation, nested workflows, and the exec-layer hardening (O_NOFOLLOW writers, pgid kill-guard, resume path confinement).
-
-## Design & research
-
-- `docs/design/judge.md` — the synthesized architecture + milestone plan (3 architects + judge).
-- The design is grounded in source-level research: the Claude Code ultracode mechanism, Codex/Qoder CLI internals (Qoder's native Workflow tool decompiled), MCP long-running-tool constraints across hosts, parallel-safety analysis, a cross-host survey, and JS-sandbox tradeoffs.
+- `docs/architecture.md` — why skill + engine + plugin are layered, the Qoder native-engine strategy, v1 scope, and what's proven end-to-end.
+- `docs/threat-model.md` — trust model, sandbox honesty, concurrency & auth, the worker-writable run store.
+- `skill/ultracode/references/dialect.md` — the full workflow dialect reference; `portability.md` beside it covers the cross-engine subset.
+- `docs/design/judge.md` — design history: the synthesized architecture + milestone plan (3 architects + judge), grounded in source-level research (the Claude Code ultracode mechanism, Codex/Qoder CLI internals, MCP long-running-tool constraints, JS-sandbox tradeoffs).
 - `SUPPORTED_VERSIONS.md` — pinned CLI versions, platform notes, live-test gate.
 
-## v1 scope
+## Status
 
-In: engine (sandbox, dialect, journal/resume, budget, watchdogs), 5 backends (mock/codex/qoder/claude/gemini), CLI, MCP triad, codex+qoder+generic installers, worktree isolation, one-level nested workflows. Deferred: Windows, cursor/copilot/opencode/amp adapters, npm publish + marketplace repos (internal-first), MCP Tasks (unsupported by target hosts).
+Internal-first: not published to npm. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.
