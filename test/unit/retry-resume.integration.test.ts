@@ -254,6 +254,19 @@ describe('task-retry resume', () => {
     expect(adapter.spawnCalls).toBe(2);
   });
 
+  it('schema repair never resumes a flag-shaped session id (fresh repair spawn instead)', async () => {
+    const adapter = new ScriptedAdapter([
+      // clean exit but invalid structured output, with a forged session id
+      { lines: [{ session: '--evil' }, { text: 'not json' }, { done: true }], exit: 0 },
+      { lines: [{ text: '{"a":1}' }, { done: true }], exit: 0 }, // fresh repair attempt
+    ]);
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ schema: { type: 'object' } }), SIGNAL);
+    expect(outcome.ok).toBe(true);
+    expect((outcome as { value?: unknown }).value).toEqual({ a: 1 });
+    expect(adapter.resumeCalls).toHaveLength(0); // '--evil' must never reach buildResume
+    expect(adapter.spawnCalls).toBe(2);
+  });
+
   it('non-cumulative usage (claude/qoder-style) sums across a resumed retry on the same session', async () => {
     const adapter = new ScriptedAdapter([
       { lines: [{ session: 's1' }, { usage: { inputTokens: 100, outputTokens: 10 } }], exit: 1 },

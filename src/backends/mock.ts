@@ -13,6 +13,7 @@
  *   anything else              → succeed with "mock response: <prompt head>"
  */
 import { setTimeout as sleep } from 'node:timers/promises';
+import { chainedTimeout } from '../exec/timers.js';
 import { validateWithSchema } from '../engine/ajv.js';
 import type { AgentExecutor, AgentOutcome, AgentProgress, AgentSpec, NormalizedUsage } from './types.js';
 
@@ -144,24 +145,40 @@ export class MockExecutor implements AgentExecutor {
 
   /** Same per-attempt timeout semantics as the real executor (per-call
    *  spec.timeoutMs wins over the run-level default) so dry-run rehearsals
-   *  stay faithful to the documented hard cap. */
+   *  stay faithful to the documented hard cap — including oversized caps:
+   *  chainedTimeout, not a raw sleep, which would overflow-fire at ~1ms.
+   *  The attempt runs on a per-call controller so the race loser is
+   *  cancelled either way (no ref'd stray delays, no listener build-up on
+   *  the shared run signal). */
   private async attemptWithTimeout(
     spec: AgentSpec,
     signal: AbortSignal,
   ): Promise<{ ok: boolean; value?: unknown; error?: string; errorKind?: AgentOutcome['errorKind'] }> {
     const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
     if (timeoutMs === undefined) return this.attempt(spec, signal);
-    const TIMEOUT = Symbol('timeout');
-    const winner = await Promise.race([
-      this.attempt(spec, signal),
-      sleep(timeoutMs, TIMEOUT as unknown, { signal, ref: false }).catch(() => TIMEOUT as unknown),
-    ]);
-    if (winner === TIMEOUT) {
-      return signal.aborted
-        ? { ok: false, error: 'aborted', errorKind: 'interrupted' }
-        : { ok: false, error: `attempt timed out after ${timeoutMs}ms`, errorKind: 'stalled' };
+    const inner = new AbortController();
+    const onAbort = (): void => inner.abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    let timer: { clear(): void } | undefined;
+    try {
+      const TIMEOUT = Symbol('timeout');
+      const winner = await Promise.race([
+        this.attempt(spec, inner.signal),
+        new Promise<symbol>((resolve) => {
+          timer = chainedTimeout(timeoutMs, () => resolve(TIMEOUT));
+        }),
+      ]);
+      if (winner === TIMEOUT) {
+        return signal.aborted
+          ? { ok: false, error: 'aborted', errorKind: 'interrupted' }
+          : { ok: false, error: `attempt timed out after ${timeoutMs}ms`, errorKind: 'stalled' };
+      }
+      return winner as { ok: boolean; value?: unknown; error?: string };
+    } finally {
+      timer?.clear();
+      signal.removeEventListener('abort', onAbort);
+      inner.abort();
     }
-    return winner as { ok: boolean; value?: unknown; error?: string };
   }
 
   private async attempt(

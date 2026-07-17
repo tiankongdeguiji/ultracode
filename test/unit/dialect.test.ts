@@ -64,6 +64,10 @@ describe('agent()', () => {
       executor: new MockExecutor({ attemptTimeoutMs: 150 }),
     });
     expect(runLevel.output.error).toContain('attempt timed out after 150ms');
+    // oversized caps are honored on the mock too (chainedTimeout, no
+    // sleep-overflow insta-fire) — parity with the real executor
+    const oversized = await run(`return agent('MOCK:ok fine', { timeoutMs: 2147483648 })`);
+    expect(oversized.output.result).toBe('fine');
   });
 
   it('junk timeoutMs is dropped at intake (0 must not insta-kill; strings must not NaN the deadline)', async () => {
