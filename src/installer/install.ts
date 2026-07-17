@@ -124,7 +124,11 @@ export function codexMcpToml(command: string[], schemaNote = ''): string {
     `args = ${JSON.stringify(args)}`,
     'tool_timeout_sec = 3600',
     // Without pre-approval, headless codex exec auto-rejects every MCP call
-    // ("user cancelled MCP tool call") — live-verified on 0.142.4.
+    // ("user cancelled MCP tool call") — live-verified on 0.142.4. This
+    // pre-approves workflow_start too: a deliberate, documented tradeoff
+    // (docs/threat-model.md; README tells users to ask the agent to show a
+    // workflow before running it) — per-tool gating would break every
+    // headless codex flow.
     'default_tools_approval_mode = "approve"',
     TOML_MARKER_END,
   ]

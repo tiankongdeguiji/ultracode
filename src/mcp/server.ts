@@ -170,7 +170,7 @@ export function createServer(baseCwd: string): McpServer {
     {
       description:
         'Run status long-poll. until="terminal" is the quiet monitor: wakes only when the run ends ' +
-        'or after waitSeconds (re-issue the same call), rolling the last 40 log lines into each ' +
+        'or after waitSeconds (re-issue the same call), rolling up to the last 40 log lines into each ' +
         'response; until="phase" additionally wakes at phase boundaries (boundaries crossed in one ' +
         'read batch into a single wake — each appears in logTail) — the sanctioned channel ' +
         'for milestone updates. Between wakes park silently: failures, crashes, and a stale runner ' +
@@ -213,16 +213,46 @@ export function createServer(baseCwd: string): McpServer {
       // through this tail — though the tail is lossy at TAIL_LINES, and the
       // full log always lives in the run store / workflow_result.
       const tail: string[] = [];
+      let lateJumps = 0;
+      // Single response builder shared by the pre-IO hard exit and the wake
+      // gate so every return path carries the identical contract.
+      const respond = (run: NonNullable<ReturnType<typeof getRun>>, terminal: boolean, stale: boolean) =>
+        ok({
+          runId: input.runId,
+          status: run.effectiveStatus,
+          phases: run.manifest.phases,
+          agentCount: run.manifest.agentCount,
+          budget: run.manifest.budget,
+          logTail: tail,
+          nextEventOffset: offset,
+          terminal,
+          ...(stale ? { stale: true } : {}),
+          ...(terminal
+            ? { next: `call workflow_result with runId=${input.runId}` }
+            : stale
+              ? { next: `runner heartbeat is stale (>${HEARTBEAT_STALE_MS / 1000}s) — the run may be wedged; diagnose (ultracode status/logs) or workflow_stop instead of re-parking` }
+              : quiet
+                ? {
+                    next: `re-issue this hold with sinceEventOffset: ${offset} and park silently — failures wake this monitor; filler updates, refresh polls, and run-store tailing waste turns`,
+                    ...(wait < SHORT_HOLD_NUDGE_MS
+                      ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (3300 where `ultracode install codex` pinned 3600)' }
+                      : {}),
+                  }
+                : {}),
+        });
 
       try {
         for (;;) {
           const run = getRun(root, input.runId);
           if (!run) return fail(`no run ${input.runId} under ${root}`);
-          // Hoisted exit test: every path below (including the jump/drain
-          // continues) must stay bounded by the deadline, client aborts, and
-          // admission-cap preemption — a worker appending ≥4 MiB per parse
-          // could otherwise re-fire the jump forever on its own log.
-          const bail = Date.now() >= deadline || extra.signal.aborted || hold.preempted;
+          // Hard exits short-circuit before any I/O: an aborted or preempted
+          // hold must not parse another page (up to 16 MiB for an oversized
+          // line) on its way out. The deadline is softer — it must not skip
+          // terminal finalization (see the jump bound below).
+          if (extra.signal.aborted || hold.preempted) {
+            const t = isTerminal(run.effectiveStatus);
+            return respond(run, t, !t && Date.now() - Date.parse(run.manifest.heartbeatAt) > HEARTBEAT_STALE_MS);
+          }
           const eventsFile = join(run.dir, 'events.jsonl');
           // Bounded read: a first poll against a long-running backlog must not
           // allocate/parse the whole file (clients page via nextEventOffset).
@@ -244,9 +274,22 @@ export function createServer(baseCwd: string): McpServer {
           // spread the raw page (a dense 4 MB page holds ~80k renderable lines —
           // enough to overflow V8's argument limit) and cap each stored line.
           const keep = fresh.slice(-TAIL_LINES).map((l) => (l.length > TAIL_LINE_CHARS ? `${l.slice(0, TAIL_LINE_CHARS)}…` : l));
+          const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
+          // A phase wake must SHOW its milestone: in a dense batch (>TAIL_LINES
+          // renderables after the boundary) the phase line would roll off, so
+          // the newest boundary displaces the oldest kept line. Earlier
+          // boundaries batched in the same read may still roll off — the
+          // phases array always carries the authoritative list.
+          if (phaseHit) {
+            const lastPhase = page.events
+              .filter((e: TimestampedEvent) => e.type === 'phase_started')
+              .map((e: TimestampedEvent) => renderEvent(e))
+              .filter((l): l is string => l !== null)
+              .pop();
+            if (lastPhase && !keep.includes(lastPhase)) keep.splice(0, 1, lastPhase);
+          }
           tail.push(...keep);
           if (tail.length > TAIL_LINES) tail.splice(0, tail.length - TAIL_LINES);
-          const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
 
           // A terminal-mode hold never wakes on history, so a backlog holds no
           // information beyond its final window (up to the last TAIL_LINES
@@ -261,7 +304,12 @@ export function createServer(baseCwd: string): McpServer {
           // not stat: events.jsonl sits in a worker-writable dir and this
           // server is unsandboxed — never follow a swapped-in symlink; a
           // non-regular-file entry falls back to the O_NOFOLLOW-guarded read.)
-          if (!bail && input.until === 'terminal' && page.hasMore) {
+          // The jump ignores the deadline for a BOUNDED number of iterations:
+          // a waitSeconds:0 terminal call must still finalize to the real
+          // tail (~2 reads on a static file), while a worker appending
+          // ≥4 MiB per parse to its own hostile log cannot re-fire it
+          // forever past the deadline.
+          if (input.until === 'terminal' && page.hasMore && (Date.now() < deadline || lateJumps++ < 2)) {
             try {
               const st = lstatSync(eventsFile);
               if (st.isFile()) {
@@ -279,31 +327,8 @@ export function createServer(baseCwd: string): McpServer {
           }
 
           const wake = quiet ? terminal || phaseHit || stale : fresh.length > 0 || terminal || stale;
-          if (wake || bail) {
-            const m = run.manifest;
-            return ok({
-              runId: input.runId,
-              status: run.effectiveStatus,
-              phases: m.phases,
-              agentCount: m.agentCount,
-              budget: m.budget,
-              logTail: tail,
-              nextEventOffset: offset,
-              terminal,
-              ...(stale ? { stale: true } : {}),
-              ...(terminal
-                ? { next: `call workflow_result with runId=${input.runId}` }
-                : stale
-                  ? { next: `runner heartbeat is stale (>${HEARTBEAT_STALE_MS / 1000}s) — the run may be wedged; diagnose (ultracode status/logs) or workflow_stop instead of re-parking` }
-                  : quiet
-                    ? {
-                        next: `re-issue this hold with sinceEventOffset: ${offset} and park silently — failures wake this monitor; filler updates, refresh polls, and run-store tailing waste turns`,
-                        ...(wait < SHORT_HOLD_NUDGE_MS
-                          ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (3300 where `ultracode install codex` pinned 3600)' }
-                          : {}),
-                      }
-                    : {}),
-            });
+          if (wake || Date.now() >= deadline) {
+            return respond(run, terminal, stale);
           }
 
           // Catching up on a clipped backlog (e.g. tick-heavy pages): read the
@@ -311,7 +336,7 @@ export function createServer(baseCwd: string): McpServer {
           // But yield between the synchronous 4 MB parses (watch.ts does the
           // same): a long backlog must not starve the event loop, or sibling
           // MCP calls and cancellations stall behind this one.
-          if (!bail && page.hasMore) {
+          if (page.hasMore) {
             await sleep(0);
             continue;
           }

@@ -459,6 +459,34 @@ describe('MCP triad', () => {
     expect(line.endsWith('…')).toBe(true);
   }, 20_000);
 
+  it('a waitSeconds:0 terminal call still finalizes to the real tail (deadline never skips the jump)', async () => {
+    const runId = 'wf_zerowait0001';
+    const { dir, manifest } = fabricateRun(runId, logLines(200_000, 'zero')); // ~11 MiB
+    flipStatus(dir, manifest, 'completed');
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 0, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(status.terminal).toBe(true);
+    expect(status.logTail[39]).toBe('   log: zero200000'); // an expired deadline must not serve the HEAD as the tail
+    const { statSync } = await import('node:fs');
+    expect(status.nextEventOffset).toBe(statSync(join(dir, 'events.jsonl')).size);
+  }, 20_000);
+
+  it('a phase wake keeps its newest boundary visible in logTail through a dense batch', async () => {
+    const runId = 'wf_densephase01';
+    fabricateRun(runId, '{"ts":1,"type":"phase_started","title":"Buried"}\n' + logLines(50, 'noise'));
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'phase', waitSeconds: 10, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(status.terminal).toBe(false);
+    expect(status.logTail).toHaveLength(40);
+    expect(status.logTail).toContain('── phase: Buried'); // 50 renderables after the boundary must not roll the milestone off
+  }, 20_000);
+
   it('the rolling tail evicts oldest-first across ticks (multi-tick accumulation)', async () => {
     const runId = 'wf_tailroll0001';
     const { dir, manifest } = fabricateRun(runId, '');
