@@ -28,6 +28,7 @@ const manifest = (from, to) => {
 rmSync(join(root, 'dist-codex'), { recursive: true, force: true });
 copy('skill/ultracode', join(root, 'dist-codex/skills/ultracode'));
 copy('hostpacks/codex/README.md', join(root, 'dist-codex/README.md'));
+copy('LICENSE', join(root, 'dist-codex/LICENSE'));
 manifest('hostpacks/codex/plugin.json', join(root, 'dist-codex/.codex-plugin/plugin.json'));
 
 // Qoder: skill + uc-* templates + effort-routing agents.
@@ -36,6 +37,7 @@ copy('skill/ultracode', join(root, 'dist-qoder/skills/ultracode'));
 copy('workflows', join(root, 'dist-qoder/workflows'));
 copy('hostpacks/qoder/agents', join(root, 'dist-qoder/agents'));
 copy('hostpacks/qoder/README.md', join(root, 'dist-qoder/README.md'));
+copy('LICENSE', join(root, 'dist-qoder/LICENSE'));
 manifest('hostpacks/qoder/plugin.json', join(root, 'dist-qoder/.qoder-plugin/plugin.json'));
 
 console.log('built dist-codex/ and dist-qoder/');

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,15 +27,18 @@ describe('plugin bundles', () => {
 
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
-  it('codex bundle: valid manifest + README + skill present', () => {
+  it('codex bundle: valid manifest + README + skill + license present', () => {
     const manifest = JSON.parse(readFileSync(join(root, 'dist-codex/.codex-plugin/plugin.json'), 'utf8'));
     expect(manifest.name).toBe('ultracode');
     expect(manifest.version).toBe(pkg.version);
     expect(existsSync(join(root, 'dist-codex/README.md'))).toBe(true);
     expect(existsSync(join(root, 'dist-codex/skills/ultracode/SKILL.md'))).toBe(true);
+    // The manifest declares a license, so the standalone bundle must carry the
+    // text — byte-identical to the root LICENSE (a truncated copy must fail).
+    expect(readFileSync(join(root, 'dist-codex/LICENSE'), 'utf8')).toBe(readFileSync(join(root, 'LICENSE'), 'utf8'));
   });
 
-  it('qoder bundle: manifest + README + skill + templates + agent defs', () => {
+  it('qoder bundle: manifest + README + skill + templates + agent defs + license', () => {
     const manifest = JSON.parse(readFileSync(join(root, 'dist-qoder/.qoder-plugin/plugin.json'), 'utf8'));
     expect(manifest.name).toBe('ultracode');
     expect(manifest.version).toBe(pkg.version);
@@ -47,6 +51,28 @@ describe('plugin bundles', () => {
       'dist-qoder/agents/uc-verifier.md',
     ]) {
       expect(existsSync(join(root, f)), f).toBe(true);
+    }
+    expect(readFileSync(join(root, 'dist-qoder/LICENSE'), 'utf8')).toBe(readFileSync(join(root, 'LICENSE'), 'utf8'));
+  });
+
+  it('root LICENSE is the canonical Apache-2.0 text', () => {
+    // The bundle assertions compare byte-identity against the root file, so pin
+    // the root itself: sha256 of https://www.apache.org/licenses/LICENSE-2.0.txt.
+    // A truncated or swapped root LICENSE would otherwise keep everything green.
+    const sha = createHash('sha256').update(readFileSync(join(root, 'LICENSE'))).digest('hex');
+    expect(sha).toBe('cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30');
+  });
+
+  it('license is Apache-2.0 across all mirrors', () => {
+    // Same rationale as the version-mirror guard above: the license is declared
+    // in package.json, the lockfile root entry, and both bundle manifests — a
+    // partial revert (regenerated lockfile, one manifest flipped back) would
+    // otherwise ship a manifest that contradicts the bundled LICENSE text.
+    expect(pkg.license).toBe('Apache-2.0');
+    const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
+    expect(lock.packages?.['']?.license).toBe('Apache-2.0');
+    for (const m of ['dist-codex/.codex-plugin/plugin.json', 'dist-qoder/.qoder-plugin/plugin.json']) {
+      expect(JSON.parse(readFileSync(join(root, m), 'utf8')).license, m).toBe('Apache-2.0');
     }
   });
 
