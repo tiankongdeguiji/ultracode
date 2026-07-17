@@ -32,8 +32,9 @@ describe('plugin bundles', () => {
     expect(manifest.version).toBe(pkg.version);
     expect(existsSync(join(root, 'dist-codex/README.md'))).toBe(true);
     expect(existsSync(join(root, 'dist-codex/skills/ultracode/SKILL.md'))).toBe(true);
-    // The manifest declares a license, so the standalone bundle must carry the text.
-    expect(readFileSync(join(root, 'dist-codex/LICENSE'), 'utf8')).toMatch(/Apache License/);
+    // The manifest declares a license, so the standalone bundle must carry the
+    // text — byte-identical to the root LICENSE (a truncated copy must fail).
+    expect(readFileSync(join(root, 'dist-codex/LICENSE'), 'utf8')).toBe(readFileSync(join(root, 'LICENSE'), 'utf8'));
   });
 
   it('qoder bundle: manifest + README + skill + templates + agent defs + license', () => {
@@ -50,7 +51,20 @@ describe('plugin bundles', () => {
     ]) {
       expect(existsSync(join(root, f)), f).toBe(true);
     }
-    expect(readFileSync(join(root, 'dist-qoder/LICENSE'), 'utf8')).toMatch(/Apache License/);
+    expect(readFileSync(join(root, 'dist-qoder/LICENSE'), 'utf8')).toBe(readFileSync(join(root, 'LICENSE'), 'utf8'));
+  });
+
+  it('license is Apache-2.0 across all mirrors', () => {
+    // Same rationale as the version-mirror guard above: the license is declared
+    // in package.json, the lockfile root entry, and both bundle manifests — a
+    // partial revert (regenerated lockfile, one manifest flipped back) would
+    // otherwise ship a manifest that contradicts the bundled LICENSE text.
+    expect(pkg.license).toBe('Apache-2.0');
+    const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
+    expect(lock.packages?.['']?.license).toBe('Apache-2.0');
+    for (const m of ['dist-codex/.codex-plugin/plugin.json', 'dist-qoder/.qoder-plugin/plugin.json']) {
+      expect(JSON.parse(readFileSync(join(root, m), 'utf8')).license, m).toBe('Apache-2.0');
+    }
   });
 
   it('engine VERSION constant matches package.json', () => {
