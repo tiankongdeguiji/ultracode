@@ -1,5 +1,7 @@
 # ultracode
 
+**English** · [简体中文](README.zh-CN.md)
+
 [![ci](https://github.com/tiankongdeguiji/ultracode/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tiankongdeguiji/ultracode/actions/workflows/ci.yml)
 [![license](https://img.shields.io/github/license/tiankongdeguiji/ultracode)](LICENSE)
 [![stars](https://img.shields.io/github/stars/tiankongdeguiji/ultracode)](https://github.com/tiankongdeguiji/ultracode/stargazers)
