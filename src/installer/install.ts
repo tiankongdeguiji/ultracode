@@ -108,8 +108,11 @@ export const TOML_MARKER_END = '# ultracode:end';
 /**
  * codex MCP registration: appended as a marker-guarded TOML block. Appending
  * a table at EOF is a safe TOML operation; we never parse or rewrite the
- * rest of the user's config.toml. tool_timeout_sec=90 gives comfortable
- * headroom over the ≤50s long-poll.
+ * rest of the user's config.toml. tool_timeout_sec=3600 is the quiet-monitor
+ * hold budget: codex never extends tool timeouts on progress notifications
+ * (verified 0.144.5), so workflow_status until='terminal' can park for up to
+ * this long per call (doctrine passes waitSeconds=3300 for margin). Re-run
+ * `ultracode install codex` on an existing install to update the block.
  */
 export function codexMcpToml(command: string[], schemaNote = ''): string {
   const [bin, ...args] = command;
@@ -119,9 +122,13 @@ export function codexMcpToml(command: string[], schemaNote = ''): string {
     '[mcp_servers.ultracode]',
     `command = ${JSON.stringify(bin)}`,
     `args = ${JSON.stringify(args)}`,
-    'tool_timeout_sec = 90',
+    'tool_timeout_sec = 3600',
     // Without pre-approval, headless codex exec auto-rejects every MCP call
-    // ("user cancelled MCP tool call") — live-verified on 0.142.4.
+    // ("user cancelled MCP tool call") — live-verified on 0.142.4. This
+    // pre-approves workflow_start too: a deliberate, documented tradeoff
+    // (docs/threat-model.md; README tells users to ask the agent to show a
+    // workflow before running it) — per-tool gating would break every
+    // headless codex flow.
     'default_tools_approval_mode = "approve"',
     TOML_MARKER_END,
   ]

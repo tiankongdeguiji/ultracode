@@ -8,7 +8,7 @@
 
 *Linux & macOS · not on npm yet — build from source.*
 
-Type the keyword `ultracode` in your coding agent and it stops doing everything in one context: the **skill** (doctrine) teaches it to author a small deterministic JS workflow — `agent()` calls are the only side effects — and hand it to the **engine** (this npm package: CLI + MCP server), which fans each `agent()` out as a real coding-agent subprocess. **Delivery** is a plugin where plugins exist and `ultracode install <host>` everywhere else; on Qoder the pack rides the native Workflow tool instead of replacing it. Watch the fleet live, stop it, resume it, get one structured result back. Full layering: `docs/architecture.md`.
+Type `ultracode` and your coding agent stops doing everything in one context: it authors a small deterministic JS workflow, and the engine — this package — fans each `agent()` call out as a real coding-agent subprocess, returning one structured result. Full layering: `docs/architecture.md`.
 
 ```text
 "ultracode: audit src/ for auth bugs"      <- the keyword arms the skill
@@ -33,7 +33,7 @@ ultracode engine: sandboxed script + scheduler + journal
 - **Live fleet panel** — foreground runs show it; `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail. In `watch`, Ctrl-C detaches and never stops the run (in an attached foreground run it stops the fleet).
 - **Opt-in budgets and timeouts** — no default caps. Pass `--budget 500k` and the engine enforces it at the dispatch gate: no new agent starts past the ceiling. Timeouts are the same deal — unlimited unless you set one.
 - **Structured output that survives sloppy models** — give `agent()` a JSON Schema and it returns a validated object; non-conforming replies get up to two schema-repair round-trips before counting as a failure.
-- **Detached, durable runs** — the runner outlives your session; state lives in `.ultracode/runs/`. Over MCP, the `workflow_start` / `workflow_status` / `workflow_result` triad drives the same run store, so sandboxed hosts orchestrate fire-and-forget across turns.
+- **Detached, durable runs** — the runner outlives your session; state lives in `.ultracode/runs/`. Over MCP, the `workflow_start` / `workflow_status` / `workflow_result` triad drives the same run store, so sandboxed hosts orchestrate fire-and-forget across turns — and `workflow_status until="terminal"` is a quiet monitor that parks the host in one long hold (~55 min with the timeout `install codex` pins), making an hour of babysitting cost ~1 turn.
 
 ## Quick start
 
@@ -57,7 +57,7 @@ Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
 "ultracode: review this repo for auth bugs +500k"
 ```
 
-The word arms the mode: your agent authors a workflow and runs it — Qoder and Claude Code natively via their Workflow tools; Codex over MCP (`workflow_start` → `workflow_status` → `workflow_result`, wired by `install codex`); hosts without MCP registration (`install generic` copies only the skill + trigger) fall back to driving the `ultracode` CLI, or register `ultracode mcp` with the host yourself. `workflow_start` has no confirmation gate — ask the agent to show the workflow before running it (`docs/threat-model.md`). `+500k` is an optional budget — omit it to run uncapped. Follow engine runs from any shell (the runId is in the agent's reply, or `ultracode list`):
+Your agent authors the workflow and runs it — natively on Qoder and Claude Code, over MCP on Codex, via the CLI elsewhere. `+500k` caps the budget; omitting it runs uncapped. `workflow_start` asks no confirmation — have the agent show the workflow first (`docs/threat-model.md`). Then follow along (the runId is in the agent's reply, or `ultracode list`):
 
 ```bash
 ultracode watch <runId>

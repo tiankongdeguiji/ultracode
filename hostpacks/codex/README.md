@@ -19,8 +19,14 @@ the installer writes these directly into your Codex config:
 
 - An **AGENTS.md** trigger snippet — standing "ultracode mode", armed only by the keyword "ultracode".
 - An **MCP server** registration (`~/.codex/config.toml` `[mcp_servers.ultracode]` block) pointing at `ultracode mcp`
-  (`tool_timeout_sec = 90`, `default_tools_approval_mode = "approve"` — headless Codex auto-rejects
-  MCP calls otherwise).
+  (`tool_timeout_sec = 3600`, `default_tools_approval_mode = "approve"` — headless Codex auto-rejects
+  MCP calls otherwise). The 3600s timeout is the **quiet-monitor hold budget**: Codex never extends
+  tool timeouts on progress notifications (verified against codex-rs 0.144.5 — it does not set rmcp's
+  `reset_timeout_on_progress`) and does not poll MCP Tasks, so the only zero-token way to babysit a
+  long run is one blocking `workflow_status {until: "terminal", waitSeconds: 3300}` call per ~55 min.
+  While it holds, the model spends nothing; interrupting it is harmless (the run is detached — re-poll).
+  Installs made before this default re-run `ultracode install codex` to update the managed block
+  (older blocks pinned `tool_timeout_sec = 90`, which kills any hold at 90s).
 
 ## Manual install (until marketplace)
 
@@ -31,6 +37,27 @@ ultracode doctor          # verify backend availability and auth topology
 ```
 
 Then in Codex: `ultracode: review this repo for auth bugs +500k`.
+
+## Why Codex narrates while monitoring (and what tames it)
+
+Codex's per-model instructions mandate a commentary cadence: gpt-5.6\* "should
+not be left without a commentary update for more than 60 seconds during ongoing
+work" and must "avoid blocking sleep or wait calls longer than 60 seconds";
+gpt-5.5/5.4 carry a 30s variant; gpt-5.2's Responsiveness section is empty
+(verified in codex-rs `models-manager/models.json` at rust-v0.144.5). Left
+unopposed, this yields ~65 wait-and-narrate turns per monitored hour (~60× the
+quiet monitor's intended cost, measured live). ultracode counters at the tiers
+that outrank AGENTS.md (the lowest tier per codex's own prompt): the skill
+reframes a parked monitor as idle time — silence is correct, collect a wrapped
+hold with ONE wait — and every quiet `workflow_status` response carries an
+in-band "park silently" nudge; `until: 'phase'` gives the model a sanctioned
+milestone-update channel (one wake per phase boundary). Residual levers if a
+model still narrates: `-c developer_instructions='While an ultracode monitor is
+parked, emit no progress commentary.'` (developer tier), and
+`background_terminal_max_timeout` (config.toml, default 300000 ms — the cap on
+empty background-terminal polls, relevant only when watching detached CLI runs
+through a background terminal). Guaranteed silence would require
+`model_instructions_file`, which upstream strongly discourages.
 
 ## Why Codex must use the MCP route
 

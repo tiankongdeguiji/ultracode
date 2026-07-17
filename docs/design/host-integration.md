@@ -124,7 +124,7 @@ when a workflow is running — you design, launch, monitor, and synthesize.
 | Your host | Primary path | Fallback |
 |---|---|---|
 | Qoder CLI/IDE | Native `Workflow` tool: pass `script` (or `name` for saved), `args`. Fire-and-forget; completion arrives as a task notification. Resume: same `scriptPath` + `resumeFromRunId`. | If tool answers "Workflow feature gate is disabled." → MCP triad below |
-| Codex, Gemini, Cursor, Copilot, opencode, Amp, Claude-as-guest | MCP tools `workflow_start` → loop `workflow_status(run_id, wait_seconds=50)` until terminal → `workflow_result`. NEVER abandon a started run; keep polling. A timed-out poll call is harmless — poll again with the same run_id. | CLI: `ultracode run <file> --args-json '…' --json` (blocking; only for short runs) |
+| Codex, Gemini, Cursor, Copilot, opencode, Amp, Claude-as-guest | MCP tools `workflow_start` → park on `workflow_status(run_id, until='terminal', wait_seconds = host tool timeout − 60s; codex hostpack 3300)` until terminal → `workflow_result`. NEVER abandon a started run; keep re-issuing the hold. A timed-out poll call is harmless — poll again with the same run_id. | CLI: `ultracode run <file> --args-json '…' --json` (blocking; only for short runs) |
 | Codex quick fan-out exception | For ≤3 trivially parallel READ-ONLY lookups with no schema/journal needs, native spawn_agent is acceptable. Everything else: engine. | — |
 - Key sentence: "workflow_start returns in <1s; the run continues server-side even
   if your turn ends — resume monitoring with workflow_status in the next turn."
@@ -211,12 +211,13 @@ ultracode-codex/                          # codex plugin add <path> / marketplac
 │   └── config.toml fragment →            # [mcp_servers.ultracode]
 │                                         # command = "ultracode", args = ["mcp"]
 │                                         # startup_timeout_sec = 20
-│                                         # tool_timeout_sec = 90        # long-poll 50s + margin
+│                                         # tool_timeout_sec = 3600      # quiet-monitor hold 3300s + margin
 │                                         # instructions injected by server (≤512c):
 │                                         # "Ultracode workflow engine. workflow_start
-│                                         #  returns run_id fast; poll workflow_status
-│                                         #  (wait_seconds<=50) until terminal, then
-│                                         #  workflow_result. Runs survive your turn."
+│                                         #  returns run_id fast; park on workflow_status
+│                                         #  (until='terminal', wait_seconds=3300) until
+│                                         #  terminal, then workflow_result. Runs survive
+│                                         #  your turn."
 └── docs/
     └── SETUP.md                          # config recommendations (below), CODEX_API_KEY note
 ```
@@ -295,20 +296,22 @@ Rule content = keyword-trigger emulation (this substitutes for Claude Code's shi
 
 ## 5. Engine MCP surface (shared by every non-Qoder host, and Qoder fallback)
 
-Four tools, shaped by the timeout research (no host extends deadlines on progress; long-poll must sit under the worst default of 300 s Codex / 600 s others; server-side persistence mandatory because Codex orphans timed-out calls without cancellation):
+Four tools, shaped by the timeout research (no host extends deadlines on progress; a hold must sit ≥60s under the host's ACTUAL tool timeout — originally the worst default of 300 s Codex / 600 s others, since 2026-07 installer-raised to 3600 s on codex; server-side persistence mandatory because Codex orphans timed-out calls without cancellation):
 
 ```
 workflow_start({ script? , name?, args?, budget?, cwd?, worker_host? })
   → { run_id, journal_path, script_path }            // returns < 1 s
-workflow_status({ run_id, wait_seconds? })            // wait clamped to 50
+workflow_status({ run_id, until?, wait_seconds? })    // explicit wait ≤3600; until:'terminal' = quiet monitor
   → { status: running|completed|failed|cancelled, phase, agents:{running,done,failed},
-      spent_tokens, budget_total, log_tail: string[≤20] }
+      spent_tokens, budget_total, log_tail: string[≤40] }
 workflow_result({ run_id })
   → { result, failures[], usage:{agents,tokens,tool_calls,duration_ms},
       artifacts:{ output_path, journal_path } }       // error if not terminal
 workflow_cancel({ run_id, reason? })
 ```
-Run state persisted under `~/.ultracode/runs/<run_id>/{manifest.json, journal.jsonl, output.json}` (survives host restarts and Codex's silent orphaning). Server emits `notifications/progress` during any blocking window (free UX on Qoder/Gemini; Codex just logs). **No `execution.taskSupport` declaration at all** (`required` breaks Qoder client-side; `optional` buys nothing today). Server `instructions` field ≤512 chars, self-contained (Codex injects first 512).
+> Design sketch — field names and shapes here predate the shipped surface; the authoritative contract is core-engine.md §4.3 and `src/mcp/server.ts`.
+
+Run state persisted under `~/.ultracode/runs/<run_id>/{manifest.json, journal.jsonl, output.json}` (survives host restarts and Codex's silent orphaning). Activity-mode waits emit `notifications/progress`, throttled to one per 10s (free UX on Qoder/Gemini; Codex just logs); quiet parks emit none. **No `execution.taskSupport` declaration at all** (`required` breaks Qoder client-side; `optional` buys nothing today). Server `instructions` field ≤512 chars, self-contained (Codex injects first 512).
 
 ---
 
@@ -316,12 +319,14 @@ Run state persisted under `~/.ultracode/runs/<run_id>/{manifest.json, journal.js
 
 ### 6.1 `ultracode install <host>` matrix
 
+> Design matrix — as shipped, `planFor` implements only the `codex`, `qoder`, and `generic` rows; the claude/gemini/cursor/copilot/opencode/amp rows are aspirational.
+
 | Host | Skill destination | MCP registration written | AGENTS/context wiring | Notes |
 |---|---|---|---|---|
-| `codex` | `.agents/skills/ultracode/` (repo) or `~/.agents/skills/` with `--user` | `~/.codex/config.toml` `[mcp_servers.ultracode]` (TOML merge, tool_timeout_sec=90) — skipped if the plugin is detected | append §2.3 block to `AGENTS.md` (`--agents-md`) | suggests `codex plugin marketplace add` as the richer path |
+| `codex` | `.agents/skills/ultracode/` (repo) or `~/.agents/skills/` with `--user` | `~/.codex/config.toml` `[mcp_servers.ultracode]` (TOML merge, tool_timeout_sec=3600) — skipped if the plugin is detected | append §2.3 block to `AGENTS.md` (`--agents-md`) | suggests `codex plugin marketplace add` as the richer path |
 | `qoder` | via plugin (`qodercli plugins install`), else `.qoder/skills/ultracode/` | `.mcp.json` mcpServers.ultracode | `.qoder/rules/ultracode.md` (always_on) + AGENTS.md block | also copies `workflows/uc-*.js` → `.qoder/workflows/` (§7) |
 | `claude` | `.claude/skills/ultracode/` | none — native Workflow tool exists | AGENTS.md/CLAUDE.md block | copies `workflows/` → `.claude/workflows/` |
-| `gemini` | `.agents/skills/ultracode/` (alias honored) | `.gemini/settings.json` `mcpServers.ultracode` (timeout: 90000) | sets `contextFileName: ["GEMINI.md","AGENTS.md"]` in `.gemini/settings.json`, then AGENTS.md block | JSON-merge, never clobber |
+| `gemini` | `.agents/skills/ultracode/` (alias honored) | `.gemini/settings.json` `mcpServers.ultracode` (stock 600s timeout already fits 540s holds — no override needed) | sets `contextFileName: ["GEMINI.md","AGENTS.md"]` in `.gemini/settings.json`, then AGENTS.md block | JSON-merge, never clobber |
 | `cursor` | `.cursor/skills/ultracode/` (or `.agents/skills/`) | `.cursor/mcp.json` | AGENTS.md block (read natively) | `/ultracode` works via skill |
 | `copilot` | `.agents/skills/ultracode/` (agents-dir compat) | `~/.copilot/mcp-config.json` (user-level; per-repo via `--additional-mcp-config` documented) | AGENTS.md block | |
 | `opencode` | `.opencode/skills/` or `.agents/skills/` | `opencode.json` `mcp` key | AGENTS.md block (native) | |
@@ -351,7 +356,7 @@ Probes and prints a table: engine binary on PATH & version; MCP registration pre
 
 ## KEY DECISIONS
 - **Answer to 'plugin vs command vs skill': layered — the doctrine is a Skill (canonical, agentskills.io-compliant, copied per host), the engine is an npm-shipped MCP server + CLI, delivery is a Plugin on Codex and Qoder and an installer command elsewhere, and the slash/dollar command surface is emergent from skills ($ultracode, /ultracode) with no separate command artifact authored.** — Skills are the only cross-host surface with implicit model-triggered invocation and progressive disclosure; an engine needs a process (skills can't host one, single blocking MCP calls die at 300-600s host timeouts); plugins are the only one-command bundle format and exist only on Codex/Qoder; every target host already maps skills to invocable commands. (rejected: A pure MCP server with no skill (model never learns the doctrine or dialect, no keyword trigger); custom prompts on Codex (officially deprecated); per-host bespoke command files (duplicated maintenance, no implicit triggering).)
-- **MCP engine surface is a start/status/result/cancel triad with workflow_status long-poll clamped to 50 seconds, server-side run persistence under ~/.ultracode/runs/, and NO execution.taskSupport declaration.** — Source-verified research: no target host extends MCP timeouts on progress notifications (Codex 300s default, Qoder/Gemini 600s), MCP Tasks are unsupported in all targets, Codex orphans timed-out calls without notifications/cancelled, and taskSupport:'required' makes tools unusable in Qoder client-side. 50s sits under every default including legacy 60s Codex. (rejected: Single blocking workflow tool (dies on any run >5 min); MCP Tasks extension (breaks Qoder, ignored by Codex which pins protocol 2025-06-18); asking users to raise tool_timeout_sec (user-hostile, undocumented key on Qoder, still orphans work on Codex).)
+- **MCP engine surface is a start/status/result/cancel triad with a workflow_status long-poll, server-side run persistence under ~/.ultracode/runs/, and NO execution.taskSupport declaration.** — Source-verified research: no target host extends MCP timeouts on progress notifications (Codex 300s default, Qoder/Gemini 600s), MCP Tasks are unsupported in all targets, Codex orphans timed-out calls without notifications/cancelled, and taskSupport:'required' makes tools unusable in Qoder client-side. (rejected: Single blocking workflow tool (dies on any run >5 min); MCP Tasks extension (breaks Qoder, ignored by Codex which pins protocol 2025-06-18); asking users to raise tool_timeout_sec (user-hostile, undocumented key on Qoder, still orphans work on Codex).) **Amended (2026-07):** the 50s clamp is gone — explicit `wait_seconds` is honored ≤3600 and `until:'terminal'` parks quietly until the run ends; on codex, OUR installer (not the user) raises the managed block's `tool_timeout_sec` to 3600, which stays safe precisely because runs are detached and a timed-out hold is a harmless re-poll.
 - **On Qoder, ride the NATIVE Workflow tool as primary (plugin ships uc-* workflow templates, skill, uc-* agent defs for effort routing, rules snippet); the external MCP engine is registered but used only when the remote 'workflows' feature gate is off (detected by a doctor probe).** — Qoder 1.0.37 is a faithful ultracode port (same dialect, schema enforcement, hash-chain journal resume, 16/1000 caps) — replacing it would duplicate a native, UI-integrated runtime and lose /workflows monitoring, per-agent skip/retry, and permission integration. (rejected: Always-external engine on Qoder (worse UX, fights the native task-notification loop, wastes the deepest native integration available); native-only with no fallback (remote feature gate can be off per account).)
 - **On Codex, ALL workflow execution goes through the external engine; native subagents (spawn_agent) are permitted only for a narrow exception — up to 3 read-only, schema-free, non-durable parallel lookups — written into the skill's dispatch table.** — Native subagents cap at max_threads 6 / depth 1, have no journal, no resume/prefix-cache, no per-agent JSON-schema enforcement, and results flow through the parent context, breaking ultracode's core properties (16-way concurrency, deterministic resume, schema-validated returns, intermediate results outside the conversation). A single execution model also keeps budget accounting truthful. (rejected: Hybrid routing by task size (two execution models with divergent semantics, journal gaps, confusing failure modes); pure native subagents (cannot implement pipeline/judge-panel/loop-until-budget patterns at fidelity).)
 - **Standing opt-in ('ultracode mode') = three cooperating carriers: sticky-for-session rule in the skill, a .ultracode/mode state file toggled by CLI or the model, and an idempotent marker-guarded AGENTS.md snippet (plus a Qoder always_on rule) as the durable trigger that survives sessions and compaction.** — No target host has /effort or a session-mode primitive; AGENTS.md is loaded every session on effectively all hosts (Gemini via contextFileName which the installer sets), making it the only reliable cross-host persistence wire; the state file gives a machine-readable toggle the snippet can reference. (rejected: Env var as primary carrier (hosts don't reliably surface env to the model); SessionStart hooks injecting context (Codex hook-trust friction, no hooks on several hosts); skill-only persistence (dies on compaction).)

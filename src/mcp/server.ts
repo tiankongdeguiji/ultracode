@@ -3,9 +3,15 @@
  * workflow_result / workflow_stop / workflow_list triad(+2).
  *
  * Design constraints (source-verified across Codex/Qoder/Gemini hosts):
- *  - No host extends tool timeouts on progress → every call returns fast;
- *    workflow_status long-polls but clamps at 50s (under every default:
- *    60s legacy Codex, 300s current Codex, 600s Qoder/Gemini).
+ *  - No host extends tool timeouts on progress (codex 0.144.5 never sets
+ *    rmcp's reset_timeout_on_progress) and none polls MCP Tasks, so the only
+ *    background monitor a host can have is one long blocking call under its
+ *    tool timeout: workflow_status until='terminal' holds silently for an
+ *    explicit waitSeconds ≤3600 (`ultracode install codex` pins
+ *    tool_timeout_sec=3600 at user scope; stock codex defaults 300s,
+ *    Qoder/Gemini 600s — doctrine states concrete holds, timeout minus ≥60s
+ *    margin). A client that times out anyway never
+ *    cancels server-side; the abandoned hold just runs out and is dropped.
  *  - NEVER declare MCP Tasks taskSupport ('required' hard-breaks Qoder
  *    client-side; no target host polls Tasks).
  *  - Runs execute in detached runner processes over the on-disk store, so
@@ -21,21 +27,50 @@ import { VERSION } from '../version.js';
 import { parseBudget } from '../budget/parse.js';
 import { startDetachedRun } from '../exec/start.js';
 import { stopRun } from '../exec/stop.js';
-import { readEventsFrom, type TimestampedEvent } from '../store/events.js';
-import { isTerminal } from '../store/manifest.js';
+import { EVENT_PAGE_BYTES, readEventsFrom, type TimestampedEvent } from '../store/events.js';
+import { HEARTBEAT_STALE_MS, isTerminal } from '../store/manifest.js';
 import { getRun, recentRuns } from '../store/runstore.js';
 import { ultracodeRoot } from '../store/layout.js';
 import { renderEvent } from '../cli/lifecycle.js';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, lstatSync } from 'node:fs';
 
-const INSTRUCTIONS =
-  'Dynamic multi-agent workflow orchestration. workflow_start returns a runId in <1s and the run ' +
-  'survives this server. Poll workflow_status (long-poll ≤50s; pass nextEventOffset back) until ' +
-  'status is terminal, then call workflow_result. A timed-out poll is harmless — re-poll the same ' +
-  'runId. Author scripts per the ultracode skill dialect (export const meta + agent/parallel/pipeline).';
+// Codex injects only the first 512 chars of server instructions; guarded in
+// bytes (the stricter reading) by test/unit/mcp.integration.test.ts.
+export const INSTRUCTIONS =
+  'Dynamic multi-agent workflow orchestration. workflow_start returns a runId in <1s; the run ' +
+  'survives this server. Park on workflow_status until="terminal": wakes only when the run ends, ' +
+  'rolling the last 40 log lines into each response. waitSeconds is the wake interval, not a ' +
+  'safety knob; pass 3300 where `ultracode install codex` pinned a 3600s tool timeout. Timed-out ' +
+  'polls are harmless: re-poll the same runId; workflow_result when terminal. Scripts follow the ' +
+  'skill dialect.';
 
-const MAX_WAIT_SECONDS = 50;
+/** Explicit waitSeconds ceiling — sized to the codex hostpack's tool_timeout_sec=3600; doctrine keeps holds ≥60s under the host's actual timeout. */
+const MAX_WAIT_SECONDS = 3600;
 const DEFAULT_WAIT_SECONDS = 25;
+/** Progress cadence for activity-mode waits (Qoder/Gemini render them; codex only logs) — quiet parks emit none, per their silent contract. */
+const PROGRESS_INTERVAL_MS = 10_000;
+/** Quiet holds shorter than this get an in-band nudge: models hedge toward tiny "safe" waits (observed: 60), and a short hold burns a turn per wake. */
+const SHORT_HOLD_NUDGE_MS = 240_000;
+/** Rolling tail cap carried on every workflow_status response. */
+const TAIL_LINES = 40;
+/** Per-line byte cap for the tail: log()/event text is script- and worker-influenced and can be huge — logTail must stay model-context-sized (worst case ~16 KB). */
+const TAIL_LINE_CHARS = 400;
+/**
+ * Admission cap on concurrent workflow_status holds per run. Clients that time
+ * out never cancel server-side, so abandoned holds would otherwise accumulate
+ * (a stale 90s-timeout client re-polling against 3300s holds stacks ~37
+ * once-per-second poll loops). The oldest hold is preempted first: it returns
+ * a normal non-terminal payload, which a still-live client just treats as an
+ * early re-poll — while genuinely abandoned loops die instead of ticking for
+ * up to an hour. The cap leaves room for several legitimate concurrent
+ * front-ends before any preemption ping-pong can start.
+ */
+const MAX_HOLDS_PER_RUN = 4;
+
+/** Pure deadline arithmetic, exported for direct test coverage: explicit waitSeconds is honored up to MAX_WAIT_SECONDS — there is no hidden 50s clamp. */
+export function effectiveWaitMs(waitSeconds?: number): number {
+  return Math.min(waitSeconds ?? DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS) * 1000;
+}
 
 function ok(structured: Record<string, unknown>) {
   return {
@@ -54,6 +89,7 @@ function fail(message: string, extra: Record<string, unknown> = {}) {
 export function createServer(baseCwd: string): McpServer {
   const server = new McpServer({ name: 'ultracode', version: VERSION }, { instructions: INSTRUCTIONS });
   const rootFor = (cwd?: string) => ultracodeRoot(cwd ?? baseCwd);
+  const activeHolds = new Map<string, { preempted: boolean }[]>();
 
   server.registerTool(
     'workflow_start',
@@ -121,7 +157,7 @@ export function createServer(baseCwd: string): McpServer {
           runId: result.runId,
           name: result.name,
           runDir: result.dir,
-          monitor: `call workflow_status with runId=${result.runId}; poll until terminal`,
+          monitor: `call workflow_status {runId: '${result.runId}', until: 'terminal', waitSeconds: 3300}; 3300 assumes \`ultracode install codex\` pinned a 3600s tool timeout — else use your MCP tool timeout − 60; re-issue until terminal and park silently between wakes ('phase' wakes per milestone if commentary is wanted)`,
         });
       } catch (err) {
         return fail((err as Error).message);
@@ -133,70 +169,200 @@ export function createServer(baseCwd: string): McpServer {
     'workflow_status',
     {
       description:
-        'Run status with long-poll: returns immediately when new events exist past sinceEventOffset or ' +
-        'the run is terminal, else waits up to waitSeconds (≤50). Pass nextEventOffset from the previous ' +
-        'call to receive only fresh log lines. Timed-out polls are harmless — call again.',
+        'Run status long-poll. until="terminal" is the quiet monitor: wakes only when the run ends ' +
+        'or after waitSeconds (re-issue the same call), rolling up to the last 40 log lines into each ' +
+        'response; until="phase" additionally wakes at phase boundaries (boundaries crossed in one ' +
+        'read batch into a single wake — each appears in logTail) — the sanctioned channel ' +
+        'for milestone updates. Between wakes park silently: failures, crashes, and a stale runner ' +
+        'heartbeat (stale: true — diagnose, do not re-park) wake the monitor, so skip filler ' +
+        'updates, refresh polls, and run-store tailing. Every wake costs a model turn — pass the ' +
+        'largest waitSeconds your host MCP tool timeout allows: 3300 where `ultracode install ' +
+        'codex` pinned tool_timeout_sec=3600 (user scope); stock codex 300 → 240; qoder/gemini ' +
+        '600 → 540; holds dying early mean a lower pinned timeout (drop waitSeconds below the ' +
+        'cutoff, re-run `ultracode install codex`). Default until="activity" returns on new log ' +
+        'lines past sinceEventOffset — pass nextEventOffset back for only fresh lines. Timed-out ' +
+        'polls are harmless — call again.',
       inputSchema: {
         runId: z.string(),
-        waitSeconds: z.number().min(0).max(600).optional(),
+        until: z.enum(['activity', 'phase', 'terminal']).optional(),
+        waitSeconds: z.number().min(0).max(MAX_WAIT_SECONDS).optional(),
         sinceEventOffset: z.number().int().min(0).optional(),
         cwd: z.string().optional(),
       },
     },
     async (input, extra) => {
       const root = rootFor(input.cwd);
-      const wait = Math.min(input.waitSeconds ?? DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS) * 1000;
+      const quiet = input.until === 'terminal' || input.until === 'phase';
+      const wait = effectiveWaitMs(input.waitSeconds);
       const deadline = Date.now() + wait;
+      const hold = { preempted: false };
+      const holds = activeHolds.get(input.runId) ?? [];
+      holds.push(hold);
+      activeHolds.set(input.runId, holds);
+      // Mark, don't remove: a preempted hold stays counted until its finally
+      // runs, keeping the cap hard, and the finally below never operates on
+      // an array it was evicted from.
+      const live = holds.filter((h) => !h.preempted);
+      if (live.length > MAX_HOLDS_PER_RUN) live[0]!.preempted = true;
       let offset = input.sinceEventOffset ?? 0;
       const progressToken = (extra as { _meta?: { progressToken?: string | number } })._meta?.progressToken;
       let ticks = 0;
+      let progressAt = Date.now();
+      // Rolling tail: quiet holds roll renderable lines up instead of waking
+      // on them. The cursor never advances past content without it passing
+      // through this tail — though the tail is lossy at TAIL_LINES, and the
+      // full log always lives in the run store / workflow_result.
+      const tail: string[] = [];
+      let lateJumps = 0;
+      // Single response builder shared by the pre-IO hard exit and the wake
+      // gate so every return path carries the identical contract.
+      const respond = (run: NonNullable<ReturnType<typeof getRun>>, terminal: boolean, stale: boolean) =>
+        ok({
+          runId: input.runId,
+          status: run.effectiveStatus,
+          phases: run.manifest.phases,
+          agentCount: run.manifest.agentCount,
+          budget: run.manifest.budget,
+          logTail: tail,
+          nextEventOffset: offset,
+          terminal,
+          ...(stale ? { stale: true } : {}),
+          ...(terminal
+            ? { next: `call workflow_result with runId=${input.runId}` }
+            : stale
+              ? { next: `runner heartbeat is stale (>${HEARTBEAT_STALE_MS / 1000}s) — the run may be wedged; diagnose (ultracode status/logs) or workflow_stop instead of re-parking` }
+              : quiet
+                ? {
+                    next: `re-issue this hold with sinceEventOffset: ${offset} and park silently — failures wake this monitor; filler updates, refresh polls, and run-store tailing waste turns`,
+                    ...(wait < SHORT_HOLD_NUDGE_MS
+                      ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (3300 where `ultracode install codex` pinned 3600)' }
+                      : {}),
+                  }
+                : {}),
+        });
 
-      for (;;) {
-        const run = getRun(root, input.runId);
-        if (!run) return fail(`no run ${input.runId} under ${root}`);
-        const eventsFile = join(run.dir, 'events.jsonl');
-        // Bounded read: a first poll against a long-running backlog must not
-        // allocate/parse the whole file (clients page via nextEventOffset).
-        const page = readEventsFrom(eventsFile, offset, 4 * 1024 * 1024);
-        offset = page.nextOffset; // consume even null-rendered pages so ticks are never re-read
-        const terminal = isTerminal(run.effectiveStatus);
-        // Wake on RENDERABLE lines, not raw events: agent_usage ticks arrive
-        // ~1/s per running agent and render null — waking on them would return
-        // empty logTails in a tight loop, burning the polling host's tokens.
-        const logTail = page.events
-          .map((e: TimestampedEvent) => renderEvent(e))
-          .filter((l): l is string => l !== null);
-
-        if (logTail.length > 0 || terminal || Date.now() >= deadline) {
-          const m = run.manifest;
-          return ok({
-            runId: input.runId,
-            status: run.effectiveStatus,
-            phases: m.phases,
-            agentCount: m.agentCount,
-            budget: m.budget,
-            logTail: logTail.slice(-40),
-            nextEventOffset: offset,
-            terminal,
-            ...(terminal ? { next: `call workflow_result with runId=${input.runId}` } : {}),
-          });
-        }
-
-        // Catching up on a clipped backlog (e.g. tick-heavy pages): read the
-        // next page immediately — pacing 4 MB per 300 ms would starve clients.
-        if (page.hasMore) continue;
-
-        if (progressToken !== undefined) {
-          try {
-            await extra.sendNotification({
-              method: 'notifications/progress',
-              params: { progressToken, progress: ++ticks, message: `waiting: ${run.effectiveStatus}, ${run.manifest.agentCount} agents so far` },
-            });
-          } catch {
-            /* progress is best-effort */
+      try {
+        for (;;) {
+          const run = getRun(root, input.runId);
+          if (!run) return fail(`no run ${input.runId} under ${root}`);
+          // Hard exits short-circuit before any I/O: an aborted or preempted
+          // hold must not parse another page (up to 16 MiB for an oversized
+          // line) on its way out. The deadline is softer — it must not skip
+          // terminal finalization (see the jump bound below).
+          if (extra.signal.aborted || hold.preempted) {
+            const t = isTerminal(run.effectiveStatus);
+            return respond(run, t, !t && Date.now() - Date.parse(run.manifest.heartbeatAt) > HEARTBEAT_STALE_MS);
           }
+          const eventsFile = join(run.dir, 'events.jsonl');
+          // Bounded read: a first poll against a long-running backlog must not
+          // allocate/parse the whole file (clients page via nextEventOffset).
+          const page = readEventsFrom(eventsFile, offset, EVENT_PAGE_BYTES);
+          offset = page.nextOffset; // consume even null-rendered pages so ticks are never re-read
+          const terminal = isTerminal(run.effectiveStatus);
+          // A wedged-but-ALIVE runner never flips terminal (liveStatus is
+          // PID-based by design; see runstore.ts) — without this, a quiet hold
+          // would park the full waitSeconds on a wedged run and the doctrine
+          // would re-park it forever. Stale heartbeat wakes the hold instead.
+          const stale = !terminal && Date.now() - Date.parse(run.manifest.heartbeatAt) > HEARTBEAT_STALE_MS;
+          // Wake on RENDERABLE lines, not raw events: agent_usage ticks arrive
+          // ~1/s per running agent and render null — waking on them would return
+          // empty logTails in a tight loop, burning the polling host's tokens.
+          const fresh = page.events
+            .map((e: TimestampedEvent) => renderEvent(e))
+            .filter((l): l is string => l !== null);
+          // Bounded append: only the last TAIL_LINES lines can survive, so never
+          // spread the raw page (a dense 4 MB page holds ~80k renderable lines —
+          // enough to overflow V8's argument limit) and cap each stored line.
+          const keep = fresh.slice(-TAIL_LINES).map((l) => (l.length > TAIL_LINE_CHARS ? `${l.slice(0, TAIL_LINE_CHARS)}…` : l));
+          const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
+          // A phase wake must SHOW its milestone: in a dense batch (>TAIL_LINES
+          // renderables after the boundary) the phase line would roll off, so
+          // the newest boundary displaces the oldest kept line. Earlier
+          // boundaries batched in the same read may still roll off — the
+          // phases array always carries the authoritative list.
+          if (phaseHit) {
+            const lastPhase = page.events
+              .filter((e: TimestampedEvent) => e.type === 'phase_started')
+              .map((e: TimestampedEvent) => renderEvent(e))
+              .filter((l): l is string => l !== null)
+              .pop();
+            if (lastPhase && !keep.includes(lastPhase)) keep.splice(0, 1, lastPhase);
+          }
+          tail.push(...keep);
+          if (tail.length > TAIL_LINES) tail.splice(0, tail.length - TAIL_LINES);
+
+          // A terminal-mode hold never wakes on history, so a backlog holds no
+          // information beyond its final window (up to the last TAIL_LINES
+          // renderable lines) — jump there instead of paging: parsing a
+          // multi-MB backlog synchronously would block this single-threaded
+          // stdio server, whether attaching late to a running run or waking on
+          // an already-terminal one. On terminal wakes this also puts the
+          // cursor at EOF so logTail is the run's REAL tail, never its head.
+          // phase mode must scan (boundaries live in the backlog); activity
+          // mode returns page-by-page. (A mid-line landing is fine — the torn
+          // fragment fails to parse and drops like any malformed line. lstat,
+          // not stat: events.jsonl sits in a worker-writable dir and this
+          // server is unsandboxed — never follow a swapped-in symlink; a
+          // non-regular-file entry falls back to the O_NOFOLLOW-guarded read.)
+          // The jump ignores the deadline for a BOUNDED number of iterations:
+          // a waitSeconds:0 terminal call must still finalize to the real
+          // tail (~2 reads on a static file), while a worker appending
+          // ≥4 MiB per parse to its own hostile log cannot re-fire it
+          // forever past the deadline.
+          if (input.until === 'terminal' && page.hasMore && (Date.now() < deadline || lateJumps++ < 2)) {
+            try {
+              const st = lstatSync(eventsFile);
+              if (st.isFile()) {
+                // The window must equal the page size the next read covers, or
+                // the jump would land outside what that read can serve.
+                const jump = Math.max(page.nextOffset, st.size - EVENT_PAGE_BYTES);
+                if (jump > page.nextOffset) tail.length = 0;
+                offset = jump;
+              }
+            } catch {
+              /* fall back to plain paging */
+            }
+            await sleep(0); // same event-loop yield as the drain below — the fallback paths degrade to multi-page parsing
+            continue;
+          }
+
+          const wake = quiet ? terminal || phaseHit || stale : fresh.length > 0 || terminal || stale;
+          if (wake || Date.now() >= deadline) {
+            return respond(run, terminal, stale);
+          }
+
+          // Catching up on a clipped backlog (e.g. tick-heavy pages): read the
+          // next page immediately — pacing 4 MB per 300 ms would starve clients.
+          // But yield between the synchronous 4 MB parses (watch.ts does the
+          // same): a long backlog must not starve the event loop, or sibling
+          // MCP calls and cancellations stall behind this one.
+          if (page.hasMore) {
+            await sleep(0);
+            continue;
+          }
+
+          if (!quiet && progressToken !== undefined && Date.now() - progressAt >= PROGRESS_INTERVAL_MS) {
+            progressAt = Date.now();
+            try {
+              await extra.sendNotification({
+                method: 'notifications/progress',
+                params: { progressToken, progress: ++ticks, message: `waiting: ${run.effectiveStatus}, ${run.manifest.agentCount} agents so far` },
+              });
+            } catch {
+              /* progress is best-effort */
+            }
+          }
+          // Quiet holds have no sub-second wake source (terminal flip and
+          // deadline only) — a wider idle tick cuts syscall churn 3× over a
+          // 55-minute park at imperceptible extra latency.
+          await sleep(quiet ? 1_000 : 300);
         }
-        await sleep(300);
+      } finally {
+        const i = holds.indexOf(hold);
+        if (i !== -1) holds.splice(i, 1);
+        // Identity-guarded: never drop a successor array that replaced this
+        // one under the key while this hold was finishing.
+        if (holds.length === 0 && activeHolds.get(input.runId) === holds) activeHolds.delete(input.runId);
       }
     },
   );

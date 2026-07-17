@@ -3,7 +3,8 @@
  * launches real detached runners on the mock backend. No network.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +12,7 @@ import { createRequire } from 'node:module';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { readProcStat } from '../../src/exec/procinfo.js';
+import { INSTRUCTIONS, effectiveWaitMs } from '../../src/mcp/server.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const mainTs = join(here, '../../src/cli/main.ts');
@@ -55,6 +57,20 @@ describe('MCP triad', () => {
     await client.close();
   });
 
+  it('server instructions fit codex 512-unit injection under the stricter byte reading', () => {
+    expect(Buffer.byteLength(INSTRUCTIONS, 'utf8')).toBeLessThanOrEqual(512);
+  });
+
+  it('deadline arithmetic honors explicit waits to 3600s — the 50s clamp stays dead', () => {
+    // The integration suite cannot wait out a >50s hold, so the arithmetic
+    // seam is pinned directly: reinstating Math.min(wait, 50) fails here.
+    expect(effectiveWaitMs(3600)).toBe(3_600_000);
+    expect(effectiveWaitMs(3300)).toBe(3_300_000);
+    expect(effectiveWaitMs(60)).toBe(60_000);
+    expect(effectiveWaitMs(undefined)).toBe(25_000); // omitted → safe default
+    expect(effectiveWaitMs(9999)).toBe(3_600_000); // defensive ceiling = schema max
+  });
+
   it('lists exactly the triad tools; taskSupport never required/optional (required breaks Qoder)', async () => {
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name).sort();
@@ -79,7 +95,7 @@ describe('MCP triad', () => {
 
     let status: Record<string, any> = {};
     let offset = 0;
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 90; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
         arguments: { runId, waitSeconds: 2, sinceEventOffset: offset },
@@ -97,7 +113,7 @@ describe('MCP triad', () => {
     expect(result.structuredContent!.result).toEqual({ g: 'hi-from-mcp' });
     expect(result.structuredContent!.logs).toEqual(['done']);
     expect(result.structuredContent!.artifacts.runDir).toContain(runId);
-  }, 60_000);
+  }, 180_000);
 
   it('workflow_start passes wallClockMs/attemptTimeoutMs through unclamped; omitting them leaves config bare', async () => {
     const start = (await client.callTool({
@@ -115,7 +131,7 @@ describe('MCP triad', () => {
 
     let status: Record<string, any> = {};
     let offset = 0;
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 90; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
         arguments: { runId, waitSeconds: 2, sinceEventOffset: offset },
@@ -141,12 +157,17 @@ describe('MCP triad', () => {
     expect('wallClockMs' in plainConfig).toBe(false);
     expect('attemptTimeoutMs' in plainConfig).toBe(false);
     let plainStatus: Record<string, any> = {};
-    for (let i = 0; i < 40; i++) {
+    // Chain the cursor: an unchained activity poll re-reads the backlog from 0
+    // and returns instantly every time, so the loop can never actually WAIT —
+    // under CI contention it exhausts before the run completes (live flake).
+    let plainOffset = 0;
+    for (let i = 0; i < 90; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
-        arguments: { runId: plain.structuredContent!.runId!, waitSeconds: 2 },
+        arguments: { runId: plain.structuredContent!.runId!, waitSeconds: 2, sinceEventOffset: plainOffset },
       })) as { structuredContent?: Record<string, any> };
       plainStatus = s.structuredContent!;
+      plainOffset = plainStatus.nextEventOffset;
       if (plainStatus.terminal) break;
     }
     expect(plainStatus.status).toBe('completed');
@@ -161,7 +182,7 @@ describe('MCP triad', () => {
     const clearedConfig = JSON.parse(readFileSync(join(cleared.structuredContent!.runDir!, 'config.json'), 'utf8'));
     expect('wallClockMs' in clearedConfig).toBe(false);
     expect('attemptTimeoutMs' in clearedConfig).toBe(false);
-  }, 60_000);
+  }, 180_000);
 
   it('long-poll is not woken by agent_usage ticks (renderable lines only)', async () => {
     // Fabricated live run: manifest points at THIS (alive) process so
@@ -208,6 +229,377 @@ describe('MCP triad', () => {
     expect(elapsed).toBeGreaterThanOrEqual(900); // waited to deadline instead of waking on ticks
   }, 20_000);
 
+  // Fabricated live run (same pattern as the ticks-only test): manifest pid
+  // points at an alive process (this one unless overridden) so liveStatus
+  // stays 'running' until the test flips status or the pid dies.
+  function fabricateRun(
+    runId: string,
+    events: string,
+    proc: { pid: number; pidStart?: number } = { pid: process.pid, pidStart: readProcStat(process.pid)?.starttime },
+  ): { dir: string; manifest: Record<string, unknown> } {
+    const dir = join(projectDir, '.ultracode', 'runs', runId);
+    mkdirSync(dir, { recursive: true });
+    const now = new Date().toISOString();
+    const manifest = {
+      runId,
+      name: 'fabricated',
+      status: 'running',
+      pid: proc.pid,
+      pidStart: proc.pidStart,
+      startedAt: now,
+      heartbeatAt: now,
+      phases: [],
+      agentCount: 0,
+      budget: { total: null, spent: 0 },
+      backendDefault: 'mock',
+      engineVersion: '0.0.0',
+    };
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify(manifest));
+    writeFileSync(join(dir, 'events.jsonl'), events);
+    return { dir, manifest };
+  }
+
+  // The server re-reads manifest.json every tick — flips must be atomic
+  // (tmp+rename, like the real writeManifest) or a read can land mid-truncate.
+  function flipStatus(dir: string, manifest: Record<string, unknown>, status: string): void {
+    writeFileSync(join(dir, 'manifest.json.tmp'), JSON.stringify({ ...manifest, status, endedAt: new Date().toISOString() }));
+    renameSync(join(dir, 'manifest.json.tmp'), join(dir, 'manifest.json'));
+  }
+
+  const logLines = (n: number, prefix = 'line'): string =>
+    Array.from({ length: n }, (_, i) => JSON.stringify({ ts: i + 1, type: 'workflow_log', message: `${prefix}${i + 1}` }) + '\n').join('');
+
+  it("quiet monitor (until='terminal') is not woken by renderable log lines; the deadline response rolls them up", async () => {
+    const runId = 'wf_quietlines01';
+    fabricateRun(runId, logLines(2, 'quiet-'));
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const elapsed = Date.now() - t0;
+    const status = s.structuredContent!;
+    expect(elapsed).toBeGreaterThanOrEqual(900); // renderable lines exist, but only terminal wakes it
+    expect(status.terminal).toBe(false);
+    expect(status.logTail).toEqual(['   log: quiet-1', '   log: quiet-2']); // rolled up, not woken on
+    expect(status.nextEventOffset).toBeGreaterThan(0); // cursor advance == content delivered
+    expect(status.hint).toContain('waitSeconds'); // sub-240s quiet holds get the in-band nudge
+    expect(status.next).toContain('silently'); // in-band counter to host commentary mandates
+    expect(status.next).toContain(`sinceEventOffset: ${status.nextEventOffset}`); // concrete cursor to re-issue with
+  }, 20_000);
+
+  it("until='phase' ignores log lines but wakes on a phase boundary appended mid-hold", async () => {
+    const runId = 'wf_phasewake001';
+    const { dir } = fabricateRun(runId, logLines(2, 'pre-'));
+
+    const t0 = Date.now();
+    const s1 = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'phase', waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900); // log lines alone don't wake phase mode
+    expect(s1.structuredContent!.terminal).toBe(false);
+
+    const pending = client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'phase', waitSeconds: 15, sinceEventOffset: s1.structuredContent!.nextEventOffset },
+    }) as Promise<{ structuredContent?: Record<string, any> }>;
+    const t1 = Date.now();
+    await new Promise((r) => setTimeout(r, 700));
+    appendFileSync(join(dir, 'events.jsonl'), '{"ts":9,"type":"phase_started","title":"Analyze"}\n');
+
+    const s2 = (await pending).structuredContent!;
+    expect(Date.now() - t1).toBeLessThan(10_000); // woke on the phase boundary, not the 15s deadline
+    expect(s2.terminal).toBe(false);
+    expect(s2.logTail).toContain('── phase: Analyze');
+    expect(s2.next).toContain('silently');
+  }, 20_000);
+
+  it("activity mode (default) still wakes on renderable lines", async () => {
+    const runId = 'wf_activewake01';
+    fabricateRun(runId, logLines(2, 'active-'));
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, waitSeconds: 10, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(Date.now() - t0).toBeLessThan(5_000); // woke on the lines, not the 10s deadline
+    expect(status.terminal).toBe(false);
+    expect(status.logTail).toEqual(['   log: active-1', '   log: active-2']);
+  }, 20_000);
+
+  it('quiet monitor wakes mid-hold on the terminal flip and delivers the rolled-up 40-line tail', async () => {
+    const runId = 'wf_quietwake001';
+    const { dir, manifest } = fabricateRun(runId, logLines(45));
+
+    const pending = client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 15, sinceEventOffset: 0 },
+    }) as Promise<{ structuredContent?: Record<string, any> }>;
+    const t0 = Date.now();
+    await new Promise((r) => setTimeout(r, 700));
+    flipStatus(dir, manifest, 'completed');
+
+    const status = (await pending).structuredContent!;
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(10_000); // woke on the flip, not the 15s deadline
+    expect(status.terminal).toBe(true);
+    expect(status.status).toBe('completed');
+    expect(status.next).toContain('workflow_result');
+    expect(status.logTail).toHaveLength(40); // rolling cap
+    expect(status.logTail[39]).toBe('   log: line45'); // the tail is the newest lines, oldest rolled off
+  }, 20_000);
+
+  it('quiet monitor wakes when the runner process dies mid-hold (orphan detection)', async () => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 800)'], { stdio: 'ignore' });
+    const runId = 'wf_quietorphan1';
+    fabricateRun(runId, '', { pid: child.pid!, pidStart: readProcStat(child.pid!)?.starttime });
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 15 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(Date.now() - t0).toBeLessThan(10_000); // dead pid flips the run terminal within a tick
+    expect(status.status).toBe('orphaned');
+    expect(status.terminal).toBe(true);
+  }, 20_000);
+
+  it('activity waits emit exactly one throttled progress ping; quiet parks emit none', async () => {
+    // Both holds must OUTLIVE the 10s throttle window or neither branch is
+    // ever eligible and the test passes with the !quiet gate deleted.
+    const runId = 'wf_quietprog001';
+    fabricateRun(runId, '');
+    let active = 0;
+    let quiet = 0;
+    await Promise.all([
+      client.callTool(
+        { name: 'workflow_status', arguments: { runId, waitSeconds: 12, sinceEventOffset: 0 } },
+        undefined,
+        { onprogress: () => void active++ },
+      ),
+      client.callTool(
+        { name: 'workflow_status', arguments: { runId, until: 'terminal', waitSeconds: 12 } },
+        undefined,
+        { onprogress: () => void quiet++ },
+      ),
+    ]);
+    expect(active).toBe(1); // fired (Qoder/Gemini liveness UX intact) AND throttled (300ms cadence would give ~40)
+    expect(quiet).toBe(0); // silent-park contract
+  }, 30_000);
+
+  it("until='terminal' rolls a phase boundary into the tail without waking", async () => {
+    const runId = 'wf_termphase001';
+    fabricateRun(runId, '{"ts":1,"type":"phase_started","title":"Analyze"}\n' + logLines(1, 'after-'));
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    // The regression this pins: phaseHit written as until !== 'activity' would
+    // wake terminal holds at every phase boundary — back to a turn per phase.
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
+    expect(s.structuredContent!.terminal).toBe(false);
+    expect(s.structuredContent!.logTail).toContain('── phase: Analyze');
+  }, 20_000);
+
+  it('a stale runner heartbeat wakes a quiet hold with stale: true (wedged-but-alive runner)', async () => {
+    const runId = 'wf_staleheart01';
+    const { dir, manifest } = fabricateRun(runId, '');
+    writeFileSync(join(dir, 'manifest.json.tmp'), JSON.stringify({ ...manifest, heartbeatAt: new Date(Date.now() - 60_000).toISOString() }));
+    renameSync(join(dir, 'manifest.json.tmp'), join(dir, 'manifest.json'));
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 15 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(Date.now() - t0).toBeLessThan(10_000); // woke on staleness, not the 15s deadline
+    expect(status.terminal).toBe(false);
+    expect(status.stale).toBe(true);
+    expect(status.next).toContain('wedged'); // diagnose, don't re-park
+  }, 20_000);
+
+  it('terminal quiet park from offset 0 over a >8 MiB backlog jumps to the real tail, cursor at EOF', async () => {
+    const runId = 'wf_quietbig0001';
+    // >8 MiB matters: the final-window jump only fires when end − 4 MiB
+    // exceeds the first page's nextOffset (~4 MiB), so a smaller fixture
+    // would silently test plain paging instead of the jump + tail reset.
+    const { dir, manifest } = fabricateRun(runId, logLines(200_000)); // ~11 MiB
+    flipStatus(dir, manifest, 'completed');
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 3300, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(status.terminal).toBe(true);
+    expect(status.logTail).toHaveLength(40);
+    expect(status.logTail[39]).toBe('   log: line200000'); // the run's REAL tail through the jump, not its head
+    const { statSync } = await import('node:fs');
+    expect(status.nextEventOffset).toBe(statSync(join(dir, 'events.jsonl')).size); // cursor at EOF
+  }, 20_000);
+
+  it('tail lines are capped per line so a huge log() message cannot flood logTail', async () => {
+    const runId = 'wf_hugelogline1';
+    fabricateRun(runId, JSON.stringify({ ts: 1, type: 'workflow_log', message: 'x'.repeat(10_000) }) + '\n');
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, waitSeconds: 5, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const line = s.structuredContent!.logTail[0] as string;
+    expect(line.length).toBeLessThanOrEqual(401); // 400 chars + ellipsis
+    expect(line.endsWith('…')).toBe(true);
+  }, 20_000);
+
+  it('a waitSeconds:0 terminal call still finalizes to the real tail (deadline never skips the jump)', async () => {
+    const runId = 'wf_zerowait0001';
+    const { dir, manifest } = fabricateRun(runId, logLines(200_000, 'zero')); // ~11 MiB
+    flipStatus(dir, manifest, 'completed');
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 0, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(status.terminal).toBe(true);
+    expect(status.logTail[39]).toBe('   log: zero200000'); // an expired deadline must not serve the HEAD as the tail
+    const { statSync } = await import('node:fs');
+    expect(status.nextEventOffset).toBe(statSync(join(dir, 'events.jsonl')).size);
+  }, 20_000);
+
+  it('a phase wake keeps its newest boundary visible in logTail through a dense batch', async () => {
+    const runId = 'wf_densephase01';
+    fabricateRun(runId, '{"ts":1,"type":"phase_started","title":"Buried"}\n' + logLines(50, 'noise'));
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'phase', waitSeconds: 10, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(status.terminal).toBe(false);
+    expect(status.logTail).toHaveLength(40);
+    expect(status.logTail).toContain('── phase: Buried'); // 50 renderables after the boundary must not roll the milestone off
+  }, 20_000);
+
+  it('the rolling tail evicts oldest-first across ticks (multi-tick accumulation)', async () => {
+    const runId = 'wf_tailroll0001';
+    const { dir, manifest } = fabricateRun(runId, '');
+    const batch = (from: number, n: number) =>
+      Array.from({ length: n }, (_, i) => JSON.stringify({ ts: from + i, type: 'workflow_log', message: `line${from + i}` }) + '\n').join('');
+
+    const pending = client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 15, sinceEventOffset: 0 },
+    }) as Promise<{ structuredContent?: Record<string, any> }>;
+    // Two sub-cap batches on separate 1s quiet ticks: neither alone trims, so
+    // only the cross-tick eviction path can hold the 40-line bound.
+    await new Promise((r) => setTimeout(r, 500));
+    appendFileSync(join(dir, 'events.jsonl'), batch(1, 30));
+    await new Promise((r) => setTimeout(r, 2_000));
+    appendFileSync(join(dir, 'events.jsonl'), batch(31, 30));
+    await new Promise((r) => setTimeout(r, 1_500));
+    flipStatus(dir, manifest, 'completed');
+
+    const status = (await pending).structuredContent!;
+    expect(status.terminal).toBe(true);
+    expect(status.logTail).toHaveLength(40); // 60 accrued → oldest 20 evicted
+    expect(status.logTail[0]).toBe('   log: line21');
+    expect(status.logTail[39]).toBe('   log: line60');
+  }, 30_000);
+
+  it('a fifth concurrent hold preempts the oldest; live holds keep parking', async () => {
+    const runId = 'wf_holdcap00001';
+    const { dir, manifest } = fabricateRun(runId, '');
+    const settled: number[] = [];
+    const holds = Array.from({ length: 5 }, (_, i) => {
+      const p = client
+        .callTool({ name: 'workflow_status', arguments: { runId, until: 'terminal', waitSeconds: 15 } })
+        .then((s) => {
+          settled.push(i);
+          return s as { structuredContent?: Record<string, any> };
+        });
+      return p;
+    });
+    await new Promise((r) => setTimeout(r, 3_000));
+    // Admission control: 5 holds on one run preempt exactly the oldest —
+    // abandoned holds must not tick for their full waitSeconds.
+    expect(settled).toEqual([0]);
+    const preempted = await holds[0]!;
+    expect(preempted.structuredContent!.terminal).toBe(false); // a normal still-running payload — just an early re-poll for a live client
+
+    flipStatus(dir, manifest, 'completed');
+    const rest = await Promise.all(holds.slice(1));
+    for (const s of rest) expect(s.structuredContent!.terminal).toBe(true);
+  }, 30_000);
+
+  it("a late until='terminal' attach to a RUNNING run jumps the backlog instead of parsing it", async () => {
+    const runId = 'wf_latebig00001';
+    const { dir } = fabricateRun(runId, logLines(200_000, 'live')); // ~11 MiB, run stays running
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(status.terminal).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    const { statSync } = await import('node:fs');
+    const size = statSync(join(dir, 'events.jsonl')).size;
+    expect(status.nextEventOffset).toBe(size); // caught up to EOF without walking the full history
+    expect(status.logTail[status.logTail.length - 1]).toBe('   log: live200000');
+  }, 20_000);
+
+  it("until='phase' without sinceEventOffset wakes instantly on a historical phase boundary (documented footgun)", async () => {
+    const runId = 'wf_phasehist001';
+    fabricateRun(runId, '{"ts":1,"type":"phase_started","title":"Old"}\n');
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'phase', waitSeconds: 10 },
+    })) as { structuredContent?: Record<string, any> };
+    expect(Date.now() - t0).toBeLessThan(5_000); // woke on the backlog boundary, not the deadline
+    expect(s.structuredContent!.terminal).toBe(false);
+    expect(s.structuredContent!.next).toContain('sinceEventOffset'); // the nudge that teaches chaining
+  }, 20_000);
+
+  // NOTE: this pins schema bounds only — a reinstated sub-schema runtime clamp
+  // (the original bug's shape) is not observable inside the 20s suite budget,
+  // since proving a >50s hold held would take >50s of wall clock.
+  it('waitSeconds schema: 3600 accepted, 3601 rejected', async () => {
+    const runId = 'wf_quietsched01';
+    const { dir, manifest } = fabricateRun(runId, '');
+    flipStatus(dir, manifest, 'completed');
+
+    const t0 = Date.now();
+    const ok = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 3600 },
+    })) as { structuredContent?: Record<string, any>; isError?: boolean };
+    expect(ok.isError).toBeFalsy();
+    expect(ok.structuredContent!.terminal).toBe(true); // terminal returns immediately regardless of hold size
+    expect(Date.now() - t0).toBeLessThan(5_000);
+
+    // Depending on SDK version the schema violation surfaces as a tool error
+    // result or a protocol-level rejection (see the count:0 precedent below).
+    let rejected = false;
+    try {
+      const over = (await client.callTool({
+        name: 'workflow_status',
+        arguments: { runId, waitSeconds: 3601 },
+      })) as { isError?: boolean };
+      rejected = Boolean(over.isError);
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+  }, 20_000);
+
   it('workflow_result on a running workflow errors with guidance; stop terminates it', async () => {
     const start = (await client.callTool({
       name: 'workflow_start',
@@ -232,7 +624,7 @@ describe('MCP triad', () => {
     };
     const entry = list.structuredContent!.runs.find((r) => r.runId === runId);
     expect(entry).toBeDefined();
-  }, 60_000);
+  }, 180_000);
 
   it('workflow_list caps to the 10 most recent by default and honors count, reporting hidden', async () => {
     // Isolated store (via the cwd input) so accumulated runs from other tests
@@ -345,12 +737,16 @@ describe('MCP triad', () => {
 
     // Drive the run terminal so it can be resumed. startDetachedRun's resume
     // config-merge is a separate implementation from the CLI's resumeCommand,
-    // so the MCP path needs its own override/inherit assertions.
-    for (let i = 0; i < 40; i++) {
+    // so the MCP path needs its own override/inherit assertions. Chain the
+    // cursor or every poll wakes instantly on the backlog and never waits;
+    // 20 × 2s stays under this test's 45s budget.
+    let driveOffset = 0;
+    for (let i = 0; i < 20; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
-        arguments: { runId, waitSeconds: 2 },
-      })) as { structuredContent?: { terminal?: boolean } };
+        arguments: { runId, waitSeconds: 2, sinceEventOffset: driveOffset },
+      })) as { structuredContent?: { terminal?: boolean; nextEventOffset?: number } };
+      driveOffset = s.structuredContent!.nextEventOffset ?? driveOffset;
       if (s.structuredContent!.terminal) break;
     }
 
