@@ -8,7 +8,7 @@
 
 *Linux & macOS · not on npm yet — build from source.*
 
-Type the keyword `ultracode` in your coding agent and it stops doing everything in one context: the **skill** (doctrine) teaches it to author a small deterministic JS workflow — `agent()` calls are the only side effects — and hand it to the **engine** (this npm package: CLI + MCP server), which fans each `agent()` out as a real coding-agent subprocess. **Delivery** is a plugin where plugins exist and `ultracode install <host>` everywhere else; on Qoder the pack rides the native Workflow tool instead of replacing it. Watch the fleet live, stop it, resume it, get one structured result back. Full layering: `docs/architecture.md`.
+Type the keyword `ultracode` in your coding agent and it stops doing everything in one context. Three layers take over. The **skill** (doctrine) teaches the agent to author a small deterministic JS workflow whose only side effects are `agent()` calls. The agent hands that workflow to the **engine** — this npm package, a CLI + MCP server — which fans each `agent()` out as a real coding-agent subprocess. **Delivery** ships it as a plugin on hosts that have plugins, and via `ultracode install <host>` everywhere else; on Qoder the pack rides the host's native Workflow tool instead of replacing it. Watch the fleet live, stop it, resume it, and get one structured result back. Full layering: `docs/architecture.md`.
 
 ```text
 "ultracode: audit src/ for auth bugs"      <- the keyword arms the skill
@@ -54,10 +54,10 @@ ultracode install codex           # skill + AGENTS.md trigger + MCP registration
 Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
 
 ```text
-"ultracode: review this repo for auth bugs +500k"
+"ultracode: review this repo for auth bugs"
 ```
 
-The word arms the mode: your agent authors a workflow and runs it — Qoder and Claude Code natively via their Workflow tools; Codex over MCP (`workflow_start` → `workflow_status` → `workflow_result`, wired by `install codex`); hosts without MCP registration (`install generic` copies only the skill + trigger) fall back to driving the `ultracode` CLI, or register `ultracode mcp` with the host yourself. `workflow_start` has no confirmation gate — ask the agent to show the workflow before running it (`docs/threat-model.md`). `+500k` is an optional budget — omit it to run uncapped. Follow engine runs from any shell (the runId is in the agent's reply, or `ultracode list`):
+The keyword arms the mode: your agent authors a workflow and runs it. Qoder and Claude Code run it natively through their own Workflow tools. Codex runs it over MCP — `workflow_start` → `workflow_status` → `workflow_result`, wired up by `install codex`. Hosts without MCP registration — where `install generic` copies only the skill + trigger — fall back to driving the `ultracode` CLI, or you can register `ultracode mcp` with the host yourself. One safety note: `workflow_start` has no confirmation gate, so ask the agent to show the workflow before running it (`docs/threat-model.md`). Follow engine runs from any shell — the runId is in the agent's reply, or from `ultracode list`:
 
 ```bash
 ultracode watch <runId>
