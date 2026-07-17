@@ -10,7 +10,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # event_name in the key keeps the nightly canary and push-to-main builds in
+  # separate groups — cancel-in-progress then only supersedes runs of the same kind
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   test:
