@@ -3,7 +3,7 @@
  * launches real detached runners on the mock backend. No network.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -265,6 +265,34 @@ describe('MCP triad', () => {
     expect(status.logTail).toEqual(['   log: quiet-1', '   log: quiet-2']); // rolled up, not woken on
     expect(status.nextEventOffset).toBeGreaterThan(0); // cursor advance == content delivered
     expect(status.hint).toContain('waitSeconds'); // sub-240s quiet holds get the in-band nudge
+    expect(status.next).toContain('silently'); // in-band counter to host commentary mandates
+  }, 20_000);
+
+  it("until='phase' ignores log lines but wakes on a phase boundary appended mid-hold", async () => {
+    const runId = 'wf_phasewake001';
+    const { dir } = fabricateRun(runId, logLines(2, 'pre-'));
+
+    const t0 = Date.now();
+    const s1 = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'phase', waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900); // log lines alone don't wake phase mode
+    expect(s1.structuredContent!.terminal).toBe(false);
+
+    const pending = client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'phase', waitSeconds: 15, sinceEventOffset: s1.structuredContent!.nextEventOffset },
+    }) as Promise<{ structuredContent?: Record<string, any> }>;
+    const t1 = Date.now();
+    await new Promise((r) => setTimeout(r, 700));
+    appendFileSync(join(dir, 'events.jsonl'), '{"ts":9,"type":"phase_started","title":"Analyze"}\n');
+
+    const s2 = (await pending).structuredContent!;
+    expect(Date.now() - t1).toBeLessThan(10_000); // woke on the phase boundary, not the 15s deadline
+    expect(s2.terminal).toBe(false);
+    expect(s2.logTail).toContain('── phase: Analyze');
+    expect(s2.next).toContain('silently');
   }, 20_000);
 
   it("activity mode (default) still wakes on renderable lines", async () => {

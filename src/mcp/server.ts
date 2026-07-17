@@ -134,7 +134,7 @@ export function createServer(baseCwd: string): McpServer {
           runId: result.runId,
           name: result.name,
           runDir: result.dir,
-          monitor: `call workflow_status {runId: '${result.runId}', until: 'terminal', waitSeconds: 3300 on the codex hostpack (else your MCP tool timeout − 60)}; re-issue until terminal`,
+          monitor: `call workflow_status {runId: '${result.runId}', until: 'terminal', waitSeconds: 3300 on the codex hostpack (else your MCP tool timeout − 60)}; re-issue until terminal and park silently between wakes ('phase' wakes per milestone if commentary is wanted)`,
         });
       } catch (err) {
         return fail((err as Error).message);
@@ -148,15 +148,17 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Run status long-poll. until="terminal" is the quiet monitor: wakes only when the run ends ' +
         'or after waitSeconds (re-issue the same call), rolling the last 40 log lines into each ' +
-        'response. Every wake costs a model turn — pass the largest waitSeconds your host MCP tool ' +
-        'timeout allows: codex hostpack (tool_timeout_sec=3600) → 3300; stock codex 300 → 240; ' +
-        'qoder/gemini 600 → 540. Holds dying early mean a lower pinned timeout — drop waitSeconds ' +
-        'below the cutoff and re-run `ultracode install codex`. Default until="activity" returns as ' +
-        'soon as new log lines exist past sinceEventOffset — pass nextEventOffset back for only ' +
-        'fresh lines. Timed-out polls are harmless — call again.',
+        'response; until="phase" additionally wakes at phase boundaries — the sanctioned channel ' +
+        'for milestone updates. Between wakes park silently: failures and crashes wake the monitor, ' +
+        'so skip filler updates, refresh polls, and run-store tailing. Every wake costs a model ' +
+        'turn — pass the largest waitSeconds your host MCP tool timeout allows: codex hostpack ' +
+        '(tool_timeout_sec=3600) → 3300; stock codex 300 → 240; qoder/gemini 600 → 540; holds dying ' +
+        'early mean a lower pinned timeout (drop waitSeconds below the cutoff, re-run `ultracode ' +
+        'install codex`). Default until="activity" returns on new log lines past sinceEventOffset — ' +
+        'pass nextEventOffset back for only fresh lines. Timed-out polls are harmless — call again.',
       inputSchema: {
         runId: z.string(),
-        until: z.enum(['activity', 'terminal']).optional(),
+        until: z.enum(['activity', 'phase', 'terminal']).optional(),
         waitSeconds: z.number().min(0).max(MAX_WAIT_SECONDS).optional(),
         sinceEventOffset: z.number().int().min(0).optional(),
         cwd: z.string().optional(),
@@ -164,7 +166,7 @@ export function createServer(baseCwd: string): McpServer {
     },
     async (input, extra) => {
       const root = rootFor(input.cwd);
-      const quiet = input.until === 'terminal';
+      const quiet = input.until === 'terminal' || input.until === 'phase';
       const wait = Math.min(input.waitSeconds ?? DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS) * 1000;
       const deadline = Date.now() + wait;
       let offset = input.sinceEventOffset ?? 0;
@@ -193,13 +195,14 @@ export function createServer(baseCwd: string): McpServer {
           .filter((l): l is string => l !== null);
         tail.push(...fresh);
         if (tail.length > 40) tail.splice(0, tail.length - 40);
+        const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
 
         // A terminal quiet wake first drains the (now finite) backlog so
         // logTail is the run's real tail and nextEventOffset reaches EOF —
         // returning mid-backlog would serve the HEAD of the log as the tail.
         if (quiet && terminal && page.hasMore) continue;
 
-        const wake = quiet ? terminal : fresh.length > 0 || terminal;
+        const wake = quiet ? terminal || phaseHit : fresh.length > 0 || terminal;
         if (wake || Date.now() >= deadline || extra.signal.aborted) {
           const m = run.manifest;
           return ok({
@@ -213,8 +216,13 @@ export function createServer(baseCwd: string): McpServer {
             terminal,
             ...(terminal
               ? { next: `call workflow_result with runId=${input.runId}` }
-              : quiet && wait < SHORT_HOLD_NUDGE_MS
-                ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (codex hostpack pins 3600 → pass 3300)' }
+              : quiet
+                ? {
+                    next: 're-issue this hold and park silently — failures wake this monitor; filler updates, refresh polls, and run-store tailing waste turns',
+                    ...(wait < SHORT_HOLD_NUDGE_MS
+                      ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (codex hostpack pins 3600 → pass 3300)' }
+                      : {}),
+                  }
                 : {}),
           });
         }
