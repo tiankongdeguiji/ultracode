@@ -264,6 +264,7 @@ describe('MCP triad', () => {
     expect(status.terminal).toBe(false);
     expect(status.logTail).toEqual(['   log: quiet-1', '   log: quiet-2']); // rolled up, not woken on
     expect(status.nextEventOffset).toBeGreaterThan(0); // cursor advance == content delivered
+    expect(status.hint).toContain('waitSeconds'); // sub-240s quiet holds get the in-band nudge
   }, 20_000);
 
   it("activity mode (default) still wakes on renderable lines", async () => {

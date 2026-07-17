@@ -19,8 +19,10 @@ The MCP triad is version-agnostic by design: `workflow_status` long-polls under
 the host's tool timeout — explicit `waitSeconds` honored up to 3600s (default
 25s). The quiet monitor (`until = "terminal"`) parks silently for the whole
 hold; the codex hostpack writes `tool_timeout_sec = 3600` so one hold covers
-~55 min (stock codex defaults 300s, Qoder/Gemini 600s — doctrine keeps holds
-≥60s under the host budget). Verified against codex-rs **0.144.5**: progress
+~55 min (stock codex defaults 300s, Qoder/Gemini 600s — doctrine holds are the
+host's tool timeout minus a ≥60s margin, stated as concrete per-host numbers:
+models hedge ambiguous rules toward tiny waits, and the server nudges quiet
+holds under 240s). Verified against codex-rs **0.144.5**: progress
 notifications never extend a tool timeout (rmcp's `reset_timeout_on_progress`
 is never set) and a client-side timeout never cancels the request server-side.
 Never declares `taskSupport` (a `required` declaration breaks Qoder clients;

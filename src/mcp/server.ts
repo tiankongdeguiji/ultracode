@@ -8,8 +8,8 @@
  *    background monitor a host can have is one long blocking call under its
  *    tool timeout: workflow_status until='terminal' holds silently for an
  *    explicit waitSeconds ≤3600 (codex hostpack writes tool_timeout_sec=3600;
- *    stock codex defaults 300s, Qoder/Gemini 600s — doctrine keeps holds
- *    ≥60s under the host budget). A client that times out anyway never
+ *    stock codex defaults 300s, Qoder/Gemini 600s — doctrine states concrete
+ *    holds, timeout minus ≥60s margin). A client that times out anyway never
  *    cancels server-side; the abandoned hold just runs out and is dropped.
  *  - NEVER declare MCP Tasks taskSupport ('required' hard-breaks Qoder
  *    client-side; no target host polls Tasks).
@@ -37,16 +37,18 @@ import { readFileSync, existsSync } from 'node:fs';
 const INSTRUCTIONS =
   'Dynamic multi-agent workflow orchestration. workflow_start returns a runId in <1s and the run ' +
   'survives this server. Park on workflow_status until="terminal" — wakes only when the run ends, ' +
-  'rolling the last 40 log lines into each response; set waitSeconds ≥60s under your MCP tool timeout ' +
-  '(codex hostpack: 3600 → pass 3300). A timed-out poll is harmless — re-poll the same runId; when ' +
-  'terminal call workflow_result. Author scripts per the ultracode skill dialect (export const meta ' +
-  '+ agent/parallel/pipeline).';
+  'rolling the last 40 log lines into each response. waitSeconds is the wake interval, not a safety ' +
+  'knob: pass 3300 on the codex hostpack (pinned 3600s tool timeout); small waits burn a turn per ' +
+  'wake. A timed-out poll is harmless — re-poll the same runId, then workflow_result when terminal. ' +
+  'Scripts follow the skill dialect.';
 
 /** Explicit waitSeconds ceiling — sized to the codex hostpack's tool_timeout_sec=3600; doctrine keeps holds ≥60s under the host's actual timeout. */
 const MAX_WAIT_SECONDS = 3600;
 const DEFAULT_WAIT_SECONDS = 25;
 /** Progress notifications reach only host log files (no host renders them or extends timeouts) — throttle so an hour-long hold doesn't append 3 lines/s there. */
 const PROGRESS_INTERVAL_MS = 10_000;
+/** Quiet holds shorter than this get an in-band nudge: models hedge toward tiny "safe" waits (observed: 60), and a short hold burns a turn per wake. */
+const SHORT_HOLD_NUDGE_MS = 240_000;
 
 function ok(structured: Record<string, unknown>) {
   return {
@@ -132,7 +134,7 @@ export function createServer(baseCwd: string): McpServer {
           runId: result.runId,
           name: result.name,
           runDir: result.dir,
-          monitor: `call workflow_status with runId=${result.runId}, until='terminal', waitSeconds ≥60s under your MCP tool timeout; re-call until terminal`,
+          monitor: `call workflow_status {runId: '${result.runId}', until: 'terminal', waitSeconds: 3300 on the codex hostpack (else your MCP tool timeout − 60)}; re-issue until terminal`,
         });
       } catch (err) {
         return fail((err as Error).message);
@@ -146,12 +148,14 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Run status long-poll. until="terminal" is the quiet monitor: wakes only when the run ends ' +
         '(or after waitSeconds — re-issue the same call), rolling the last 40 log lines into each ' +
-        'response instead of waking on them, so a long hold costs one cheap turn. Set waitSeconds ' +
-        '≥60s under your host MCP tool timeout (codex hostpack config 3600 → pass 3300; stock codex ' +
-        '300; qoder/gemini 600); if holds die client-side after ~N seconds your config pins a lower ' +
-        'timeout — use waitSeconds under N and re-run `ultracode install codex`. Default ' +
-        'until="activity" returns as soon as new log lines exist past sinceEventOffset — pass ' +
-        'nextEventOffset back to receive only fresh lines. Timed-out polls are harmless — call again.',
+        'response instead of waking on them. waitSeconds is the wake INTERVAL between free parks, ' +
+        'not a safety knob — every wake costs a full model turn, so pass the LARGEST value your ' +
+        'host MCP tool timeout allows with ~60s margin: codex hostpack pins tool_timeout_sec=3600 → ' +
+        'ALWAYS pass 3300; stock codex 300 → 240; qoder/gemini 600 → 540. Only if holds die ' +
+        'client-side after ~N seconds does your config pin a lower timeout: use N−60 and re-run ' +
+        '`ultracode install codex`. Default until="activity" returns as soon as new log lines exist ' +
+        'past sinceEventOffset — pass nextEventOffset back to receive only fresh lines. Timed-out ' +
+        'polls are harmless — call again.',
       inputSchema: {
         runId: z.string(),
         until: z.enum(['activity', 'terminal']).optional(),
@@ -209,7 +213,11 @@ export function createServer(baseCwd: string): McpServer {
             logTail: tail.slice(-40),
             nextEventOffset: offset,
             terminal,
-            ...(terminal ? { next: `call workflow_result with runId=${input.runId}` } : {}),
+            ...(terminal
+              ? { next: `call workflow_result with runId=${input.runId}` }
+              : quiet && wait < SHORT_HOLD_NUDGE_MS
+                ? { hint: 'short quiet holds burn a model turn per wake — re-issue with waitSeconds close to your MCP tool timeout (codex hostpack pins 3600 → pass 3300)' }
+                : {}),
           });
         }
 

@@ -124,7 +124,7 @@ when a workflow is running — you design, launch, monitor, and synthesize.
 | Your host | Primary path | Fallback |
 |---|---|---|
 | Qoder CLI/IDE | Native `Workflow` tool: pass `script` (or `name` for saved), `args`. Fire-and-forget; completion arrives as a task notification. Resume: same `scriptPath` + `resumeFromRunId`. | If tool answers "Workflow feature gate is disabled." → MCP triad below |
-| Codex, Gemini, Cursor, Copilot, opencode, Amp, Claude-as-guest | MCP tools `workflow_start` → park on `workflow_status(run_id, until='terminal', wait_seconds ≥60s under the host tool timeout)` until terminal → `workflow_result`. NEVER abandon a started run; keep re-issuing the hold. A timed-out poll call is harmless — poll again with the same run_id. | CLI: `ultracode run <file> --args-json '…' --json` (blocking; only for short runs) |
+| Codex, Gemini, Cursor, Copilot, opencode, Amp, Claude-as-guest | MCP tools `workflow_start` → park on `workflow_status(run_id, until='terminal', wait_seconds = host tool timeout − 60s; codex hostpack 3300)` until terminal → `workflow_result`. NEVER abandon a started run; keep re-issuing the hold. A timed-out poll call is harmless — poll again with the same run_id. | CLI: `ultracode run <file> --args-json '…' --json` (blocking; only for short runs) |
 | Codex quick fan-out exception | For ≤3 trivially parallel READ-ONLY lookups with no schema/journal needs, native spawn_agent is acceptable. Everything else: engine. | — |
 - Key sentence: "workflow_start returns in <1s; the run continues server-side even
   if your turn ends — resume monitoring with workflow_status in the next turn."
