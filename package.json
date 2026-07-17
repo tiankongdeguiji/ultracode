@@ -1,6 +1,6 @@
 {
   "name": "ultracode",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Portable ultracode: dynamic multi-agent workflow orchestration for Codex, Qoder, Claude Code, Gemini CLI and other coding agents",
   "type": "module",
   "license": "MIT",
