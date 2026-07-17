@@ -8,7 +8,7 @@
 
 *Linux & macOS · not on npm yet — build from source.*
 
-Type the keyword `ultracode` in your coding agent and it stops doing everything in one context. The **skill** teaches the agent to author a small deterministic JS workflow whose only side effects are `agent()` calls. The **engine** — this npm package — fans each `agent()` out as a real coding-agent subprocess. Watch it live, stop, resume, get one structured result back.
+Type `ultracode` in your coding agent and it stops working in one context: the **skill** authors a deterministic JS workflow; the **engine** runs each `agent()` as a subprocess.
 
 ```text
 "ultracode: audit src/ for auth bugs"      <- the keyword arms the skill
@@ -57,7 +57,7 @@ Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
 "ultracode: review this repo for auth bugs"
 ```
 
-The keyword arms the mode: your agent authors and runs a workflow. Qoder and Claude Code run it natively via their Workflow tools; Codex over MCP (`install codex`); others fall back to the `ultracode` CLI. `workflow_start` has no confirmation gate — ask to see it first. Follow engine runs from a shell — runId from the agent's reply or `ultracode list`:
+The keyword arms the mode: your agent authors and runs a workflow — native on Qoder/Claude Code, over MCP on Codex, via the `ultracode` CLI elsewhere. Follow runs from a shell:
 
 ```bash
 ultracode watch <runId>
