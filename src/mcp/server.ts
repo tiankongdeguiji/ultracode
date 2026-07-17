@@ -147,15 +147,13 @@ export function createServer(baseCwd: string): McpServer {
     {
       description:
         'Run status long-poll. until="terminal" is the quiet monitor: wakes only when the run ends ' +
-        '(or after waitSeconds — re-issue the same call), rolling the last 40 log lines into each ' +
-        'response instead of waking on them. waitSeconds is the wake INTERVAL between free parks, ' +
-        'not a safety knob — every wake costs a full model turn, so pass the LARGEST value your ' +
-        'host MCP tool timeout allows with ~60s margin: codex hostpack pins tool_timeout_sec=3600 → ' +
-        'ALWAYS pass 3300; stock codex 300 → 240; qoder/gemini 600 → 540. Only if holds die ' +
-        'client-side after ~N seconds does your config pin a lower timeout: use N−60 and re-run ' +
-        '`ultracode install codex`. Default until="activity" returns as soon as new log lines exist ' +
-        'past sinceEventOffset — pass nextEventOffset back to receive only fresh lines. Timed-out ' +
-        'polls are harmless — call again.',
+        'or after waitSeconds (re-issue the same call), rolling the last 40 log lines into each ' +
+        'response. Every wake costs a model turn — pass the largest waitSeconds your host MCP tool ' +
+        'timeout allows: codex hostpack (tool_timeout_sec=3600) → 3300; stock codex 300 → 240; ' +
+        'qoder/gemini 600 → 540. Holds dying early mean a lower pinned timeout — drop waitSeconds ' +
+        'below the cutoff and re-run `ultracode install codex`. Default until="activity" returns as ' +
+        'soon as new log lines exist past sinceEventOffset — pass nextEventOffset back for only ' +
+        'fresh lines. Timed-out polls are harmless — call again.',
       inputSchema: {
         runId: z.string(),
         until: z.enum(['activity', 'terminal']).optional(),
