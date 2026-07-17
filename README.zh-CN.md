@@ -48,7 +48,7 @@ ultracode engine: sandboxed script + scheduler + journal
 * **预算与超时可按需启用**——默认不设置任何上限；未配置即不限制。`--budget 500k` 会在任务派发时强制执行：达到上限后不再启动新的 agent。超时限制采用相同的控制方式。
 * **结构化输出容错**——为 `agent()` 提供 `JSON Schema` 后，引擎会返回经过校验的对象。若模型输出不符合 schema，最多会自动进行两次修复重试，之后才将该调用判定为失败。
 
-## 快速上手
+## 快速开始
 
 ```bash
 npm install && npm run build && npm link   # 构建项目，并链接出全局 `ultracode` 命令
@@ -67,7 +67,7 @@ ultracode install codex           # skill + AGENTS.md 触发器 + MCP 注册
 然后在 Codex（或 Qoder、Gemini CLI、Claude Code）中输入：
 
 ```text
-"ultracode: 审查这个仓库有没有鉴权漏洞"
+"ultracode: review this repo for auth bugs"
 ```
 
 这个关键词会启用 ultracode 模式：你的 agent 会生成并运行一份工作流。在 Qoder 和 Claude Code 中使用原生工作流，在 Codex 中通过 MCP，在其他宿主中则通过 `ultracode` CLI。你可以在 shell 中查看运行进度：
@@ -108,7 +108,7 @@ const audits = await pipeline(files, (f) => agent(`Audit ${f} for missing auth c
 return { audits: audits.filter(Boolean) }
 ```
 
-主要接口就是这些；除此之外还有 `parallel()`、`log()`、`args`、`budget`，以及一层 `workflow()` 嵌套。为了保证工作流可以重放，脚本中禁用了熵源：调用 `Date.now()` 或 `Math.random()` 会直接抛出异常。完整的方言参考见 `skill/ultracode/references/dialect.md`。
+主要接口就是这些；除此之外还有 `parallel()`、`log()`、`args`、`budget`，以及一层 `workflow()` 嵌套。为了保证工作流可以重放，脚本中排除了所有不确定性：调用 `Date.now()` 或 `Math.random()` 会直接抛出异常。完整的方言参考见 `skill/ultracode/references/dialect.md`。
 
 ```bash
 ultracode validate my.workflow.js
