@@ -317,12 +317,14 @@ Run state persisted under `~/.ultracode/runs/<run_id>/{manifest.json, journal.js
 
 ### 6.1 `ultracode install <host>` matrix
 
+> Design matrix — as shipped, `planFor` implements only the `codex`, `qoder`, and `generic` rows; the claude/gemini/cursor/copilot/opencode/amp rows are aspirational.
+
 | Host | Skill destination | MCP registration written | AGENTS/context wiring | Notes |
 |---|---|---|---|---|
 | `codex` | `.agents/skills/ultracode/` (repo) or `~/.agents/skills/` with `--user` | `~/.codex/config.toml` `[mcp_servers.ultracode]` (TOML merge, tool_timeout_sec=3600) — skipped if the plugin is detected | append §2.3 block to `AGENTS.md` (`--agents-md`) | suggests `codex plugin marketplace add` as the richer path |
 | `qoder` | via plugin (`qodercli plugins install`), else `.qoder/skills/ultracode/` | `.mcp.json` mcpServers.ultracode | `.qoder/rules/ultracode.md` (always_on) + AGENTS.md block | also copies `workflows/uc-*.js` → `.qoder/workflows/` (§7) |
 | `claude` | `.claude/skills/ultracode/` | none — native Workflow tool exists | AGENTS.md/CLAUDE.md block | copies `workflows/` → `.claude/workflows/` |
-| `gemini` | `.agents/skills/ultracode/` (alias honored) | `.gemini/settings.json` `mcpServers.ultracode` (timeout: 600000) | sets `contextFileName: ["GEMINI.md","AGENTS.md"]` in `.gemini/settings.json`, then AGENTS.md block | JSON-merge, never clobber |
+| `gemini` | `.agents/skills/ultracode/` (alias honored) | `.gemini/settings.json` `mcpServers.ultracode` (stock 600s timeout already fits 540s holds — no override needed) | sets `contextFileName: ["GEMINI.md","AGENTS.md"]` in `.gemini/settings.json`, then AGENTS.md block | JSON-merge, never clobber |
 | `cursor` | `.cursor/skills/ultracode/` (or `.agents/skills/`) | `.cursor/mcp.json` | AGENTS.md block (read natively) | `/ultracode` works via skill |
 | `copilot` | `.agents/skills/ultracode/` (agents-dir compat) | `~/.copilot/mcp-config.json` (user-level; per-repo via `--additional-mcp-config` documented) | AGENTS.md block | |
 | `opencode` | `.opencode/skills/` or `.agents/skills/` | `opencode.json` `mcp` key | AGENTS.md block (native) | |

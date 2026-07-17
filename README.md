@@ -33,7 +33,7 @@ ultracode engine: sandboxed script + scheduler + journal
 - **Live fleet panel** — foreground runs show it; `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail. In `watch`, Ctrl-C detaches and never stops the run (in an attached foreground run it stops the fleet).
 - **Opt-in budgets and timeouts** — no default caps. Pass `--budget 500k` and the engine enforces it at the dispatch gate: no new agent starts past the ceiling. Timeouts are the same deal — unlimited unless you set one.
 - **Structured output that survives sloppy models** — give `agent()` a JSON Schema and it returns a validated object; non-conforming replies get up to two schema-repair round-trips before counting as a failure.
-- **Detached, durable runs** — the runner outlives your session; state lives in `.ultracode/runs/`. Over MCP, the `workflow_start` / `workflow_status` / `workflow_result` triad drives the same run store, so sandboxed hosts orchestrate fire-and-forget across turns — and `workflow_status until="terminal"` is a quiet monitor that parks the host in one long hold (~55 min on the codex hostpack), making an hour of babysitting cost ~1 turn.
+- **Detached, durable runs** — the runner outlives your session; state lives in `.ultracode/runs/`. Over MCP, the `workflow_start` / `workflow_status` / `workflow_result` triad drives the same run store, so sandboxed hosts orchestrate fire-and-forget across turns — and `workflow_status until="terminal"` is a quiet monitor that parks the host in one long hold (~55 min with the timeout `install codex` pins), making an hour of babysitting cost ~1 turn.
 
 ## Quick start
 

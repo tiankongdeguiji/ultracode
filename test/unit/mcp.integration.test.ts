@@ -12,6 +12,7 @@ import { createRequire } from 'node:module';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { readProcStat } from '../../src/exec/procinfo.js';
+import { INSTRUCTIONS } from '../../src/mcp/server.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const mainTs = join(here, '../../src/cli/main.ts');
@@ -54,6 +55,10 @@ describe('MCP triad', () => {
 
   afterAll(async () => {
     await client.close();
+  });
+
+  it('server instructions fit codex 512-unit injection under the stricter byte reading', () => {
+    expect(Buffer.byteLength(INSTRUCTIONS, 'utf8')).toBeLessThanOrEqual(512);
   });
 
   it('lists exactly the triad tools; taskSupport never required/optional (required breaks Qoder)', async () => {
@@ -354,16 +359,60 @@ describe('MCP triad', () => {
     expect(status.terminal).toBe(true);
   }, 20_000);
 
-  it('quiet holds emit no progress notifications (silent-park contract)', async () => {
+  it('activity waits emit exactly one throttled progress ping; quiet parks emit none', async () => {
+    // Both holds must OUTLIVE the 10s throttle window or neither branch is
+    // ever eligible and the test passes with the !quiet gate deleted.
     const runId = 'wf_quietprog001';
     fabricateRun(runId, '');
-    let notifications = 0;
-    await client.callTool(
-      { name: 'workflow_status', arguments: { runId, until: 'terminal', waitSeconds: 1 } },
-      undefined,
-      { onprogress: () => void notifications++ },
-    );
-    expect(notifications).toBe(0); // quiet parks are structurally silent; activity mode still throttles at 10s
+    let active = 0;
+    let quiet = 0;
+    await Promise.all([
+      client.callTool(
+        { name: 'workflow_status', arguments: { runId, waitSeconds: 12, sinceEventOffset: 0 } },
+        undefined,
+        { onprogress: () => void active++ },
+      ),
+      client.callTool(
+        { name: 'workflow_status', arguments: { runId, until: 'terminal', waitSeconds: 12 } },
+        undefined,
+        { onprogress: () => void quiet++ },
+      ),
+    ]);
+    expect(active).toBe(1); // fired (Qoder/Gemini liveness UX intact) AND throttled (300ms cadence would give ~40)
+    expect(quiet).toBe(0); // silent-park contract
+  }, 30_000);
+
+  it("until='terminal' rolls a phase boundary into the tail without waking", async () => {
+    const runId = 'wf_termphase001';
+    fabricateRun(runId, '{"ts":1,"type":"phase_started","title":"Analyze"}\n' + logLines(1, 'after-'));
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    // The regression this pins: phaseHit written as until !== 'activity' would
+    // wake terminal holds at every phase boundary — back to a turn per phase.
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
+    expect(s.structuredContent!.terminal).toBe(false);
+    expect(s.structuredContent!.logTail).toContain('── phase: Analyze');
+  }, 20_000);
+
+  it('a stale runner heartbeat wakes a quiet hold with stale: true (wedged-but-alive runner)', async () => {
+    const runId = 'wf_staleheart01';
+    const { dir, manifest } = fabricateRun(runId, '');
+    writeFileSync(join(dir, 'manifest.json.tmp'), JSON.stringify({ ...manifest, heartbeatAt: new Date(Date.now() - 60_000).toISOString() }));
+    renameSync(join(dir, 'manifest.json.tmp'), join(dir, 'manifest.json'));
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 15 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(Date.now() - t0).toBeLessThan(10_000); // woke on staleness, not the 15s deadline
+    expect(status.terminal).toBe(false);
+    expect(status.stale).toBe(true);
+    expect(status.next).toContain('wedged'); // diagnose, don't re-park
   }, 20_000);
 
   it('terminal quiet park from offset 0 over a >8 MiB backlog jumps to the real tail, cursor at EOF', async () => {
@@ -582,12 +631,16 @@ describe('MCP triad', () => {
 
     // Drive the run terminal so it can be resumed. startDetachedRun's resume
     // config-merge is a separate implementation from the CLI's resumeCommand,
-    // so the MCP path needs its own override/inherit assertions.
-    for (let i = 0; i < 90; i++) {
+    // so the MCP path needs its own override/inherit assertions. Chain the
+    // cursor or every poll wakes instantly on the backlog and never waits;
+    // 20 × 2s stays under this test's 45s budget.
+    let driveOffset = 0;
+    for (let i = 0; i < 20; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
-        arguments: { runId, waitSeconds: 2 },
-      })) as { structuredContent?: { terminal?: boolean } };
+        arguments: { runId, waitSeconds: 2, sinceEventOffset: driveOffset },
+      })) as { structuredContent?: { terminal?: boolean; nextEventOffset?: number } };
+      driveOffset = s.structuredContent!.nextEventOffset ?? driveOffset;
       if (s.structuredContent!.terminal) break;
     }
 

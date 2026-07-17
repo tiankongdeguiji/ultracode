@@ -17,8 +17,9 @@ tests before trusting a new parser path.
 
 The MCP triad is version-agnostic: `workflow_status` long-polls under the
 host's tool timeout (explicit `waitSeconds` ≤3600, default 25s), and the quiet
-monitor (`until = "terminal"`) parks silently for the whole hold — the codex
-hostpack writes `tool_timeout_sec = 3600`, so one hold covers ~55 min (stock
+monitor (`until = "terminal"`) parks silently for the whole hold —
+`ultracode install codex` pins `tool_timeout_sec = 3600` (user scope), so one
+hold covers ~55 min (stock
 codex 300s, Qoder/Gemini 600s). Doctrine states holds as concrete per-host
 numbers and the server nudges quiet holds under 240s (models hedge ambiguous
 rules toward tiny waits). Verified on codex-rs **0.144.5**: progress
