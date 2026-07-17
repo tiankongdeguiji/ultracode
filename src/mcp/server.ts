@@ -32,7 +32,7 @@ import { HEARTBEAT_STALE_MS, isTerminal } from '../store/manifest.js';
 import { getRun, recentRuns } from '../store/runstore.js';
 import { ultracodeRoot } from '../store/layout.js';
 import { renderEvent } from '../cli/lifecycle.js';
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, lstatSync } from 'node:fs';
 
 // Codex injects only the first 512 chars of server instructions; guarded in
 // bytes (the stricter reading) by test/unit/mcp.integration.test.ts.
@@ -55,6 +55,22 @@ const SHORT_HOLD_NUDGE_MS = 240_000;
 const TAIL_LINES = 40;
 /** Per-line byte cap for the tail: log()/event text is script- and worker-influenced and can be huge — logTail must stay model-context-sized (worst case ~16 KB). */
 const TAIL_LINE_CHARS = 400;
+/**
+ * Admission cap on concurrent workflow_status holds per run. Clients that time
+ * out never cancel server-side, so abandoned holds would otherwise accumulate
+ * (a stale 90s-timeout client re-polling against 3300s holds stacks ~37
+ * once-per-second poll loops). The oldest hold is preempted first: it returns
+ * a normal non-terminal payload, which a still-live client just treats as an
+ * early re-poll — while genuinely abandoned loops die instead of ticking for
+ * up to an hour. The cap leaves room for several legitimate concurrent
+ * front-ends before any preemption ping-pong can start.
+ */
+const MAX_HOLDS_PER_RUN = 4;
+
+/** Pure deadline arithmetic, exported for direct test coverage: explicit waitSeconds is honored up to MAX_WAIT_SECONDS — there is no hidden 50s clamp. */
+export function effectiveWaitMs(waitSeconds?: number): number {
+  return Math.min(waitSeconds ?? DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS) * 1000;
+}
 
 function ok(structured: Record<string, unknown>) {
   return {
@@ -73,6 +89,7 @@ function fail(message: string, extra: Record<string, unknown> = {}) {
 export function createServer(baseCwd: string): McpServer {
   const server = new McpServer({ name: 'ultracode', version: VERSION }, { instructions: INSTRUCTIONS });
   const rootFor = (cwd?: string) => ultracodeRoot(cwd ?? baseCwd);
+  const activeHolds = new Map<string, { preempted: boolean }[]>();
 
   server.registerTool(
     'workflow_start',
@@ -176,8 +193,22 @@ export function createServer(baseCwd: string): McpServer {
     async (input, extra) => {
       const root = rootFor(input.cwd);
       const quiet = input.until === 'terminal' || input.until === 'phase';
-      const wait = Math.min(input.waitSeconds ?? DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS) * 1000;
+      const wait = effectiveWaitMs(input.waitSeconds);
       const deadline = Date.now() + wait;
+      const hold = { preempted: false };
+      const holds = activeHolds.get(input.runId) ?? [];
+      holds.push(hold);
+      activeHolds.set(input.runId, holds);
+      if (holds.length > MAX_HOLDS_PER_RUN) holds.shift()!.preempted = true;
+      try {
+        return await runStatusHold();
+      } finally {
+        const i = holds.indexOf(hold);
+        if (i !== -1) holds.splice(i, 1);
+        if (holds.length === 0) activeHolds.delete(input.runId);
+      }
+
+      async function runStatusHold() {
       let offset = input.sinceEventOffset ?? 0;
       const progressToken = (extra as { _meta?: { progressToken?: string | number } })._meta?.progressToken;
       let ticks = 0;
@@ -217,30 +248,38 @@ export function createServer(baseCwd: string): McpServer {
         if (tail.length > TAIL_LINES) tail.splice(0, tail.length - TAIL_LINES);
         const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
 
-        // A terminal quiet wake serves the run's REAL tail with the cursor at
-        // EOF — returning mid-backlog would serve the head of the log. Jump
-        // straight to the final window instead of paging: only it can hold
-        // the last TAIL_LINES renderable lines, and synchronously JSON-parsing
-        // a multi-MB backlog would block this single-threaded stdio server.
-        // (A mid-line landing is fine — the torn fragment fails to parse and
-        // is dropped, exactly like any other malformed line.)
-        if (quiet && terminal && page.hasMore) {
+        // A terminal-mode hold never wakes on history, so a backlog holds no
+        // information beyond its final window (up to the last TAIL_LINES
+        // renderable lines) — jump there instead of paging: parsing a
+        // multi-MB backlog synchronously would block this single-threaded
+        // stdio server, whether attaching late to a running run or waking on
+        // an already-terminal one. On terminal wakes this also puts the
+        // cursor at EOF so logTail is the run's REAL tail, never its head.
+        // phase mode must scan (boundaries live in the backlog); activity
+        // mode returns page-by-page. (A mid-line landing is fine — the torn
+        // fragment fails to parse and drops like any malformed line. lstat,
+        // not stat: events.jsonl sits in a worker-writable dir and this
+        // server is unsandboxed — never follow a swapped-in symlink; a
+        // non-regular-file entry falls back to the O_NOFOLLOW-guarded read.)
+        if (input.until === 'terminal' && page.hasMore) {
           try {
-            const end = statSync(eventsFile).size;
-            // The window must equal the page size the next read covers, or
-            // the jump would land outside what that read can serve.
-            const jump = Math.max(page.nextOffset, end - EVENT_PAGE_BYTES);
-            if (jump > page.nextOffset) tail.length = 0;
-            offset = jump;
+            const st = lstatSync(eventsFile);
+            if (st.isFile()) {
+              // The window must equal the page size the next read covers, or
+              // the jump would land outside what that read can serve.
+              const jump = Math.max(page.nextOffset, st.size - EVENT_PAGE_BYTES);
+              if (jump > page.nextOffset) tail.length = 0;
+              offset = jump;
+            }
           } catch {
             /* fall back to plain paging */
           }
-          await sleep(0); // same event-loop yield as the drain below — the catch path degrades to multi-page parsing
+          await sleep(0); // same event-loop yield as the drain below — the fallback paths degrade to multi-page parsing
           continue;
         }
 
         const wake = quiet ? terminal || phaseHit || stale : fresh.length > 0 || terminal || stale;
-        if (wake || Date.now() >= deadline || extra.signal.aborted) {
+        if (wake || Date.now() >= deadline || extra.signal.aborted || hold.preempted) {
           const m = run.manifest;
           return ok({
             runId: input.runId,
@@ -292,6 +331,7 @@ export function createServer(baseCwd: string): McpServer {
         // deadline only) — a wider idle tick cuts syscall churn 3× over a
         // 55-minute park at imperceptible extra latency.
         await sleep(quiet ? 1_000 : 300);
+      }
       }
     },
   );

@@ -12,7 +12,7 @@ import { createRequire } from 'node:module';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { readProcStat } from '../../src/exec/procinfo.js';
-import { INSTRUCTIONS } from '../../src/mcp/server.js';
+import { INSTRUCTIONS, effectiveWaitMs } from '../../src/mcp/server.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const mainTs = join(here, '../../src/cli/main.ts');
@@ -59,6 +59,16 @@ describe('MCP triad', () => {
 
   it('server instructions fit codex 512-unit injection under the stricter byte reading', () => {
     expect(Buffer.byteLength(INSTRUCTIONS, 'utf8')).toBeLessThanOrEqual(512);
+  });
+
+  it('deadline arithmetic honors explicit waits to 3600s — the 50s clamp stays dead', () => {
+    // The integration suite cannot wait out a >50s hold, so the arithmetic
+    // seam is pinned directly: reinstating Math.min(wait, 50) fails here.
+    expect(effectiveWaitMs(3600)).toBe(3_600_000);
+    expect(effectiveWaitMs(3300)).toBe(3_300_000);
+    expect(effectiveWaitMs(60)).toBe(60_000);
+    expect(effectiveWaitMs(undefined)).toBe(25_000); // omitted → safe default
+    expect(effectiveWaitMs(9999)).toBe(3_600_000); // defensive ceiling = schema max
   });
 
   it('lists exactly the triad tools; taskSupport never required/optional (required breaks Qoder)', async () => {
@@ -447,6 +457,48 @@ describe('MCP triad', () => {
     const line = s.structuredContent!.logTail[0] as string;
     expect(line.length).toBeLessThanOrEqual(401); // 400 chars + ellipsis
     expect(line.endsWith('…')).toBe(true);
+  }, 20_000);
+
+  it('a fifth concurrent hold preempts the oldest; live holds keep parking', async () => {
+    const runId = 'wf_holdcap00001';
+    const { dir, manifest } = fabricateRun(runId, '');
+    const settled: number[] = [];
+    const holds = Array.from({ length: 5 }, (_, i) => {
+      const p = client
+        .callTool({ name: 'workflow_status', arguments: { runId, until: 'terminal', waitSeconds: 15 } })
+        .then((s) => {
+          settled.push(i);
+          return s as { structuredContent?: Record<string, any> };
+        });
+      return p;
+    });
+    await new Promise((r) => setTimeout(r, 3_000));
+    // Admission control: 5 holds on one run preempt exactly the oldest —
+    // abandoned holds must not tick for their full waitSeconds.
+    expect(settled).toEqual([0]);
+    const preempted = await holds[0]!;
+    expect(preempted.structuredContent!.terminal).toBe(false); // a normal still-running payload — just an early re-poll for a live client
+
+    flipStatus(dir, manifest, 'completed');
+    const rest = await Promise.all(holds.slice(1));
+    for (const s of rest) expect(s.structuredContent!.terminal).toBe(true);
+  }, 30_000);
+
+  it("a late until='terminal' attach to a RUNNING run jumps the backlog instead of parsing it", async () => {
+    const runId = 'wf_latebig00001';
+    const { dir } = fabricateRun(runId, logLines(200_000, 'live')); // ~11 MiB, run stays running
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 1, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(status.terminal).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    const { statSync } = await import('node:fs');
+    const size = statSync(join(dir, 'events.jsonl')).size;
+    expect(status.nextEventOffset).toBe(size); // caught up to EOF without walking the full history
+    expect(status.logTail[status.logTail.length - 1]).toBe('   log: live200000');
   }, 20_000);
 
   it("until='phase' without sinceEventOffset wakes instantly on a historical phase boundary (documented footgun)", async () => {
