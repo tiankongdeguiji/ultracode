@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { newRunId, RUN_ID_RE, agentDirName, ultracodeRoot } from '../../src/store/layout.js';
 import { readManifest, writeManifest, isTerminal, type RunManifest } from '../../src/store/manifest.js';
 import { EventWriter, readEventsFrom } from '../../src/store/events.js';
-import { createRunDir, getRun, listRuns, liveStatus, reapOrphans, isPidAlive } from '../../src/store/runstore.js';
+import { createRunDir, getRun, listRuns, liveStatus, reapOrphans, isPidAlive, recentRuns, DEFAULT_LIST_COUNT } from '../../src/store/runstore.js';
 
 function tmpRoot(): string {
   return mkdtempSync(join(tmpdir(), 'uc-store-'));
@@ -236,5 +236,109 @@ describe('runstore', () => {
     expect(isPidAlive(process.pid)).toBe(true);
     expect(isPidAlive(999999999)).toBe(false);
     expect(isPidAlive(0)).toBe(false);
+  });
+});
+
+describe('recentRuns', () => {
+  const DAY = 24 * 3600e3;
+
+  function makeRun(root: string, startedAt: string, status: RunManifest['status'] = 'running'): string {
+    const runId = newRunId();
+    const dir = createRunDir(root, { runId, name: 'demo', source: 's', args: null, config: { backend: 'mock', cwd: '/p' } });
+    writeManifest(dir, { ...baseManifest(runId), startedAt, status });
+    return runId;
+  }
+
+  it('default caps to the 10 most recent (oldest-first) and reports the rest as hidden', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    const ids: string[] = [];
+    for (let i = 0; i < 13; i++) ids.push(makeRun(root, new Date(base - (13 - i) * 60_000).toISOString()));
+    const { runs, hidden } = recentRuns(root, {});
+    expect(runs).toHaveLength(DEFAULT_LIST_COUNT);
+    expect(hidden).toBe(3);
+    expect(runs.map((r) => r.runId)).toEqual(ids.slice(-DEFAULT_LIST_COUNT));
+  });
+
+  it('at the exact cap boundary (10 runs) shows all with hidden 0', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < DEFAULT_LIST_COUNT; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    const { runs, hidden } = recentRuns(root, {});
+    expect(runs).toHaveLength(DEFAULT_LIST_COUNT);
+    expect(hidden).toBe(0);
+  });
+
+  it('one past the cap boundary (11 runs) shows 10 with hidden 1', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < DEFAULT_LIST_COUNT + 1; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    const { runs, hidden } = recentRuns(root, {});
+    expect(runs).toHaveLength(DEFAULT_LIST_COUNT);
+    expect(hidden).toBe(1);
+  });
+
+  it('an explicit count sets the cap', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < 5; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    const { runs, hidden } = recentRuns(root, { count: 2 });
+    expect(runs).toHaveLength(2);
+    expect(hidden).toBe(3);
+  });
+
+  it('all returns every run including old terminal ones, nothing hidden', () => {
+    const root = tmpRoot();
+    const old = new Date(Date.now() - 2 * DAY).toISOString();
+    makeRun(root, old, 'completed');
+    makeRun(root, old, 'failed');
+    makeRun(root, new Date().toISOString());
+    const { runs, hidden } = recentRuns(root, { all: true });
+    expect(runs).toHaveLength(3);
+    expect(hidden).toBe(0);
+  });
+
+  it('default filter drops old terminal runs but keeps an old still-running one', () => {
+    const root = tmpRoot();
+    const old = new Date(Date.now() - 2 * DAY).toISOString();
+    const oldDone = makeRun(root, old, 'completed');
+    const oldRunning = makeRun(root, old, 'running');
+    const recent = makeRun(root, new Date().toISOString(), 'completed');
+    const shown = recentRuns(root, {}).runs.map((r) => r.runId);
+    expect(shown).toContain(oldRunning);
+    expect(shown).toContain(recent);
+    expect(shown).not.toContain(oldDone);
+  });
+
+  it('hidden counts only cap-dropped runs, never filter-dropped ones', () => {
+    const root = tmpRoot();
+    const oldTs = new Date(Date.now() - 2 * DAY).toISOString();
+    for (let i = 0; i < 3; i++) makeRun(root, oldTs, 'completed'); // old terminal → filtered out
+    const base = Date.now();
+    for (let i = 0; i < 12; i++) makeRun(root, new Date(base - i * 60_000).toISOString()); // recent, active
+    const { runs, hidden } = recentRuns(root, {});
+    expect(runs).toHaveLength(DEFAULT_LIST_COUNT);
+    // 12 recent − 10 shown; the 3 old terminal runs are filtered, NOT counted in hidden
+    // (computing hidden from the unfiltered length of 15 would wrongly give 5).
+    expect(hidden).toBe(2);
+  });
+
+  it('a non-positive count is treated as unset (no slice(-0) returning everything)', () => {
+    const root = tmpRoot();
+    const base = Date.now();
+    for (let i = 0; i < 12; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    expect(recentRuns(root, { count: 0 }).runs).toHaveLength(DEFAULT_LIST_COUNT);
+    expect(recentRuns(root, { count: 0, all: true }).runs).toHaveLength(12);
+  });
+
+  it('all with an explicit count caps within the unfiltered set', () => {
+    const root = tmpRoot();
+    makeRun(root, new Date(Date.now() - 2 * DAY).toISOString(), 'completed');
+    makeRun(root, new Date(Date.now() - 47 * 3600e3).toISOString(), 'completed');
+    const newest = makeRun(root, new Date().toISOString(), 'completed');
+    const { runs, hidden } = recentRuns(root, { all: true, count: 1 });
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.runId).toBe(newest);
+    expect(hidden).toBe(2);
   });
 });

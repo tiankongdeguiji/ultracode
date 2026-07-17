@@ -130,6 +130,31 @@ export function listRuns(root: string): RunSummary[] {
   return out.sort((a, b) => Date.parse(a.manifest.startedAt) - Date.parse(b.manifest.startedAt));
 }
 
+/** Default cap for `list` / `workflow_list` when neither an explicit count nor `all` is given. */
+export const DEFAULT_LIST_COUNT = 10;
+
+/**
+ * Filter + cap runs for the `list` CLI command and the `workflow_list` MCP tool,
+ * so the recency rule and the default cap live in exactly one place and can't
+ * drift between the two surfaces. Without `all`, keeps only active or last-24h
+ * runs; `all` skips that filter entirely. Returns the most-recent `count`
+ * (default 10; `all` with no `count` uncaps), oldest-first like `listRuns`, plus
+ * `hidden` = how many the *cap* dropped (never counts runs the recency filter
+ * removed). An explicit positive `count` caps even under `all`; a non-positive
+ * `count` (which callers reject) is treated as unset.
+ */
+export function recentRuns(root: string, opts: { all?: boolean; count?: number }): { runs: RunSummary[]; hidden: number } {
+  let runs = listRuns(root);
+  if (!opts.all) {
+    runs = runs.filter((r) => !isTerminal(r.effectiveStatus) || Date.parse(r.manifest.startedAt) > Date.now() - 24 * 3600e3);
+  }
+  // Only a positive count caps the tail; anything else falls back to
+  // default/uncapped — never slice(-0), which would return the whole array.
+  const cap = opts.count && opts.count > 0 ? opts.count : opts.all ? Infinity : DEFAULT_LIST_COUNT;
+  const shown = Number.isFinite(cap) ? runs.slice(-cap) : runs;
+  return { runs: shown, hidden: runs.length - shown.length };
+}
+
 /** Finalize orphaned runs (runner died without writing a terminal manifest). */
 export function reapOrphans(root: string): string[] {
   const reaped: string[] = [];

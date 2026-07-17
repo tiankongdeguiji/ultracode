@@ -248,7 +248,7 @@ Default root: `<project>/.ultracode/` (git-ignorable), overridable `$ULTRACODE_H
 ### 3.2 Concurrency & crash safety
 
 - **Single-writer**: only the runner process writes inside its run dir. CLI/MCP are pure readers. No locks needed for readers; `manifest.json` is atomic-swapped; `events.jsonl`/`journal.jsonl` are O_APPEND single-`write()` lines (atomic under PIPE_BUF-sized records).
-- **Liveness**: runner refreshes `heartbeatAt` every 5s. Readers report `orphaned` when `status==='running'` but pid is dead or heartbeat > 30s stale; `ultracode list` offers `--reap` to finalize orphans (`status:'failed', error:'runner died'`), which also unblocks resume.
+- **Liveness**: runner refreshes `heartbeatAt` every 5s. Readers report `orphaned` only when `status==='running'` but the recorded pid is dead (or, on Linux where `/proc` exposes start-time, a recycled PID — macOS detects a dead pid but not a recycled live one); a stale heartbeat alone keeps a live-but-wedged runner `running`, so `stop` can still signal it; `ultracode list` offers `--reap` to finalize orphans (`status:'orphaned', error:'runner died without finalizing'`), which also unblocks resume.
 - **runId** from `crypto.randomBytes` (host-side; the determinism ban applies to scripts, not the engine). Distinct dirs ⇒ no cross-run contention. Worktrees live at `.ultracode/worktrees/<runId>/<seq>/` on branch `ultracode/<runId>/<seq>`, branched from the default branch; removed post-run if clean, kept (path recorded in result.json) if the agent left changes.
 - **Stop**: SIGTERM to runner → runner aborts the run AbortController, sends SIGTERM to each child's **process group** (children spawned with `detached:true` + `kill(-pgid)`), waits 5s, SIGKILL, marks `stopped`, flushes partial `output.json`.
 
@@ -278,7 +278,7 @@ ultracode status <runId> [--watch] [--json]     # phases, agent table, budget, h
 ultracode logs   <runId> [--follow] [--agent seq]
 ultracode resume <runId> [--script f] [--args j]
 ultracode stop   <runId>
-ultracode list   [--all] [--reap] [--json]
+ultracode list   [--all] [--count <n>] [--reap] [--json]   # default: up to 10 active-or-last-24h runs
 ultracode validate <script.js>                   # meta + acorn + dry compile
 ultracode doctor                                 # probe all backends: binary, version, auth mode, parallel-safety warnings
 ultracode mcp                                    # start MCP stdio server
@@ -291,7 +291,7 @@ stdio transport, no session-affinity assumptions (2026-07-28-ready). Tools (neve
 - **`workflow_start`** `{script?|scriptPath?|name?, args?, backend?, budget?, resumeFromRunId?}` → returns in <1s: `{ runId, scriptPath, monitor: 'call workflow_status with runId', summary }`. Mirrors the Workflow tool's fire-and-forget contract.
 - **`workflow_status`** `{runId, waitSeconds?: number /* clamped to 50 */, sinceEventOffset?: number}` → **long-poll**: returns immediately if terminal or new events exist past the offset, else waits up to `min(waitSeconds,50)`s (safely under every host default timeout: Codex 300s—and 60s on legacy installs—Qoder/Gemini 600s). Response: `{ status, phases, agentsRunning, agentsDone, budget, logTail, nextEventOffset }`. Emits `notifications/progress` against the caller's progressToken during the wait (UX for Qoder/Gemini; Codex just logs it).
 - **`workflow_result`** `{runId}` → `output.json` content as `structuredContent` + failures + artifact paths; error `-32602`-style tool error if not terminal (with current status so the model self-corrects).
-- **`workflow_stop`** `{runId}`, **`workflow_list`** `{}`.
+- **`workflow_stop`** `{runId}`, **`workflow_list`** `{all?, count?}` → `{runs, hidden}` (up to 10 active-or-last-24h runs unless `all`/`count`).
 
 Because runs are detached, the MCP server is stateless over the run store: it can be killed and restarted (or run as multiple instances for multiple host sessions) with no run loss.
 
