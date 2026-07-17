@@ -25,23 +25,6 @@ ultracode engine: sandboxed script + scheduler + journal
 .ultracode/runs/<id>/ --> watch | status | logs | stop | resume
 ```
 
-## What a workflow looks like
-
-```js
-export const meta = { name: 'audit-routes', description: 'Audit route handlers for missing auth', phases: [{ title: 'Find' }, { title: 'Audit' }] }
-
-phase('Find')
-const { files } = await agent('List every route file under src/. Return JSON.', {
-  schema: { type: 'object', properties: { files: { type: 'array', items: { type: 'string' } } }, required: ['files'] },
-})
-
-phase('Audit')
-const audits = await pipeline(files, (f) => agent(`Audit ${f} for missing auth checks. Be self-contained.`, { label: f }))
-return { audits: audits.filter(Boolean) }
-```
-
-That's most of the surface — the rest is `parallel()`, `log()`, `args`, `budget`, and one level of `workflow()` nesting. Entropy is banned (`Date.now()` / `Math.random()` throw), so every run can replay. `ultracode run audit.workflow.js --dry-run` rehearses it for free on the mock backend. Full dialect reference: `skill/ultracode/references/dialect.md`.
-
 ## Why ultracode
 
 - **One dialect, three engines** — the same script text runs on Claude Code (native), Qoder (native), and this engine; `ultracode lint` checks it stays in the portable subset.
@@ -54,11 +37,16 @@ That's most of the surface — the rest is `parallel()`, `log()`, `args`, `budge
 
 ## Quick start
 
-Set up once, then orchestrate from inside your coding agent — the intended daily path:
-
 ```bash
 npm install && npm run build && npm link   # build, then link a global `ultracode`
 ultracode doctor                  # which backends are available + auth modes
+```
+
+### Use with your coding agent
+
+The intended daily path — install the skill and MCP registration into the host:
+
+```bash
 ultracode install codex           # skill + AGENTS.md trigger + MCP registration
 ```
 
@@ -89,9 +77,24 @@ agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
 ```
 
-## Driving the engine directly
+### Driving the engine directly
 
-The skill normally does this for you; the same surface is there for authoring and debugging workflows by hand:
+The skill normally does this for you; the same surface is there for authoring and debugging workflows by hand. A workflow is a small deterministic JS script:
+
+```js
+export const meta = { name: 'audit-routes', description: 'Audit route handlers for missing auth', phases: [{ title: 'Find' }, { title: 'Audit' }] }
+
+phase('Find')
+const { files } = await agent('List every route file under src/. Return JSON.', {
+  schema: { type: 'object', properties: { files: { type: 'array', items: { type: 'string' } } }, required: ['files'] },
+})
+
+phase('Audit')
+const audits = await pipeline(files, (f) => agent(`Audit ${f} for missing auth checks. Be self-contained.`, { label: f }))
+return { audits: audits.filter(Boolean) }
+```
+
+That's most of the surface — the rest is `parallel()`, `log()`, `args`, `budget`, and one level of `workflow()` nesting. Entropy is banned (`Date.now()` / `Math.random()` throw), so every run can replay — full dialect reference in `skill/ultracode/references/dialect.md`.
 
 ```bash
 ultracode validate my.workflow.js
