@@ -40,6 +40,7 @@ export interface ExecuteOptions {
   cwd?: string;
   syncTimeoutMs?: number;
   onEvent?: (ev: RunEvent) => void;
+  onAgentStarted?: (spec: AgentSpec) => void;
   onAgentSettled?: (record: AgentSettledRecord) => void;
   keyChain?: { next(spec: AgentSpec): string };
   cacheLookup?: (spec: AgentSpec, cacheKey: string | undefined) => { hit: boolean; value?: unknown } | undefined;
@@ -111,6 +112,7 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
           defaultBackend: opts.defaultBackend ?? 'mock',
           cwd: opts.cwd ?? process.cwd(),
           onEvent,
+          onAgentStarted: opts.onAgentStarted,
           onAgentSettled: opts.onAgentSettled,
           cacheLookup: opts.cacheLookup,
           // Propagate caps so a child honors the parent's agent ceiling (the
@@ -135,6 +137,7 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
     maxAgents: opts.maxAgents,
     logCap: opts.logCap,
     onEvent,
+    onAgentStarted: opts.onAgentStarted,
     onAgentSettled: opts.onAgentSettled,
     keyChain: opts.keyChain,
     cacheLookup: opts.cacheLookup,

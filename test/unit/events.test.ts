@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { executeWorkflow, type ExecuteOptions } from '../../src/engine/run.js';
 import { MockExecutor } from '../../src/backends/mock.js';
-import type { RunEvent } from '../../src/engine/hostapi.js';
+import { TOOL_EVENT_CAP, type RunEvent } from '../../src/engine/hostapi.js';
+import type { AgentExecutor, AgentOutcome, AgentProgress } from '../../src/backends/types.js';
 
 type EventOf<T extends RunEvent['type']> = Extract<RunEvent, { type: T }>;
 
@@ -49,6 +50,95 @@ await agent('MOCK:ok x', { label: 'm', model: 'sonnet', effort: 'low', agentType
 return 1`);
     expect(ofType('agent_started')[0]).toMatchObject({ model: 'sonnet', effort: 'low', agentType: 'reviewer' });
     expect(ofType('agent_model')).toEqual([expect.objectContaining({ seq: 0, model: 'sonnet' })]);
+  });
+
+  it('MOCK:tools emits paired agent_tool events before completion; agent_completed carries the count', async () => {
+    const { out, events, ofType } = await run(`export const meta = { name: 't', description: 'd' }
+await agent('MOCK:tools 3 MOCK:ok x', { label: 'tooler' })
+return 1`);
+    expect(out.error).toBeUndefined();
+    const tools = ofType('agent_tool');
+    expect(tools).toEqual([
+      { type: 'agent_tool', seq: 0, name: 'tool:mock-1', status: 'started' },
+      { type: 'agent_tool', seq: 0, name: 'tool:mock-1', status: 'completed' },
+      { type: 'agent_tool', seq: 0, name: 'tool:mock-2', status: 'started' },
+      { type: 'agent_tool', seq: 0, name: 'tool:mock-2', status: 'completed' },
+      { type: 'agent_tool', seq: 0, name: 'tool:mock-3', status: 'started' },
+      { type: 'agent_tool', seq: 0, name: 'tool:mock-3', status: 'completed' },
+    ]);
+    expect(events.findIndex((e) => e.type === 'agent_completed')).toBeGreaterThan(
+      events.findLastIndex((e) => e.type === 'agent_tool'),
+    );
+    expect(ofType('agent_completed')[0]).toMatchObject({ toolCalls: 3 });
+  });
+
+  it('agent_tool names are bounded at emission (control bytes stripped, length capped) and ticks capped per dispatch', async () => {
+    const evil = 'x'.repeat(300) + '\x1b[2J\x07';
+    const floodExecutor: AgentExecutor = {
+      execute(_spec, _signal, onProgress?: (p: AgentProgress) => void): Promise<AgentOutcome> {
+        // In-bounds hostile name: the ESC must be removed by the scrub regex
+        // itself, not as a side effect of the 80-char truncation.
+        onProgress?.({ type: 'tool', name: 'bash\x1b[2Jls', status: 'started' });
+        // The exact cap boundary: 80 chars pass through; 81 get the ellipsis cut.
+        onProgress?.({ type: 'tool', name: 'a'.repeat(80), status: 'started' });
+        onProgress?.({ type: 'tool', name: 'b'.repeat(81), status: 'started' });
+        onProgress?.({ type: 'tool', name: evil, status: 'started' });
+        for (let i = 0; i < TOOL_EVENT_CAP + 50; i++) {
+          onProgress?.({ type: 'tool', name: 'flood', status: 'started' });
+        }
+        return Promise.resolve({
+          ok: true,
+          value: 'done',
+          usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0, reasoningTokens: 0, totalTokens: 2, estimated: false },
+          toolCalls: TOOL_EVENT_CAP + 51,
+          attempts: 1,
+        });
+      },
+    };
+    const { ofType } = await run(
+      `export const meta = { name: 't', description: 'd' }
+await agent('anything', { label: 'evil' })
+return 1`,
+      { executor: floodExecutor },
+    );
+    const tools = ofType('agent_tool');
+    expect(tools).toHaveLength(TOOL_EVENT_CAP); // cap holds
+    expect(tools[0]!.name).toBe('bash [2Jls'); // scrubbed by the regex, untouched by the cap
+    expect(tools[1]!.name).toBe('a'.repeat(80)); // exactly at the cap — untouched
+    expect(tools[2]!.name).toBe('b'.repeat(79) + '…'); // one past — truncated to 80 with ellipsis
+    const name = tools[3]!.name;
+    expect(name.length).toBeLessThanOrEqual(80);
+    expect(name).not.toMatch(/[\x00-\x1f]/); // control bytes never enter the stream
+    expect(ofType('agent_completed')[0]).toMatchObject({ toolCalls: TOOL_EVENT_CAP + 51 }); // authority unaffected
+  });
+
+  it('onAgentSettled fires BEFORE agent_completed on every settle path (artifacts land before the event)', async () => {
+    // Watchers treat agent_completed as "result.json/prompt.md are final on
+    // disk" — the settle hook (which writes them) must run first, on the
+    // live, skip, and failure paths alike.
+    const merged: string[] = [];
+    await executeWorkflow(
+      `export const meta = { name: 't', description: 'd' }
+await agent('MOCK:ok x', { label: 'live' })
+await agent('MOCK:ok y', { label: 'skipme', skip: true })
+try { await agent('MOCK:fail boom', { label: 'dies' }) } catch { /* expected */ }
+return 1`,
+      {
+        executor: new MockExecutor(),
+        onAgentSettled: (r) => merged.push(`settled:${r.spec.label}:${r.status}`),
+        onEvent: (e) => {
+          if (e.type === 'agent_completed') merged.push(`completed:${e.label}`);
+        },
+      },
+    );
+    expect(merged).toEqual([
+      'settled:live:ok',
+      'completed:live',
+      'settled:skipme:skip',
+      'completed:skipme',
+      'settled:dies:error',
+      'completed:dies',
+    ]);
   });
 
   it('cache-replayed agents complete with cached:true, zero tokens, and no queued/started events', async () => {

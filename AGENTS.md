@@ -19,7 +19,7 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 
 ## Testing
 
-- Vitest. Full: `npm test`; single file `npx vitest run test/unit/<x>.test.ts`; single case append `-t "name"`. Keep the suite offline and deterministic (no network / real backends, 20s timeout): drive behavior through the mock backend (`src/backends/mock.ts`; `MOCK:ok|echo|fail|fail-then-ok|delay|badjson`) and assert on run output and `executor.stats`.
+- Vitest. Full: `npm test`; single file `npx vitest run test/unit/<x>.test.ts`; single case append `-t "name"`. Keep the suite offline and deterministic (no network / real backends, 20s timeout): drive behavior through the mock backend (`src/backends/mock.ts`; `MOCK:ok|echo|fail|fail-then-ok|delay|tools|badjson`) and assert on run output and `executor.stats`.
 - Backend parsers test against golden NDJSON fixtures in `test/fixtures/<backend>/` (provenance in the READMEs); when a pinned CLI bumps (`SUPPORTED_VERSIONS.md`), re-record live fixtures via `record.sh` (codex only) and verify synthetics against a live capture. Token-spending tests go in `test/live/` (self-skip unless `UC_LIVE_TESTS=1`; excluded from the default suite).
 - Tests live flat in `test/unit/` as `<area>.test.ts` (`.integration.test.ts` for spawn-heavy); isolate via `mkdtempSync(join(tmpdir(), 'uc-...'))` with small local helpers (no shared helper module). Point any `ultracode install` / `sync` exercise at a temp dir — never the repo root.
 

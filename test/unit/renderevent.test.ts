@@ -23,6 +23,7 @@ describe('renderEvent sanitization', () => {
   it('clean lines pass through unchanged; unknown types stay null', () => {
     expect(renderEvent(ev('run_started', { name: 'demo' }))).toBe('▶ run started: demo');
     expect(renderEvent(ev('agent_usage', { seq: 0, totalTokens: 5 }))).toBeNull();
+    expect(renderEvent(ev('agent_tool', { seq: 0, name: 'bash:ls', status: 'started' }))).toBeNull();
     expect(renderEvent(ev('mystery_event', {}))).toBeNull();
   });
 });

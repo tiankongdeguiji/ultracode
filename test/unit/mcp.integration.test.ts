@@ -16,6 +16,15 @@ const here = dirname(fileURLToPath(import.meta.url));
 const mainTs = join(here, '../../src/cli/main.ts');
 const tsxLoader = createRequire(import.meta.url).resolve('tsx');
 
+// Spawned MCP servers must resolve their store from cwd, not an inherited
+// $ULTRACODE_HOME (ultracodeRoot prefers the override) — else the isolated-store
+// and restart tests would read a different store than they wrote.
+function childEnv(): Record<string, string> {
+  const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+  delete env.ULTRACODE_HOME;
+  return env;
+}
+
 const HELLO = `export const meta = { name: 'mcp-hello', description: 'd', phases: [{ title: 'Greet' }] }
 phase('Greet')
 const g = await agent('MOCK:ok hi-from-mcp', { label: 'greeter' })
@@ -37,7 +46,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: process.env as Record<string, string>,
+      env: childEnv(),
     });
     await client.connect(transport);
   }, 30_000);
@@ -181,7 +190,9 @@ describe('MCP triad', () => {
     writeFileSync(
       join(dir, 'events.jsonl'),
       '{"ts":1,"type":"agent_usage","seq":0,"totalTokens":100,"estimated":false}\n' +
-        '{"ts":2,"type":"agent_usage","seq":0,"totalTokens":200,"estimated":false}\n',
+        '{"ts":2,"type":"agent_usage","seq":0,"totalTokens":200,"estimated":false}\n' +
+        '{"ts":3,"type":"agent_tool","seq":0,"name":"bash:ls","status":"started"}\n' +
+        '{"ts":4,"type":"agent_tool","seq":0,"name":"bash:ls","status":"completed"}\n',
     );
 
     const t0 = Date.now();
@@ -223,6 +234,57 @@ describe('MCP triad', () => {
     expect(entry).toBeDefined();
   }, 60_000);
 
+  it('workflow_list caps to the 10 most recent by default and honors count, reporting hidden', async () => {
+    // Isolated store (via the cwd input) so accumulated runs from other tests
+    // don't perturb the exact cap/hidden counts.
+    const isolated = mkdtempSync(join(tmpdir(), 'uc-mcp-list-'));
+    const runsBase = join(isolated, '.ultracode', 'runs');
+    const base = Date.now();
+    for (let i = 0; i < 12; i++) {
+      const runId = 'wf_cap' + String(i).padStart(4, '0');
+      const dir = join(runsBase, runId);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'manifest.json'),
+        JSON.stringify({
+          runId,
+          name: 'cap',
+          status: 'running',
+          pid: process.pid,
+          pidStart: readProcStat(process.pid)?.starttime,
+          startedAt: new Date(base - i * 60_000).toISOString(),
+          heartbeatAt: new Date().toISOString(),
+          phases: [],
+          agentCount: 0,
+          budget: { total: null, spent: 0 },
+          backendDefault: 'mock',
+          engineVersion: '0.0.0',
+        }),
+      );
+    }
+    const def = (await client.callTool({ name: 'workflow_list', arguments: { cwd: isolated } })) as {
+      structuredContent?: { runs: unknown[]; hidden: number };
+    };
+    expect(def.structuredContent!.runs).toHaveLength(10);
+    expect(def.structuredContent!.hidden).toBe(2);
+
+    const capped = (await client.callTool({ name: 'workflow_list', arguments: { cwd: isolated, count: 2 } })) as {
+      structuredContent?: { runs: unknown[]; hidden: number };
+    };
+    expect(capped.structuredContent!.runs).toHaveLength(2);
+    expect(capped.structuredContent!.hidden).toBe(10);
+
+    // count's zod guard (z.number().int().positive()) must reject non-positive input.
+    let rejected = false;
+    try {
+      const bad = (await client.callTool({ name: 'workflow_list', arguments: { cwd: isolated, count: 0 } })) as { isError?: boolean };
+      rejected = bad.isError === true;
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+  }, 20_000);
+
   it('refuses workflow_start and workflow_stop from inside a run (recursion / confused-deputy guard)', async () => {
     // A worker that inherited the MCP server has ULTRACODE_INSIDE_RUN set: it
     // must not launch fresh runs, nor make this unsandboxed process signal an
@@ -232,7 +294,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: { ...(process.env as Record<string, string>), ULTRACODE_INSIDE_RUN: '1' },
+      env: { ...childEnv(), ULTRACODE_INSIDE_RUN: '1' },
     });
     await inside.connect(transport);
     try {
@@ -324,7 +386,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: process.env as Record<string, string>,
+      env: childEnv(),
     });
     await second.connect(transport);
     try {

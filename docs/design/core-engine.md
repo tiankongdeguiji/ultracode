@@ -128,7 +128,7 @@ key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0"
 
 ### 1.5 Progress events
 
-The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair'}, agent_model {seq,model}` (backend-resolved), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens,estimated?}, workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `logs --follow`, and MCP long-poll all tail this file by byte offset (`status --watch` polls manifest.json instead); the MCP long-poll wakes only on *renderable* lines, so usage ticks never spin it.
+The runner appends every state change to `events.jsonl` (separate from the journal so cache logic stays pure): `run_started, phase_started, agent_queued, agent_started {seq,label,phase,backend,model?,effort?,agentType?}, agent_usage {seq,totalTokens,estimated}` (throttled ≤1/s cumulative live token tick, display-only — budget accounting stays on `budget_tick`), `agent_retry {seq,label,attempt,maxAttempts,kind:'task'|'schema-repair',reason?}, agent_model {seq,model}` (backend-resolved), `agent_tool {seq,name,status:'started'|'completed'|'failed'|'declined'}` (unthrottled discrete tool-call tick, display-only — name sanitized + capped at 80 chars at emission, ≤5000 events per dispatch; feeds the panel's live count and detail-view activity feed), `agent_completed {seq,label,phase,ok,skipped?,cached?,totalTokens,estimated?,toolCalls?,error?}` (`toolCalls` is the authoritative started-tool count; absent on skip/cached and on streams from engines predating `agent_tool`), `workflow_log, budget_tick {spent}, child_started {childId,name,argsHash} | child_completed {childId,name,ok,agentCount}, stop_requested, run_completed|run_failed|run_stopped`. Events emitted inside a nested `workflow()` child carry `childId`/`childName` tags (per-event attribution — child agents can interleave with concurrent parent agents); the child's own `run_*` lifecycle events are dropped. CLI `watch` (the live panel), `logs --follow`, and MCP long-poll all tail this file by byte offset (`status --watch` polls manifest.json instead); the MCP long-poll wakes only on *renderable* lines, so usage and tool ticks never spin it.
 
 ---
 
@@ -150,16 +150,16 @@ export interface SpawnPlan { bin: string; argv: string[]; env: Record<string,str
 }
 
 export type AgentEvent =
-  | { kind:'session';  sessionId: string }
+  | { kind:'session';  sessionId: string; model?: string }  // model when the stream reports one (init lines)
   | { kind:'message';  text: string }                       // assistant text; consumers keep the LAST
-  | { kind:'tool';     name: string; status:'started'|'completed'|'failed' }
-  | { kind:'usage';    usage: Partial<NormalizedUsage> }
+  | { kind:'tool';     name: string; status:'started'|'completed'|'failed'|'declined' }
+  | { kind:'usage';    usage: Partial<NormalizedUsage>; interim?: boolean; threadCumulative?: boolean }
   | { kind:'result';   text?: string; structured?: unknown; isError: boolean;
-      errorKind?: ErrorKind; raw: unknown }
+      errorKind?: ErrorKind; raw?: unknown }
   | { kind:'notice';   message: string };                    // benign (e.g. codex "Reconnecting… n/5")
 
 export type ErrorKind = 'auth'|'schema-rejected'|'max-turns'|'budget'|'rate-limit'
-  |'structured-output-retries'|'interrupted'|'infra'|'unknown';
+  |'structured-output-retries'|'interrupted'|'stalled'|'infra'|'unknown';
 
 export interface ExitClass { ok: boolean; errorKind?: ErrorKind; retryable: boolean; message: string; }
 
@@ -248,7 +248,7 @@ Default root: `<project>/.ultracode/` (git-ignorable), overridable `$ULTRACODE_H
 ### 3.2 Concurrency & crash safety
 
 - **Single-writer**: only the runner process writes inside its run dir. CLI/MCP are pure readers. No locks needed for readers; `manifest.json` is atomic-swapped; `events.jsonl`/`journal.jsonl` are O_APPEND single-`write()` lines (atomic under PIPE_BUF-sized records).
-- **Liveness**: runner refreshes `heartbeatAt` every 5s. Readers report `orphaned` when `status==='running'` but pid is dead or heartbeat > 30s stale; `ultracode list` offers `--reap` to finalize orphans (`status:'failed', error:'runner died'`), which also unblocks resume.
+- **Liveness**: runner refreshes `heartbeatAt` every 5s. Readers report `orphaned` only when `status==='running'` but the recorded pid is dead (or, on Linux where `/proc` exposes start-time, a recycled PID — macOS detects a dead pid but not a recycled live one); a stale heartbeat alone keeps a live-but-wedged runner `running`, so `stop` can still signal it; `ultracode list` offers `--reap` to finalize orphans (`status:'orphaned', error:'runner died without finalizing'`), which also unblocks resume.
 - **runId** from `crypto.randomBytes` (host-side; the determinism ban applies to scripts, not the engine). Distinct dirs ⇒ no cross-run contention. Worktrees live at `.ultracode/worktrees/<runId>/<seq>/` on branch `ultracode/<runId>/<seq>`, branched from the default branch; removed post-run if clean, kept (path recorded in result.json) if the agent left changes.
 - **Stop**: SIGTERM to runner → runner aborts the run AbortController, sends SIGTERM to each child's **process group** (children spawned with `detached:true` + `kill(-pgid)`), waits 5s, SIGKILL, marks `stopped`, flushes partial `output.json`.
 
@@ -271,12 +271,14 @@ ultracode run <script.js | name> [--args '<json>'] [--backend id]
               [--budget 500k|+500k] [--max-concurrency N] [--permission safe|auto|danger]
               [--timeout minutes] [--detach] [--json] [--plain] [--no-color]
    # default: FOREGROUND attach (live panel on a TTY), exit 0/1 mirrors run status; --detach prints runId + paths
-ultracode watch  <runId> [--plain] [--no-color] # live panel: phases, per-agent tokens/elapsed, budget; Ctrl-C detaches
+ultracode watch  <runId> [--plain] [--no-color] # live panel: phases, per-agent tokens/elapsed, budget; Ctrl-C detaches.
+                                                # Interactive on a TTY: ↑/↓ (j/k) select an agent, ⏎ opens its detail view
+                                                # (prompt / tool activity / outcome), esc back (overview: clear selection), q detach
 ultracode status <runId> [--watch] [--json]     # phases, agent table, budget, heartbeat
 ultracode logs   <runId> [--follow] [--agent seq]
 ultracode resume <runId> [--script f] [--args j]
 ultracode stop   <runId>
-ultracode list   [--all] [--reap] [--json]
+ultracode list   [--all] [--count <n>] [--reap] [--json]   # default: up to 10 active-or-last-24h runs
 ultracode validate <script.js>                   # meta + acorn + dry compile
 ultracode doctor                                 # probe all backends: binary, version, auth mode, parallel-safety warnings
 ultracode mcp                                    # start MCP stdio server
@@ -289,7 +291,7 @@ stdio transport, no session-affinity assumptions (2026-07-28-ready). Tools (neve
 - **`workflow_start`** `{script?|scriptPath?|name?, args?, backend?, budget?, resumeFromRunId?}` → returns in <1s: `{ runId, scriptPath, monitor: 'call workflow_status with runId', summary }`. Mirrors the Workflow tool's fire-and-forget contract.
 - **`workflow_status`** `{runId, waitSeconds?: number /* clamped to 50 */, sinceEventOffset?: number}` → **long-poll**: returns immediately if terminal or new events exist past the offset, else waits up to `min(waitSeconds,50)`s (safely under every host default timeout: Codex 300s—and 60s on legacy installs—Qoder/Gemini 600s). Response: `{ status, phases, agentsRunning, agentsDone, budget, logTail, nextEventOffset }`. Emits `notifications/progress` against the caller's progressToken during the wait (UX for Qoder/Gemini; Codex just logs it).
 - **`workflow_result`** `{runId}` → `output.json` content as `structuredContent` + failures + artifact paths; error `-32602`-style tool error if not terminal (with current status so the model self-corrects).
-- **`workflow_stop`** `{runId}`, **`workflow_list`** `{}`.
+- **`workflow_stop`** `{runId}`, **`workflow_list`** `{all?, count?}` → `{runs, hidden}` (up to 10 active-or-last-24h runs unless `all`/`count`).
 
 Because runs are detached, the MCP server is stateless over the run store: it can be killed and restarted (or run as multiple instances for multiple host sessions) with no run loss.
 
@@ -313,7 +315,7 @@ script: await agent(prompt, {schema, label})
   → miss (prefix broken from here on):
       adapter.checkSchema → adapter.buildSpawn → spawn.ts (own pgid, cwd=worktree if isolation)
       stdout → ndjson splitter → adapter.createParser() → AgentEvent[]
-        → events.jsonl (agent_usage/agent_retry/agent_model ticks), transcript.jsonl (raw)
+        → events.jsonl (agent_usage/agent_retry/agent_model/agent_tool ticks), transcript.jsonl (raw)
       exit → adapter.classifyExit → retryable? (retries/stallMs budget) → respawn or fail
       structured pipeline: extract → ajv(original schema) → repair-resume ≤2 → value | WorkflowSchemaError
       usage → BudgetAccount.add → journal.append({t:'agent', key, status, totalTokens, resultRef})

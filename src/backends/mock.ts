@@ -8,6 +8,10 @@
  *   MOCK:fail [msg]            → fail every attempt
  *   MOCK:fail-then-ok <n> <v>  → fail the first n attempts, then succeed with v
  *   MOCK:delay <ms> <rest...>  → wait ms (abortable), then process rest
+ *   MOCK:tools <n> <rest...>   → emit n synthetic tool progress pairs
+ *                                (tool:mock-i started+completed), then process
+ *                                rest; outcome.toolCalls reflects the count
+ *                                (n capped at MOCK_TOOLS_CAP, abortable)
  *   MOCK:badjson               → succeed with a value that violates any schema
  *                                expecting different keys ({"unexpected": true})
  *   anything else              → succeed with "mock response: <prompt head>"
@@ -22,6 +26,10 @@ export interface MockStats {
   attempts: number;
   maxConcurrent: number;
 }
+
+/** Ceiling on MOCK:tools emissions: an over-large (or Infinity-parsing) count
+ *  must never wedge the runner in a synchronous loop that SIGTERM cannot enter. */
+export const MOCK_TOOLS_CAP = 1000;
 
 /** Minimal valid instance for a JSON Schema (dry-run stubs). */
 export function stubFromSchema(schema: Record<string, unknown>): unknown {
@@ -87,6 +95,9 @@ export class MockExecutor implements AgentExecutor {
     this.stats.maxConcurrent = Math.max(this.stats.maxConcurrent, this.inFlight);
     // Deterministic progress for tests: the mock "resolves" the requested model.
     if (spec.model !== undefined) onProgress?.({ type: 'model', model: spec.model });
+    // Tool ticks accumulate across attempts (real backends re-run tools on
+    // retry, and the engine's outcome.toolCalls sums attempts the same way).
+    const tools = { started: 0, seen: false };
     try {
       const maxAttempts = spec.retries + 1;
       let lastError = 'mock failure';
@@ -94,9 +105,9 @@ export class MockExecutor implements AgentExecutor {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         this.stats.attempts++;
         if (signal.aborted) {
-          return this.outcome(spec, { ok: false, error: 'aborted', errorKind: 'interrupted', attempts: attempt });
+          return this.outcome(spec, { ok: false, error: 'aborted', errorKind: 'interrupted', attempts: attempt }, tools);
         }
-        const res = await this.attemptWithTimeout(spec, signal);
+        const res = await this.attemptWithTimeout(spec, signal, onProgress, tools);
         // One cumulative usage tick per attempt (same figures the outcome reports).
         onProgress?.({ type: 'usage', usage: usageFor(spec) });
         if (!res.ok && attempt < maxAttempts) {
@@ -108,20 +119,24 @@ export class MockExecutor implements AgentExecutor {
           if (spec.schema) {
             const validation = validateWithSchema(spec.schema, res.value);
             if (!validation.ok) {
-              return this.outcome(spec, {
-                ok: false,
-                error: `structured output failed validation: ${validation.errors.slice(0, 5).join('; ')}`,
-                errorKind: 'structured-output-retries',
-                attempts: attempt,
-              });
+              return this.outcome(
+                spec,
+                {
+                  ok: false,
+                  error: `structured output failed validation: ${validation.errors.slice(0, 5).join('; ')}`,
+                  errorKind: 'structured-output-retries',
+                  attempts: attempt,
+                },
+                tools,
+              );
             }
           }
-          return this.outcome(spec, { ...res, attempts: attempt });
+          return this.outcome(spec, { ...res, attempts: attempt }, tools);
         }
         lastError = res.error ?? lastError;
         lastErrorKind = res.errorKind ?? 'unknown';
       }
-      return this.outcome(spec, { ok: false, error: lastError, errorKind: lastErrorKind, attempts: maxAttempts });
+      return this.outcome(spec, { ok: false, error: lastError, errorKind: lastErrorKind, attempts: maxAttempts }, tools);
     } finally {
       this.inFlight--;
     }
@@ -130,6 +145,7 @@ export class MockExecutor implements AgentExecutor {
   private outcome(
     spec: AgentSpec,
     partial: { ok: boolean; value?: unknown; error?: string; errorKind?: AgentOutcome['errorKind']; attempts: number },
+    tools?: { started: number; seen: boolean },
   ): AgentOutcome {
     return {
       ok: partial.ok,
@@ -138,7 +154,9 @@ export class MockExecutor implements AgentExecutor {
       errorKind: partial.errorKind,
       usage: usageFor(spec),
       sessionId: `mock-session-${spec.seq}`,
-      toolCalls: 1,
+      // Historical default of 1 survives (tests pin totalToolCalls); an
+      // explicit MOCK:tools directive makes the count exact, including 0.
+      toolCalls: tools?.seen ? tools.started : 1,
       attempts: partial.attempts,
     };
   }
@@ -153,9 +171,11 @@ export class MockExecutor implements AgentExecutor {
   private async attemptWithTimeout(
     spec: AgentSpec,
     signal: AbortSignal,
+    onProgress?: (p: AgentProgress) => void,
+    tools?: { started: number; seen: boolean },
   ): Promise<{ ok: boolean; value?: unknown; error?: string; errorKind?: AgentOutcome['errorKind'] }> {
     const timeoutMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
-    if (timeoutMs === undefined) return this.attempt(spec, signal);
+    if (timeoutMs === undefined) return this.attempt(spec, signal, onProgress, tools);
     const inner = new AbortController();
     const onAbort = (): void => inner.abort();
     signal.addEventListener('abort', onAbort, { once: true });
@@ -163,7 +183,7 @@ export class MockExecutor implements AgentExecutor {
     try {
       const TIMEOUT = Symbol('timeout');
       const winner = await Promise.race([
-        this.attempt(spec, inner.signal),
+        this.attempt(spec, inner.signal, onProgress, tools),
         new Promise<symbol>((resolve) => {
           timer = chainedTimeout(timeoutMs, () => resolve(TIMEOUT));
         }),
@@ -184,21 +204,48 @@ export class MockExecutor implements AgentExecutor {
   private async attempt(
     spec: AgentSpec,
     signal: AbortSignal,
+    onProgress?: (p: AgentProgress) => void,
+    tools?: { started: number; seen: boolean },
   ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
     if (this.opts.latencyMs) await sleep(this.opts.latencyMs, undefined, { signal }).catch(() => {});
-    return this.interpret(spec.prompt.trim(), spec, signal);
+    return this.interpret(spec.prompt.trim(), spec, signal, onProgress, tools);
   }
 
   private async interpret(
     prompt: string,
     spec: AgentSpec,
     signal: AbortSignal,
+    onProgress?: (p: AgentProgress) => void,
+    tools?: { started: number; seen: boolean },
   ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
     const delayMatch = prompt.match(/^MOCK:delay (\d+)\s*([\s\S]*)$/);
     if (delayMatch) {
       await sleep(Number(delayMatch[1]), undefined, { signal }).catch(() => {});
       if (signal.aborted) return { ok: false, error: 'aborted' };
-      return this.interpret(delayMatch[2] ?? '', spec, signal);
+      return this.interpret(delayMatch[2] ?? '', spec, signal, onProgress, tools);
+    }
+
+    // Consecutive MOCK:tools directives are peeled iteratively (a long chain
+    // must not grow a synchronous recursion stack), and the cap is ONE
+    // aggregate budget for the whole attempt — per-directive caps would let a
+    // chain emit unboundedly and starve SIGTERM of the event loop.
+    let toolsMatch = prompt.match(/^MOCK:tools (\d+)\s*([\s\S]*)$/);
+    if (toolsMatch) {
+      let rest = prompt;
+      let emitted = tools?.started ?? 0;
+      do {
+        if (tools) tools.seen = true;
+        const n = Math.min(Number(toolsMatch[1]), MOCK_TOOLS_CAP);
+        for (let i = 1; i <= n && emitted < MOCK_TOOLS_CAP; i++) {
+          if (signal.aborted) break;
+          emitted++;
+          if (tools) tools.started++;
+          onProgress?.({ type: 'tool', name: `tool:mock-${i}`, status: 'started' });
+          onProgress?.({ type: 'tool', name: `tool:mock-${i}`, status: 'completed' });
+        }
+        rest = toolsMatch[2] ?? '';
+      } while ((toolsMatch = rest.match(/^MOCK:tools (\d+)\s*([\s\S]*)$/)));
+      return this.interpret(rest, spec, signal, onProgress, tools);
     }
 
     const failThenOk = prompt.match(/^MOCK:fail-then-ok (\d+)\s*([\s\S]*)$/);

@@ -1,5 +1,13 @@
 # Ultracode Host-Integration Architecture (per-host delivery surfaces)
 
+> **Design history (predates the keyword-only narrowing in PR #10, 2026-07-17).** Throughout this
+> document (§2, §2.3, the Qoder rule at §4.1, etc.), the current-tense descriptions of what *arms*
+> ultracode mode — the keyword, a budget like "+500k", "use a workflow" / "fan out" phrasing,
+> `.ultracode/mode`, task decomposability — and the "default budget 300k" reflect an earlier design.
+> The shipped doctrine now arms the mode ONLY on the literal keyword "ultracode" written as the
+> user's own request; budgets are opt-in (uncapped default). Read the arming/budget prose below as
+> historical, not current behavior.
+
 ## 0. The one-line answer to "plugin? command? skill?"
 
 **All three, in distinct layers — and the layering is the design:**

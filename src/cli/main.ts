@@ -42,7 +42,10 @@ program
 program
   .command('watch')
   .argument('<runId>')
-  .description('live progress panel: phases, per-agent tokens/elapsed, budget (Ctrl-C detaches, never stops the run)')
+  .description(
+    'live progress panel: phases, per-agent tokens/elapsed, budget (Ctrl-C detaches, never stops the run). ' +
+      'Interactive on a TTY: up/down or j/k select an agent, enter opens its prompt/activity/outcome detail, esc backs out of the detail (in the overview it clears the selection), q detach',
+  )
   .option('--plain', 'line-per-event output instead of the panel')
   .option('--no-color', 'panel without colors')
   .option('--home <dir>')
@@ -106,9 +109,10 @@ program
 program
   .command('list')
   .description('list runs in the run store')
-  .option('--all', 'include old terminal runs')
+  .option('--count <n>', 'max runs to show (default 10; also caps --all)')
+  .option('--all', 'show every run: no recency filter, uncapped unless --count is given')
   .option('--reap', 'finalize orphaned runs first')
-  .option('--json')
+  .option('--json', 'machine-readable JSON (also capped; pass --all for the full store, optionally --count to cap it)')
   .option('--home <dir>')
   .action(async (opts: Record<string, string | boolean>) => {
     const { listCommand } = await import('./lifecycle.js');

@@ -8,6 +8,7 @@ import {
   formatDuration,
   sanitizeText,
   truncateToWidth,
+  RECENT_TOOLS_CAP,
   type PanelSeed,
   type PanelState,
 } from '../../src/cli/panel.js';
@@ -172,6 +173,77 @@ describe('panel fold', () => {
     expect(s.phases).toEqual([]); // numeric title rejected
     expect(takeNarratorLines(s)).toEqual([]);
     expect(s.spentTokens).toBe(0);
+  });
+
+  it('agent_tool counts starts only; lifecycle events upgrade the newest matching entry in place', () => {
+    const s = fold(createPanelState(seed()), [
+      ev('agent_started', { seq: 0, label: 'worker', backend: 'codex' }, 10),
+      ev('agent_tool', { seq: 0, name: 'bash:ls', status: 'started' }, 20),
+      ev('agent_tool', { seq: 0, name: 'bash:ls', status: 'completed' }, 30),
+      ev('agent_tool', { seq: 0, name: 'web_search:docs', status: 'started' }, 40),
+      ev('agent_tool', { seq: 0, name: 'web_search:docs', status: 'failed' }, 50),
+    ]);
+    const row = s.agents.get(0)!;
+    expect(row.toolCalls).toBe(2); // started ticks only — completed/failed never increment
+    expect(row.recentTools).toEqual([
+      { name: 'bash:ls', status: 'completed' },
+      { name: 'web_search:docs', status: 'failed' },
+    ]);
+    expect(row.lastActivityTs).toBe(50);
+  });
+
+  it('recentTools is a ring: oldest evicted at the cap; an upgrade after eviction appends instead', () => {
+    const events = [ev('agent_started', { seq: 0, label: 'busy', backend: 'codex' }, 1)];
+    for (let i = 1; i <= RECENT_TOOLS_CAP + 2; i++) {
+      events.push(ev('agent_tool', { seq: 0, name: `bash:cmd${i}`, status: 'started' }, i + 1));
+    }
+    // cmd1 was evicted; its completion has no matching entry → appended (evicting again)
+    events.push(ev('agent_tool', { seq: 0, name: 'bash:cmd1', status: 'completed' }, 99));
+    const s = fold(createPanelState(seed()), events);
+    const row = s.agents.get(0)!;
+    expect(row.toolCalls).toBe(RECENT_TOOLS_CAP + 2);
+    expect(row.recentTools).toHaveLength(RECENT_TOOLS_CAP);
+    expect(row.recentTools.at(-1)).toEqual({ name: 'bash:cmd1', status: 'completed' });
+  });
+
+  it('agent_tool drops garbage, unknown seqs, and ticks after completion; agent_completed.toolCalls is authoritative', () => {
+    const s = fold(createPanelState(seed()), [
+      ev('agent_started', { seq: 0, label: 'a', backend: 'codex' }, 1),
+      ev('agent_tool', { seq: 0, name: 'bash:x', status: 'started' }, 2),
+      ev('agent_tool', { seq: 99, name: 'bash:x', status: 'started' }, 3), // unknown seq
+      ev('agent_tool', { seq: 0, name: 'bash:y', status: 'exploded' }, 4), // bad status
+      ev('agent_tool', { seq: 0, status: 'started' }, 5), // no name
+      ev('agent_tool', { seq: 0, name: 'evil\x1b[2J', status: 'started' }, 6), // control bytes scrubbed
+      ev('agent_completed', { seq: 0, label: 'a', ok: true, totalTokens: 10, toolCalls: 7 }, 7),
+      ev('agent_tool', { seq: 0, name: 'bash:late', status: 'started' }, 8), // after completion — dropped
+    ]);
+    const row = s.agents.get(0)!;
+    expect(row.toolCalls).toBe(7); // completion overrides the live count of 2
+    expect(row.recentTools.map((t) => t.name)).toEqual(['bash:x', 'evil [2J']);
+  });
+
+  it('old-stream agent_completed without toolCalls keeps the live count; retries never reset the ring', () => {
+    const s = fold(createPanelState(seed()), [
+      ev('agent_started', { seq: 0, label: 'a', backend: 'codex' }, 1),
+      ev('agent_tool', { seq: 0, name: 'bash:one', status: 'started' }, 2),
+      ev('agent_retry', { seq: 0, label: 'a', attempt: 2, maxAttempts: 3, kind: 'task' }, 3),
+      ev('agent_tool', { seq: 0, name: 'bash:two', status: 'started' }, 4),
+      ev('agent_completed', { seq: 0, label: 'a', ok: true, totalTokens: 10 }, 5), // no toolCalls field
+    ]);
+    const row = s.agents.get(0)!;
+    expect(row.toolCalls).toBe(2); // accumulated across attempts, kept at completion
+    expect(row.recentTools.map((t) => t.name)).toEqual(['bash:one', 'bash:two']);
+  });
+
+  it('lastActivityTs comes from the envelope ts of tool/usage/retry events, never a wall clock', () => {
+    const s = fold(createPanelState(seed()), [
+      ev('agent_started', { seq: 0, label: 'a', backend: 'mock' }, 100),
+      ev('agent_usage', { seq: 0, totalTokens: 10 }, 200),
+      ev('agent_retry', { seq: 0, label: 'a', attempt: 2, maxAttempts: 3, kind: 'task' }, 300),
+      ev('agent_tool', { seq: 0, name: 'bash:z', status: 'started' }, 400),
+      { type: 'agent_tool', seq: 0, name: 'bash:no-ts', status: 'completed' } as unknown as TimestampedEvent,
+    ]);
+    expect(s.agents.get(0)!.lastActivityTs).toBe(400); // missing ts leaves the last value
   });
 
   it('merges event phases into seeded ones by title and appends unseeded phases', () => {
