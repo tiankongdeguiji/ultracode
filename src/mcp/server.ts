@@ -31,7 +31,7 @@ import { isTerminal } from '../store/manifest.js';
 import { getRun, recentRuns } from '../store/runstore.js';
 import { ultracodeRoot } from '../store/layout.js';
 import { renderEvent } from '../cli/lifecycle.js';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 
 // Codex injects only the first 512 chars of server instructions — keep under.
 const INSTRUCTIONS =
@@ -45,10 +45,12 @@ const INSTRUCTIONS =
 /** Explicit waitSeconds ceiling — sized to the codex hostpack's tool_timeout_sec=3600; doctrine keeps holds ≥60s under the host's actual timeout. */
 const MAX_WAIT_SECONDS = 3600;
 const DEFAULT_WAIT_SECONDS = 25;
-/** Progress notifications reach only host log files (no host renders them or extends timeouts) — throttle so an hour-long hold doesn't append 3 lines/s there. */
+/** Progress cadence for activity-mode waits (Qoder/Gemini render them; codex only logs) — quiet parks emit none, per their silent contract. */
 const PROGRESS_INTERVAL_MS = 10_000;
 /** Quiet holds shorter than this get an in-band nudge: models hedge toward tiny "safe" waits (observed: 60), and a short hold burns a turn per wake. */
 const SHORT_HOLD_NUDGE_MS = 240_000;
+/** Rolling tail cap carried on every workflow_status response. */
+const TAIL_LINES = 40;
 
 function ok(structured: Record<string, unknown>) {
   return {
@@ -174,8 +176,9 @@ export function createServer(baseCwd: string): McpServer {
       let ticks = 0;
       let progressAt = Date.now();
       // Rolling tail: quiet holds roll renderable lines up instead of waking
-      // on them; every response carries the last 40, so the cursor invariant
-      // (offset advanced == content delivered) holds in both modes.
+      // on them. The cursor never advances past content without it passing
+      // through this tail — though the tail is lossy at TAIL_LINES, and the
+      // full log always lives in the run store / workflow_result.
       const tail: string[] = [];
 
       for (;;) {
@@ -194,13 +197,27 @@ export function createServer(baseCwd: string): McpServer {
           .map((e: TimestampedEvent) => renderEvent(e))
           .filter((l): l is string => l !== null);
         tail.push(...fresh);
-        if (tail.length > 40) tail.splice(0, tail.length - 40);
+        if (tail.length > TAIL_LINES) tail.splice(0, tail.length - TAIL_LINES);
         const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
 
-        // A terminal quiet wake first drains the (now finite) backlog so
-        // logTail is the run's real tail and nextEventOffset reaches EOF —
-        // returning mid-backlog would serve the HEAD of the log as the tail.
-        if (quiet && terminal && page.hasMore) continue;
+        // A terminal quiet wake serves the run's REAL tail with the cursor at
+        // EOF — returning mid-backlog would serve the head of the log. Jump
+        // straight to the final window instead of paging: only it can hold
+        // the last TAIL_LINES renderable lines, and synchronously JSON-parsing
+        // a multi-MB backlog would block this single-threaded stdio server.
+        // (A mid-line landing is fine — the torn fragment fails to parse and
+        // is dropped, exactly like any other malformed line.)
+        if (quiet && terminal && page.hasMore) {
+          try {
+            const end = statSync(eventsFile).size;
+            const jump = Math.max(page.nextOffset, end - 4 * 1024 * 1024);
+            if (jump > page.nextOffset) tail.length = 0;
+            offset = jump;
+          } catch {
+            /* fall back to plain paging */
+          }
+          continue;
+        }
 
         const wake = quiet ? terminal || phaseHit : fresh.length > 0 || terminal;
         if (wake || Date.now() >= deadline || extra.signal.aborted) {
@@ -211,7 +228,7 @@ export function createServer(baseCwd: string): McpServer {
             phases: m.phases,
             agentCount: m.agentCount,
             budget: m.budget,
-            logTail: tail.slice(-40),
+            logTail: tail,
             nextEventOffset: offset,
             terminal,
             ...(terminal
@@ -231,7 +248,7 @@ export function createServer(baseCwd: string): McpServer {
         // next page immediately — pacing 4 MB per 300 ms would starve clients.
         if (page.hasMore) continue;
 
-        if (progressToken !== undefined && Date.now() - progressAt >= PROGRESS_INTERVAL_MS) {
+        if (!quiet && progressToken !== undefined && Date.now() - progressAt >= PROGRESS_INTERVAL_MS) {
           progressAt = Date.now();
           try {
             await extra.sendNotification({

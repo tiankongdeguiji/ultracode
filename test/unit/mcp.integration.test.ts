@@ -349,7 +349,7 @@ describe('MCP triad', () => {
     expect(status.terminal).toBe(true);
   }, 20_000);
 
-  it('quiet holds emit no progress notifications inside the first 10s throttle window', async () => {
+  it('quiet holds emit no progress notifications (silent-park contract)', async () => {
     const runId = 'wf_quietprog001';
     fabricateRun(runId, '');
     let notifications = 0;
@@ -358,7 +358,39 @@ describe('MCP triad', () => {
       undefined,
       { onprogress: () => void notifications++ },
     );
-    expect(notifications).toBe(0); // was ~3/s before throttling
+    expect(notifications).toBe(0); // quiet parks are structurally silent; activity mode still throttles at 10s
+  }, 20_000);
+
+  it('terminal quiet park from offset 0 over a multi-MB backlog serves the real tail fast, cursor at EOF', async () => {
+    const runId = 'wf_quietbig0001';
+    const { dir, manifest } = fabricateRun(runId, logLines(100_000)); // ~5 MB — beyond one 4 MB page
+    flipStatus(dir, manifest, 'completed');
+
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'terminal', waitSeconds: 3300, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const status = s.structuredContent!;
+    expect(Date.now() - t0).toBeLessThan(5_000); // final-window jump, not an O(backlog) parse
+    expect(status.terminal).toBe(true);
+    expect(status.logTail).toHaveLength(40);
+    expect(status.logTail[39]).toBe('   log: line100000'); // the run's REAL tail, not its head
+    const { statSync } = await import('node:fs');
+    expect(status.nextEventOffset).toBe(statSync(join(dir, 'events.jsonl')).size); // cursor at EOF
+  }, 20_000);
+
+  it("until='phase' without sinceEventOffset wakes instantly on a historical phase boundary (documented footgun)", async () => {
+    const runId = 'wf_phasehist001';
+    fabricateRun(runId, '{"ts":1,"type":"phase_started","title":"Old"}\n');
+    const t0 = Date.now();
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, until: 'phase', waitSeconds: 10 },
+    })) as { structuredContent?: Record<string, any> };
+    expect(Date.now() - t0).toBeLessThan(5_000); // woke on the backlog boundary, not the deadline
+    expect(s.structuredContent!.terminal).toBe(false);
+    expect(s.structuredContent!.next).toContain('sinceEventOffset'); // the nudge that teaches chaining
   }, 20_000);
 
   it('explicit waitSeconds up to 3600 is accepted (no 50s clamp); beyond schema max is rejected', async () => {
