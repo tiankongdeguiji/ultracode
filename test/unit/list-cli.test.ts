@@ -112,16 +112,24 @@ describe('list CLI', () => {
     expect(JSON.parse(capped.chunks.join(''))).toHaveLength(4);
   });
 
-  it('--all shows every run with no footer', () => {
+  it('--all surfaces old terminal runs (full store) with no footer; default omits them', () => {
     const root = tmpRoot();
     const base = Date.now();
-    for (let i = 0; i < 12; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    const oldDone = makeRun(root, new Date(base - 48 * 3600e3).toISOString(), 'completed'); // filtered by default
+    for (let i = 0; i < 5; i++) makeRun(root, new Date(base - i * 60_000).toISOString());
+    // default recency filter drops the old terminal run
+    const def = capture('stdout');
+    listCommand({ home: root });
+    def.restore();
+    expect(def.chunks.join('')).not.toContain(oldDone);
+    // --all removes the filter (surfaces it) and the cap (no footer)
     const out = capture('stdout');
     listCommand({ home: root, all: true });
     out.restore();
-    const lines = out.chunks.join('').trimEnd().split('\n');
-    expect(lines).toHaveLength(12);
-    expect(out.chunks.join('')).not.toContain('more (use');
+    const all = out.chunks.join('');
+    expect(all).toContain(oldDone);
+    expect(all.trimEnd().split('\n')).toHaveLength(6); // 5 recent + 1 old terminal
+    expect(all).not.toContain('more (use');
   });
 
   it('--count shows exactly N newest-first with a footer for the rest', () => {
