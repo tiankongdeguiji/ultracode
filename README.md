@@ -28,8 +28,8 @@ ultracode engine: sandboxed script + scheduler + journal
 ## Why ultracode
 
 - **One dialect, three engines** — the same script text runs on Claude Code (native), Qoder (native), and this engine; `ultracode lint` checks it stays in the portable subset.
-- **Real agents, not simulations** — every `agent()` is a coding-agent subprocess. Five backends: codex, qoder, claude, gemini, mock — `--dry-run` rehearses a whole workflow for zero tokens.
-- **Journal-based resume** — deterministic scripts + a hash-chained journal mean `ultracode resume <runId>` replays completed agents free and runs only what's left; edit the script and the unchanged prefix still replays.
+- **Real agents, not simulations** — on the four real backends (codex, qoder, claude, gemini) every `agent()` is a coding-agent subprocess; the fifth, mock, is an in-process test double that powers `--dry-run` rehearsals for zero tokens.
+- **Journal-based resume** — deterministic scripts + a hash-chained journal mean `ultracode resume <runId>` replays the longest unchanged, successful prefix of `agent()` calls free and runs the rest live — including after a script edit (the first divergence ends the cached prefix).
 - **Live fleet panel** — foreground runs show it; `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail. In `watch`, Ctrl-C detaches and never stops the run (in an attached foreground run it stops the fleet).
 - **Opt-in budgets and timeouts** — no default caps. Pass `--budget 500k` and the engine enforces it at the dispatch gate: no new agent starts past the ceiling. Timeouts are the same deal — unlimited unless you set one.
 - **Structured output that survives sloppy models** — give `agent()` a JSON Schema and it returns a validated object; non-conforming replies get up to two schema-repair round-trips before counting as a failure.
@@ -57,7 +57,7 @@ Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
 "ultracode: review this repo for auth bugs +500k"
 ```
 
-The word arms the mode: your agent authors a workflow and drives it over MCP (`workflow_start` → `workflow_status` → `workflow_result`); on Qoder it uses the native Workflow tool instead. `workflow_start` has no confirmation gate — ask the agent to show the workflow before running it (`docs/threat-model.md`). `+500k` is an optional budget — omit it to run uncapped. Follow engine runs from any shell (the runId is in the agent's reply, or `ultracode list`):
+The word arms the mode: your agent authors a workflow and runs it — Qoder and Claude Code natively via their Workflow tools; Codex over MCP (`workflow_start` → `workflow_status` → `workflow_result`, wired by `install codex`); hosts without MCP registration (`install generic` copies only the skill + trigger) fall back to driving the `ultracode` CLI, or register `ultracode mcp` with the host yourself. `workflow_start` has no confirmation gate — ask the agent to show the workflow before running it (`docs/threat-model.md`). `+500k` is an optional budget — omit it to run uncapped. Follow engine runs from any shell (the runId is in the agent's reply, or `ultracode list`):
 
 ```bash
 ultracode watch <runId>
@@ -101,7 +101,7 @@ That's most of the surface — the rest is `parallel()`, `log()`, `args`, `budge
 ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
 ultracode run my.workflow.js --backend codex    # foreground live panel; --detach to background
-ultracode resume <runId> [--script edited.js]   # completed agents replay free
+ultracode resume <runId> [--script edited.js]   # unchanged journal prefix replays free
 ```
 
 ## Commands
@@ -111,7 +111,7 @@ ultracode resume <runId> [--script edited.js]   # completed agents replay free
 | author | `validate <script>` | check the meta block, dialect constraints, and compilability |
 | | `lint <script>` | cross-engine portability check (Claude Code / Qoder native / ultracode) |
 | run | `run <script>` | run a workflow: live panel in the foreground, `--detach` to background, `--dry-run` for a free mock rehearsal |
-| | `resume <runId>` | completed agents replay free from the journal; `--script edited.js` keeps the unchanged prefix |
+| | `resume <runId>` | the unchanged, successful journal prefix replays free (also with `--script edited.js`); the rest runs live |
 | | `stop <runId>` | stop a running workflow (SIGTERM → 7s → SIGKILL) |
 | observe | `watch <runId>` | live panel: phases, per-agent tokens/elapsed; ↑/↓ select an agent, ⏎ opens its detail, q detaches |
 | | `status <runId>` | show run status: phases, agents, budget (`--watch` polls until terminal) |
