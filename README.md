@@ -1,14 +1,16 @@
 # ultracode
 
+**English** · [简体中文](README.zh-CN.md)
+
 [![ci](https://github.com/tiankongdeguiji/ultracode/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tiankongdeguiji/ultracode/actions/workflows/ci.yml)
 [![license](https://img.shields.io/github/license/tiankongdeguiji/ultracode)](LICENSE)
 [![stars](https://img.shields.io/github/stars/tiankongdeguiji/ultracode)](https://github.com/tiankongdeguiji/ultracode/stargazers)
 
-**Say the word, get a fleet.** Portable **ultracode** — dynamic multi-agent workflow orchestration — for coding agents that don't ship it natively: OpenAI Codex CLI, Qoder, Gemini CLI, and friends. Faithful to the Claude Code Workflow dialect, so the same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine.
+**Say the word, get an agent fleet.** Portable **ultracode** — dynamic multi-agent workflow orchestration — for coding agents that don't ship it natively: OpenAI Codex CLI, Gemini CLI, and friends. Faithful to the Claude Code Workflow dialect, so the same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine.
 
-*Linux & macOS · not on npm yet — build from source.*
+*Linux & macOS · build from source.*
 
-Type `ultracode` and your coding agent stops doing everything in one context: it authors a small deterministic JS workflow, and the engine — this package — fans each `agent()` call out as a real coding-agent subprocess, returning one structured result. Full layering: `docs/architecture.md`.
+Type `ultracode` in your coding agent and it stops working in one context: the **skill** has your agent author a deterministic JS workflow; the **engine** runs each `agent()` as a subprocess.
 
 ```text
 "ultracode: audit src/ for auth bugs"      <- the keyword arms the skill
@@ -27,13 +29,24 @@ ultracode engine: sandboxed script + scheduler + journal
 
 ## Why ultracode
 
-- **One dialect, three engines** — the same script text runs on Claude Code (native), Qoder (native), and this engine; `ultracode lint` checks it stays in the portable subset.
-- **Real agents, not simulations** — on the four real backends (codex, qoder, claude, gemini) every `agent()` is a coding-agent subprocess; the fifth, mock, is an in-process test double that powers `--dry-run` rehearsals for zero tokens.
-- **Journal-based resume** — deterministic scripts + a hash-chained journal mean `ultracode resume <runId>` replays the longest unchanged, successful prefix of `agent()` calls free and runs the rest live — including after a script edit (the first divergence ends the cached prefix).
-- **Live fleet panel** — foreground runs show it; `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail. In `watch`, Ctrl-C detaches and never stops the run (in an attached foreground run it stops the fleet).
-- **Opt-in budgets and timeouts** — no default caps. Pass `--budget 500k` and the engine enforces it at the dispatch gate: no new agent starts past the ceiling. Timeouts are the same deal — unlimited unless you set one.
-- **Structured output that survives sloppy models** — give `agent()` a JSON Schema and it returns a validated object; non-conforming replies get up to two schema-repair round-trips before counting as a failure.
-- **Detached, durable runs** — the runner outlives your session; state lives in `.ultracode/runs/`. Over MCP, the `workflow_start` / `workflow_status` / `workflow_result` triad drives the same run store, so sandboxed hosts orchestrate fire-and-forget across turns — and `workflow_status until="terminal"` is a quiet monitor that parks the host in one long hold (~55 min with the timeout `install codex` pins), making an hour of babysitting cost ~1 turn.
+One agent, one context window, one linear transcript — that's the ceiling. `ultracode` trades it for a coordinated fleet: fresh-context sub-agents working in parallel, with only their conclusions flowing back to you.
+
+### What the fleet buys you
+
+- **Divide and conquer** — typing the keyword `ultracode` arms a skill (doctrine) that has *your* agent break a big task into a workflow of small `agent()` calls, each a subprocess with its own fresh context.
+- **Fan out, bounded** — one task spreads across many sub-agents: up to `50` by default (the soft cap), a hard ceiling of `1000` per run, up to 10 at a time (`min(10, max(2, cores-2))`) — concurrency and the soft cap yours via `--max-concurrency` and `--max-agents`.
+- **Nothing floods your session** — a sub-agent's transcript (every tool call, file read, streamed token) stays in its run dir; only its final value comes back — a structured object or last message, plus a short error excerpt if it fails.
+- **Cross-check by construction** — `parallel()` and `pipeline()` are first-class, and the doctrine teaches quality patterns: adversarial verify (independent skeptics prompted to refute, majority kills a finding), judge panels, perspective-diverse review, loop-until-dry. The shipped `uc-review` workflow runs parallel finders → adversarial verification → synthesis.
+- **Kick it off, walk away** — each run is its own detached OS process (no daemon), so it keeps going after the launching CLI or MCP server exits; watch, stop, or resume it from any shell.
+- **Reusable assets, not one-shots** — workflows are plain deterministic JS: read them, rehearse them free with `--dry-run`, keep them in `.ultracode/workflows/`, and nest one inside another with `workflow()` (one level deep).
+
+### The engine that runs it
+
+- **One dialect, three engines** — the same `*.workflow.js` text runs on Claude Code (native), Qoder (native), and this engine; `ultracode lint` keeps it in the portable subset, and `ultracode sync` mirrors workflows into `.claude/workflows/` and `.qoder/workflows/`.
+- **Journal-based resume** — deterministic scripts plus a hash-chained journal let `ultracode resume <runId>` replay the longest unchanged, successful prefix of `agent()` calls for free, then run the rest live — even after a script edit (the first divergence ends the cached prefix).
+- **Live fleet panel** — foreground runs show it, and `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail (in `watch`, Ctrl-C detaches and never stops the run; in an attached foreground run it stops the fleet).
+- **Opt-in budgets and timeouts** — no default caps (unset = unlimited); `--budget 500k` gates dispatch: once spend passes it, no new agent starts (running agents still finish, so the total can overshoot). A timeout is opt-in the same way, unlimited until you set one.
+- **Structured output that survives sloppy models** — give `agent()` a `JSON Schema` and it returns a validated object; non-conforming replies get up to two schema-repair retries before counting as a failure.
 
 ## Quick start
 
@@ -54,10 +67,10 @@ ultracode install codex           # skill + AGENTS.md trigger + MCP registration
 Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
 
 ```text
-"ultracode: review this repo for auth bugs +500k"
+"ultracode: review this repo for auth bugs"
 ```
 
-Your agent authors the workflow and runs it — natively on Qoder and Claude Code, over MCP on Codex, via the CLI elsewhere. `+500k` caps the budget; omitting it runs uncapped. `workflow_start` asks no confirmation — have the agent show the workflow first (`docs/threat-model.md`). Then follow along (the runId is in the agent's reply, or `ultracode list`):
+The keyword arms the mode: your agent authors and runs a workflow — native on Qoder/Claude Code, over MCP on Codex, via the `ultracode` CLI elsewhere. `workflow_start` runs with no confirmation gate, so have the agent show you the workflow first (`docs/threat-model.md`). Follow runs from a shell:
 
 ```bash
 ultracode watch <runId>
@@ -121,7 +134,7 @@ ultracode resume <runId> [--script edited.js]   # unchanged journal prefix repla
 | | `doctor` | probe backends: availability, versions, auth topology |
 | | `mode [on\|off]` | read or set the standing ultracode-mode marker (`.ultracode/mode`) |
 | | `sync` | mirror canonical `.ultracode/workflows` into `.claude/` and `.qoder/` copies |
-| | `mcp` | stdio MCP server: `workflow_start` / `workflow_status` / `workflow_result` (+ stop/list) |
+| | `mcp` | stdio MCP server: `workflow_start` / `workflow_status` (long-poll `until="terminal"` for a quiet monitor) / `workflow_result` (+ stop/list) |
 
 ## Docs
 
@@ -133,4 +146,4 @@ ultracode resume <runId> [--script edited.js]   # unchanged journal prefix repla
 
 ## Status
 
-Internal-first: not published to npm. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.
+Not published to npm. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.
