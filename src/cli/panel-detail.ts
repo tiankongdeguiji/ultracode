@@ -36,6 +36,8 @@ export interface AgentArtifacts {
   wrapMemo?: WrapMemo;
 }
 
+/** Memoized lines are stored ALREADY indented, so a paint only copies array
+ *  references into the body instead of allocating one string per line. */
 interface WrapMemo {
   width: number;
   promptFor?: string;
@@ -142,19 +144,19 @@ function outcomeLines(
   memo: WrapMemo,
 ): string[] {
   if (row.endedTs === undefined && !isTerminal(opts.runStatus)) {
-    return [paint('2', 'Still running…')];
+    return [BODY_INDENT + paint('2', 'Still running…')];
   }
   if (row.status === 'running' || row.status === 'queued') {
-    return [paint('33', row.status === 'running' ? 'interrupted' : 'never started')];
+    return [BODY_INDENT + paint('33', row.status === 'running' ? 'interrupted' : 'never started')];
   }
-  if (row.status === 'skipped') return [paint('2', 'skipped')];
+  if (row.status === 'skipped') return [BODY_INDENT + paint('2', 'skipped')];
   const res = (art.result ?? undefined) as { value?: unknown; error?: unknown } | undefined;
   if (row.status === 'failed') {
     const error = row.error ?? (typeof res?.error === 'string' ? res.error : undefined);
-    return wrapToWidth(`failed: ${error ?? 'unknown error'}`, width).map((l) => paint('31', l));
+    return wrapToWidth(`failed: ${error ?? 'unknown error'}`, width).map((l) => BODY_INDENT + paint('31', l));
   }
   if (res === undefined || typeof res !== 'object') {
-    return [paint('2', '(finalizing…)')]; // result.json not readable yet — caller retries next paint
+    return [BODY_INDENT + paint('2', '(finalizing…)')]; // result.json not readable yet — caller retries next paint
   }
   // Memoized on the parsed result's identity: stringify+wrap of a large value
   // is pure and its inputs only change when the artifact cache replaces `res`.
@@ -164,7 +166,7 @@ function outcomeLines(
     memo.valueLines = wrapToWidth(
       typeof value === 'string' ? value : value === undefined ? 'null' : JSON.stringify(value, null, 2),
       width,
-    );
+    ).map((l) => BODY_INDENT + l);
   }
   return memo.valueLines;
 }
@@ -201,7 +203,7 @@ export function renderDetailFrame(
   if (art.prompt !== undefined) {
     if (memo.promptFor !== art.prompt || memo.promptLines === undefined) {
       memo.promptFor = art.prompt;
-      memo.promptLines = wrapToWidth(art.prompt, bodyWidth);
+      memo.promptLines = wrapToWidth(art.prompt, bodyWidth).map((l) => BODY_INDENT + l);
     }
     promptLines = memo.promptLines;
   }
@@ -210,12 +212,12 @@ export function renderDetailFrame(
   if (promptLines === undefined) {
     body.push(BODY_INDENT + paint('2', '(prompt not yet written)'));
   } else if (opts.promptExpanded || promptLines.length <= PROMPT_COLLAPSED_LINES) {
-    for (const l of promptLines) body.push(BODY_INDENT + l);
+    for (const l of promptLines) body.push(l); // pre-indented; loop — spread would overflow argc on huge prompts
     if (opts.promptExpanded && promptLines.length > PROMPT_COLLAPSED_LINES) {
       body.push(BODY_INDENT + paint('2', '(⏎ collapse)'));
     }
   } else {
-    for (const l of promptLines.slice(0, PROMPT_COLLAPSED_LINES)) body.push(BODY_INDENT + l);
+    body.push(...promptLines.slice(0, PROMPT_COLLAPSED_LINES));
     body.push(BODY_INDENT + paint('2', `… ${promptLines.length - PROMPT_COLLAPSED_LINES} more lines (⏎ expand)`));
   }
   body.push('');
@@ -224,7 +226,7 @@ export function renderDetailFrame(
   body.push('');
   const outcomeIdx = body.length;
   body.push(paint('1', 'Outcome'));
-  for (const l of outcomeLines(row, art, opts, paint, bodyWidth, memo)) body.push(BODY_INDENT + l);
+  for (const l of outcomeLines(row, art, opts, paint, bodyWidth, memo)) body.push(l); // pre-indented
 
   // One bottom line merges the scroll indicator and the keymap. Decide whether
   // it exists against the FULL unreserved capacity first — reserving it up

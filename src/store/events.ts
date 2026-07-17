@@ -91,14 +91,28 @@ export function readEventsFrom(file: string, offset: number, maxBytes?: number):
       window = Math.min(size - offset, window * 2);
     }
     const lastNewline = text.lastIndexOf('\n');
-    if (lastNewline === -1) return { events: [], nextOffset: offset, hasMore: false };
+    if (lastNewline === -1) {
+      // Unterminated suffix at EOF. A small one is a torn tail — wait for the
+      // writer. One past the growth cap is the same pathology as above and no
+      // writer will ever finish it: discard to EOF, or the tail loop re-decodes
+      // up to the whole suffix on every tick forever.
+      if (maxBytes !== undefined && window >= maxBytes * MAX_LINE_GROWTH_FACTOR) {
+        return { events: [], nextOffset: offset + window, hasMore: offset + window < size };
+      }
+      return { events: [], nextOffset: offset, hasMore: false };
+    }
     const complete = text.slice(0, lastNewline);
     const consumed = Buffer.byteLength(complete, 'utf8') + 1;
     const events: TimestampedEvent[] = [];
     for (const line of complete.split('\n')) {
       if (!line.trim()) continue;
       try {
-        events.push(JSON.parse(line) as TimestampedEvent);
+        const parsed: unknown = JSON.parse(line);
+        // The envelope itself is untrusted: a valid `null` or `42` line would
+        // pass JSON.parse and crash every consumer that dereferences .type.
+        if (typeof parsed === 'object' && parsed !== null && typeof (parsed as { type?: unknown }).type === 'string') {
+          events.push(parsed as TimestampedEvent);
+        }
       } catch {
         /* torn line — skip */
       }

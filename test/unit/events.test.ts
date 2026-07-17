@@ -112,6 +112,35 @@ return 1`,
     expect(ofType('agent_completed')[0]).toMatchObject({ toolCalls: TOOL_EVENT_CAP + 51 }); // authority unaffected
   });
 
+  it('onAgentSettled fires BEFORE agent_completed on every settle path (artifacts land before the event)', async () => {
+    // Watchers treat agent_completed as "result.json/prompt.md are final on
+    // disk" — the settle hook (which writes them) must run first, on the
+    // live, skip, and failure paths alike.
+    const merged: string[] = [];
+    await executeWorkflow(
+      `export const meta = { name: 't', description: 'd' }
+await agent('MOCK:ok x', { label: 'live' })
+await agent('MOCK:ok y', { label: 'skipme', skip: true })
+try { await agent('MOCK:fail boom', { label: 'dies' }) } catch { /* expected */ }
+return 1`,
+      {
+        executor: new MockExecutor(),
+        onAgentSettled: (r) => merged.push(`settled:${r.spec.label}:${r.status}`),
+        onEvent: (e) => {
+          if (e.type === 'agent_completed') merged.push(`completed:${e.label}`);
+        },
+      },
+    );
+    expect(merged).toEqual([
+      'settled:live:ok',
+      'completed:live',
+      'settled:skipme:skip',
+      'completed:skipme',
+      'settled:dies:error',
+      'completed:dies',
+    ]);
+  });
+
   it('cache-replayed agents complete with cached:true, zero tokens, and no queued/started events', async () => {
     const { out, events, ofType } = await run(
       `export const meta = { name: 't', description: 'd' }

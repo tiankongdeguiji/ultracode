@@ -270,6 +270,19 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
     paint(lastManifest, lastStatus, Date.now(), false);
   };
 
+  /** Coalesced repaint for navigation keys: attachKeys dispatches a whole
+   *  input chunk synchronously, so a pasted run of j/k would otherwise fold
+   *  and render once per byte. One microtask per chunk instead. */
+  let repaintQueued = false;
+  const scheduleRepaint = (): void => {
+    if (repaintQueued) return;
+    repaintQueued = true;
+    queueMicrotask(() => {
+      repaintQueued = false;
+      repaintNow();
+    });
+  };
+
   const moveSelection = (delta: 1 | -1): void => {
     const seqs = selectableSeqs(state);
     if (seqs.length === 0) return;
@@ -341,7 +354,7 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
       } else if (key.type === 'esc') ui.selectedSeq = undefined;
       else return;
     }
-    repaintNow();
+    scheduleRepaint();
   };
 
   const input: KeyInput = opts.input ?? process.stdin;

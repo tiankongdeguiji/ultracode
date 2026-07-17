@@ -334,8 +334,12 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     // in seq order, synchronously (no await between seq assignment and here).
     const cacheKey = opts.keyChain?.next(spec);
 
+    // NOTE: onAgentSettled always fires BEFORE the agent_completed event, here
+    // and at every settle site below. Watchers treat the event as "artifacts
+    // are final on disk" — the reverse order would open a window where a
+    // worker-planted result.json/prompt.md could be read (and cached) as if
+    // the runner had written it.
     if (spec.skip) {
-      onEvent({ type: 'agent_completed', seq, label: spec.label, phase: spec.phase, ok: true, skipped: true, totalTokens: 0 });
       onAgentSettled?.({
         spec,
         status: 'skip',
@@ -343,13 +347,13 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         usage: { totalTokens: 0, estimated: false },
         cacheKey,
       });
+      onEvent({ type: 'agent_completed', seq, label: spec.label, phase: spec.phase, ok: true, skipped: true, totalTokens: 0 });
       return null;
     }
 
     const cached = cacheLookup?.(spec, cacheKey);
     if (cached?.hit) {
       bumpPhase(spec.phase);
-      onEvent({ type: 'agent_completed', seq, label: spec.label, phase: spec.phase, ok: true, cached: true, totalTokens: 0 });
       onAgentSettled?.({
         spec,
         status: 'ok',
@@ -358,6 +362,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         cacheKey,
         cached: true,
       });
+      onEvent({ type: 'agent_completed', seq, label: spec.label, phase: spec.phase, ok: true, cached: true, totalTokens: 0 });
       return roundTrip(cached.value);
     }
 
@@ -423,6 +428,15 @@ export function createHostApi(opts: HostApiOptions): HostApi {
       // stop — otherwise stopped runs underreport tokens and drop the journal
       // entry (which also lets a completed-then-stopped agent replay on resume).
       if (signal.aborted) {
+        onAgentSettled?.({
+          spec,
+          status: outcome.ok ? 'ok' : 'error',
+          value: outcome.ok ? outcome.value : undefined,
+          error: outcome.error,
+          usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
+          sessionId: outcome.sessionId,
+          cacheKey,
+        });
         onEvent({
           type: 'agent_completed',
           seq,
@@ -434,21 +448,20 @@ export function createHostApi(opts: HostApiOptions): HostApi {
           toolCalls: outcome.toolCalls,
           error: outcome.error,
         });
-        onAgentSettled?.({
-          spec,
-          status: outcome.ok ? 'ok' : 'error',
-          value: outcome.ok ? outcome.value : undefined,
-          error: outcome.error,
-          usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
-          sessionId: outcome.sessionId,
-          cacheKey,
-        });
         throw new UltracodeError('Workflow stopped', 'aborted');
       }
 
       if (!outcome.ok) {
         const failure = `agent[${seq}] ${spec.label} failed: ${outcome.error ?? 'unknown error'}`;
         state.failures.push(failure);
+        onAgentSettled?.({
+          spec,
+          status: 'error',
+          error: outcome.error,
+          usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
+          sessionId: outcome.sessionId,
+          cacheKey,
+        });
         onEvent({
           type: 'agent_completed',
           seq,
@@ -460,14 +473,6 @@ export function createHostApi(opts: HostApiOptions): HostApi {
           toolCalls: outcome.toolCalls,
           error: outcome.error,
         });
-        onAgentSettled?.({
-          spec,
-          status: 'error',
-          error: outcome.error,
-          usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
-          sessionId: outcome.sessionId,
-          cacheKey,
-        });
         throw new WorkflowAgentError(failure, seq, spec.label);
       }
 
@@ -477,6 +482,14 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         state.failures.push(msg);
         pushLog(msg);
       }
+      onAgentSettled?.({
+        spec,
+        status: 'ok',
+        value: outcome.value,
+        usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
+        sessionId: outcome.sessionId,
+        cacheKey,
+      });
       onEvent({
         type: 'agent_completed',
         seq,
@@ -486,14 +499,6 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         totalTokens: outcome.usage.totalTokens,
         estimated: outcome.usage.estimated,
         toolCalls: outcome.toolCalls,
-      });
-      onAgentSettled?.({
-        spec,
-        status: 'ok',
-        value: outcome.value,
-        usage: { totalTokens: outcome.usage.totalTokens, estimated: outcome.usage.estimated },
-        sessionId: outcome.sessionId,
-        cacheKey,
       });
       return roundTrip(outcome.value);
     } finally {

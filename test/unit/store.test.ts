@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunId, RUN_ID_RE, agentDirName, ultracodeRoot } from '../../src/store/layout.js';
@@ -127,6 +127,17 @@ describe('events', () => {
     const page1 = readEventsFrom(file, 0, 256);
     expect(page1.events.map((e) => e.type)).toEqual(['workflow_log', 'run_completed']);
     expect(page1.hasMore).toBe(false);
+  });
+
+  it('non-object and type-less envelopes are dropped like malformed JSON (a null line must not crash consumers)', () => {
+    const dir = tmpRoot();
+    const file = join(dir, 'events.jsonl');
+    writeFileSync(
+      file,
+      'null\n42\n"str"\n[]\n{}\n{"type":5}\n{"ts":1,"type":"workflow_log","message":"ok"}\n',
+    );
+    const page = readEventsFrom(file, 0);
+    expect(page.events).toEqual([{ ts: 1, type: 'workflow_log', message: 'ok' }]);
   });
 
   it('a pathological unterminated line past the growth cap is skipped in bounded steps, and the tail self-heals', () => {

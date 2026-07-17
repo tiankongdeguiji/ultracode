@@ -96,6 +96,12 @@ async function waitForOutput(chunks: string[], needle: string, timeoutMs = 10_00
   }
 }
 
+/** press + flush: navigation repaints are coalesced into a microtask per chunk. */
+async function tap(stdin: { press: (seq: string) => void }, seq: string): Promise<void> {
+  stdin.press(seq);
+  await sleep(0);
+}
+
 afterEach(() => vi.restoreAllMocks());
 
 describe('resolveRenderMode', () => {
@@ -361,10 +367,10 @@ return 1
     await waitForOutput(stream.chunks, 'worker'); // agent row folded and painted
     expect(stream.chunks.join('')).toContain('↑/↓ select'); // overview keymap on
 
-    stdin.press('\x1b[B'); // ↓ selects the first row — repaint is immediate
+    await tap(stdin, '\x1b[B'); // ↓ selects the first row
     expect(stream.chunks.at(-1)).toContain('❯');
 
-    stdin.press('\r'); // ⏎ opens the detail view
+    await tap(stdin, '\r'); // ⏎ opens the detail view
     expect(stream.chunks.at(-1)).toContain('Outcome'); // detail layout is up immediately…
     // …while artifact/tool data may lag a fold tick or two — poll, don't race.
     await waitForOutput(stream.chunks, 'Prompt · 1 line'); // prompt.md readable while RUNNING (early write)
@@ -375,11 +381,11 @@ return 1
     expect(detail).toContain('Still running…');
     expect(detail).toContain('j/k scroll');
 
-    stdin.press('\x1b'); // esc back to the overview, selection retained
+    await tap(stdin, '\x1b'); // esc back to the overview, selection retained
     expect(stream.chunks.at(-1)).toContain('❯');
     expect(stream.chunks.at(-1)).not.toContain('Outcome');
 
-    stdin.press('\r'); // back into detail, then let the run get stopped under us
+    await tap(stdin, '\r'); // back into detail, then let the run get stopped under us
     process.kill(pid, 'SIGTERM');
     const { exitCode } = await loop;
     expect(exitCode).toBe(1);
@@ -444,15 +450,15 @@ return 1
       stream.chunks.at(-1)!.split('\n').find((l) => l.includes('❯'));
     try {
       await waitForOutput(stream.chunks, 'beta');
-      stdin.press('\x1b[A'); // ↑ with no selection → selects the LAST row
+      await tap(stdin, '\x1b[A'); // ↑ with no selection → selects the LAST row
       expect(selectedRow()).toContain('beta');
-      stdin.press('\x1b[B'); // ↓ at the bottom edge → clamped, stays put
+      await tap(stdin, '\x1b[B'); // ↓ at the bottom edge → clamped, stays put
       expect(selectedRow()).toContain('beta');
-      stdin.press('k'); // up → alpha
+      await tap(stdin, 'k'); // up → alpha
       expect(selectedRow()).toContain('alpha');
-      stdin.press('k'); // top edge → clamped
+      await tap(stdin, 'k'); // top edge → clamped
       expect(selectedRow()).toContain('alpha');
-      stdin.press('\x1b'); // esc clears the selection entirely
+      await tap(stdin, '\x1b'); // esc clears the selection entirely
       expect(selectedRow()).toBeUndefined();
     } finally {
       process.kill(pid, 'SIGTERM');
@@ -475,14 +481,13 @@ return 1
     const frameLines = (c: string): number => c.slice(c.indexOf('⏺')).trimEnd().split('\n').length;
     try {
       await waitForOutput(stream.chunks, 'wordy');
-      stdin.press('\x1b[B');
-      stdin.press('\r'); // detail
-      stdin.press('\r'); // expand the 41-line prompt → scrollable body
+      await tap(stdin, '\x1b[B');
+      await tap(stdin, '\r'); // detail
+      await tap(stdin, '\r'); // expand the 41-line prompt → scrollable body
       expect(stream.chunks.at(-1)).toMatch(/\n1–\d+ of \d+ ↓/);
-      stdin.press('j');
-      stdin.press('j');
+      await tap(stdin, 'jj'); // one chunk, two keys → ONE coalesced repaint
       expect(stream.chunks.at(-1)).toMatch(/\n3–\d+ of \d+ ↑ ↓/);
-      stdin.press('k');
+      await tap(stdin, 'k');
       expect(stream.chunks.at(-1)).toMatch(/\n2–\d+ of \d+ ↑ ↓/);
       expect(frameLines(stream.chunks.at(-1)!)).toBeLessThanOrEqual(19);
 
@@ -498,7 +503,7 @@ return 1
         if (Date.now() > deadline) throw new Error('never repainted within the shrunken budget');
         await sleep(50);
       }
-      stdin.press('j'); // scrolling still works post-resize
+      await tap(stdin, 'j'); // scrolling still works post-resize
       expect(frameLines(stream.chunks.at(-1)!)).toBeLessThanOrEqual(7);
     } finally {
       process.kill(pid, 'SIGTERM');
@@ -531,7 +536,7 @@ return 1
       process.emit('SIGCONT'); // resume: raw mode + cursor re-hidden + repaint
       expect(stdin.rawCalls).toEqual([true, false, true]);
       expect(stdin.emitter.listenerCount('data')).toBe(1); // exactly one handler — keys never double-dispatch
-      stdin.press('\x1b[B');
+      await tap(stdin, '\x1b[B');
       expect(stream.chunks.at(-1)).toContain('❯'); // keys live again after resume
     } finally {
       killSpy.mockRestore();
