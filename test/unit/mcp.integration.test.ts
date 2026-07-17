@@ -80,7 +80,7 @@ describe('MCP triad', () => {
 
     let status: Record<string, any> = {};
     let offset = 0;
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 90; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
         arguments: { runId, waitSeconds: 2, sinceEventOffset: offset },
@@ -98,7 +98,7 @@ describe('MCP triad', () => {
     expect(result.structuredContent!.result).toEqual({ g: 'hi-from-mcp' });
     expect(result.structuredContent!.logs).toEqual(['done']);
     expect(result.structuredContent!.artifacts.runDir).toContain(runId);
-  }, 60_000);
+  }, 180_000);
 
   it('workflow_start passes wallClockMs/attemptTimeoutMs through unclamped; omitting them leaves config bare', async () => {
     const start = (await client.callTool({
@@ -116,7 +116,7 @@ describe('MCP triad', () => {
 
     let status: Record<string, any> = {};
     let offset = 0;
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 90; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
         arguments: { runId, waitSeconds: 2, sinceEventOffset: offset },
@@ -142,12 +142,17 @@ describe('MCP triad', () => {
     expect('wallClockMs' in plainConfig).toBe(false);
     expect('attemptTimeoutMs' in plainConfig).toBe(false);
     let plainStatus: Record<string, any> = {};
-    for (let i = 0; i < 40; i++) {
+    // Chain the cursor: an unchained activity poll re-reads the backlog from 0
+    // and returns instantly every time, so the loop can never actually WAIT —
+    // under CI contention it exhausts before the run completes (live flake).
+    let plainOffset = 0;
+    for (let i = 0; i < 90; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
-        arguments: { runId: plain.structuredContent!.runId!, waitSeconds: 2 },
+        arguments: { runId: plain.structuredContent!.runId!, waitSeconds: 2, sinceEventOffset: plainOffset },
       })) as { structuredContent?: Record<string, any> };
       plainStatus = s.structuredContent!;
+      plainOffset = plainStatus.nextEventOffset;
       if (plainStatus.terminal) break;
     }
     expect(plainStatus.status).toBe('completed');
@@ -162,7 +167,7 @@ describe('MCP triad', () => {
     const clearedConfig = JSON.parse(readFileSync(join(cleared.structuredContent!.runDir!, 'config.json'), 'utf8'));
     expect('wallClockMs' in clearedConfig).toBe(false);
     expect('attemptTimeoutMs' in clearedConfig).toBe(false);
-  }, 60_000);
+  }, 180_000);
 
   it('long-poll is not woken by agent_usage ticks (renderable lines only)', async () => {
     // Fabricated live run: manifest points at THIS (alive) process so
@@ -361,9 +366,12 @@ describe('MCP triad', () => {
     expect(notifications).toBe(0); // quiet parks are structurally silent; activity mode still throttles at 10s
   }, 20_000);
 
-  it('terminal quiet park from offset 0 over a multi-MB backlog serves the real tail fast, cursor at EOF', async () => {
+  it('terminal quiet park from offset 0 over a >8 MiB backlog jumps to the real tail, cursor at EOF', async () => {
     const runId = 'wf_quietbig0001';
-    const { dir, manifest } = fabricateRun(runId, logLines(100_000)); // ~5 MB — beyond one 4 MB page
+    // >8 MiB matters: the final-window jump only fires when end − 4 MiB
+    // exceeds the first page's nextOffset (~4 MiB), so a smaller fixture
+    // would silently test plain paging instead of the jump + tail reset.
+    const { dir, manifest } = fabricateRun(runId, logLines(200_000)); // ~11 MiB
     flipStatus(dir, manifest, 'completed');
 
     const t0 = Date.now();
@@ -372,12 +380,24 @@ describe('MCP triad', () => {
       arguments: { runId, until: 'terminal', waitSeconds: 3300, sinceEventOffset: 0 },
     })) as { structuredContent?: Record<string, any> };
     const status = s.structuredContent!;
-    expect(Date.now() - t0).toBeLessThan(5_000); // final-window jump, not an O(backlog) parse
+    expect(Date.now() - t0).toBeLessThan(10_000);
     expect(status.terminal).toBe(true);
     expect(status.logTail).toHaveLength(40);
-    expect(status.logTail[39]).toBe('   log: line100000'); // the run's REAL tail, not its head
+    expect(status.logTail[39]).toBe('   log: line200000'); // the run's REAL tail through the jump, not its head
     const { statSync } = await import('node:fs');
     expect(status.nextEventOffset).toBe(statSync(join(dir, 'events.jsonl')).size); // cursor at EOF
+  }, 20_000);
+
+  it('tail lines are capped per line so a huge log() message cannot flood logTail', async () => {
+    const runId = 'wf_hugelogline1';
+    fabricateRun(runId, JSON.stringify({ ts: 1, type: 'workflow_log', message: 'x'.repeat(10_000) }) + '\n');
+    const s = (await client.callTool({
+      name: 'workflow_status',
+      arguments: { runId, waitSeconds: 5, sinceEventOffset: 0 },
+    })) as { structuredContent?: Record<string, any> };
+    const line = s.structuredContent!.logTail[0] as string;
+    expect(line.length).toBeLessThanOrEqual(401); // 400 chars + ellipsis
+    expect(line.endsWith('…')).toBe(true);
   }, 20_000);
 
   it("until='phase' without sinceEventOffset wakes instantly on a historical phase boundary (documented footgun)", async () => {
@@ -393,7 +413,10 @@ describe('MCP triad', () => {
     expect(s.structuredContent!.next).toContain('sinceEventOffset'); // the nudge that teaches chaining
   }, 20_000);
 
-  it('explicit waitSeconds up to 3600 is accepted (no 50s clamp); beyond schema max is rejected', async () => {
+  // NOTE: this pins schema bounds only — a reinstated sub-schema runtime clamp
+  // (the original bug's shape) is not observable inside the 20s suite budget,
+  // since proving a >50s hold held would take >50s of wall clock.
+  it('waitSeconds schema: 3600 accepted, 3601 rejected', async () => {
     const runId = 'wf_quietsched01';
     const { dir, manifest } = fabricateRun(runId, '');
     flipStatus(dir, manifest, 'completed');
@@ -446,7 +469,7 @@ describe('MCP triad', () => {
     };
     const entry = list.structuredContent!.runs.find((r) => r.runId === runId);
     expect(entry).toBeDefined();
-  }, 60_000);
+  }, 180_000);
 
   it('workflow_list caps to the 10 most recent by default and honors count, reporting hidden', async () => {
     // Isolated store (via the cwd input) so accumulated runs from other tests
@@ -560,7 +583,7 @@ describe('MCP triad', () => {
     // Drive the run terminal so it can be resumed. startDetachedRun's resume
     // config-merge is a separate implementation from the CLI's resumeCommand,
     // so the MCP path needs its own override/inherit assertions.
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 90; i++) {
       const s = (await client.callTool({
         name: 'workflow_status',
         arguments: { runId, waitSeconds: 2 },

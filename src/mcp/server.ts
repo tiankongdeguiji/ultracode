@@ -51,6 +51,8 @@ const PROGRESS_INTERVAL_MS = 10_000;
 const SHORT_HOLD_NUDGE_MS = 240_000;
 /** Rolling tail cap carried on every workflow_status response. */
 const TAIL_LINES = 40;
+/** Per-line byte cap for the tail: log()/event text is script- and worker-influenced and can be huge — logTail must stay model-context-sized (worst case ~16 KB). */
+const TAIL_LINE_CHARS = 400;
 
 function ok(structured: Record<string, unknown>) {
   return {
@@ -150,7 +152,8 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Run status long-poll. until="terminal" is the quiet monitor: wakes only when the run ends ' +
         'or after waitSeconds (re-issue the same call), rolling the last 40 log lines into each ' +
-        'response; until="phase" additionally wakes at phase boundaries — the sanctioned channel ' +
+        'response; until="phase" additionally wakes at phase boundaries (boundaries crossed in one ' +
+        'read batch into a single wake — each appears in logTail) — the sanctioned channel ' +
         'for milestone updates. Between wakes park silently: failures and crashes wake the monitor, ' +
         'so skip filler updates, refresh polls, and run-store tailing. Every wake costs a model ' +
         'turn — pass the largest waitSeconds your host MCP tool timeout allows: codex hostpack ' +
@@ -196,7 +199,12 @@ export function createServer(baseCwd: string): McpServer {
         const fresh = page.events
           .map((e: TimestampedEvent) => renderEvent(e))
           .filter((l): l is string => l !== null);
-        tail.push(...fresh);
+        // Bounded append: only the last TAIL_LINES lines can survive, so never
+        // spread the raw page (a dense 4 MB page holds ~80k renderable lines —
+        // enough to overflow V8's argument limit) and cap each stored line.
+        const keep = fresh.slice(-TAIL_LINES).map((l) => (l.length > TAIL_LINE_CHARS ? `${l.slice(0, TAIL_LINE_CHARS)}…` : l));
+        if (keep.length === TAIL_LINES) tail.length = 0;
+        tail.push(...keep);
         if (tail.length > TAIL_LINES) tail.splice(0, tail.length - TAIL_LINES);
         const phaseHit = input.until === 'phase' && page.events.some((e: TimestampedEvent) => e.type === 'phase_started');
 
@@ -246,7 +254,13 @@ export function createServer(baseCwd: string): McpServer {
 
         // Catching up on a clipped backlog (e.g. tick-heavy pages): read the
         // next page immediately — pacing 4 MB per 300 ms would starve clients.
-        if (page.hasMore) continue;
+        // But yield between the synchronous 4 MB parses (watch.ts does the
+        // same): a long backlog must not starve the event loop, or sibling
+        // MCP calls and cancellations stall behind this one.
+        if (page.hasMore) {
+          await sleep(0);
+          continue;
+        }
 
         if (!quiet && progressToken !== undefined && Date.now() - progressAt >= PROGRESS_INTERVAL_MS) {
           progressAt = Date.now();
