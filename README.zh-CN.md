@@ -35,8 +35,8 @@ ultracode engine: sandboxed script + scheduler + journal
 
 - **分而治之**——输入关键词 `ultracode` 会激活一个 skill（工作方法），引导你的 agent 将大型任务拆成由多个小型 `agent()` 调用组成的工作流。每个调用都是一个拥有独立全新上下文的子进程。
 - **可控的任务分派**——一个任务可以分派给多个子 agent：默认软上限为 `50` 个，每次运行的硬上限为 `1000` 个，默认最多同时并发 10 个（`min(10, max(2, cores-2))`）。并发数和软上限分别通过 `--max-concurrency` 与 `--max-agents` 调整。
-- **主会话保持精简**——子 agent 只返回最终结果：一个结构化对象，或它的最后一条消息。对话记录，包括工具调用、文件读取和流式 token，都会保存在对应的 run 目录中，不会回流到主会话。
-- **支持交叉验证**——`parallel()` 和 `pipeline()` 都是一等能力，skill 还提供多种质量控制模式：让多个独立 agent 专门尝试推翻某项发现的对抗式验证、评审团、多视角复审，以及循环检查直到不再出现新问题。内置的 `uc-review` 工作流采用的正是“并行查找 → 对抗式验证 → 综合汇总”流程。
+- **主会话保持精简**——子 agent 的对话记录（工具调用、文件读取、流式 token）都保存在对应的 run 目录中；只有最终结果会返回——一个结构化对象或最后一条消息，失败时再加一小段错误摘要。
+- **支持交叉验证**——`parallel()` 和 `pipeline()` 都是一等能力，skill 还提供多种质量控制模式：对抗式验证（多个独立 agent 专门尝试推翻某项发现，多数支持推翻即删除它）、评审团、多视角复审，以及循环检查直到不再出现新问题。内置的 `uc-review` 工作流采用的正是“并行查找 → 对抗式验证 → 综合汇总”流程。
 - **无需驻守**——每次运行都是一个独立、脱离会话的操作系统进程，不依赖守护进程。即使启动它的 CLI 或 MCP 服务器退出，工作流仍会继续执行；你可以从任意 shell 中重新查看、停止或续跑。
 - **工作流可沉淀复用**——工作流就是普通的确定性 JS：便于阅读，可以通过 `--dry-run` 免费演练，能够保存在 `.ultracode/workflows/` 中，也可以通过 `workflow()` 嵌入另一个工作流，支持一层嵌套。
 
@@ -44,8 +44,8 @@ ultracode engine: sandboxed script + scheduler + journal
 
 - **一套方言，三个引擎**——同一份 `*.workflow.js` 可以在 Claude Code（原生）、Qoder（原生）和 ultracode 引擎上运行。`ultracode lint` 用于确保脚本位于跨引擎可移植子集内，`ultracode sync` 则会将工作流同步到 `.claude/workflows/` 和 `.qoder/workflows/`。
 - **基于 journal 的续跑**——确定性脚本结合哈希链式 journal，使 `ultracode resume <runId>` 可以直接重放最长的、未发生变化且已成功执行的 `agent()` 调用前缀，再继续运行剩余部分。即使脚本已经修改，也可以从第一处差异开始重新执行。
-- **实时运行面板**——前台运行时会直接显示面板，`ultracode watch` 也可以从任意 shell 重新接入。面板会展示每个 agent 的 token 数和耗时；使用方向键选中 agent 后，可以查看它的 prompt、当前活动和最终结果。在 `watch` 中按 Ctrl-C 只会退出查看，不会停止工作流。
-- **预算与超时可按需启用**——默认不设置任何上限；未配置即不限制。`--budget 500k` 会在任务派发时强制执行：达到上限后不再启动新的 agent。超时限制同样是可选的，默认不设上限。
+- **实时运行面板**——前台运行时会直接显示面板，`ultracode watch` 也可以从任意 shell 重新接入。面板会展示每个 agent 的 token 数和耗时；使用方向键选中 agent 后，可以查看它的 prompt、当前活动和最终结果。在 `watch` 中按 Ctrl-C 只会退出查看，不会停止工作流；但在前台接入的运行中，Ctrl-C 会停止整个工作流。
+- **预算与超时可按需启用**——默认不设置任何上限；未配置即不限制。`--budget 500k` 会在任务派发时把关：一旦花费超过上限，就不再启动新的 agent（已在运行的 agent 会继续跑完，因此总量可能略有超出）。超时限制同样是可选的，默认不设上限。
 - **结构化输出容错**——为 `agent()` 提供 `JSON Schema` 后，引擎会返回经过校验的对象。若模型输出不符合 schema，最多会自动进行两次修复重试，之后才将该调用判定为失败。
 
 ## 快速开始
@@ -119,22 +119,22 @@ ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journ
 
 ## 命令
 
-|    | 命令                                | 功能                                                                                    |
-| -- | --------------------------------- | ------------------------------------------------------------------------------------- |
-| 编写 | `validate <script>`               | 检查 meta 块、方言约束以及脚本是否可编译                                                               |
-|    | `lint <script>`                   | 检查工作流在 Claude Code、Qoder 原生引擎和 ultracode 之间的可移植性                                      |
-| 运行 | `run <script>`                    | 运行工作流：前台显示实时面板，使用 `--detach` 转入后台，使用 `--dry-run` 进行免费的 mock 演练                        |
-|    | `resume <runId>`                  | 直接重放未变化且已成功的 journal 前缀，也支持 `--script edited.js`；剩余部分继续实时运行                           |
-|    | `stop <runId>`                    | 停止正在运行的工作流（SIGTERM → 等待 7 秒 → SIGKILL）                                                |
-| 查看 | `watch <runId>`                   | 打开实时面板，查看阶段、各 agent 的 token 数和耗时；↑/↓ 选择 agent，⏎ 查看详情，q 退出查看                           |
-|    | `status <runId>`                  | 显示运行状态，包括阶段、agent 和预算；`--watch` 会持续轮询直到运行结束                                           |
-|    | `logs <runId>`                    | 输出运行事件；`--follow` 会持续跟踪新日志                                                            |
-|    | `list`                            | 列出运行记录存储中的最近任务；使用 `--all` 查看全部记录                                                      |
-| 集成 | `install <codex\|qoder\|generic>` | 安装 skill 和宿主触发器（AGENTS.md 片段或 Qoder 规则）；以用户级方式安装 Codex 时，还会注册 MCP 服务器                 |
-|    | `doctor`                          | 探测各后端的可用性、版本和鉴权方式                                                                     |
-|    | `mode [on\|off]`                  | 读取或设置常驻的 ultracode 模式标记（`.ultracode/mode`）                                            |
-|    | `sync`                            | 将 `.ultracode/workflows` 中的权威版本同步到 `.claude/` 和 `.qoder/`                             |
-|    | `mcp`                             | 启动 stdio MCP 服务器，提供 `workflow_start`、`workflow_status`（`until="terminal"` 长轮询，可充当安静的监视器）、`workflow_result`，以及 stop/list |
+|  | 命令 | 功能 |
+|---|---|---|
+| 编写 | `validate <script>` | 检查 meta 块、方言约束以及脚本是否可编译 |
+|  | `lint <script>` | 检查工作流在 Claude Code、Qoder 原生引擎和 ultracode 之间的可移植性 |
+| 运行 | `run <script>` | 运行工作流：前台显示实时面板，使用 `--detach` 转入后台，使用 `--dry-run` 进行免费的 mock 演练 |
+|  | `resume <runId>` | 直接重放未变化且已成功的 journal 前缀，也支持 `--script edited.js`；剩余部分继续实时运行 |
+|  | `stop <runId>` | 停止正在运行的工作流（SIGTERM → 等待 7 秒 → SIGKILL） |
+| 查看 | `watch <runId>` | 打开实时面板，查看阶段、各 agent 的 token 数和耗时；↑/↓ 选择 agent，⏎ 查看详情，q 退出查看 |
+|  | `status <runId>` | 显示运行状态，包括阶段、agent 和预算；`--watch` 会持续轮询直到运行结束 |
+|  | `logs <runId>` | 输出运行事件；`--follow` 会持续跟踪新日志 |
+|  | `list` | 列出运行记录存储中的最近任务；使用 `--all` 查看全部记录 |
+| 集成 | `install <codex\|qoder\|generic>` | 安装 skill 和宿主触发器（AGENTS.md 片段或 Qoder 规则）；以用户级方式安装 Codex 时，还会注册 MCP 服务器 |
+|  | `doctor` | 探测各后端的可用性、版本和鉴权方式 |
+|  | `mode [on\|off]` | 读取或设置常驻的 ultracode 模式标记（`.ultracode/mode`） |
+|  | `sync` | 将 `.ultracode/workflows` 中的权威版本同步到 `.claude/` 和 `.qoder/` |
+|  | `mcp` | 启动 stdio MCP 服务器，提供 `workflow_start`、`workflow_status`（`until="terminal"` 长轮询，可充当安静的监视器）、`workflow_result`，以及 stop/list |
 
 ## 文档
 

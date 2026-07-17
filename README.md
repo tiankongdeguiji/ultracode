@@ -35,7 +35,7 @@ One agent, one context window, one linear transcript — that's the ceiling. `ul
 
 - **Divide and conquer** — typing the keyword `ultracode` arms a skill (doctrine) that has *your* agent break a big task into a workflow of small `agent()` calls, each a subprocess with its own fresh context.
 - **Fan out, bounded** — one task spreads across many sub-agents: up to `50` by default (the soft cap), a hard ceiling of `1000` per run, up to 10 at a time (`min(10, max(2, cores-2))`) — concurrency and the soft cap yours via `--max-concurrency` and `--max-agents`.
-- **Nothing floods your session** — only a sub-agent's final value (a structured object, or its last message) comes back; its transcript — every tool call, file read, streamed token — stays in its run dir and never flows back.
+- **Nothing floods your session** — a sub-agent's transcript (every tool call, file read, streamed token) stays in its run dir; only its final value comes back — a structured object or last message, plus a short error excerpt if it fails.
 - **Cross-check by construction** — `parallel()` and `pipeline()` are first-class, and the doctrine teaches quality patterns: adversarial verify (independent skeptics prompted to refute, majority kills a finding), judge panels, perspective-diverse review, loop-until-dry. The shipped `uc-review` workflow runs parallel finders → adversarial verification → synthesis.
 - **Kick it off, walk away** — each run is its own detached OS process (no daemon), so it keeps going after the launching CLI or MCP server exits; watch, stop, or resume it from any shell.
 - **Reusable assets, not one-shots** — workflows are plain deterministic JS: read them, rehearse them free with `--dry-run`, keep them in `.ultracode/workflows/`, and nest one inside another with `workflow()` (one level deep).
@@ -44,8 +44,8 @@ One agent, one context window, one linear transcript — that's the ceiling. `ul
 
 - **One dialect, three engines** — the same `*.workflow.js` text runs on Claude Code (native), Qoder (native), and this engine; `ultracode lint` keeps it in the portable subset, and `ultracode sync` mirrors workflows into `.claude/workflows/` and `.qoder/workflows/`.
 - **Journal-based resume** — deterministic scripts plus a hash-chained journal let `ultracode resume <runId>` replay the longest unchanged, successful prefix of `agent()` calls for free, then run the rest live — even after a script edit (the first divergence ends the cached prefix).
-- **Live fleet panel** — foreground runs show it, and `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail (in `watch`, Ctrl-C detaches and never stops the run).
-- **Opt-in budgets and timeouts** — no default caps (unset = unlimited); `--budget 500k` is enforced at the dispatch gate — no new agent starts past the ceiling — and a timeout is opt-in the same way, unlimited until you set one.
+- **Live fleet panel** — foreground runs show it, and `ultracode watch` re-attaches from any shell: per-agent tokens and elapsed time, arrow-select an agent, open its prompt/activity/outcome detail (in `watch`, Ctrl-C detaches and never stops the run; in an attached foreground run it stops the fleet).
+- **Opt-in budgets and timeouts** — no default caps (unset = unlimited); `--budget 500k` gates dispatch: once spend passes it, no new agent starts (running agents still finish, so the total can overshoot). A timeout is opt-in the same way, unlimited until you set one.
 - **Structured output that survives sloppy models** — give `agent()` a `JSON Schema` and it returns a validated object; non-conforming replies get up to two schema-repair retries before counting as a failure.
 
 ## Quick start
