@@ -148,4 +148,4 @@ ultracode resume <runId> [--script edited.js]   # unchanged journal prefix repla
 
 ## Status
 
-Internal-first: not published to npm. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.
+Not published to npm. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.
