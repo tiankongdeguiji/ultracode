@@ -8,7 +8,7 @@
 
 *Linux & macOS · not on npm yet — build from source.*
 
-Type the keyword `ultracode` and your coding agent stops doing everything in one context: the **skill** teaches it to author a small deterministic JS workflow — `agent()` calls are the only side effects — and the **engine** (this npm package: CLI + MCP server) fans each `agent()` out as a real coding-agent subprocess. Watch the fleet live, stop it, resume it, get one structured result back. Full layering: `docs/architecture.md`.
+Type `ultracode` and your coding agent stops doing everything in one context: it authors a small deterministic JS workflow, and the engine — this package — fans each `agent()` call out as a real coding-agent subprocess, returning one structured result. Full layering: `docs/architecture.md`.
 
 ```text
 "ultracode: audit src/ for auth bugs"      <- the keyword arms the skill
@@ -57,7 +57,7 @@ Then type the keyword inside Codex (or Qoder, Gemini CLI, Claude Code):
 "ultracode: review this repo for auth bugs +500k"
 ```
 
-The word arms the mode: your agent authors a workflow and runs it — natively on Qoder and Claude Code, over MCP on Codex (wired by `install codex`), via the `ultracode` CLI on skill-only hosts (`install generic`). `+500k` is an optional budget — omit it to run uncapped. `workflow_start` has no confirmation gate: ask the agent to show the workflow before running it (`docs/threat-model.md`). Follow runs from any shell (the runId is in the agent's reply, or `ultracode list`):
+Your agent authors the workflow and runs it — natively on Qoder and Claude Code, over MCP on Codex, via the CLI elsewhere. `+500k` caps the budget; omitting it runs uncapped. `workflow_start` asks no confirmation — have the agent show the workflow first (`docs/threat-model.md`). Then follow along (the runId is in the agent's reply, or `ultracode list`):
 
 ```bash
 ultracode watch <runId>
