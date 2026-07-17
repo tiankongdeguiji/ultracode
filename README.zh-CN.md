@@ -6,7 +6,7 @@
 [![license](https://img.shields.io/github/license/tiankongdeguiji/ultracode)](LICENSE)
 [![stars](https://img.shields.io/github/stars/tiankongdeguiji/ultracode)](https://github.com/tiankongdeguiji/ultracode/stargazers)
 
-**一句话，唤来一支舰队。** 可移植的 **ultracode**——动态多 agent 工作流编排——为那些原生不支持它的编码 agent 而生：OpenAI Codex CLI、Qoder、Gemini CLI 等等。它忠实于 Claude Code Workflow 方言，因此同一份 `*.workflow.js` 脚本能在 Claude Code（原生）、Qoder（原生）以及本引擎上运行。
+**Say the word, get an agent fleet.** 可移植的 **ultracode**——动态多 agent 工作流编排——为那些原生不支持它的编码 agent 而生：OpenAI Codex CLI、Qoder、Gemini CLI 等等。它基于 Claude Code Workflow 方言，因此同一份 `*.workflow.js` 脚本能在 Claude Code（原生）、Qoder（原生）以及本引擎上运行。
 
 *Linux 与 macOS · 尚未发布到 npm——需从源码构建。*
 
