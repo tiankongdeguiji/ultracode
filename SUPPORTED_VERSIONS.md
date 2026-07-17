@@ -15,18 +15,16 @@ tests before trusting a new parser path.
 
 ## MCP hosts
 
-The MCP triad is version-agnostic by design: `workflow_status` long-polls under
-the host's tool timeout — explicit `waitSeconds` honored up to 3600s (default
-25s). The quiet monitor (`until = "terminal"`) parks silently for the whole
-hold; the codex hostpack writes `tool_timeout_sec = 3600` so one hold covers
-~55 min (stock codex defaults 300s, Qoder/Gemini 600s — doctrine holds are the
-host's tool timeout minus a ≥60s margin, stated as concrete per-host numbers:
-models hedge ambiguous rules toward tiny waits, and the server nudges quiet
-holds under 240s). Verified against codex-rs **0.144.5**: progress
-notifications never extend a tool timeout (rmcp's `reset_timeout_on_progress`
-is never set) and a client-side timeout never cancels the request server-side.
-Never declares `taskSupport` (a `required` declaration breaks Qoder clients;
-codex pins protocol 2025-06-18 and rejects all `tasks/*`).
+The MCP triad is version-agnostic: `workflow_status` long-polls under the
+host's tool timeout (explicit `waitSeconds` ≤3600, default 25s), and the quiet
+monitor (`until = "terminal"`) parks silently for the whole hold — the codex
+hostpack writes `tool_timeout_sec = 3600`, so one hold covers ~55 min (stock
+codex 300s, Qoder/Gemini 600s). Doctrine states holds as concrete per-host
+numbers and the server nudges quiet holds under 240s (models hedge ambiguous
+rules toward tiny waits). Verified on codex-rs **0.144.5**: progress
+notifications never extend a tool timeout, and a client-side timeout never
+cancels the request server-side. Never declares `taskSupport` (`required`
+breaks Qoder; codex pins protocol 2025-06-18 and rejects `tasks/*`).
 
 ## Platform
 
