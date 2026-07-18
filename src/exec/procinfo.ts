@@ -1,16 +1,24 @@
 /**
- * Best-effort Linux `/proc/<pid>/stat` reader. Used to bind a recorded worker
- * PGID to the exact process *instance* (via its kernel start-time) so a later
- * force-kill can't be redirected to a recycled — or worker-forged — PID.
- * Returns undefined on any platform without `/proc`, or if the pid is gone.
+ * Linux procfs process identity and lifecycle-token discovery. Start-times bind
+ * recorded PGIDs to exact process instances; environment tokens find sandbox
+ * descendants after they leave the original process group.
  */
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+
+/** Per-attempt environment marker inherited by backend children and their tool
+ *  sandboxes. Unlike a process group, it survives setsid()/new PID sessions. */
+export const WORKER_TOKEN_ENV = 'ULTRACODE_WORKER_TOKEN';
+const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
 
 export interface ProcStat {
   /** Process-group id (field 5). A detached worker is its own group leader, so pgrp === pid. */
   pgrp: number;
   /** Kernel start-time in clock ticks since boot (field 22) — unique per process instance. */
   starttime: string;
+}
+
+export interface TrackedProcess extends ProcStat {
+  pid: number;
 }
 
 export function readProcStat(pid: number): ProcStat | undefined {
@@ -30,6 +38,62 @@ export function readProcStat(pid: number): ProcStat | undefined {
   const starttime = rest[19];
   if (!Number.isInteger(pgrp) || starttime === undefined) return undefined;
   return { pgrp, starttime };
+}
+
+/** Worker tokens cross a worker-writable boundary when persisted in the run
+ *  store. Only the exact high-entropy shape minted by spawn.ts is actionable. */
+export function isWorkerToken(value: string | undefined): value is string {
+  return value !== undefined && WORKER_TOKEN_RE.test(value);
+}
+
+/** Find same-user Linux processes carrying an exact worker lifecycle token.
+ *  The token follows Codex/bwrap descendants even after they call setsid() or
+ *  are reparented to PID 1. `/proc/<pid>/environ` is unreadable for other users
+ *  under normal procfs permissions; every read still fails closed. */
+export function findWorkerProcesses(token: string): TrackedProcess[] {
+  if (process.platform !== 'linux' || !isWorkerToken(token)) return [];
+  let entries: string[];
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return [];
+  }
+  const marker = `${WORKER_TOKEN_ENV}=${token}`;
+  const found: TrackedProcess[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+    let environ: string;
+    try {
+      environ = readFileSync(`/proc/${pid}/environ`, 'utf8');
+    } catch {
+      continue;
+    }
+    if (!environ.split('\0').includes(marker)) continue;
+    const stat = readProcStat(pid);
+    if (stat) found.push({ pid, ...stat });
+  }
+  return found;
+}
+
+/** Signal every currently-live process carrying `token`. Re-read procfs on
+ *  every call so a later SIGKILL sweep also catches descendants forked while
+ *  the graceful signal was in flight. */
+export function signalWorkerProcesses(token: string, signal: NodeJS.Signals): number {
+  let signaled = 0;
+  for (const proc of findWorkerProcesses(token)) {
+    // Close the environ→kill PID-reuse window as far as procfs permits: the
+    // exact process instance observed above must still own this PID.
+    if (readProcStat(proc.pid)?.starttime !== proc.starttime) continue;
+    try {
+      process.kill(proc.pid, signal);
+      signaled++;
+    } catch {
+      /* raced with exit */
+    }
+  }
+  return signaled;
 }
 
 /**

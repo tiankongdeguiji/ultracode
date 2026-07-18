@@ -4,43 +4,59 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, isRunnerAlive, reapOrphans } from '../store/runstore.js';
-import { readProcStat } from './procinfo.js';
+import { isWorkerToken, readProcStat, signalWorkerProcesses } from './procinfo.js';
 
-/** Kill recorded worker process groups — used when the runner was SIGKILL'd
- *  unresponsive and never cleaned up its own detached agents.
+/** Kill recorded worker process groups and token-tracked Linux descendants —
+ *  used when the runner could not finish its own detached-agent cleanup.
  *
- *  The `pgid` file lives in the worker-writable run store, so it is UNTRUSTED
+ *  The `pgid*` records live in the worker-writable run store, so they are UNTRUSTED
  *  input (a prompt-injected worker reading hostile repo content could plant
  *  one). `process.kill(-pid, …)` on a hostile value is catastrophic: `-1`
  *  broadcasts SIGKILL to every process the user owns, `-0` hits our own group.
- *  So we (a) refuse pid ≤ 1 and our own pid, and (b) bind to the exact process
- *  the runner spawned — the recorded kernel start-time must still match, and the
- *  target must be its own group leader (true for our detached workers). A
- *  recycled or forged PID fails one of these. */
+ *  So we (a) refuse pid ≤ 1 and our own pid, and (b) bind a live group leader to
+ *  the recorded kernel start-time. The third field is a high-entropy lifecycle
+ *  token: on Linux it also finds descendants that escaped the PGID via setsid(). */
 export function killWorkerGroups(runDir: string): number {
   const agentsDir = join(runDir, 'agents');
   if (!existsSync(agentsDir)) return 0;
   let killed = 0;
   for (const d of readdirSync(agentsDir)) {
-    const pgidFile = join(agentsDir, d, 'pgid');
-    if (!existsSync(pgidFile)) continue;
-    const [pidStr, recordedStart] = readFileSync(pgidFile, 'utf8').trim().split(/\s+/);
-    const pid = Number(pidStr);
-    if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
-    // Verify identity where /proc exists (Linux). FAIL CLOSED: only kill when we
-    // can prove this is the process the runner spawned — a recorded start-time
-    // that still matches, and the target is its own group leader (our detached
-    // workers are). A worker that overwrites its pgid file with just a victim
-    // PID (no start-time) therefore never passes. Elsewhere (`readProcStat`
-    // undefined — no /proc) we fall back to the pid>1/self guards above,
-    // best-effort as the whole force-kill path is.
-    const live = readProcStat(pid);
-    if (live && (!recordedStart || live.starttime !== recordedStart || live.pgrp !== pid)) continue;
+    const agentDir = join(agentsDir, d);
+    let recordNames: string[];
     try {
-      process.kill(-pid, 'SIGKILL');
-      killed++;
+      recordNames = readdirSync(agentDir).filter((name) => name === 'pgid' || name.startsWith('pgid.attempt'));
     } catch {
-      /* group already gone */
+      continue;
+    }
+    for (const recordName of recordNames) {
+      let fields: string[];
+      try {
+        fields = readFileSync(join(agentDir, recordName), 'utf8').trim().split(/\s+/);
+      } catch {
+        continue;
+      }
+      const [pidStr, recordedStart, workerToken] = fields;
+      const pid = Number(pidStr);
+      let acted = false;
+      if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) {
+        const live = readProcStat(pid);
+        // Linux fails closed when the leader is gone or its identity mismatches;
+        // the token sweep below is the safe recovery path for leaderless groups.
+        // Platforms without procfs retain the guarded best-effort PGID fallback.
+        const groupVerified =
+          process.platform !== 'linux' ||
+          (live !== undefined && recordedStart !== undefined && live.starttime === recordedStart && live.pgrp === pid);
+        if (groupVerified) {
+          try {
+            process.kill(-pid, 'SIGKILL');
+            acted = true;
+          } catch {
+            /* group already gone */
+          }
+        }
+      }
+      if (isWorkerToken(workerToken) && signalWorkerProcesses(workerToken, 'SIGKILL') > 0) acted = true;
+      if (acted) killed++;
     }
   }
   return killed;
@@ -56,14 +72,14 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   const run = getRun(root, runId);
   if (!run) return { ok: false, status: 'unknown', message: `no run ${runId} under ${root}` };
   if (isTerminal(run.effectiveStatus)) {
-    // A crashed/OOMed runner surfaces as terminal 'orphaned' (dead pid) without
-    // having cleaned up its detached workers — reap them here so they can't keep
-    // spending/mutating after every later stop returns "already orphaned".
-    const killed = run.effectiveStatus === 'orphaned' ? killWorkerGroups(run.dir) : 0;
+    // A hard-stop can finalize as `stopped` immediately before process.exit(),
+    // and a backend can leave setsid() descendants after any terminal outcome.
+    // Stale records are therefore actionable for every terminal status.
+    const killed = killWorkerGroups(run.dir);
     return {
       ok: true,
       status: run.effectiveStatus,
-      message: `already ${run.effectiveStatus}${killed ? ` (+${killed} orphaned worker group(s))` : ''}`,
+      message: `already ${run.effectiveStatus}${killed ? ` (+${killed} stale worker record(s))` : ''}`,
     };
   }
   const pid = run.manifest.pid;

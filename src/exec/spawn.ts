@@ -1,13 +1,20 @@
 /**
- * Child-process plumbing: every agent CLI runs in its OWN process group
- * (detached:true) so stop can kill the whole tree with kill(-pgid) — agent
- * CLIs spawn their own children (shells, tools).
+ * Child-process plumbing: every agent CLI runs in its own process group for
+ * portable bulk signaling. Linux also assigns a per-attempt environment token
+ * because Codex/bwrap descendants may call setsid() and leave that group.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { findWorkerProcesses, signalWorkerProcesses, WORKER_TOKEN_ENV } from './procinfo.js';
 
 export interface SpawnedAgent {
   child: ChildProcess;
+  /** High-entropy marker inherited by descendants even if they leave our PGID. */
+  workerToken: string;
   killTree(signal?: NodeJS.Signals): void;
+  /** Reap token-bearing descendants left after the direct child closes. */
+  cleanupEscaped(graceMs?: number): Promise<number>;
 }
 
 export interface SpawnAgentOptions {
@@ -17,9 +24,10 @@ export interface SpawnAgentOptions {
 }
 
 export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentOptions): SpawnedAgent {
+  const workerToken = randomBytes(16).toString('hex');
   const child = spawn(bin, argv, {
     cwd: opts.cwd,
-    env: opts.env as NodeJS.ProcessEnv,
+    env: { ...opts.env, [WORKER_TOKEN_ENV]: workerToken } as NodeJS.ProcessEnv,
     detached: true, // own process group → killable as a tree
     stdio: [opts.stdinData !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
   });
@@ -46,9 +54,31 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
         /* already gone */
       }
     }
+    // Codex's Linux sandbox calls setsid()/bwrap --new-session, so descendants
+    // can leave the worker PGID. The inherited token is the containment
+    // boundary for those escaped sessions.
+    signalWorkerProcesses(workerToken, signal);
   };
 
-  return { child, killTree };
+  const cleanupEscaped = async (graceMs = 500): Promise<number> => {
+    if (findWorkerProcesses(workerToken).length === 0) return 0;
+    signalWorkerProcesses(workerToken, 'SIGTERM');
+    const gracefulDeadline = Date.now() + graceMs;
+    while (Date.now() < gracefulDeadline) {
+      if (findWorkerProcesses(workerToken).length === 0) return 0;
+      await sleep(25);
+    }
+    signalWorkerProcesses(workerToken, 'SIGKILL');
+    const killDeadline = Date.now() + graceMs;
+    while (Date.now() < killDeadline) {
+      const remaining = findWorkerProcesses(workerToken);
+      if (remaining.length === 0) return 0;
+      await sleep(25);
+    }
+    return findWorkerProcesses(workerToken).length;
+  };
+
+  return { child, workerToken, killTree, cleanupEscaped };
 }
 
 /** Keep only the trailing maxBytes of accumulated text (stderr tails). */

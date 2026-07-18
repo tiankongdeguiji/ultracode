@@ -31,6 +31,7 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 ## Commits & PRs
 
 - Conventional Commits, scoped, lowercase imperative: `feat(engine): ...`, `fix(exec): ...`, `docs: ...`, `chore: ...`, `ci: ...`. The `(#123)` suffix is added by squash merge — don't add it. A `fix` body explains root cause + fix; a change adding tests ends with a `Tests (+N):` line enumerating them.
+- PR titles and bodies must be written in English.
 - PR body: clear, with a Test Plan; when several paths were possible, call out and justify the one taken.
 
 ## Coding Style
@@ -38,6 +39,7 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 - Strict ESM / NodeNext: relative imports carry `.js` (even in `.ts`); Node builtins use the `node:` prefix; `import type` for type-only imports.
 - Naming: camelCase vars/functions, PascalCase types/classes, SCREAMING_SNAKE module constants; filenames lowercase, hyphenated when multiword (`safe-write.ts`).
 - Doc comments are JSDoc prose (no `@param`/`@returns`): non-trivial modules open with a `/** */` header stating role + contract (small single-purpose files may put it on the first export); exported symbols get a behavior-and-rationale line; interface fields get inline `/** */` notes for units, invariants, provenance.
+- Code comments must be written in English.
 - Inline `//` comments are minimized: code should be self-explanatory; comment only non-obvious "why" context, one short line. No commented-out code, no change-history or tombstone comments. Use `// TODO(username): ...` and `// NOTE: ...`; do not introduce `FIXME`/`XXX`/`HACK`.
 - No `console.*` in `src/`: CLI writes to `process.stdout`/`stderr`, the engine emits typed `RunEvent`s via `onEvent`, workflow scripts use the injected `log()`.
 - Errors: extend the `UltracodeError` taxonomy in `src/engine/errors.ts` and use its `errorMessage()` helper (vm-context errors fail `instanceof Error`). For worker-writable paths use the symlink-safe helpers in `src/exec/safe-write.ts`, never plain `writeFileSync`.

@@ -13,6 +13,7 @@ import { createRunDir, getRun, isPidAlive } from '../../src/store/runstore.js';
 import { readManifest, isTerminal } from '../../src/store/manifest.js';
 import { launchRunner } from '../../src/exec/daemonize.js';
 import { readJournal } from '../../src/engine/journal.js';
+import { readProcStat } from '../../src/exec/procinfo.js';
 
 const HELLO = `export const meta = { name: 'hello', description: 'd', phases: [{ title: 'Greet' }] }
 phase('Greet')
@@ -35,6 +36,13 @@ await new Promise(() => {})
 return 'unreachable'
 `;
 
+const HANG_WITH_AGENT = `export const meta = { name: 'hang-agent', description: 'd' }
+agent('spawn an escaped helper', { label: 'escape' }).catch(() => {})
+setTimeout(() => {}, 600000)
+await new Promise(() => {})
+return 'unreachable'
+`;
+
 async function waitTerminal(dir: string, timeoutMs = 15_000): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -43,6 +51,15 @@ async function waitTerminal(dir: string, timeoutMs = 15_000): Promise<string> {
     if (Date.now() > deadline) throw new Error(`run did not finish; status=${m?.status}`);
     await sleep(100);
   }
+}
+
+async function waitProcessGone(pid: number, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!readProcStat(pid)) return true;
+    await sleep(50);
+  }
+  return false;
 }
 
 const TIMEOUT_PROBE = (opts: string) => `export const meta = { name: 'timeout-probe', description: 'd' }
@@ -165,6 +182,60 @@ describe('detached runner', () => {
     } finally {
       if (prev === undefined) delete process.env.ULTRACODE_HARD_STOP_GRACE_MS;
       else process.env.ULTRACODE_HARD_STOP_GRACE_MS = prev;
+    }
+  }, 20_000);
+
+  it('hard-stop reaps an active backend descendant that escaped into a new session', async () => {
+    if (process.platform !== 'linux') return;
+    const binDir = mkdtempSync(join(tmpdir(), 'uc-hard-stop-bin-'));
+    const fake = join(binDir, 'fake-claude.cjs');
+    const pidsFile = join(binDir, 'pids.json');
+    const escapedSource = "process.on('SIGTERM', () => {}); setInterval(() => {}, 60_000)";
+    writeFileSync(
+      fake,
+      [
+        '#!/usr/bin/env node',
+        "const { spawn } = require('node:child_process');",
+        "const { writeFileSync } = require('node:fs');",
+        "process.on('SIGTERM', () => {});",
+        `const escaped = spawn(process.execPath, ['-e', ${JSON.stringify(escapedSource)}], { detached: true, stdio: 'ignore', env: process.env });`,
+        `writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify({ worker: process.pid, escaped: escaped.pid }));`,
+        'escaped.unref();',
+        'setInterval(() => {}, 60_000);',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    const prevBin = process.env.ULTRACODE_CLAUDE_BIN;
+    const prevGrace = process.env.ULTRACODE_HARD_STOP_GRACE_MS;
+    process.env.ULTRACODE_CLAUDE_BIN = fake;
+    process.env.ULTRACODE_HARD_STOP_GRACE_MS = '1500';
+    let workerPid = 0;
+    let escapedPid = 0;
+    try {
+      const { dir } = makeRun(HANG_WITH_AGENT, { backend: 'claude', wallClockMs: 500 });
+      const { pid } = await launchRunner(dir);
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(pidsFile) && Date.now() < deadline) await sleep(50);
+      expect(existsSync(pidsFile)).toBe(true);
+      ({ worker: workerPid, escaped: escapedPid } = JSON.parse(readFileSync(pidsFile, 'utf8')));
+
+      expect(await waitTerminal(dir, 12_000)).toBe('stopped');
+      expect(await waitProcessGone(pid)).toBe(true);
+      expect(await waitProcessGone(workerPid)).toBe(true);
+      expect(await waitProcessGone(escapedPid)).toBe(true);
+    } finally {
+      if (prevBin === undefined) delete process.env.ULTRACODE_CLAUDE_BIN;
+      else process.env.ULTRACODE_CLAUDE_BIN = prevBin;
+      if (prevGrace === undefined) delete process.env.ULTRACODE_HARD_STOP_GRACE_MS;
+      else process.env.ULTRACODE_HARD_STOP_GRACE_MS = prevGrace;
+      for (const pid of [workerPid, escapedPid]) {
+        if (pid <= 1) continue;
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
     }
   }, 20_000);
 

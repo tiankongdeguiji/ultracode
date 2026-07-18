@@ -33,7 +33,10 @@ rejects `tasks/*`).
 
 ## Platform
 
-- **Linux, macOS**: supported (CI runs both).
+- **Linux, macOS**: supported (CI runs both). Both use per-worker process
+  groups; Linux additionally sweeps a high-entropy inherited lifecycle token
+  through `/proc` so Codex/bwrap descendants that create a new session are
+  still reaped on completion, timeout, stop, and runner failure.
 - **Windows**: **not supported in v1** — the engine relies on POSIX process
   groups (`setsid` / `kill(-pgid)`) for stop/kill-tree and O_APPEND atomicity.
   A `win32` startup error points to WSL. A Windows port (Job Objects /

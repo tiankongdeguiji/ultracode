@@ -18,6 +18,7 @@ import { MockExecutor } from '../backends/mock.js';
 import { createExecutorForBackend } from '../engine/agentcall.js';
 import { readProcStat } from '../exec/procinfo.js';
 import { chainedTimeout } from '../exec/timers.js';
+import { killWorkerGroups } from '../exec/stop.js';
 import { Semaphore, defaultConcurrency, isPositiveInt } from '../engine/semaphore.js';
 import { BudgetAccount } from '../budget/account.js';
 import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
@@ -99,6 +100,13 @@ export async function runnerMain(dir: string): Promise<number> {
         message: `hard stop: runner did not unwind ${HARD_STOP_GRACE_MS}ms after ${reason} — force-exiting`,
       });
       try {
+        const killedWorkers = killWorkerGroups(dir);
+        if (killedWorkers > 0) {
+          events.write({
+            type: 'workflow_log',
+            message: `hard stop reaped ${killedWorkers} worker record(s)`,
+          });
+        }
         writeManifest(dir, {
           ...manifest,
           status: 'stopped',

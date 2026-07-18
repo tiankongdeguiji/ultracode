@@ -20,7 +20,7 @@ import {
   schemaPromptSuffix,
 } from '../backends/structured.js';
 import { validateWithSchema } from './ajv.js';
-import { spawnAgentProcess, TailBuffer } from '../exec/spawn.js';
+import { spawnAgentProcess, TailBuffer, type SpawnedAgent } from '../exec/spawn.js';
 import { chainedTimeout } from '../exec/timers.js';
 import type {
   AgentEvent,
@@ -487,6 +487,9 @@ export class AgentCallExecutor implements AgentExecutor {
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
     const transcriptFile = artifactDir ? join(artifactDir, 'transcript.jsonl') : undefined;
+    // One record per physical spawn: a stubborn escaped process from an earlier
+    // retry must not be hidden when the next attempt writes its own identity.
+    const processRecordFile = artifactDir ? join(artifactDir, `pgid.attempt${attempt}${stderrSuffix}`) : undefined;
 
     // Schema temp file (codex --output-schema wants a path). Inserted before
     // the trailing '-' stdin positional when present.
@@ -563,6 +566,7 @@ export class AgentCallExecutor implements AgentExecutor {
     let timer: { clear(): void } | undefined;
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     let onAbort: (() => void) | undefined;
+    let proc: SpawnedAgent | undefined;
     // Delayed SIGKILL escalations scheduled after a SIGTERM. Tracked so `finally`
     // can cancel any still pending — otherwise a kill stays armed 5s out against
     // a pid that has already closed and may be recycled (→ kill the wrong group).
@@ -572,7 +576,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // appendFileSync (open+write+close) per NDJSON line, which serializes
       // every concurrent agent's IO behind blocking syscalls on the hot path.
       if (transcriptFile) transcriptFd = openWriteFdNoFollow(transcriptFile);
-      const proc = spawnAgentProcess(plan.bin, argv, {
+      const spawned = spawnAgentProcess(plan.bin, argv, {
         cwd: spec.cwd,
         // Scrub OTHER backends' credentials so a prompt-injected worker can't
         // exfiltrate them. ULTRACODE_INSIDE_RUN marks spawned workers so an
@@ -580,21 +584,27 @@ export class AgentCallExecutor implements AgentExecutor {
         env: { ...scrubForeignBackendSecrets(process.env, spec.backend), ...plan.env, ULTRACODE_INSIDE_RUN: '1' },
         stdinData: plan.stdinData,
       });
+      proc = spawned;
       // Persist the worker's PGID so `ultracode stop` can kill the group if the
       // runner is unresponsive and gets SIGKILL'd (detached workers survive it).
-      // Record `<pid> <starttime>`: the kernel start-time binds the pgid to this
-      // exact process instance so a later forced stop can't be redirected to a
-      // recycled — or worker-forged — PID (see stop.ts killWorkerGroups).
-      if (artifactDir && proc.child.pid) {
-        const stat = readProcStat(proc.child.pid);
-        writeFileNoFollow(join(artifactDir, 'pgid'), `${proc.child.pid} ${stat?.starttime ?? ''}`);
+      // Record `<pid> <starttime> <worker-token>`: start-time binds the PGID to
+      // this process instance; the token finds descendants that leave the PGID.
+      if (processRecordFile && spawned.child.pid) {
+        const stat = readProcStat(spawned.child.pid);
+        // Keep an explicit placeholder when a very short-lived leader exits
+        // before procfs can be read; whitespace splitting must retain the token
+        // as field three for recovery of any descendants it already launched.
+        writeFileNoFollow(processRecordFile, `${spawned.child.pid} ${stat?.starttime ?? '-'} ${spawned.workerToken}`);
       }
 
       // SIGTERM the tree, then escalate to SIGKILL if it survives — but track the
       // escalation so `finally` can cancel it if the child closes first.
+      let terminationStarted = false;
       const killWithEscalation = () => {
-        proc.killTree('SIGTERM');
-        escalationTimers.push(setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref());
+        if (terminationStarted) return;
+        terminationStarted = true;
+        spawned.killTree('SIGTERM');
+        escalationTimers.push(setTimeout(() => spawned.killTree('SIGKILL'), 5_000).unref());
       };
 
       // Timeouts are user-opt-in: no per-call timeoutMs and no run-level
@@ -625,23 +635,23 @@ export class AgentCallExecutor implements AgentExecutor {
       onAbort = () => killWithEscalation();
       signal.addEventListener('abort', onAbort, { once: true });
 
-      proc.child.stdout?.setEncoding('utf8');
-      proc.child.stderr?.setEncoding('utf8');
-      proc.child.stdout?.on('data', (chunk: string) => {
+      spawned.child.stdout?.setEncoding('utf8');
+      spawned.child.stderr?.setEncoding('utf8');
+      spawned.child.stdout?.on('data', (chunk: string) => {
         lastActivityAt = Date.now();
         for (const line of splitter.push(chunk)) {
           if (transcriptFd !== undefined) writeSync(transcriptFd, line + '\n');
           consume(parser.push(line));
         }
       });
-      proc.child.stderr?.on('data', (chunk: string) => {
+      spawned.child.stderr?.on('data', (chunk: string) => {
         lastActivityAt = Date.now();
         stderrTail.push(chunk);
       });
 
       const [code, sig] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
-        proc.child.on('error', reject);
-        proc.child.on('close', (c, s) => resolve([c, s]));
+        spawned.child.on('error', reject);
+        spawned.child.on('close', (c, s) => resolve([c, s]));
       });
 
       for (const line of splitter.end()) {
@@ -692,13 +702,18 @@ export class AgentCallExecutor implements AgentExecutor {
       if (stallTimer) clearInterval(stallTimer);
       for (const t of escalationTimers) clearTimeout(t);
       if (onAbort) signal.removeEventListener('abort', onAbort);
+      // `close` covers only the backend CLI and its stdio. Codex/bwrap tool
+      // sandboxes may have called setsid(), escaped the CLI's PGID, and been
+      // reparented to PID 1. Reap every process carrying this attempt's token
+      // before dropping the persistent recovery record.
+      const escapedRemaining = (await proc?.cleanupEscaped()) ?? 0;
       if (transcriptFd !== undefined) closeSync(transcriptFd);
       try {
         sidecar?.close();
       } catch {
         /* display-only */
       }
-      if (artifactDir) rmSync(join(artifactDir, 'pgid'), { force: true });
+      if (processRecordFile && escapedRemaining === 0) rmSync(processRecordFile, { force: true });
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }
   }

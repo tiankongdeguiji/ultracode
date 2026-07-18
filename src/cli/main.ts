@@ -205,6 +205,12 @@ program
     try {
       process.exit(await runnerMain(opts.runDir));
     } catch (err) {
+      try {
+        const { killWorkerGroups } = await import('../exec/stop.js');
+        killWorkerGroups(opts.runDir);
+      } catch {
+        /* fatal path: best-effort worker containment */
+      }
       process.stderr.write(`runner fatal: ${(err as Error)?.stack ?? err}\n`);
       process.exit(1);
     }
