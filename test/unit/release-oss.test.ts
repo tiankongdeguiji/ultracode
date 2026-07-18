@@ -421,6 +421,66 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
     }
   });
 
+  it('--mirror-node uploads absent platforms, skips mirrored ones, and restores a lone missing sidecar', async () => {
+    const content = 'node-tarball-bytes';
+    const hex = createHash('sha256').update(content).digest('hex');
+    const shasums = PLATFORMS.map((p) => `${hex}  node-v22.14.0-${p}.tar.gz`).join('\n') + '\n';
+    const hits: string[] = [];
+    const mirror = createServer((req, res) => {
+      hits.push(req.url!);
+      res.end(req.url!.endsWith('SHASUMS256.txt') ? shasums : content);
+    });
+    await new Promise<void>((r) => mirror.listen(0, '127.0.0.1', r));
+    const addr = mirror.address();
+    if (addr === null || typeof addr !== 'object') throw new Error('no mirror address');
+    try {
+      const { dir } = makeRoot();
+      const RT = (p: string) => `oss://hongsheng-jhs/ultracode/runtime/node-v22.14.0-${p}.tar.gz`;
+      // linux-x64 fully mirrored; linux-arm64 tarball-only; darwins absent.
+      const { env, log } = stubEnv(
+        { [RT('linux-x64')]: '', [`${RT('linux-x64')}.sha256`]: '', [RT('linux-arm64')]: '' },
+        {},
+        { prefillRuntime: false },
+      );
+      const out = await runAsync(
+        ['--mirror-node', '--root', dir],
+        { ...env, UC_MIRROR_BASE_URL: `http://127.0.0.1:${addr.port}/` },
+      );
+      expect(out).toContain('node-v22.14.0-linux-x64.tar.gz already mirrored — skipping');
+      expect(uploads(log).map((a) => a[3])).toEqual([
+        `${RT('linux-arm64')}.sha256`,
+        RT('darwin-x64'),
+        `${RT('darwin-x64')}.sha256`,
+        RT('darwin-arm64'),
+        `${RT('darwin-arm64')}.sha256`,
+      ]);
+      // Only the two absent platforms were downloaded; the sidecar restore
+      // came straight from SHASUMS256.txt.
+      expect(hits.filter((u) => !u.endsWith('SHASUMS256.txt'))).toEqual([
+        '/node-v22.14.0-darwin-x64.tar.gz',
+        '/node-v22.14.0-darwin-arm64.tar.gz',
+      ]);
+    } finally {
+      await new Promise((r) => mirror.close(r));
+    }
+  });
+
+  it('publish fails closed when the pinned Node runtime is not mirrored', async () => {
+    const { dir } = makeRoot();
+    const { env, log } = stubEnv({}, {}, { prefillRuntime: false });
+    const r = await runFailAsync(['--root', dir], env);
+    expect(r.status).not.toBe(0);
+    expect(r.output).toMatch(/--mirror-node first/);
+    expect(uploads(log)).toHaveLength(0);
+  });
+
+  it('--skip-runtime-check publishes despite a missing runtime mirror', async () => {
+    const { dir } = makeRoot();
+    const { env, log } = stubEnv({}, {}, { prefillRuntime: false });
+    await runAsync(['--skip-runtime-check', '--root', dir], env);
+    expect(uploads(log)).toHaveLength(4);
+  });
+
   it('--resume with a missing sidecar restores it from the remote bytes before the pointers', async () => {
     const { dir } = makeRoot();
     const remoteBytes = 'remote-tarball-bytes';

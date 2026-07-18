@@ -46,7 +46,7 @@ const POINTER_META = 'Cache-Control:max-age=60';
 const NODE_PIN_RE = /^\s*:\s*"\$\{UC_NODE_VERSION:=(\d+\.\d+\.\d+)\}"/m;
 
 const USAGE = [
-  'usage: node scripts/release-oss.mjs [--dry-run] [--resume] [--force] [--allow-dirty] [--root <dir>]',
+  'usage: node scripts/release-oss.mjs [--dry-run] [--resume] [--force] [--allow-dirty] [--skip-runtime-check] [--root <dir>]',
   '       node scripts/release-oss.mjs --mirror-node [x.y.z] [--from npmmirror|nodejs] [--dry-run] [--root <dir>]',
 ].join('\n');
 
@@ -67,6 +67,7 @@ function parseArgs(argv) {
     resume: false,
     force: false,
     allowDirty: false,
+    skipRuntimeCheck: false,
     mirrorNode: false,
     nodeVersion: undefined,
     from: 'npmmirror',
@@ -78,6 +79,7 @@ function parseArgs(argv) {
     else if (arg === '--resume') opts.resume = true;
     else if (arg === '--force') opts.force = true;
     else if (arg === '--allow-dirty') opts.allowDirty = true;
+    else if (arg === '--skip-runtime-check') opts.skipRuntimeCheck = true;
     else if (arg === '--mirror-node') {
       opts.mirrorNode = true;
       if (argv[i + 1] && !argv[i + 1].startsWith('--')) opts.nodeVersion = argv[++i];
@@ -253,9 +255,13 @@ async function publish(ctx, root, opts) {
     console.log(`dry-run: skipping runtime presence check for Node v${pin}`);
   } else {
     const missing = NODE_PLATFORMS.filter((p) => !statExists(ctx, `runtime/node-v${pin}-${p}.tar.gz`));
-    if (missing.length > 0) {
-      console.error(
-        `warning: Node v${pin} runtime missing on OSS for ${missing.join(', ')} — run scripts/release-oss.mjs --mirror-node or fresh installs will fail`,
+    if (missing.length > 0 && !opts.skipRuntimeCheck) {
+      // Fail closed: shipping a release whose no-preexisting-node install
+      // path is broken, then being boxed in by the immutability guard, is a
+      // worse failure than aborting here.
+      fail(
+        `Node v${pin} runtime missing on OSS for ${missing.join(', ')} — run scripts/release-oss.mjs --mirror-node first ` +
+          '(or pass --skip-runtime-check to publish anyway)',
       );
     }
   }
@@ -324,7 +330,7 @@ async function publish(ctx, root, opts) {
   // the public endpoint, exactly as an installer would fetch them.
   for (const key of [releaseKey, sidecarKey, 'install.sh', 'latest.json']) {
     const url = `${ctx.publicUrl}/${key}`;
-    const res = await fetch(url, { method: 'HEAD' });
+    const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(30_000) });
     if (res.status !== 200) fail(`HEAD ${url} returned ${res.status} — object missing or ACL not public-read`);
   }
   console.log(`published v${version} — install: curl -fsSL ${ctx.publicUrl}/install.sh | sh`);

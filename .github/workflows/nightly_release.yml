@@ -76,6 +76,12 @@ jobs:
         id: gate
         run: |
           v=$(node -p "require('./package.json').version")
+          # Shape-validate before the value reaches $GITHUB_OUTPUT and later
+          # run: blocks (newlines/metacharacters here are the classic
+          # workflow-injection sink).
+          case "$v" in
+            *[!0-9A-Za-z.+-]*|'') echo "::error::package.json version has an unexpected shape: '$v'"; exit 1 ;;
+          esac
           echo "v=$v" >> "$GITHUB_OUTPUT"
           tag_sha=$(git rev-parse -q --verify "v$v^{commit}" || true)
           if [ -n "$tag_sha" ] && [ "$tag_sha" != "$(git rev-parse HEAD)" ]; then
@@ -101,8 +107,10 @@ jobs:
       # (GITHUB_TOKEN pushes do not recursively trigger workflows.)
       - name: Tag the release
         if: steps.gate.outputs.skip != 'true'
+        env:
+          UC_V: ${{ steps.gate.outputs.v }}
         run: |
-          v='${{ steps.gate.outputs.v }}'
+          v="$UC_V"
           if git rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
             echo "v$v already tagged; reconcile re-run"
           else
@@ -110,9 +118,8 @@ jobs:
             git push origin "v$v"
           fi
 
-      - name: Build release tarball
-        if: steps.gate.outputs.skip != 'true'
-        run: npm run build:release
+      # No separate build step: publish() always rebuilds dist-release/ from
+      # the tree it is publishing.
 
       # The binary runs with release-publishing credentials, so a pinned copy
       # is ALWAYS installed and invoked by explicit path (OSSUTIL_BIN) — a
@@ -149,8 +156,10 @@ jobs:
       # original remote tarball, not the local rebuild).
       - name: GitHub Release with generated notes
         if: steps.gate.outputs.skip != 'true'
+        env:
+          UC_V: ${{ steps.gate.outputs.v }}
         run: |
-          v='${{ steps.gate.outputs.v }}'
+          v="$UC_V"
           gh release view "v$v" >/dev/null 2>&1 || gh release create "v$v" --generate-notes
           mkdir -p .gh-assets
           base='https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode'
