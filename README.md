@@ -55,16 +55,6 @@ curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.
 ultracode doctor                  # which backends are available + auth modes
 ```
 
-The installer needs only `curl`: it fetches a self-contained ~360 KB tarball, verifies checksums, and — if no Node >= 20 is present — provisions a Node runtime from the same bucket. From source instead: `npm install && npm run build && npm link`.
-
-### Upgrading
-
-```bash
-ultracode update                  # self-update; --check reports without installing
-```
-
-Re-running the install one-liner does the same. The installer puts `ultracode` in `~/.local/bin`, which must be on your `PATH`. Old versions are retained under `~/.ultracode/app/` on purpose — running detached workflows and host MCP registrations pin the versioned path. After upgrading, re-run `ultracode install <host>` so host integrations pick up the new engine path; an old version's directory is safe to delete only after that, once no detached runs from it remain.
-
 ### Use with your coding agent
 
 The intended daily path — install the skill and the host wiring:
@@ -99,6 +89,22 @@ ultracode watch <runId>
     ⎿ ⠧ src/routes/admin.ts      88.9k tok · 2m37s · model-name
 agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
+```
+
+### Upgrading
+
+```bash
+ultracode update                  # self-update; --check reports without installing
+```
+
+Re-running the install one-liner does the same. After upgrading, re-run `ultracode install <host>` so host integrations pick up the new engine path.
+
+### Build from source
+
+The installer needs only `curl`: it fetches a self-contained ~360 KB tarball, verifies checksums, and — if no Node >= 20 is present — provisions a Node runtime from the same bucket. To build from source instead:
+
+```bash
+npm install && npm run build && npm link
 ```
 
 ### Driving the engine directly

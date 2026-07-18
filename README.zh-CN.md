@@ -55,16 +55,6 @@ curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.
 ultracode doctor                  # 查看可用后端及其鉴权方式
 ```
 
-安装器只依赖 `curl`：它会下载一个约 360 KB 的自包含 tarball 并验证校验和；若系统中没有 Node >= 20，还会从同一个 OSS bucket 自动补齐一份 Node 运行时。也可以改为从源码构建：`npm install && npm run build && npm link`。
-
-### 升级
-
-```bash
-ultracode update                  # 自升级；--check 只检查、不安装
-```
-
-重新执行上面的一行安装命令效果相同。安装器会把 `ultracode` 放在 `~/.local/bin` 下，请确保该目录在 `PATH` 中。旧版本会有意保留在 `~/.ultracode/app/` 中——正在运行的后台工作流和宿主的 MCP 注册都固定引用带版本号的路径。升级后请重新执行 `ultracode install <host>`，让宿主集成指向新的引擎路径；此后确认没有后台工作流仍运行在旧版本上，才可以手动删除旧版本目录。
-
 ### 配合编码 agent 使用
 
 推荐的日常使用方式，是先安装 skill 和宿主集成：
@@ -99,6 +89,22 @@ ultracode watch <runId>
     ⎿ ⠧ src/routes/admin.ts      88.9k tok · 2m37s · model-name
 agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
+```
+
+### 升级
+
+```bash
+ultracode update                  # 自升级；--check 只检查、不安装
+```
+
+重新执行上面的一行安装命令效果相同。升级后请重新执行 `ultracode install <host>`，让宿主集成指向新的引擎路径。
+
+### 从源码构建
+
+安装器只依赖 `curl`：它会下载一个约 360 KB 的自包含 tarball 并验证校验和；若系统中没有 Node >= 20，还会从同一个 OSS bucket 自动补齐一份 Node 运行时。如需改为从源码构建：
+
+```bash
+npm install && npm run build && npm link
 ```
 
 ### 直接使用引擎
