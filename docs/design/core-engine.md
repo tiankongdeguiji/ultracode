@@ -238,6 +238,7 @@ Default root: `<project>/.ultracode/` (git-ignorable), overridable `$ULTRACODE_H
         ├── args.json
         ├── journal.jsonl           # hash-chain cache records (§1.4)
         ├── events.jsonl            # append-only progress stream (§1.5)
+        ├── worker-records/<seq>/pgid.attempt*  # fixed-address crash recovery
         ├── output.json             # final {result, logs, failures, agentCount, totalTokens, totalToolCalls, durationMs, error?}
         ├── runner.pid
         └── agents/<seq>-<label>/{prompt.md, schema.json, transcript.jsonl, stderr.log, result.json}

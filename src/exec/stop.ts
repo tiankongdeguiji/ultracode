@@ -8,19 +8,26 @@ import {
   findWorkerProcessesForTokens,
   isSafeProcessId,
   isWorkerToken,
+  readProcessIdentity,
   signalWorkerProcessTokens,
+  signalWorkerProcessTokensUntilGone,
 } from './procinfo.js';
+import {
+  MAX_WORKER_SEQUENCES,
+  WORKER_RECORD_FILE_NAMES,
+  workerRecordDir,
+} from './worker-record.js';
 
 // One initial attempt, five task retries, and two schema repairs are the
 // maximum ordinals the engine can create. `-fresh` shares that ordinal.
 const WORKER_RECORD_RE = /^pgid(?:\.attempt[1-8](?:-fresh)?)?$/;
-const MAX_WORKER_RECORDS = 2_048;
+const MAX_LEGACY_WORKER_RECORDS = 2_048;
 const MAX_AGENT_ENTRIES = 2_048;
 const MAX_WORKER_RECORDS_PER_AGENT = 16;
 const MAX_RECORD_ENTRIES_PER_AGENT = 64;
 const MAX_WORKER_RECORD_BYTES = 512;
 
-function collectWorkerRecordPaths(agentsDir: string): string[] {
+function collectLegacyWorkerRecordPaths(agentsDir: string): string[] {
   const records: string[] = [];
   const perAgentRecords: string[][] = [];
   let agents;
@@ -78,17 +85,32 @@ function collectWorkerRecordPaths(agentsDir: string): string[] {
   // Take one record from every agent before taking a second from any agent.
   // A compromised worker can fill its own directory, but cannot consume the
   // global recovery budget and hide another agent's cleanup record.
-  for (let offset = 0; records.length < MAX_WORKER_RECORDS; offset++) {
+  for (let offset = 0; records.length < MAX_LEGACY_WORKER_RECORDS; offset++) {
     let added = false;
     for (const agentRecords of perAgentRecords) {
       const path = agentRecords[offset];
       if (path === undefined) continue;
       records.push(path);
       added = true;
-      if (records.length >= MAX_WORKER_RECORDS) break;
+      if (records.length >= MAX_LEGACY_WORKER_RECORDS) break;
     }
     if (!added) break;
   }
+  return records;
+}
+
+function collectWorkerRecordPaths(runDir: string): string[] {
+  const records: string[] = [];
+  // Fixed addressing prevents worker-created directory entries from consuming
+  // a discovery quota before a real sibling record is reached.
+  if (existsSync(join(runDir, 'worker-records'))) {
+    for (let seq = 0; seq < MAX_WORKER_SEQUENCES; seq++) {
+      const recordDir = workerRecordDir(runDir, seq);
+      if (!existsSync(recordDir)) continue;
+      for (const name of WORKER_RECORD_FILE_NAMES) records.push(join(recordDir, name));
+    }
+  }
+  records.push(...collectLegacyWorkerRecordPaths(join(runDir, 'agents')));
   return records;
 }
 
@@ -114,22 +136,15 @@ function readWorkerRecord(path: string): string | undefined {
   }
 }
 
-/** Kill recorded worker process groups and token-tracked Linux descendants —
- *  used when the runner could not finish its own detached-agent cleanup.
- *
- *  The `pgid*` records live in the worker-writable run store, so they are UNTRUSTED
- *  input (a prompt-injected worker reading hostile repo content could plant
- *  one). `process.kill(-pid, …)` on a hostile value is catastrophic: `-1`
- *  broadcasts SIGKILL to every process the user owns, `-0` hits our own group.
- *  So we (a) refuse pid ≤ 1 and our own pid, and (b) bind a live group leader to
- *  its recorded OS start-time, lifecycle token, and run scope. On Linux the
- *  token also finds descendants that escaped the PGID via setsid(). */
-export function killWorkerGroups(runDir: string): number {
-  const agentsDir = join(runDir, 'agents');
-  if (!existsSync(agentsDir)) return 0;
+interface RecoveryRecords {
+  groupRecords: Map<string, { path: string; pid: number; starttime: string; token: string }>;
+  tokenRecords: Map<string, string>;
+}
+
+function loadRecoveryRecords(runDir: string): RecoveryRecords {
   const groupRecords = new Map<string, { path: string; pid: number; starttime: string; token: string }>();
   const tokenRecords = new Map<string, string>();
-  for (const path of collectWorkerRecordPaths(agentsDir)) {
+  for (const path of collectWorkerRecordPaths(runDir)) {
     const raw = readWorkerRecord(path);
     if (raw === undefined) continue;
     const fields = raw.trim().split(/\s+/);
@@ -151,7 +166,11 @@ export function killWorkerGroups(runDir: string): number {
     }
     if (isWorkerToken(workerToken) && !tokenRecords.has(workerToken)) tokenRecords.set(workerToken, path);
   }
+  return { groupRecords, tokenRecords };
+}
 
+function signalRecordedWorkerGroups(runDir: string, records: RecoveryRecords): Set<string> {
+  const { groupRecords, tokenRecords } = records;
   const actedRecords = new Set<string>();
   const verifiedLeaders = new Map(
     findWorkerProcessesForTokens(
@@ -166,6 +185,17 @@ export function killWorkerGroups(runDir: string): number {
     // Signal the group only when the exact leader also carries this record's
     // lifecycle token and run scope in its initial environment.
     if (!live || live.pgrp !== record.pid) continue;
+    const immediate = findWorkerProcessesForTokens([record.token], runDir, [record.pid])[0];
+    if (
+      !immediate ||
+      immediate.pid !== record.pid ||
+      immediate.pgrp !== record.pid ||
+      immediate.starttime !== record.starttime
+    ) {
+      continue;
+    }
+    const finalIdentity = readProcessIdentity(record.pid);
+    if (!finalIdentity || finalIdentity.pgrp !== record.pid || finalIdentity.starttime !== record.starttime) continue;
     try {
       process.kill(-record.pid, 'SIGKILL');
       actedRecords.add(record.path);
@@ -173,15 +203,48 @@ export function killWorkerGroups(runDir: string): number {
       /* group already gone */
     }
   }
+  return actedRecords;
+}
+
+function recordSignaledTokens(
+  actedRecords: Set<string>,
+  tokenRecords: Map<string, string>,
+  tokens: Iterable<string>,
+): void {
+  for (const token of tokens) {
+    const path = tokenRecords.get(token);
+    if (path) actedRecords.add(path);
+  }
+}
+
+/** Kill recorded worker process groups and one Linux token snapshot.
+ *
+ * The records live in the worker-writable run store, so they are UNTRUSTED.
+ * Group signaling requires an exact live leader identity, lifecycle token, and
+ * run scope; token matching contains descendants that left the original PGID. */
+export function killWorkerGroups(runDir: string): number {
+  const records = loadRecoveryRecords(runDir);
+  const actedRecords = signalRecordedWorkerGroups(runDir, records);
 
   // The run scope is checked in each target process's immutable initial
   // environment. Copying another run's readable token into this untrusted
   // record store therefore cannot authorize signaling that run's workers.
-  const tokenResult = signalWorkerProcessTokens(tokenRecords.keys(), 'SIGKILL', runDir);
-  for (const token of tokenResult.tokens) {
-    const path = tokenRecords.get(token);
-    if (path) actedRecords.add(path);
-  }
+  const tokenResult = signalWorkerProcessTokens(records.tokenRecords.keys(), 'SIGKILL', runDir);
+  recordSignaledTokens(actedRecords, records.tokenRecords, tokenResult.tokens);
+  return actedRecords.size;
+}
+
+/** Kill workers, then asynchronously confirm stable token absence. */
+export async function killWorkerGroupsUntilGone(runDir: string, graceMs = 100): Promise<number> {
+  const records = loadRecoveryRecords(runDir);
+  const actedRecords = signalRecordedWorkerGroups(runDir, records);
+  const tokenResult = await signalWorkerProcessTokensUntilGone(
+    records.tokenRecords.keys(),
+    'SIGKILL',
+    runDir,
+    graceMs,
+  );
+  recordSignaledTokens(actedRecords, records.tokenRecords, tokenResult.tokens);
   return actedRecords.size;
 }
 
@@ -198,7 +261,7 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
     // A hard-stop can finalize as `stopped` immediately before process.exit(),
     // and a backend can leave setsid() descendants after any terminal outcome.
     // Stale records are therefore actionable for every terminal status.
-    const killed = killWorkerGroups(run.dir);
+    const killed = await killWorkerGroupsUntilGone(run.dir);
     return {
       ok: true,
       status: run.effectiveStatus,
@@ -210,7 +273,7 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   // matches is a recycled PID, not our runner — signaling it would hit an
   // unrelated process. Treat that as already-dead (and reap its workers).
   if (!isRunnerAlive(run.manifest)) {
-    const killed = killWorkerGroups(run.dir);
+    const killed = await killWorkerGroupsUntilGone(run.dir);
     reapOrphans(root);
     return {
       ok: true,
@@ -236,7 +299,7 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   }
   // The runner was unresponsive → it never killed its detached agent groups;
   // do it here so workers don't keep running/mutating files after "stopped".
-  const killedGroups = killWorkerGroups(run.dir);
+  const killedGroups = await killWorkerGroupsUntilGone(run.dir);
   reapOrphans(root);
   return {
     ok: true,

@@ -20,6 +20,7 @@ import {
 } from '../../src/exec/procinfo.js';
 import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { killWorkerGroups } from '../../src/exec/stop.js';
+import { workerRecordDir, workerRecordPath } from '../../src/exec/worker-record.js';
 import { PrefixReplayCache, type JournalRecord } from '../../src/engine/journal.js';
 import type { AgentSpec } from '../../src/backends/types.js';
 
@@ -134,16 +135,18 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     }
   });
 
-  it('does not let one agent directory exhaust every recovery-record slot', async () => {
+  it('does not let worker-created directories hide a sibling recovery record', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return;
     const runDir = tmp('uc-kill-fair-');
     const noisyAgentDir = join(runDir, 'agents', '0000-noisy');
-    const victimAgentDir = join(runDir, 'agents', '0001-victim');
     mkdirSync(noisyAgentDir, { recursive: true });
     for (let attempt = 1; attempt <= 1_024; attempt++) {
       writeFileSync(join(noisyAgentDir, `pgid.attempt${attempt}`), `999999999 - ${'a'.repeat(32)}`);
     }
-    mkdirSync(victimAgentDir, { recursive: true });
+    for (let index = 0; index < 2_048; index++) {
+      mkdirSync(join(runDir, 'agents', `junk-${String(index).padStart(4, '0')}`));
+    }
+    mkdirSync(workerRecordDir(runDir, 1), { recursive: true });
     const worker = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
       cwd: process.cwd(),
       env: {},
@@ -152,7 +155,7 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     const pid = worker.child.pid!;
     try {
       const stat = readProcessIdentity(pid)!;
-      writeFileSync(join(victimAgentDir, 'pgid'), `${pid} ${stat.starttime} ${worker.workerToken}`);
+      writeFileSync(workerRecordPath(runDir, 1, 1), `${pid} ${stat.starttime} ${worker.workerToken}`);
       expect(killWorkerGroups(runDir)).toBe(1);
       await sleep(150);
       expect(readProcessIdentity(pid)).toBeUndefined();

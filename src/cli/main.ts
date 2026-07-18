@@ -202,7 +202,7 @@ program
   .requiredOption('--run-dir <dir>')
   .action(async (opts: { runDir: string }) => {
     const { runnerMain } = await import('./runner.js');
-    const { killWorkerGroups } = await import('../exec/stop.js');
+    const { killWorkerGroups, killWorkerGroupsUntilGone } = await import('../exec/stop.js');
     const cleanupWorkers = () => {
       try {
         killWorkerGroups(opts.runDir);
@@ -216,7 +216,11 @@ program
     try {
       process.exit(await runnerMain(opts.runDir));
     } catch (err) {
-      cleanupWorkers();
+      try {
+        await killWorkerGroupsUntilGone(opts.runDir);
+      } catch {
+        /* fatal path: best-effort worker containment */
+      }
       process.stderr.write(`runner fatal: ${(err as Error)?.stack ?? err}\n`);
       process.exit(1);
     } finally {

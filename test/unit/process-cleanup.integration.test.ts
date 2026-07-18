@@ -19,6 +19,7 @@ import {
 } from '../../src/exec/procinfo.js';
 import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { killWorkerGroups } from '../../src/exec/stop.js';
+import { workerRecordDir, workerRecordPath } from '../../src/exec/worker-record.js';
 
 const SIGNAL = new AbortController().signal;
 
@@ -132,6 +133,45 @@ describe('escaped worker descendant cleanup', () => {
       expect(readFileSync(observedFile, 'utf8')).toBe(`- - ${launcher.workerToken}`);
     } finally {
       launcher.killTree('SIGKILL');
+    }
+  });
+
+  it('reaps a worker tree from a token-only crash-window record', async () => {
+    if (process.platform !== 'linux') return;
+    const runDir = mkdtempSync(join(tmpdir(), 'uc-token-recovery-'));
+    const pidFile = join(runDir, 'escaped.pid');
+    const escapedSource = 'setInterval(() => {}, 60_000)';
+    const launcherSource = [
+      "const { spawn } = require('node:child_process')",
+      "const { writeFileSync } = require('node:fs')",
+      `const escaped = spawn(process.execPath, ['-e', ${JSON.stringify(escapedSource)}], { detached: true, stdio: 'ignore', env: process.env })`,
+      `writeFileSync(${JSON.stringify(pidFile)}, String(escaped.pid))`,
+      'escaped.unref()',
+      'setInterval(() => {}, 60_000)',
+    ].join(';');
+    const launcher = spawnAgentProcess(process.execPath, ['-e', launcherSource], {
+      cwd: process.cwd(),
+      env: {},
+      workerScope: runDir,
+    });
+    const launcherPid = launcher.child.pid!;
+    let escapedPid: number | undefined;
+    try {
+      escapedPid = await waitForPid(pidFile);
+      mkdirSync(workerRecordDir(runDir, 0), { recursive: true });
+      writeFileSync(workerRecordPath(runDir, 0, 1), `- - ${launcher.workerToken}`);
+      expect(killWorkerGroups(runDir)).toBe(1);
+      expect(await waitUntilGone(launcherPid)).toBe(true);
+      expect(await waitUntilGone(escapedPid)).toBe(true);
+    } finally {
+      launcher.killTree('SIGKILL');
+      if (escapedPid !== undefined) {
+        try {
+          process.kill(-escapedPid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
     }
   });
 

@@ -22,6 +22,7 @@ import {
 import { validateWithSchema } from './ajv.js';
 import { spawnAgentProcess, TailBuffer, type SpawnedAgent } from '../exec/spawn.js';
 import { chainedTimeout } from '../exec/timers.js';
+import { workerRecordDir, workerRecordPath } from '../exec/worker-record.js';
 import type {
   AgentEvent,
   AgentExecutor,
@@ -503,10 +504,16 @@ export class AgentCallExecutor implements AgentExecutor {
     const { onStreamEvent, resumedSession = false, stderrSuffix = '', timeoutOverrideMs } = opts;
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
+    const recoveryDir = this.opts.workerScope ? workerRecordDir(this.opts.workerScope, spec.seq) : artifactDir;
+    if (recoveryDir && recoveryDir !== artifactDir) mkdirSync(recoveryDir, { recursive: true });
     const transcriptFile = artifactDir ? join(artifactDir, 'transcript.jsonl') : undefined;
     // One record per physical spawn: a stubborn escaped process from an earlier
     // retry must not be hidden when the next attempt writes its own identity.
-    const processRecordFile = artifactDir ? join(artifactDir, `pgid.attempt${attempt}${stderrSuffix}`) : undefined;
+    const processRecordFile = this.opts.workerScope
+      ? workerRecordPath(this.opts.workerScope, spec.seq, attempt, stderrSuffix)
+      : artifactDir
+        ? join(artifactDir, `pgid.attempt${attempt}${stderrSuffix}`)
+        : undefined;
 
     // Schema temp file (codex --output-schema wants a path). Inserted before
     // the trailing '-' stdin positional when present.
