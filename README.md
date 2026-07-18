@@ -99,14 +99,6 @@ ultracode update                  # self-update; --check reports without install
 
 Re-running the install one-liner does the same. After upgrading, re-run `ultracode install <host>` so host integrations pick up the new engine path.
 
-### Build from source
-
-The installer needs only `curl`: it fetches a self-contained ~360 KB tarball, verifies checksums, and — if no Node >= 20 is present — provisions a Node runtime from the same bucket. To build from source instead:
-
-```bash
-npm install && npm run build && npm link
-```
-
 ### Driving the engine directly
 
 The skill normally does this for you; the same surface is there for authoring and debugging workflows by hand. A workflow is a small deterministic JS script:
@@ -131,6 +123,16 @@ ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
 ultracode run my.workflow.js --backend codex    # foreground live panel; --detach to background
 ultracode resume <runId> [--script edited.js]   # unchanged journal prefix replays free
+```
+
+### Build from source
+
+The installer needs only `curl`: it fetches a self-contained ~360 KB tarball, verifies checksums, and — if no Node >= 20 is present — provisions a Node runtime from the same bucket. To build from source instead:
+
+```bash
+git clone https://github.com/tiankongdeguiji/ultracode.git
+cd ultracode
+npm install && npm run build && npm link
 ```
 
 ## Commands

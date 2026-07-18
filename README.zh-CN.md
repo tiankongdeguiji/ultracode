@@ -99,14 +99,6 @@ ultracode update                  # 自升级；--check 只检查、不安装
 
 重新执行上面的一行安装命令效果相同。升级后请重新执行 `ultracode install <host>`，让宿主集成指向新的引擎路径。
 
-### 从源码构建
-
-安装器只依赖 `curl`：它会下载一个约 360 KB 的自包含 tarball 并验证校验和；若系统中没有 Node >= 20，还会从同一个 OSS bucket 自动补齐一份 Node 运行时。如需改为从源码构建：
-
-```bash
-npm install && npm run build && npm link
-```
-
 ### 直接使用引擎
 
 通常这些步骤都会由 skill 自动完成；为了方便手动编写和调试工作流，引擎也提供了同一套接口。一份工作流就是一小段确定性的 JS 脚本：
@@ -131,6 +123,16 @@ ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # 使用 mock 后端免费演练
 ultracode run my.workflow.js --backend codex    # 前台显示实时面板；使用 --detach 转入后台
 ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journal 前缀
+```
+
+### 从源码构建
+
+安装器只依赖 `curl`：它会下载一个约 360 KB 的自包含 tarball 并验证校验和；若系统中没有 Node >= 20，还会从同一个 OSS bucket 自动补齐一份 Node 运行时。如需改为从源码构建：
+
+```bash
+git clone https://github.com/tiankongdeguiji/ultracode.git
+cd ultracode
+npm install && npm run build && npm link
 ```
 
 ## 命令
