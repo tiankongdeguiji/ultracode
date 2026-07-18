@@ -66,6 +66,18 @@ uc_fetch() {
     || die "download failed: $2"
 }
 
+stage_pid_live() {
+  # $1 = a .stage dir, $2 = the pid separator ('.' or '-'). True when the
+  # owning installer process is still alive — reaping a live concurrent
+  # install's stage would make its second mv fail under set -eu. All installs
+  # are HOME-scoped (same user), so kill -0 is authoritative here.
+  uc_sp=${1##*.stage"$2"}
+  case "$uc_sp" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$uc_sp" 2>/dev/null
+}
+
 link_swap() {
   # Point symlink $2 at $1. GNU mv -T renames over the old link atomically —
   # a concurrent shim launch never observes a missing link; BSD mv (macOS)
@@ -171,6 +183,7 @@ provision_node() {
     mkdir -p "$UC_INSTALL_DIR/runtime"
     for uc_rt_stale in "$UC_INSTALL_DIR/runtime"/.stage.*; do
       [ -e "$uc_rt_stale" ] || continue
+      stage_pid_live "$uc_rt_stale" . && continue
       rm -rf "$uc_rt_stale"
     done
     uc_node_stage="$UC_INSTALL_DIR/runtime/.stage.$$"
@@ -255,6 +268,7 @@ install_app() {
   mkdir -p "$UC_INSTALL_DIR/app"
   for uc_stale in "$UC_INSTALL_DIR/app"/.stage-*; do
     [ -e "$uc_stale" ] || continue
+    stage_pid_live "$uc_stale" - && continue
     rm -rf "$uc_stale"
   done
   uc_app_stage="$UC_INSTALL_DIR/app/.stage-$$"

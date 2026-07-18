@@ -153,13 +153,14 @@ describe('release-oss publish --dry-run', () => {
 });
 
 describe('release-oss credential chain', () => {
-  it('ECS RAM role wins over an AccessKey pair and prints the role name in clear', () => {
+  it('ECS RAM role wins over an AccessKey pair and its name is redacted in output', () => {
     const { dir } = makeRoot();
     const out = run(
       ['--dry-run', '--root', dir],
       baseEnv({ ALIBABA_CLOUD_ECS_METADATA: 'my-role', OSS_ACCESS_KEY_ID: 'AKIDFAKE', OSS_ACCESS_KEY_SECRET: 'sekret' }),
     );
-    expect(out).toContain('--mode EcsRamRole --ecs-role-name my-role');
+    expect(out).toContain('--mode EcsRamRole --ecs-role-name ***');
+    expect(out).not.toContain('my-role');
     expect(out).not.toContain(' -i ');
     expect(out).not.toContain('AKIDFAKE');
   });
@@ -280,6 +281,7 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
   function stubEnv(
     remoteObjects: Record<string, string>,
     errors: Record<string, string> = {},
+    opts: { prefillRuntime?: boolean } = {},
   ): { env: NodeJS.ProcessEnv; log: string } {
     // Stub state lives OUTSIDE the fixture repo — extra files there would
     // trip the clean-tree preflight.
@@ -289,9 +291,12 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
     chmodSync(stub, 0o755);
     const log = join(stubDir, 'stub-log.jsonl');
     writeFileSync(log, '');
-    // Runtime objects exist so the missing-runtime warning path stays quiet.
-    for (const plat of PLATFORMS) {
-      remoteObjects[`oss://hongsheng-jhs/ultracode/runtime/node-v22.14.0-${plat}.tar.gz`] ??= '';
+    // Runtime objects exist so the missing-runtime warning path stays quiet
+    // (mirror-mode tests opt out to exercise the download path).
+    if (opts.prefillRuntime !== false) {
+      for (const plat of PLATFORMS) {
+        remoteObjects[`oss://hongsheng-jhs/ultracode/runtime/node-v22.14.0-${plat}.tar.gz`] ??= '';
+      }
     }
     const objects = join(stubDir, 'stub-objects.json');
     writeFileSync(objects, JSON.stringify({ objects: remoteObjects, errors }));
@@ -388,6 +393,32 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
     expect(r.status).not.toBe(0);
     expect(r.output).toMatch(/refusing to guess/);
     expect(uploads(log)).toHaveLength(0);
+  });
+
+  it('--mirror-node aborts when a download does not match SHASUMS256.txt', async () => {
+    // A loopback origin (UC_MIRROR_BASE_URL test seam) serving tarball bytes
+    // that do NOT hash to the SHASUMS entry — the anti-tamper abort must fire
+    // before any upload.
+    const shasums = PLATFORMS.map((p) => `${'0'.repeat(64)}  node-v22.14.0-${p}.tar.gz`).join('\n') + '\n';
+    const mirror = createServer((req, res) => {
+      res.end(req.url!.endsWith('SHASUMS256.txt') ? shasums : 'tarball-bytes-that-hash-differently');
+    });
+    await new Promise<void>((r) => mirror.listen(0, '127.0.0.1', r));
+    const addr = mirror.address();
+    if (addr === null || typeof addr !== 'object') throw new Error('no mirror address');
+    try {
+      const { dir } = makeRoot();
+      const { env, log } = stubEnv({}, {}, { prefillRuntime: false });
+      const r = await runFailAsync(
+        ['--mirror-node', '--root', dir],
+        { ...env, UC_MIRROR_BASE_URL: `http://127.0.0.1:${addr.port}/` },
+      );
+      expect(r.status).not.toBe(0);
+      expect(r.output).toMatch(/checksum mismatch/);
+      expect(uploads(log)).toHaveLength(0);
+    } finally {
+      await new Promise((r) => mirror.close(r));
+    }
   });
 
   it('--resume with a missing sidecar restores it from the remote bytes before the pointers', async () => {

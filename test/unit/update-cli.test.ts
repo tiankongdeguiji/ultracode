@@ -186,6 +186,16 @@ describe('update CLI', () => {
     expect(compareVersions('1.2.3-rc.1+build.7', '1.2.3-rc.1')).toBe(0);
   });
 
+  it('--to an older version is allowed and plumbs UC_VERSION to the installer', async () => {
+    const origin = makeOrigin();
+    writeFileSync(join(origin, 'install.sh'), '#!/bin/sh\nprintf %s "$UC_VERSION" > "$UC_INSTALL_DIR/version-used"\n');
+    const installDir = mkdtempSync(join(tmpdir(), 'uc-update-idir-'));
+    const { deps } = makeInstalled({ baseUrl: `file://${origin}`, installDir, binDir: '/y' });
+    const code = await updateCommand({ to: '0.0.1' }, deps);
+    expect(code).toBe(0);
+    expect(readFileSync(join(installDir, 'version-used'), 'utf8')).toBe('0.0.1');
+  });
+
   it('full update hands the running node to the installer as UC_NODE', async () => {
     const origin = makeOrigin('{ "version": "99.0.0" }');
     // Stub install.sh records the UC_NODE the updater passed down.

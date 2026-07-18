@@ -21,8 +21,9 @@
 // (optional OSS_STS_TOKEN; written to a 0600 temp config passed via -c so no
 // secret ever rides an argv), or OSS_CONFIG_FILE. --dry-run runs every local preflight and
 // prints the exact argv stream without contacting OSS; --root <dir> overrides
-// the repo root and OSS_PUBLIC_URL the public endpoint (both exist for tests
-// and future mirrors).
+// the repo root, OSS_PUBLIC_URL the public endpoint, and UC_MIRROR_BASE_URL
+// the Node mirror origin (all exist for tests; the first two also serve
+// future mirrors).
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -96,7 +97,12 @@ function parseArgs(argv) {
 // argv values that must appear as *** in anything we print.
 function resolveCredentials(env) {
   if (env.ALIBABA_CLOUD_ECS_METADATA) {
-    return { credArgs: ['--mode', 'EcsRamRole', '--ecs-role-name', env.ALIBABA_CLOUD_ECS_METADATA], secrets: [] };
+    // The role name is stored as a repo secret — redact it in our own output
+    // too instead of relying on the CI log masker.
+    return {
+      credArgs: ['--mode', 'EcsRamRole', '--ecs-role-name', env.ALIBABA_CLOUD_ECS_METADATA],
+      secrets: [env.ALIBABA_CLOUD_ECS_METADATA],
+    };
   }
   if (env.OSS_ACCESS_KEY_ID && env.OSS_ACCESS_KEY_SECRET) {
     // Secrets must not ride ossutil's argv — /proc/<pid>/cmdline is world-
@@ -106,7 +112,16 @@ function resolveCredentials(env) {
     const lines = ['[Credentials]', `accessKeyID=${env.OSS_ACCESS_KEY_ID}`, `accessKeySecret=${env.OSS_ACCESS_KEY_SECRET}`];
     if (env.OSS_STS_TOKEN) lines.push(`stsToken=${env.OSS_STS_TOKEN}`);
     writeFileSync(cfg, lines.join('\n') + '\n', { mode: 0o600 });
-    process.on('exit', () => rmSync(dir, { recursive: true, force: true }));
+    const cleanup = () => rmSync(dir, { recursive: true, force: true });
+    process.on('exit', cleanup);
+    // 'exit' does not fire on signals — a Ctrl-C or CI timeout must not leave
+    // the secret file behind.
+    for (const sig of ['SIGINT', 'SIGTERM']) {
+      process.on(sig, () => {
+        cleanup();
+        process.exit(1);
+      });
+    }
     return { credArgs: ['-c', cfg], secrets: [] };
   }
   if (env.OSS_CONFIG_FILE) {
@@ -314,11 +329,13 @@ async function mirrorNode(ctx, root, opts) {
     version = parseNodePin(readFileSync(installSh, 'utf8'));
   }
   if (!/^\d+\.\d+\.\d+$/.test(version)) fail(`--mirror-node version must be x.y.z, got ${JSON.stringify(version)}`);
-  const base = opts.from === 'nodejs' ? `https://nodejs.org/dist/v${version}/` : `https://npmmirror.com/mirrors/node/v${version}/`;
-  // Checksums always come from the origin, not the mirror — a compromised
-  // mirror must not be able to vouch for its own tarballs.
-  const shasumsUrl = `https://nodejs.org/dist/v${version}/SHASUMS256.txt`;
-  console.log(`mirroring Node v${version} from ${base} to ${BUCKET_URL}/runtime/ (checksums from nodejs.org)`);
+  // UC_MIRROR_BASE_URL is a TEST seam (offline loopback origins); real runs
+  // keep checksums pinned to nodejs.org — a compromised mirror must not be
+  // able to vouch for its own tarballs.
+  const testBase = process.env.UC_MIRROR_BASE_URL;
+  const base = testBase ?? (opts.from === 'nodejs' ? `https://nodejs.org/dist/v${version}/` : `https://npmmirror.com/mirrors/node/v${version}/`);
+  const shasumsUrl = testBase ? `${testBase}SHASUMS256.txt` : `https://nodejs.org/dist/v${version}/SHASUMS256.txt`;
+  console.log(`mirroring Node v${version} from ${base} to ${BUCKET_URL}/runtime/ (checksums from ${testBase ? 'the test seam' : 'nodejs.org'})`);
 
   if (ctx.dryRun) {
     for (const plat of NODE_PLATFORMS) {
@@ -348,11 +365,15 @@ async function mirrorNode(ctx, root, opts) {
       }
       const expected = shasumFor(await getShasums(), name);
       const local = join(dir, name);
-      await download(`${base}${name}`, local);
-      const actual = sha256File(local);
-      if (actual !== expected) fail(`checksum mismatch for ${name}: SHASUMS256.txt says ${expected}, download hashes to ${actual}`);
-      writeFileSync(`${local}.sha256`, `${actual}  ${name}\n`);
-      if (!haveTar) cp(ctx, local, tarKey, IMMUTABLE_META);
+      if (!haveTar) {
+        await download(`${base}${name}`, local);
+        const actual = sha256File(local);
+        if (actual !== expected) fail(`checksum mismatch for ${name}: SHASUMS256.txt says ${expected}, download hashes to ${actual}`);
+        cp(ctx, local, tarKey, IMMUTABLE_META);
+      }
+      // Sidecar content comes from the authoritative SHASUMS256.txt, so a
+      // missing sidecar is restored without re-downloading the tarball.
+      writeFileSync(`${local}.sha256`, `${expected}  ${name}\n`);
       if (!haveSha) cp(ctx, `${local}.sha256`, `${tarKey}.sha256`, IMMUTABLE_META);
       uploaded += 1;
     }

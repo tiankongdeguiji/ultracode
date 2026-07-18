@@ -13,13 +13,16 @@
 # allows oss:PutObject, oss:PutObjectAcl, oss:GetObject and oss:HeadObject on
 # the hongsheng-jhs bucket's ultracode/* prefix, and the repo secret
 # ALIBABA_CLOUD_ECS_METADATA must hold that RAM role name.
-# ACCEPTED RISK: this job shares the code_review runner. Instance-role
-# credentials are ambient to every process on the host (metadata endpoint),
-# so PR-triggered review jobs running there could in principle mint
-# bucket-write credentials; scoping the RAM role to the ultracode/* prefix
-# does not change that (it is the write target). Hardening option if this
-# ever needs closing: move this job to a dedicated runner label on its own
-# ECS instance.
+# ACCEPTED RISK (maintainer decision): this job shares the code_review
+# runner, whose PR-triggered jobs run untrusted PR code on the same host.
+# Instance-role credentials are ambient there (metadata endpoint) and cover
+# the MUTABLE pointer objects users execute (install.sh, latest.json) — i.e.
+# minted credentials mean installer RCE, not just bucket corruption — and
+# release immutability is script-enforced only (no OSS object lock; the role
+# also holds PutObjectAcl). Scoping the RAM role to ultracode/* does not
+# change any of this: that prefix is the write target. Hardening options
+# before the channel is broadly public: a dedicated release runner, OSS
+# versioning/object lock, and artifact signing (docs/architecture.md).
 # ---- End Prerequisites ----
 
 name: Nightly Release
