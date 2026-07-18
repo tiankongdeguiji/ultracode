@@ -9,6 +9,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 /** Per-attempt environment marker inherited by backend children and their tool
  *  sandboxes. Unlike a process group, it survives setsid()/new PID sessions. */
 export const WORKER_TOKEN_ENV = 'ULTRACODE_WORKER_TOKEN';
+export const WORKER_SCOPE_ENV = 'ULTRACODE_WORKER_SCOPE';
 const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
 
 export interface ProcStat {
@@ -41,27 +42,44 @@ export function readProcStat(pid: number): ProcStat | undefined {
   return { pgrp, starttime };
 }
 
-/** Read a process-group identity on supported hosts. Linux uses kernel clock
- *  ticks from procfs; macOS uses `ps` start-time output under a fixed locale. */
-export function readProcessIdentity(pid: number): ProcStat | undefined {
-  const linux = readProcStat(pid);
-  if (linux || process.platform !== 'darwin') return linux;
+/** Read process-group identities on supported hosts in one bounded operation.
+ *  Linux uses procfs; macOS batches `ps` under a fixed locale. */
+export function readProcessIdentities(pids: Iterable<number>): Map<number, ProcStat> {
+  const requested = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid > 1);
+  const found = new Map<number, ProcStat>();
+  if (process.platform === 'linux') {
+    for (const pid of requested) {
+      const stat = readProcStat(pid);
+      if (stat) found.set(pid, stat);
+    }
+    return found;
+  }
+  if (process.platform !== 'darwin' || requested.length === 0) return found;
   let raw: string;
   try {
-    raw = execFileSync('/bin/ps', ['-o', 'pgid=', '-o', 'lstart=', '-p', String(pid)], {
+    raw = execFileSync('/bin/ps', ['-o', 'pid=', '-o', 'pgid=', '-o', 'lstart=', '-p', requested.join(',')], {
       encoding: 'utf8',
       env: { ...process.env, LC_ALL: 'C' },
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 1_000,
-      maxBuffer: 4_096,
+      maxBuffer: 256 * 1_024,
     }).trim();
   } catch {
-    return undefined;
+    return found;
   }
-  const [pgrpText, ...started] = raw.split(/\s+/);
-  const pgrp = Number(pgrpText);
-  if (!Number.isInteger(pgrp) || started.length === 0) return undefined;
-  return { pgrp, starttime: `darwin:${started.join('_')}` };
+  for (const line of raw.split('\n')) {
+    const [pidText, pgrpText, ...started] = line.trim().split(/\s+/);
+    const pid = Number(pidText);
+    const pgrp = Number(pgrpText);
+    if (!Number.isInteger(pid) || !Number.isInteger(pgrp) || started.length === 0) continue;
+    found.set(pid, { pgrp, starttime: `darwin:${started.join('_')}` });
+  }
+  return found;
+}
+
+/** Read one process-group identity. */
+export function readProcessIdentity(pid: number): ProcStat | undefined {
+  return readProcessIdentities([pid]).get(pid);
 }
 
 /** Worker tokens cross a worker-writable boundary when persisted in the run
@@ -70,20 +88,27 @@ export function isWorkerToken(value: string | undefined): value is string {
   return value !== undefined && WORKER_TOKEN_RE.test(value);
 }
 
-/** Find same-user Linux processes carrying an exact worker lifecycle token.
- *  The token follows Codex/bwrap descendants even after they call setsid() or
- *  are reparented to PID 1. `/proc/<pid>/environ` is unreadable for other users
- *  under normal procfs permissions; every read still fails closed. */
-export function findWorkerProcesses(token: string): TrackedProcess[] {
-  if (process.platform !== 'linux' || !isWorkerToken(token)) return [];
+/** One Linux process carrying a tracked worker lifecycle token. */
+export interface TrackedWorkerProcess extends TrackedProcess {
+  token: string;
+}
+
+/** Find same-user Linux processes for a bounded token set with one process-table
+ *  pass. Tokens follow Codex/bwrap descendants across setsid() and reparenting;
+ *  every procfs read still fails closed. */
+export function findWorkerProcessesForTokens(tokens: Iterable<string>, scope?: string): TrackedWorkerProcess[] {
+  if (process.platform !== 'linux') return [];
+  const accepted = new Set([...tokens].filter(isWorkerToken));
+  if (accepted.size === 0) return [];
   let entries: string[];
   try {
     entries = readdirSync('/proc');
   } catch {
     return [];
   }
-  const marker = `${WORKER_TOKEN_ENV}=${token}`;
-  const found: TrackedProcess[] = [];
+  const tokenPrefix = `${WORKER_TOKEN_ENV}=`;
+  const scopeMarker = scope === undefined ? undefined : `${WORKER_SCOPE_ENV}=${scope}`;
+  const found: TrackedWorkerProcess[] = [];
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
@@ -94,43 +119,68 @@ export function findWorkerProcesses(token: string): TrackedProcess[] {
     } catch {
       continue;
     }
-    if (!environ.split('\0').includes(marker)) continue;
+    const environment = environ.split('\0');
+    if (scopeMarker !== undefined && !environment.includes(scopeMarker)) continue;
+    const tokenEntry = environment.find((entry) => entry.startsWith(tokenPrefix));
+    const token = tokenEntry?.slice(tokenPrefix.length);
+    if (token === undefined || !accepted.has(token)) continue;
     const stat = readProcStat(pid);
-    if (stat) found.push({ pid, ...stat });
+    if (stat) found.push({ pid, token, ...stat });
   }
   return found;
 }
 
-/** Signal every currently-live process carrying `token`. Re-read procfs on
- *  every call so a later SIGKILL sweep also catches descendants forked while
- *  the graceful signal was in flight. */
-export function signalWorkerProcesses(token: string, signal: NodeJS.Signals): number {
+/** Find processes carrying one exact token and optional run scope. */
+export function findWorkerProcesses(token: string, scope?: string): TrackedProcess[] {
+  return findWorkerProcessesForTokens([token], scope).map(({ token: _token, ...proc }) => proc);
+}
+
+export interface WorkerSignalResult {
+  processes: number;
+  tokens: Set<string>;
+}
+
+/** Signal a token set using bounded, batched process-table sweeps. */
+export function signalWorkerProcessTokens(
+  tokens: Iterable<string>,
+  signal: NodeJS.Signals,
+  scope?: string,
+): WorkerSignalResult {
+  const accepted = new Set([...tokens].filter(isWorkerToken));
   const seen = new Set<string>();
-  let signaled = 0;
+  const signaledTokens = new Set<string>();
+  let processes = 0;
+  if (accepted.size === 0) return { processes, tokens: signaledTokens };
   // A marked process can fork between discovery and signal delivery. Re-scan
   // after every batch until no new process identity appears. SIGKILLed members
   // cannot fork after delivery; graceful cleanup calls this function again on
   // every bounded wait pass to catch later SIGTERM-handler forks.
   for (let pass = 0; pass < 16; pass++) {
     let discovered = false;
-    for (const proc of findWorkerProcesses(token)) {
+    for (const proc of findWorkerProcessesForTokens(accepted, scope)) {
       const identity = `${proc.pid}:${proc.starttime}`;
       if (seen.has(identity)) continue;
       seen.add(identity);
       discovered = true;
-      // Close the environ→kill PID-reuse window as far as procfs permits: the
-      // exact process instance observed above must still own this PID.
       if (readProcStat(proc.pid)?.starttime !== proc.starttime) continue;
       try {
         process.kill(proc.pid, signal);
-        signaled++;
+        processes++;
+        signaledTokens.add(proc.token);
       } catch {
         /* raced with exit */
       }
     }
     if (!discovered) break;
   }
-  return signaled;
+  return { processes, tokens: signaledTokens };
+}
+
+/** Signal every currently-live process carrying `token`. Re-read procfs on
+ *  every call so a later SIGKILL sweep also catches descendants forked while
+ *  the graceful signal was in flight. */
+export function signalWorkerProcesses(token: string, signal: NodeJS.Signals, scope?: string): number {
+  return signalWorkerProcessTokens([token], signal, scope).processes;
 }
 
 /**

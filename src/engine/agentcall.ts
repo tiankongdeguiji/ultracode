@@ -72,6 +72,8 @@ export interface AgentCallOptions {
   attemptTimeoutMs?: number;
   /** min gap between live usage ticks per agent (0 = every change; for tests) */
   usageTickIntervalMs?: number;
+  /** Stable run-dir scope inherited by workers and checked during recovery. */
+  workerScope?: string;
 }
 
 export const USAGE_TICK_INTERVAL_MS = 1000;
@@ -583,6 +585,7 @@ export class AgentCallExecutor implements AgentExecutor {
         // ultracode MCP server inherited by a worker refuses workflow_start.
         env: { ...scrubForeignBackendSecrets(process.env, spec.backend), ...plan.env, ULTRACODE_INSIDE_RUN: '1' },
         stdinData: plan.stdinData,
+        workerScope: this.opts.workerScope,
       });
       proc = spawned;
       // Persist the worker's PGID so `ultracode stop` can kill the group if the
@@ -702,18 +705,17 @@ export class AgentCallExecutor implements AgentExecutor {
       if (stallTimer) clearInterval(stallTimer);
       for (const t of escalationTimers) clearTimeout(t);
       if (onAbort) signal.removeEventListener('abort', onAbort);
-      // `close` covers only the backend CLI and its stdio. Codex/bwrap tool
-      // sandboxes may have called setsid(), escaped the CLI's PGID, and been
-      // reparented to PID 1. Reap every process carrying this attempt's token
-      // before dropping the persistent recovery record.
-      const escapedRemaining = (await proc?.cleanupEscaped()) ?? 0;
+      // `close` covers only the backend CLI and its stdio. Reap helpers left in
+      // its PGID plus Codex/bwrap sandboxes that escaped via setsid() before
+      // dropping the persistent recovery record.
+      const descendantsRemaining = (await proc?.cleanupEscaped()) ?? 0;
       if (transcriptFd !== undefined) closeSync(transcriptFd);
       try {
         sidecar?.close();
       } catch {
         /* display-only */
       }
-      if (processRecordFile && escapedRemaining === 0) rmSync(processRecordFile, { force: true });
+      if (processRecordFile && descendantsRemaining === 0) rmSync(processRecordFile, { force: true });
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }
   }

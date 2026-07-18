@@ -1,10 +1,89 @@
 /** Shared stop logic (CLI `stop` and MCP `workflow_stop`). */
 import { setTimeout as sleep } from 'node:timers/promises';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, opendirSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, isRunnerAlive, reapOrphans } from '../store/runstore.js';
-import { isWorkerToken, readProcessIdentity, signalWorkerProcesses } from './procinfo.js';
+import { isWorkerToken, readProcessIdentities, signalWorkerProcessTokens } from './procinfo.js';
+
+const WORKER_RECORD_RE = /^pgid(?:\.attempt[1-9]\d*(?:-fresh)?)?$/;
+const MAX_WORKER_RECORDS = 1_024;
+const MAX_AGENT_ENTRIES = 2_048;
+const MAX_RECORD_ENTRIES = 8_192;
+const MAX_WORKER_RECORD_BYTES = 512;
+
+function collectWorkerRecordPaths(agentsDir: string): string[] {
+  const records: string[] = [];
+  let agents;
+  try {
+    agents = opendirSync(agentsDir);
+  } catch {
+    return records;
+  }
+  let agentEntries = 0;
+  let recordEntries = 0;
+  try {
+    for (;;) {
+      if (records.length >= MAX_WORKER_RECORDS || agentEntries >= MAX_AGENT_ENTRIES) break;
+      const agent = agents.readSync();
+      if (!agent) break;
+      agentEntries++;
+      if (!agent.isDirectory()) continue;
+      const agentDir = join(agentsDir, agent.name);
+      let files;
+      try {
+        files = opendirSync(agentDir);
+      } catch {
+        continue;
+      }
+      try {
+        for (;;) {
+          if (records.length >= MAX_WORKER_RECORDS || recordEntries >= MAX_RECORD_ENTRIES) break;
+          const file = files.readSync();
+          if (!file) break;
+          recordEntries++;
+          if (WORKER_RECORD_RE.test(file.name)) records.push(join(agentDir, file.name));
+        }
+      } finally {
+        try {
+          files.closeSync();
+        } catch {
+          /* already closed */
+        }
+      }
+      if (recordEntries >= MAX_RECORD_ENTRIES) break;
+    }
+  } finally {
+    try {
+      agents.closeSync();
+    } catch {
+      /* already closed */
+    }
+  }
+  return records;
+}
+
+function readWorkerRecord(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_WORKER_RECORD_BYTES) return undefined;
+    const buffer = Buffer.alloc(Number(stat.size));
+    const bytes = readSync(fd, buffer, 0, buffer.length, 0);
+    return buffer.toString('utf8', 0, bytes);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+}
 
 /** Kill recorded worker process groups and token-tracked Linux descendants —
  *  used when the runner could not finish its own detached-agent cleanup.
@@ -19,46 +98,46 @@ import { isWorkerToken, readProcessIdentity, signalWorkerProcesses } from './pro
 export function killWorkerGroups(runDir: string): number {
   const agentsDir = join(runDir, 'agents');
   if (!existsSync(agentsDir)) return 0;
-  let killed = 0;
-  for (const d of readdirSync(agentsDir)) {
-    const agentDir = join(agentsDir, d);
-    let recordNames: string[];
-    try {
-      recordNames = readdirSync(agentDir).filter((name) => name === 'pgid' || name.startsWith('pgid.attempt'));
-    } catch {
-      continue;
+  const groupRecords = new Map<string, { path: string; pid: number; starttime: string }>();
+  const tokenRecords = new Map<string, string>();
+  for (const path of collectWorkerRecordPaths(agentsDir)) {
+    const raw = readWorkerRecord(path);
+    if (raw === undefined) continue;
+    const fields = raw.trim().split(/\s+/);
+    if (fields.length < 2 || fields.length > 3) continue;
+    const [pidStr, recordedStart, workerToken] = fields;
+    const pid = Number(pidStr);
+    if (Number.isInteger(pid) && pid > 1 && pid !== process.pid && recordedStart !== undefined) {
+      groupRecords.set(`${pid}:${recordedStart}`, { path, pid, starttime: recordedStart });
     }
-    for (const recordName of recordNames) {
-      let fields: string[];
-      try {
-        fields = readFileSync(join(agentDir, recordName), 'utf8').trim().split(/\s+/);
-      } catch {
-        continue;
-      }
-      const [pidStr, recordedStart, workerToken] = fields;
-      const pid = Number(pidStr);
-      let acted = false;
-      if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) {
-        const live = readProcessIdentity(pid);
-        // Fail closed when the leader is gone or its OS start-time identity
-        // mismatches. Linux's token sweep below is the recovery path for
-        // leaderless groups; macOS safely remains process-group-only.
-        const groupVerified =
-          live !== undefined && recordedStart !== undefined && live.starttime === recordedStart && live.pgrp === pid;
-        if (groupVerified) {
-          try {
-            process.kill(-pid, 'SIGKILL');
-            acted = true;
-          } catch {
-            /* group already gone */
-          }
-        }
-      }
-      if (isWorkerToken(workerToken) && signalWorkerProcesses(workerToken, 'SIGKILL') > 0) acted = true;
-      if (acted) killed++;
+    if (isWorkerToken(workerToken) && !tokenRecords.has(workerToken)) tokenRecords.set(workerToken, path);
+  }
+
+  const actedRecords = new Set<string>();
+  const identities = readProcessIdentities([...groupRecords.values()].map((record) => record.pid));
+  for (const record of groupRecords.values()) {
+    const live = identities.get(record.pid);
+    // Fail closed when the leader is gone or its OS start-time identity
+    // mismatches. Linux's scoped token sweep below is the recovery path for
+    // leaderless groups; macOS safely remains process-group-only.
+    if (!live || live.starttime !== record.starttime || live.pgrp !== record.pid) continue;
+    try {
+      process.kill(-record.pid, 'SIGKILL');
+      actedRecords.add(record.path);
+    } catch {
+      /* group already gone */
     }
   }
-  return killed;
+
+  // The run scope is checked in each target process's immutable initial
+  // environment. Copying another run's readable token into this untrusted
+  // record store therefore cannot authorize signaling that run's workers.
+  const tokenResult = signalWorkerProcessTokens(tokenRecords.keys(), 'SIGKILL', runDir);
+  for (const token of tokenResult.tokens) {
+    const path = tokenRecords.get(token);
+    if (path) actedRecords.add(path);
+  }
+  return actedRecords.size;
 }
 
 export interface StopResult {

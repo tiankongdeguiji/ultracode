@@ -6,14 +6,19 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { findWorkerProcesses, signalWorkerProcesses, WORKER_TOKEN_ENV } from './procinfo.js';
+import {
+  findWorkerProcesses,
+  signalWorkerProcesses,
+  WORKER_SCOPE_ENV,
+  WORKER_TOKEN_ENV,
+} from './procinfo.js';
 
 export interface SpawnedAgent {
   child: ChildProcess;
   /** High-entropy marker inherited by descendants even if they leave our PGID. */
   workerToken: string;
   killTree(signal?: NodeJS.Signals): void;
-  /** Reap token-bearing descendants left after the direct child closes. */
+  /** Reap same-group and token-bearing descendants after the direct child closes. */
   cleanupEscaped(graceMs?: number): Promise<number>;
 }
 
@@ -21,13 +26,17 @@ export interface SpawnAgentOptions {
   cwd: string;
   env: Record<string, string | undefined>;
   stdinData?: string;
+  /** Stable run-dir scope used to authorize persisted token recovery. */
+  workerScope?: string;
 }
 
 export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentOptions): SpawnedAgent {
   const workerToken = randomBytes(16).toString('hex');
+  const env: NodeJS.ProcessEnv = { ...opts.env, [WORKER_TOKEN_ENV]: workerToken };
+  if (opts.workerScope !== undefined) env[WORKER_SCOPE_ENV] = opts.workerScope;
   const child = spawn(bin, argv, {
     cwd: opts.cwd,
-    env: { ...opts.env, [WORKER_TOKEN_ENV]: workerToken } as NodeJS.ProcessEnv,
+    env,
     detached: true, // own process group → killable as a tree
     stdio: [opts.stdinData !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
   });
@@ -57,22 +66,42 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     // Codex's Linux sandbox calls setsid()/bwrap --new-session, so descendants
     // can leave the worker PGID. The inherited token is the containment
     // boundary for those escaped sessions.
-    signalWorkerProcesses(workerToken, signal);
+    signalWorkerProcesses(workerToken, signal, opts.workerScope);
   };
 
   const cleanupEscaped = async (graceMs = 500): Promise<number> => {
-    if (findWorkerProcesses(workerToken).length === 0) return 0;
+    const pid = child.pid;
+    const groupAlive = (): boolean => {
+      if (!pid) return false;
+      try {
+        process.kill(-pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const signalGroup = (signal: NodeJS.Signals): void => {
+      if (!pid) return;
+      try {
+        process.kill(-pid, signal);
+      } catch {
+        /* group already gone */
+      }
+    };
+    const tokenProcesses = () => findWorkerProcesses(workerToken, opts.workerScope);
+    if (!groupAlive() && tokenProcesses().length === 0) return 0;
     const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
       for (;;) {
-        signalWorkerProcesses(workerToken, signal);
-        if (findWorkerProcesses(workerToken).length === 0) return true;
+        signalGroup(signal);
+        signalWorkerProcesses(workerToken, signal, opts.workerScope);
+        if (!groupAlive() && tokenProcesses().length === 0) return true;
         if (Date.now() >= deadline) return false;
         await sleep(25);
       }
     };
     if (await sweepUntil('SIGTERM', Date.now() + graceMs)) return 0;
     if (await sweepUntil('SIGKILL', Date.now() + graceMs)) return 0;
-    return findWorkerProcesses(workerToken).length;
+    return tokenProcesses().length + Number(groupAlive());
   };
 
   return { child, workerToken, killTree, cleanupEscaped };

@@ -40,7 +40,7 @@ function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger', at
       ex =
         backend === 'mock'
           ? new MockExecutor({ attemptTimeoutMs })
-          : (createExecutorForBackend(backend, { artifactDir, permission, attemptTimeoutMs }) ??
+          : (createExecutorForBackend(backend, { artifactDir, permission, attemptTimeoutMs, workerScope: dir }) ??
             (() => {
               throw new Error(`backend '${backend}' is not implemented yet`);
             })());

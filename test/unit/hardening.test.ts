@@ -125,6 +125,29 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     }
   });
 
+  it('ignores non-exact and oversized recovery record files', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    const pid = child.pid!;
+    const runDir = tmp('uc-kill-bounded-');
+    const agentDir = join(runDir, 'agents', 'a');
+    mkdirSync(agentDir, { recursive: true });
+    try {
+      const stat = readProcessIdentity(pid)!;
+      const valid = `${pid} ${stat.starttime}`;
+      writeFileSync(join(agentDir, 'pgid.attempt1.extra'), valid);
+      writeFileSync(join(agentDir, 'pgid.attempt2'), valid.padEnd(513, ' '));
+      expect(killWorkerGroups(runDir)).toBe(0);
+      expect(readProcessIdentity(pid)).toBeTruthy();
+    } finally {
+      process.kill(-pid, 'SIGKILL');
+    }
+  });
+
   it('skips a start-time mismatch — a recycled or forged pid is not killed', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return;
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {

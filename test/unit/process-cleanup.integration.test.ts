@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 import type { AgentEvent, AgentRequest, AgentSpec, BackendAdapter, ExitClass, SpawnPlan } from '../../src/backends/types.js';
 import { ZERO_USAGE } from '../../src/backends/types.js';
 import { AgentCallExecutor } from '../../src/engine/agentcall.js';
-import { readProcStat } from '../../src/exec/procinfo.js';
+import { readProcessIdentity, readProcStat } from '../../src/exec/procinfo.js';
 import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { killWorkerGroups } from '../../src/exec/stop.js';
 
@@ -80,13 +80,41 @@ async function waitForPid(file: string): Promise<number> {
 async function waitUntilGone(pid: number): Promise<boolean> {
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
-    if (!readProcStat(pid)) return true;
+    if (!readProcessIdentity(pid)) return true;
     await sleep(25);
   }
   return false;
 }
 
 describe('escaped worker descendant cleanup', () => {
+  it('reaps a same-group helper after the backend group leader exits', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const dir = mkdtempSync(join(tmpdir(), 'uc-group-helper-'));
+    const pidFile = join(dir, 'pid');
+    const helperSource = 'setInterval(() => {}, 60_000)';
+    const launcherSource = [
+      "const { spawn } = require('node:child_process')",
+      "const { writeFileSync } = require('node:fs')",
+      `const helper = spawn(process.execPath, ['-e', ${JSON.stringify(helperSource)}], { stdio: 'ignore', env: process.env })`,
+      `writeFileSync(${JSON.stringify(pidFile)}, String(helper.pid))`,
+      'helper.unref()',
+    ].join(';');
+    const launcher = spawnAgentProcess(process.execPath, ['-e', launcherSource], {
+      cwd: process.cwd(),
+      env: {},
+    });
+    const closed = new Promise<void>((resolve) => launcher.child.once('close', () => resolve()));
+    const helperPid = await waitForPid(pidFile);
+    await closed;
+    try {
+      expect(readProcessIdentity(helperPid)).toBeTruthy();
+      expect(await launcher.cleanupEscaped()).toBe(0);
+      expect(await waitUntilGone(helperPid)).toBe(true);
+    } finally {
+      launcher.killTree('SIGKILL');
+    }
+  });
+
   it('reaps a descendant that creates a new session before the worker exits', async () => {
     if (process.platform !== 'linux') return;
     const pidFile = join(mkdtempSync(join(tmpdir(), 'uc-escaped-')), 'pid');
@@ -199,6 +227,7 @@ describe('escaped worker descendant cleanup', () => {
     const launcher = spawnAgentProcess(process.execPath, ['-e', launcherSource], {
       cwd: process.cwd(),
       env: {},
+      workerScope: runDir,
     });
     const launcherPid = launcher.child.pid!;
     writeFileSync(join(agentDir, 'pgid.attempt1'), `${launcherPid} - ${launcher.workerToken}`);
@@ -217,6 +246,32 @@ describe('escaped worker descendant cleanup', () => {
       } catch {
         /* already gone */
       }
+    }
+  });
+
+  it('does not authorize a copied token outside its original run scope', async () => {
+    if (process.platform !== 'linux') return;
+    const attackerRun = mkdtempSync(join(tmpdir(), 'uc-scope-attacker-'));
+    const victimRun = mkdtempSync(join(tmpdir(), 'uc-scope-victim-'));
+    const attackerAgent = join(attackerRun, 'agents', '0000-forged');
+    const victimAgent = join(victimRun, 'agents', '0000-real');
+    mkdirSync(attackerAgent, { recursive: true });
+    mkdirSync(victimAgent, { recursive: true });
+    const launcher = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 60_000)'], {
+      cwd: process.cwd(),
+      env: {},
+      workerScope: victimRun,
+    });
+    const pid = launcher.child.pid!;
+    writeFileSync(join(attackerAgent, 'pgid.attempt1'), `999999999 - ${launcher.workerToken}`);
+    writeFileSync(join(victimAgent, 'pgid.attempt1'), `999999999 - ${launcher.workerToken}`);
+    try {
+      expect(killWorkerGroups(attackerRun)).toBe(0);
+      expect(readProcStat(pid)).toBeTruthy();
+      expect(killWorkerGroups(victimRun)).toBe(1);
+      expect(await waitUntilGone(pid)).toBe(true);
+    } finally {
+      launcher.killTree('SIGKILL');
     }
   });
 });
