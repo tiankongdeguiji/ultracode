@@ -24,6 +24,11 @@
 // the repo root, OSS_PUBLIC_URL the public endpoint, and UC_MIRROR_BASE_URL
 // the Node mirror origin (all exist for tests; the first two also serve
 // future mirrors).
+// Concurrency: publishes are assumed single-flight — the nightly workflow is
+// serialized by its concurrency group and local runs are a manual escape
+// hatch. The stat-then-upload immutability guard is not atomic across two
+// simultaneous publishers; the worst interleaving leaves a tarball/sidecar
+// mismatch that fails installs closed and is repaired with --resume.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -220,12 +225,18 @@ async function publish(ctx, root, opts) {
   const tarName = `ultracode-${version}.tar.gz`;
   const tarPath = join(root, 'dist-release', tarName);
   const shaPath = `${tarPath}.sha256`;
-  if (!existsSync(tarPath) || !existsSync(shaPath)) {
-    console.log('dist-release artifacts missing — running scripts/build-release.mjs');
-    const b = spawnSync(process.execPath, [join(root, 'scripts/build-release.mjs')], { cwd: root, stdio: 'inherit' });
+  // Always rebuild when the build script exists: a clean tree does not prove
+  // a pre-existing (gitignored) dist-release/ was built from THIS commit, and
+  // publishing a stale artifact would ship old code under a new-looking
+  // release. Test fixture roots have no build script and supply artifacts
+  // directly.
+  const buildScript = join(root, 'scripts/build-release.mjs');
+  if (existsSync(buildScript)) {
+    console.log('building release artifacts from the current tree');
+    const b = spawnSync(process.execPath, [buildScript], { cwd: root, stdio: 'inherit' });
     if (b.status !== 0) fail(`scripts/build-release.mjs failed (${b.error ? b.error.message : `exit ${b.status}`})`);
-    if (!existsSync(tarPath) || !existsSync(shaPath)) fail(`scripts/build-release.mjs did not produce ${tarName} + .sha256`);
   }
+  if (!existsSync(tarPath) || !existsSync(shaPath)) fail(`missing ${tarName} + .sha256 under dist-release/`);
 
   // Stale-pair guard: the sidecar is what installers verify against, so it
   // must describe exactly the tarball being uploaded.

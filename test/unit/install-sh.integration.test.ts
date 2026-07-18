@@ -327,6 +327,14 @@ describe.skipIf(!hasCurl)('install.sh', () => {
     expect(heal.status, heal.stderr).toBe(0);
     expect(statSync(provisionedNode).mode & 0o111).toBeTruthy();
     expect(runShim(home).stdout).toContain('FAKE-NODE-RAN');
+
+    // Self-heal again for an executable-but-broken runtime (arch mismatch,
+    // truncation): node_ok gates the keep decision, not a bare -x test.
+    writeFileSync(provisionedNode, '#!/bin/sh\nexit 1\n');
+    chmodSync(provisionedNode, 0o755);
+    const heal2 = runInstall(home, origin, { UC_NODE: '', PATH: `${fakeBin}:${process.env.PATH ?? ''}` });
+    expect(heal2.status, heal2.stderr).toBe(0);
+    expect(runShim(home).stdout).toContain('FAKE-NODE-RAN');
   }, 30_000);
 
   it('a corrupted Node runtime download dies before installing anything', () => {

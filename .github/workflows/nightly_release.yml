@@ -118,15 +118,17 @@ jobs:
       # is ALWAYS installed and invoked by explicit path (OSSUTIL_BIN) — a
       # preinstalled ossutil on the shared runner is never trusted. Bump the
       # version and hash together.
+      # Installed OUTSIDE the checkout ($RUNNER_TEMP): anything untracked in
+      # the workspace would trip the publisher's clean-tree guard.
       - name: Install pinned ossutil
         if: steps.gate.outputs.skip != 'true'
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/.ossutil-bin"
+          mkdir -p "$RUNNER_TEMP/ossutil-bin"
           curl -fsSL https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64 \
-            -o "$GITHUB_WORKSPACE/.ossutil-bin/ossutil"
-          echo 'c0d1c40cb406ae2295a4d1e6a8a0aef8b4319d609c6b8acd742348c88734b697  '"$GITHUB_WORKSPACE/.ossutil-bin/ossutil" | sha256sum -c -
-          chmod +x "$GITHUB_WORKSPACE/.ossutil-bin/ossutil"
-          echo "OSSUTIL_BIN=$GITHUB_WORKSPACE/.ossutil-bin/ossutil" >> "$GITHUB_ENV"
+            -o "$RUNNER_TEMP/ossutil-bin/ossutil"
+          echo 'c0d1c40cb406ae2295a4d1e6a8a0aef8b4319d609c6b8acd742348c88734b697  '"$RUNNER_TEMP/ossutil-bin/ossutil" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/ossutil-bin/ossutil"
+          echo "OSSUTIL_BIN=$RUNNER_TEMP/ossutil-bin/ossutil" >> "$GITHUB_ENV"
 
       - name: Mirror Node runtime (idempotent)
         if: steps.gate.outputs.skip != 'true'

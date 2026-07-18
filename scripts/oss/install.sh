@@ -168,7 +168,9 @@ sha256_of() {
 provision_node() {
   uc_node_name="node-v$UC_NODE_VERSION-$UC_OS-$UC_ARCH"
   uc_node_dir="$UC_INSTALL_DIR/runtime/$uc_node_name"
-  if [ ! -x "$uc_node_dir/bin/node" ]; then
+  # node_ok (not a bare -x test) so an executable-but-broken runtime — arch
+  # mismatch, truncated binary — is replaced instead of being kept forever.
+  if ! node_ok "$uc_node_dir/bin/node"; then
     info "no usable Node >= 20 found; provisioning Node v$UC_NODE_VERSION"
     uc_fetch "$UC_TMP/$uc_node_name.tar.gz" "$UC_BASE_URL/runtime/$uc_node_name.tar.gz" 600
     uc_fetch "$UC_TMP/$uc_node_name.tar.gz.sha256" "$UC_BASE_URL/runtime/$uc_node_name.tar.gz.sha256"
@@ -188,12 +190,13 @@ provision_node() {
     done
     uc_node_stage="$UC_INSTALL_DIR/runtime/.stage.$$"
     mv "$UC_TMP/node-extract/$uc_node_name" "$uc_node_stage"
-    if [ -x "$uc_node_dir/bin/node" ]; then
-      # A concurrent install landed a good runtime while we downloaded — keep it.
+    if node_ok "$uc_node_dir/bin/node"; then
+      # A concurrent install landed a working runtime while we downloaded —
+      # keep it.
       rm -rf "$uc_node_stage"
     else
-      # Same gate as the provisioning entry check: a dir without an executable
-      # bin/node is broken (lost exec bits, partial copy) — replace, don't keep.
+      # Same gate as the provisioning entry check: a runtime that is missing,
+      # non-executable, or not runnable is broken — replace, don't keep.
       rm -rf "$uc_node_dir"
       mv "$uc_node_stage" "$uc_node_dir"
     fi
@@ -254,10 +257,6 @@ EOF
 }
 
 install_app() {
-  if [ -e "$UC_APP_TARGET" ] || [ -L "$UC_APP_TARGET" ]; then
-    warn "removing incomplete install at $UC_APP_TARGET"
-    rm -rf "$UC_APP_TARGET"
-  fi
   mkdir -p "$UC_TMP/app-extract"
   tar -xzf "$UC_TARBALL_PATH" -C "$UC_TMP/app-extract"
   uc_extracted="$UC_TMP/app-extract/ultracode-$UC_RESOLVED_VERSION"
@@ -273,7 +272,19 @@ install_app() {
   done
   uc_app_stage="$UC_INSTALL_DIR/app/.stage-$$"
   mv "$uc_extracted" "$uc_app_stage"
-  mv "$uc_app_stage" "$UC_APP_TARGET"
+  # Decide at the last instant, mirroring provision_node: a concurrent
+  # same-version install may have landed a complete copy while we downloaded
+  # — keep it (current/a detached runner may already reference it) instead
+  # of wiping and re-landing ours.
+  if [ -f "$UC_APP_TARGET/.install-receipt.json" ] && [ -f "$UC_APP_TARGET/dist/cli/main.js" ]; then
+    rm -rf "$uc_app_stage"
+  else
+    if [ -e "$UC_APP_TARGET" ] || [ -L "$UC_APP_TARGET" ]; then
+      warn "removing incomplete install at $UC_APP_TARGET"
+      rm -rf "$UC_APP_TARGET"
+    fi
+    mv "$uc_app_stage" "$UC_APP_TARGET"
+  fi
 }
 
 flip_current() {
