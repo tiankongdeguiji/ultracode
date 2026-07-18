@@ -127,7 +127,7 @@ ultracode resume <runId> [--script edited.js]   # unchanged journal prefix repla
 
 ### Build from source
 
-The installer needs only `curl`: it fetches a self-contained ~360 KB tarball, verifies checksums, and — if no Node >= 20 is present — provisions a Node runtime from the same bucket. To build from source instead:
+If you need to develop ultracode, build from source:
 
 ```bash
 git clone https://github.com/tiankongdeguiji/ultracode.git

@@ -127,7 +127,7 @@ ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journ
 
 ### 从源码构建
 
-安装器只依赖 `curl`：它会下载一个约 360 KB 的自包含 tarball 并验证校验和；若系统中没有 Node >= 20，还会从同一个 OSS bucket 自动补齐一份 Node 运行时。如需改为从源码构建：
+如需参与开发 ultracode，可从源码构建：
 
 ```bash
 git clone https://github.com/tiankongdeguiji/ultracode.git
