@@ -1,10 +1,12 @@
 # Nightly Release
 #
 # Every night (or on manual dispatch — that is how the first publish happens,
-# and how a partially-failed release is reconciled), if main has commits since
-# the last v* tag: run the full CI gate on that exact HEAD, bump the patch
-# version, tag, upload the tarball + Node runtime mirror to OSS, then publish
-# a GitHub Release with generated notes.
+# and how a partially-failed release is reconciled), if package.json holds a
+# version with no v<version> tag yet: run the full CI gate on that exact HEAD,
+# tag it, upload the tarball + Node runtime mirror to OSS, then publish a
+# GitHub Release with generated notes. Releases are version-gated, not
+# commit-gated: maintainers bump via `npm version <bump> --no-git-tag-version`
+# and merge to main; CI never invents version numbers.
 #
 # ---- Ops Prerequisites ----
 # The runner must be an Alibaba Cloud ECS instance with a RAM role attached that
@@ -49,26 +51,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Scheduled runs skip when HEAD is already tagged (this also prevents the
-      # nightly bump commit from re-triggering a release the next night). A
-      # manual dispatch ALWAYS proceeds — it is the reconcile path after a
-      # partial failure (tag or GitHub Release created but OSS incomplete).
-      - name: Check for new commits
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Scheduled runs skip when the version in package.json is already
+      # released (its v<version> tag exists on the remote). A manual dispatch
+      # ALWAYS proceeds — it is the reconcile path after a partial failure
+      # (tag or GitHub Release created but OSS incomplete).
+      - name: Check for an unreleased version
         id: gate
         run: |
-          last=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
-          if [ "$GITHUB_EVENT_NAME" = 'schedule' ] && [ -n "$last" ] && [ "$(git rev-list "$last"..HEAD --count)" -eq 0 ]; then
-            echo 'no commits since '"$last"', skipping'
+          v=$(node -p "require('./package.json').version")
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = 'schedule' ] && [ -n "$(git ls-remote --tags origin "refs/tags/v$v")" ]; then
+            echo "v$v is already released, skipping"
             echo 'skip=true' >> "$GITHUB_OUTPUT"
           else
             echo 'skip=false' >> "$GITHUB_OUTPUT"
           fi
-
-      - if: steps.gate.outputs.skip != 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
 
       - if: steps.gate.outputs.skip != 'true'
         run: npm ci
@@ -77,27 +79,19 @@ jobs:
       - if: steps.gate.outputs.skip != 'true'
         run: npm run typecheck && npm run lint && npm test
 
-      # GITHUB_TOKEN pushes do not recursively trigger workflows; the gate
-      # already ran on this tree. An already-tagged HEAD means a previous run
-      # bumped and then failed later — keep that version and reconcile.
-      - name: Bump version and tag
+      # A tag on the exact HEAD the gate just ran on. An existing tag means a
+      # previous run tagged and then failed later — keep it and reconcile.
+      # (GITHUB_TOKEN pushes do not recursively trigger workflows.)
+      - name: Tag the release
         if: steps.gate.outputs.skip != 'true'
         run: |
-          if git describe --tags --exact-match --match 'v*' HEAD >/dev/null 2>&1; then
-            echo 'HEAD is already tagged; skipping bump (reconcile re-run)'
+          v='${{ steps.gate.outputs.v }}'
+          if git rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
+            echo "v$v already tagged; reconcile re-run"
           else
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            npm version patch -m 'chore: bump version to %s'
-            git push origin HEAD:main --follow-tags
+            git tag "v$v"
+            git push origin "v$v"
           fi
-
-      - name: Capture released version
-        id: version
-        if: steps.gate.outputs.skip != 'true'
-        run: |
-          v=$(node -p "require('./package.json').version")
-          echo "v=$v" >> "$GITHUB_OUTPUT"
 
       - name: Build release tarball
         if: steps.gate.outputs.skip != 'true'
@@ -134,7 +128,7 @@ jobs:
       - name: GitHub Release with generated notes
         if: steps.gate.outputs.skip != 'true'
         run: |
-          v='${{ steps.version.outputs.v }}'
+          v='${{ steps.gate.outputs.v }}'
           gh release view "v$v" >/dev/null 2>&1 || gh release create "v$v" --generate-notes \
             "dist-release/ultracode-$v.tar.gz" \
             "dist-release/ultracode-$v.tar.gz.sha256"
