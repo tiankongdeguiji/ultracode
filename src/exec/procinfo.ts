@@ -176,6 +176,7 @@ export function findWorkerProcessesForTokens(
           const raw = execFileSync(
             '/bin/ps',
             [
+              '-ww',
               ...(includeEnvironment ? ['-E'] : []),
               '-o',
               'pid=',
@@ -306,7 +307,10 @@ export function signalTrackedWorkerProcesses(
     const live = readProcStat(proc.pid);
     if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
     try {
-      process.kill(proc.pid, signal);
+      // An authenticated session leader may have same-group descendants that
+      // deliberately replaced their environment. Cover those children without
+      // extending group signaling to a marked process inside another PGID.
+      process.kill(proc.pgrp === proc.pid ? -proc.pid : proc.pid, signal);
       processes++;
       signaledTokens.add(proc.token);
       signaledIdentities.add(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`);

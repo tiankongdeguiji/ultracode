@@ -136,17 +136,21 @@ describe('escaped worker descendant cleanup', () => {
     }
   });
 
-  it('reaps a worker tree from a token-only crash-window record', async () => {
+  it('reaps escaped and markerless same-group children from a token-only record', async () => {
     if (process.platform !== 'linux') return;
     const runDir = mkdtempSync(join(tmpdir(), 'uc-token-recovery-'));
     const pidFile = join(runDir, 'escaped.pid');
+    const markerlessPidFile = join(runDir, 'markerless.pid');
     const escapedSource = 'setInterval(() => {}, 60_000)';
     const launcherSource = [
       "const { spawn } = require('node:child_process')",
       "const { writeFileSync } = require('node:fs')",
       `const escaped = spawn(process.execPath, ['-e', ${JSON.stringify(escapedSource)}], { detached: true, stdio: 'ignore', env: process.env })`,
+      `const markerless = spawn(process.execPath, ['-e', ${JSON.stringify(escapedSource)}], { stdio: 'ignore', env: {} })`,
       `writeFileSync(${JSON.stringify(pidFile)}, String(escaped.pid))`,
+      `writeFileSync(${JSON.stringify(markerlessPidFile)}, String(markerless.pid))`,
       'escaped.unref()',
+      'markerless.unref()',
       'setInterval(() => {}, 60_000)',
     ].join(';');
     const launcher = spawnAgentProcess(process.execPath, ['-e', launcherSource], {
@@ -156,18 +160,28 @@ describe('escaped worker descendant cleanup', () => {
     });
     const launcherPid = launcher.child.pid!;
     let escapedPid: number | undefined;
+    let markerlessPid: number | undefined;
     try {
       escapedPid = await waitForPid(pidFile);
+      markerlessPid = await waitForPid(markerlessPidFile);
       mkdirSync(workerRecordDir(runDir, 0), { recursive: true });
       writeFileSync(workerRecordPath(runDir, 0, 1), `- - ${launcher.workerToken}`);
       expect(killWorkerGroups(runDir)).toBe(1);
       expect(await waitUntilGone(launcherPid)).toBe(true);
       expect(await waitUntilGone(escapedPid)).toBe(true);
+      expect(await waitUntilGone(markerlessPid)).toBe(true);
     } finally {
       launcher.killTree('SIGKILL');
       if (escapedPid !== undefined) {
         try {
           process.kill(-escapedPid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      if (markerlessPid !== undefined) {
+        try {
+          process.kill(markerlessPid, 'SIGKILL');
         } catch {
           /* already gone */
         }

@@ -4,7 +4,8 @@
  * unit-adjacent tests (~2-4s each).
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -13,7 +14,12 @@ import { createRunDir, getRun, isPidAlive } from '../../src/store/runstore.js';
 import { readManifest, isTerminal } from '../../src/store/manifest.js';
 import { launchRunner } from '../../src/exec/daemonize.js';
 import { readJournal } from '../../src/engine/journal.js';
-import { findWorkerProcesses, readProcStat, WORKER_TOKEN_ENV } from '../../src/exec/procinfo.js';
+import {
+  findWorkerProcesses,
+  readProcessIdentity,
+  readProcStat,
+  WORKER_TOKEN_ENV,
+} from '../../src/exec/procinfo.js';
 import { killWorkerGroups, stopRun } from '../../src/exec/stop.js';
 
 const HELLO = `export const meta = { name: 'hello', description: 'd', phases: [{ title: 'Greet' }] }
@@ -200,6 +206,34 @@ describe('detached runner', () => {
     await sleep(200);
     expect(isPidAlive(pid)).toBe(false);
   }, 30_000);
+
+  it('surfaces a live unauthenticated legacy worker record for manual cleanup', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const run = makeRun(HELLO);
+    const legacyDir = join(run.dir, 'agents', '0000-legacy');
+    mkdirSync(legacyDir, { recursive: true });
+    const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60_000)'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    worker.unref();
+    const pid = worker.pid!;
+    try {
+      const identity = readProcessIdentity(pid)!;
+      writeFileSync(join(legacyDir, 'pgid'), `${pid} ${identity.starttime}`);
+      const stopped = await stopRun(run.root, run.runId);
+      expect(stopped).toMatchObject({ ok: false, status: 'orphaned' });
+      expect(stopped.message).toContain('unauthenticated legacy worker group(s) still active');
+      expect(stopped.message).toContain('manual cleanup required');
+      expect(readProcessIdentity(pid)).toBeTruthy();
+    } finally {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  });
 
   it('hard-stop backstop force-exits a run whose script never unwinds after the wall-clock cap', async () => {
     // The script awaits a never-settling promise: the wall-clock cap fires

@@ -9,11 +9,36 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import {
   findWorkerProcessesForTokens,
   signalTrackedWorkerProcesses,
+  signalWorkerProcessTokens,
   signalWorkerProcesses,
   WORKER_SCOPE_ENV,
   WORKER_TOKEN_ENV,
   workerScopeValue,
 } from './procinfo.js';
+
+interface ActiveWorker {
+  scope: string | undefined;
+  signalGroup(signal: NodeJS.Signals): boolean;
+  token: string;
+}
+
+const ACTIVE_WORKERS = new Map<string, ActiveWorker>();
+
+/** Signal trusted in-memory worker identities without reading recovery files. */
+export function killActiveWorkers(signal: NodeJS.Signals = 'SIGKILL'): number {
+  const tokensByScope = new Map<string | undefined, string[]>();
+  let signaled = 0;
+  for (const worker of ACTIVE_WORKERS.values()) {
+    if (worker.signalGroup(signal)) signaled++;
+    const tokens = tokensByScope.get(worker.scope) ?? [];
+    tokens.push(worker.token);
+    tokensByScope.set(worker.scope, tokens);
+  }
+  for (const [scope, tokens] of tokensByScope) {
+    signaled += signalWorkerProcessTokens(tokens, signal, scope).processes;
+  }
+  return signaled;
+}
 
 export interface SpawnedAgent {
   child: ChildProcess;
@@ -72,18 +97,33 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     return groupTargetRetired;
   };
 
-  const killTree = (signal: NodeJS.Signals = 'SIGTERM'): void => {
-    if (pid && !groupTargetRetired) {
-      if (groupAlive()) {
-        try {
-          process.kill(-pid, signal); // whole process group
-        } catch {
-          retireGroupIfGone();
-        }
-      } else {
-        groupTargetRetired = true;
-      }
+  const signalGroup = (signal: NodeJS.Signals): boolean => {
+    if (!pid || groupTargetRetired) return false;
+    if (!groupAlive()) {
+      // Never target this numeric PGID after observing it absent; a later
+      // process group may reuse the id during or after cleanup.
+      groupTargetRetired = true;
+      return false;
     }
+    try {
+      process.kill(-pid, signal);
+      return true;
+    } catch {
+      retireGroupIfGone();
+      return false;
+    }
+  };
+
+  if (pid) {
+    ACTIVE_WORKERS.set(workerToken, {
+      scope: opts.workerScope,
+      signalGroup,
+      token: workerToken,
+    });
+  }
+
+  const killTree = (signal: NodeJS.Signals = 'SIGTERM'): void => {
+    signalGroup(signal);
     // Codex's Linux sandbox calls setsid()/bwrap --new-session, so descendants
     // can leave the worker PGID. The inherited token is the containment
     // boundary for those escaped sessions.
@@ -92,20 +132,6 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
 
   const cleanupEscaped = async (graceMs = 500): Promise<number> => {
     retireGroupIfGone();
-    const signalGroup = (signal: NodeJS.Signals): void => {
-      if (!pid || groupTargetRetired) return;
-      if (!groupAlive()) {
-        // Never target this numeric PGID again after observing it absent: a
-        // later process group may reuse the id during or after this sweep.
-        groupTargetRetired = true;
-        return;
-      }
-      try {
-        process.kill(-pid, signal);
-      } catch {
-        /* group already gone */
-      }
-    };
     const tokenProcesses = () => findWorkerProcessesForTokens([workerToken], opts.workerScope);
     const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
       let delayMs = 25;
@@ -124,8 +150,14 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
         delayMs = Math.min(delayMs * 2, 100);
       }
     };
-    if (await sweepUntil('SIGTERM', Date.now() + graceMs)) return 0;
-    if (await sweepUntil('SIGKILL', Date.now() + graceMs)) return 0;
+    if (await sweepUntil('SIGTERM', Date.now() + graceMs)) {
+      ACTIVE_WORKERS.delete(workerToken);
+      return 0;
+    }
+    if (await sweepUntil('SIGKILL', Date.now() + graceMs)) {
+      ACTIVE_WORKERS.delete(workerToken);
+      return 0;
+    }
     retireGroupIfGone();
     return tokenProcesses().length + Number(!groupTargetRetired);
   };

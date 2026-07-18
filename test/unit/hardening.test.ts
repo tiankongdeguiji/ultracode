@@ -118,11 +118,15 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     const runDir = tmp('uc-kill-matching-');
     const agentDir = join(runDir, 'agents', 'worker');
     mkdirSync(agentDir, { recursive: true });
-    const worker = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
-      cwd: process.cwd(),
-      env: {},
-      workerScope: runDir,
-    });
+    const worker = spawnAgentProcess(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1e9)', 'x'.repeat(1_024)],
+      {
+        cwd: process.cwd(),
+        env: {},
+        workerScope: runDir,
+      },
+    );
     const pid = worker.child.pid!;
     try {
       const stat = readProcessIdentity(pid)!;

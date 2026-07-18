@@ -138,19 +138,25 @@ function readWorkerRecord(path: string): string | undefined {
 
 interface RecoveryRecords {
   groupRecords: Map<string, { path: string; pid: number; starttime: string; token: string }>;
+  legacyGroupIds: Set<number>;
   tokenRecords: Map<string, string>;
 }
 
 function loadRecoveryRecords(runDir: string): RecoveryRecords {
   const groupRecords = new Map<string, { path: string; pid: number; starttime: string; token: string }>();
+  const legacyGroupIds = new Set<number>();
   const tokenRecords = new Map<string, string>();
   for (const path of collectWorkerRecordPaths(runDir)) {
     const raw = readWorkerRecord(path);
     if (raw === undefined) continue;
     const fields = raw.trim().split(/\s+/);
-    if (fields.length < 2 || fields.length > 3) continue;
+    if (fields.length > 3) continue;
     const [pidStr, recordedStart, workerToken] = fields;
     const pid = Number(pidStr);
+    if (fields.length < 3 && isSafeProcessId(pid) && pid !== process.pid) {
+      legacyGroupIds.add(pid);
+      continue;
+    }
     if (
       isSafeProcessId(pid) &&
       pid !== process.pid &&
@@ -166,7 +172,22 @@ function loadRecoveryRecords(runDir: string): RecoveryRecords {
     }
     if (isWorkerToken(workerToken) && !tokenRecords.has(workerToken)) tokenRecords.set(workerToken, path);
   }
-  return { groupRecords, tokenRecords };
+  return { groupRecords, legacyGroupIds, tokenRecords };
+}
+
+function countLiveLegacyWorkerGroups(records: RecoveryRecords): number {
+  const liveGroups = new Set<number>();
+  for (const pid of records.legacyGroupIds) {
+    // The old leader may already be gone while same-PGID helpers remain. A
+    // signal-0 probe can surface that group without authorizing a real signal.
+    try {
+      process.kill(-pid, 0);
+      liveGroups.add(pid);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') liveGroups.add(pid);
+    }
+  }
+  return liveGroups.size;
 }
 
 function signalRecordedWorkerGroups(runDir: string, records: RecoveryRecords): Set<string> {
@@ -234,8 +255,12 @@ export function killWorkerGroups(runDir: string): number {
   return actedRecords.size;
 }
 
-/** Kill workers, then asynchronously confirm stable token absence. */
-export async function killWorkerGroupsUntilGone(runDir: string, graceMs = 100): Promise<number> {
+interface WorkerCleanupReport {
+  killedRecords: number;
+  liveLegacyGroups: number;
+}
+
+async function cleanupWorkerGroupsUntilGone(runDir: string, graceMs = 100): Promise<WorkerCleanupReport> {
   const records = loadRecoveryRecords(runDir);
   const actedRecords = signalRecordedWorkerGroups(runDir, records);
   const tokenResult = await signalWorkerProcessTokensUntilGone(
@@ -245,13 +270,28 @@ export async function killWorkerGroupsUntilGone(runDir: string, graceMs = 100): 
     graceMs,
   );
   recordSignaledTokens(actedRecords, records.tokenRecords, tokenResult.tokens);
-  return actedRecords.size;
+  return {
+    killedRecords: actedRecords.size,
+    liveLegacyGroups: countLiveLegacyWorkerGroups(records),
+  };
+}
+
+/** Kill workers, then asynchronously confirm stable token absence. */
+export async function killWorkerGroupsUntilGone(runDir: string, graceMs = 100): Promise<number> {
+  return (await cleanupWorkerGroupsUntilGone(runDir, graceMs)).killedRecords;
 }
 
 export interface StopResult {
   ok: boolean;
   status: string;
   message: string;
+}
+
+function cleanupStopResult(status: string, message: string, report: WorkerCleanupReport): StopResult {
+  const killed = report.killedRecords ? ` (+${report.killedRecords} worker record(s))` : '';
+  if (report.liveLegacyGroups === 0) return { ok: true, status, message: `${message}${killed}` };
+  const legacy = `${report.liveLegacyGroups} unauthenticated legacy worker group(s) still active; manual cleanup required`;
+  return { ok: false, status, message: `${message}${killed}; ${legacy}` };
 }
 
 export async function stopRun(root: string, runId: string): Promise<StopResult> {
@@ -261,25 +301,17 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
     // A hard-stop can finalize as `stopped` immediately before process.exit(),
     // and a backend can leave setsid() descendants after any terminal outcome.
     // Stale records are therefore actionable for every terminal status.
-    const killed = await killWorkerGroupsUntilGone(run.dir);
-    return {
-      ok: true,
-      status: run.effectiveStatus,
-      message: `already ${run.effectiveStatus}${killed ? ` (+${killed} stale worker record(s))` : ''}`,
-    };
+    const cleanup = await cleanupWorkerGroupsUntilGone(run.dir);
+    return cleanupStopResult(run.effectiveStatus, `already ${run.effectiveStatus}`, cleanup);
   }
   const pid = run.manifest.pid;
   // isRunnerAlive (not isPidAlive): a live PID whose start-time no longer
   // matches is a recycled PID, not our runner — signaling it would hit an
   // unrelated process. Treat that as already-dead (and reap its workers).
   if (!isRunnerAlive(run.manifest)) {
-    const killed = await killWorkerGroupsUntilGone(run.dir);
+    const cleanup = await cleanupWorkerGroupsUntilGone(run.dir);
     reapOrphans(root);
-    return {
-      ok: true,
-      status: 'orphaned',
-      message: `runner already dead; marked orphaned${killed ? ` (+${killed} worker group(s))` : ''}`,
-    };
+    return cleanupStopResult('orphaned', 'runner already dead; marked orphaned', cleanup);
   }
   try {
     process.kill(pid, 'SIGTERM');
@@ -289,7 +321,10 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   const deadline = Date.now() + 7_000;
   while (Date.now() < deadline) {
     const m = readManifest(run.dir);
-    if (m && isTerminal(m.status)) return { ok: true, status: m.status, message: m.status };
+    if (m && isTerminal(m.status)) {
+      const cleanup = await cleanupWorkerGroupsUntilGone(run.dir);
+      return cleanupStopResult(m.status, m.status, cleanup);
+    }
     await sleep(200);
   }
   try {
@@ -299,11 +334,7 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   }
   // The runner was unresponsive → it never killed its detached agent groups;
   // do it here so workers don't keep running/mutating files after "stopped".
-  const killedGroups = await killWorkerGroupsUntilGone(run.dir);
+  const cleanup = await cleanupWorkerGroupsUntilGone(run.dir);
   reapOrphans(root);
-  return {
-    ok: true,
-    status: 'stopped',
-    message: `force-killed after 7s grace${killedGroups ? ` (+${killedGroups} worker group(s))` : ''}`,
-  };
+  return cleanupStopResult('stopped', 'force-killed after 7s grace', cleanup);
 }

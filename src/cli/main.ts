@@ -202,10 +202,13 @@ program
   .requiredOption('--run-dir <dir>')
   .action(async (opts: { runDir: string }) => {
     const { runnerMain } = await import('./runner.js');
-    const { killWorkerGroups, killWorkerGroupsUntilGone } = await import('../exec/stop.js');
+    const { killActiveWorkers } = await import('../exec/spawn.js');
+    const { killWorkerGroupsUntilGone } = await import('../exec/stop.js');
     const cleanupWorkers = () => {
       try {
-        killWorkerGroups(opts.runDir);
+        // Fatal monitors cannot await and must not parse worker-writable disk
+        // state. In-memory identities cover workers active in this runner.
+        killActiveWorkers();
       } catch {
         /* fatal path: best-effort worker containment */
       }
