@@ -18,6 +18,7 @@ import {
   mkdtempSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -291,7 +292,9 @@ describe.skipIf(!hasCurl)('install.sh', () => {
       },
     });
     expect(res.status, res.stderr).toBe(0);
-    expect(readlinkSync(join(home, 'inst/app/current'))).toBe(join(home, 'inst/app/9.9.9'));
+    // The shell's $PWD is the physical cwd — on macOS tmpdir() is behind the
+    // /var -> /private/var symlink, so compare against the realpath.
+    expect(readlinkSync(join(home, 'inst/app/current'))).toBe(join(realpathSync(home), 'inst/app/9.9.9'));
     const run = spawnSync(join(home, 'bin/ultracode'), { encoding: 'utf8', env: { HOME: home, PATH: process.env.PATH ?? '' } });
     expect(run.stdout.trim()).toBe('9.9.9');
   }, 30_000);
