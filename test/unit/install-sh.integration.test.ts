@@ -313,6 +313,35 @@ describe.skipIf(!hasCurl)('install.sh', () => {
     expect(runShim(home).stdout).toContain('FAKE-NODE-RAN');
   }, 30_000);
 
+  it('a corrupted Node runtime download dies before installing anything', () => {
+    const home = makeHome();
+    const origin = makeOrigin();
+    addRelease(origin, '9.9.9');
+    const fakeBin = mkdtempSync(join(tmpdir(), 'uc-inst-fakebin-'));
+    writeFileSync(join(fakeBin, 'node'), '#!/bin/sh\nexit 1\n');
+    chmodSync(join(fakeBin, 'node'), 0o755);
+    const os = process.platform === 'darwin' ? 'darwin' : 'linux';
+    const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+    const runtimeName = `node-v22.14.0-${os}-${arch}`;
+    const rtStage = mkdtempSync(join(tmpdir(), 'uc-inst-rt-'));
+    mkdirSync(join(rtStage, runtimeName, 'bin'), { recursive: true });
+    writeFileSync(join(rtStage, runtimeName, 'bin/node'), '#!/bin/sh\necho v22.14.0\n');
+    chmodSync(join(rtStage, runtimeName, 'bin/node'), 0o755);
+    mkdirSync(join(origin, 'runtime'), { recursive: true });
+    const rtTarball = join(origin, 'runtime', `${runtimeName}.tar.gz`);
+    const tar = spawnSync('tar', ['-czf', rtTarball, '-C', rtStage, runtimeName]);
+    expect(tar.status).toBe(0);
+    writeFileSync(`${rtTarball}.sha256`, `${sha256(rtTarball)}  ${runtimeName}.tar.gz\n`);
+    appendFileSync(rtTarball, 'garbage');
+
+    const res = runInstall(home, origin, { UC_NODE: '', PATH: `${fakeBin}:${process.env.PATH ?? ''}` });
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toContain('sha256 mismatch for the Node runtime');
+    expect(existsSync(join(home, '.ultracode/runtime'))).toBe(false);
+    expect(existsSync(join(home, '.ultracode/app'))).toBe(false);
+    expect(existsSync(join(home, '.local/bin/ultracode'))).toBe(false);
+  }, 30_000);
+
   it('installs a freshly built real release artifact and the shim reports --version', () => {
     // Built into a private outDir — reading the repo-default dist-release/
     // would race release.test.ts, which wipes and rebuilds it in a parallel

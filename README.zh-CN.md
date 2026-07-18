@@ -97,7 +97,7 @@ agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ultracode update                  # 自升级；--check 只检查、不安装
 ```
 
-重新执行上面的一行安装命令效果相同。升级后请重新执行 `ultracode install <host>`，让宿主集成指向新的引擎路径。
+对于安装在默认位置的情况，重新执行上面的一行安装命令效果相同。升级后请重新执行 `ultracode install <host>`，让宿主集成指向新的引擎路径。
 
 ### 直接使用引擎
 

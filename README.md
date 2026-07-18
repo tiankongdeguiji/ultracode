@@ -97,7 +97,7 @@ agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ultracode update                  # self-update; --check reports without installing
 ```
 
-Re-running the install one-liner does the same. After upgrading, re-run `ultracode install <host>` so host integrations pick up the new engine path.
+Re-running the install one-liner does the same for a default-location install. After upgrading, re-run `ultracode install <host>` so host integrations pick up the new engine path.
 
 ### Driving the engine directly
 

@@ -128,11 +128,13 @@ describe('release-oss publish --dry-run', () => {
     expect(tarball).not.toContain('Content-Type');
   });
 
-  it('redacts AccessKey id, secret, and STS token everywhere in output', () => {
+  it('keeps AccessKey id, secret, and STS token off every argv (temp config via -c)', () => {
     expect(out).not.toContain('AKIDFAKE');
     expect(out).not.toContain('sekret');
     expect(out).not.toContain('ststoken');
-    expect(out).toContain('-i *** -k *** -t ***');
+    expect(out).not.toContain(' -i ');
+    expect(out).not.toContain(' -k ');
+    expect(out).toMatch(/ -c \S*uc-osscred-/);
   });
 
   it('writes dist-release/latest.json with schema, release key, and the real sha256', () => {
@@ -222,10 +224,16 @@ const STUB_SOURCE = `#!/usr/bin/env node
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 appendFileSync(process.env.STUB_LOG, JSON.stringify(args) + '\\n');
-const objects = JSON.parse(readFileSync(process.env.STUB_OBJECTS, 'utf8'));
+const cfg = JSON.parse(readFileSync(process.env.STUB_OBJECTS, 'utf8'));
+const objects = cfg.objects;
+const errors = cfg.errors ?? {};
 const sub = args[0];
 if (sub === 'stat' || sub === 'cat') {
   const key = args[1];
+  if (key in errors) {
+    process.stderr.write(errors[key] + '\\n');
+    process.exit(1);
+  }
   if (!(key in objects)) {
     process.stderr.write('oss: object not exists\\n');
     process.exit(1);
@@ -269,7 +277,10 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
   const REMOTE_TAR = 'oss://hongsheng-jhs/ultracode/releases/v1.2.3/ultracode-1.2.3.tar.gz';
   const REMOTE_SHA = `${REMOTE_TAR}.sha256`;
 
-  function stubEnv(remoteObjects: Record<string, string>): { env: NodeJS.ProcessEnv; log: string } {
+  function stubEnv(
+    remoteObjects: Record<string, string>,
+    errors: Record<string, string> = {},
+  ): { env: NodeJS.ProcessEnv; log: string } {
     // Stub state lives OUTSIDE the fixture repo — extra files there would
     // trip the clean-tree preflight.
     const stubDir = mkdtempSync(join(tmpdir(), 'uc-osstub-'));
@@ -283,7 +294,7 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
       remoteObjects[`oss://hongsheng-jhs/ultracode/runtime/node-v22.14.0-${plat}.tar.gz`] ??= '';
     }
     const objects = join(stubDir, 'stub-objects.json');
-    writeFileSync(objects, JSON.stringify(remoteObjects));
+    writeFileSync(objects, JSON.stringify({ objects: remoteObjects, errors }));
     const env = baseEnv({
       ALIBABA_CLOUD_ECS_METADATA: 'ci-role',
       OSSUTIL_BIN: stub,
@@ -348,6 +359,35 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
     const latest = JSON.parse(readFileSync(join(dir, 'dist-release/latest.json'), 'utf8'));
     expect(latest.sha256).toBe(remoteSha);
     expect(latest.sha256).not.toBe(sha256);
+  });
+
+  it('--force overwrites an existing release with the local artifacts', async () => {
+    const { dir, sha256 } = makeRoot();
+    const { env, log } = stubEnv({
+      [REMOTE_TAR]: 'remote-bytes',
+      [REMOTE_SHA]: `${'b'.repeat(64)}  ultracode-1.2.3.tar.gz\n`,
+    });
+    await runAsync(['--force', '--root', dir], env);
+    const dests = uploads(log).map((a) => a[3]);
+    expect(dests).toEqual([
+      REMOTE_TAR,
+      REMOTE_SHA,
+      'oss://hongsheng-jhs/ultracode/install.sh',
+      'oss://hongsheng-jhs/ultracode/latest.json',
+    ]);
+    expect(JSON.parse(readFileSync(join(dir, 'dist-release/latest.json'), 'utf8')).sha256).toBe(sha256);
+  });
+
+  it('an auth/network stat error aborts instead of being read as absence', async () => {
+    const { dir } = makeRoot();
+    const { env, log } = stubEnv(
+      {},
+      { [REMOTE_TAR]: 'Error: oss: service returned error: StatusCode=403, ErrorCode=AccessDenied' },
+    );
+    const r = await runFailAsync(['--root', dir], env);
+    expect(r.status).not.toBe(0);
+    expect(r.output).toMatch(/refusing to guess/);
+    expect(uploads(log)).toHaveLength(0);
   });
 
   it('--resume with a missing sidecar restores it from the remote bytes before the pointers', async () => {

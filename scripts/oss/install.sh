@@ -224,13 +224,6 @@ EOF
 }
 
 install_app() {
-  UC_APP_TARGET="$UC_INSTALL_DIR/app/$UC_RESOLVED_VERSION"
-  if [ -f "$UC_APP_TARGET/.install-receipt.json" ]; then
-    # A receipted dir is a valid same-version install — and a detached runner
-    # may be executing from it right now, so leave it alone.
-    info "ultracode $UC_RESOLVED_VERSION is already installed; keeping the existing copy"
-    return 0
-  fi
   if [ -e "$UC_APP_TARGET" ] || [ -L "$UC_APP_TARGET" ]; then
     warn "removing receiptless partial install at $UC_APP_TARGET"
     rm -rf "$UC_APP_TARGET"
@@ -346,10 +339,18 @@ main() {
   trap cleanup_tmp EXIT
   trap 'exit 1' INT TERM
   resolve_version
-  info "installing ultracode $UC_RESOLVED_VERSION ($UC_OS-$UC_ARCH) into $UC_INSTALL_DIR"
+  UC_APP_TARGET="$UC_INSTALL_DIR/app/$UC_RESOLVED_VERSION"
   choose_node
-  download_app
-  install_app
+  if [ -f "$UC_APP_TARGET/.install-receipt.json" ]; then
+    # A receipted dir is a valid same-version install — a detached runner may
+    # be executing from it right now, so keep it and skip the download; the
+    # symlink and shim below still get refreshed.
+    info "ultracode $UC_RESOLVED_VERSION is already installed; keeping the existing copy"
+  else
+    info "installing ultracode $UC_RESOLVED_VERSION ($UC_OS-$UC_ARCH) into $UC_INSTALL_DIR"
+    download_app
+    install_app
+  fi
   flip_current
   write_shim
   path_hint

@@ -122,6 +122,13 @@ async function performUpdate(
     process.stdout.write(`already on ${VERSION} — nothing to update\n`);
     return 0;
   }
+  if (!opts.to && compareVersions(target, VERSION) < 0) {
+    // Matches --check: when latest.json lags the running build (prerelease,
+    // --to-pinned install, or a rolled-back pointer) a bare update must not
+    // silently downgrade; only an explicit --to goes backward.
+    process.stdout.write(`up to date (${VERSION}; latest is ${target})\n`);
+    return 0;
+  }
   if (!receipt.installDir || !receipt.binDir) {
     throw new Error(`receipt at ${receiptPath} is missing installDir/binDir`);
   }

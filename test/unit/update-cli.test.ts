@@ -185,6 +185,18 @@ describe('update CLI', () => {
     expect(out.chunks.join('')).toContain(`already on ${VERSION}`);
   });
 
+  it('bare update never downgrades when latest.json lags the running version', async () => {
+    // No install.sh exists in this origin — exit 0 proves the downgrade gate
+    // returned before any re-exec was attempted.
+    const origin = makeOrigin('{ "version": "0.0.1" }');
+    const { deps } = makeInstalled({ baseUrl: `file://${origin}`, installDir: '/x', binDir: '/y' });
+    const out = capture('stdout');
+    const code = await updateCommand({}, deps);
+    out.restore();
+    expect(code).toBe(0);
+    expect(out.chunks.join('')).toContain('up to date');
+  });
+
   it('--to rejects a malformed version with exit 2', async () => {
     const { deps } = makeInstalled({ baseUrl: 'file:///nowhere', installDir: '/x', binDir: '/y' });
     const err = capture('stderr');

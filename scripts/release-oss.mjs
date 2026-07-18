@@ -18,14 +18,14 @@
 //     defaults to the UC_NODE_VERSION pin in scripts/oss/install.sh.
 // Credentials come from the environment — ALIBABA_CLOUD_ECS_METADATA (ECS RAM
 // role, the nightly-CI path), OSS_ACCESS_KEY_ID + OSS_ACCESS_KEY_SECRET
-// (optional OSS_STS_TOKEN), or OSS_CONFIG_FILE — and key material is redacted
-// as *** in every printed command. --dry-run runs every local preflight and
+// (optional OSS_STS_TOKEN; written to a 0600 temp config passed via -c so no
+// secret ever rides an argv), or OSS_CONFIG_FILE. --dry-run runs every local preflight and
 // prints the exact argv stream without contacting OSS; --root <dir> overrides
 // the repo root and OSS_PUBLIC_URL the public endpoint (both exist for tests
 // and future mirrors).
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -99,13 +99,15 @@ function resolveCredentials(env) {
     return { credArgs: ['--mode', 'EcsRamRole', '--ecs-role-name', env.ALIBABA_CLOUD_ECS_METADATA], secrets: [] };
   }
   if (env.OSS_ACCESS_KEY_ID && env.OSS_ACCESS_KEY_SECRET) {
-    const credArgs = ['-i', env.OSS_ACCESS_KEY_ID, '-k', env.OSS_ACCESS_KEY_SECRET];
-    const secrets = [env.OSS_ACCESS_KEY_ID, env.OSS_ACCESS_KEY_SECRET];
-    if (env.OSS_STS_TOKEN) {
-      credArgs.push('-t', env.OSS_STS_TOKEN);
-      secrets.push(env.OSS_STS_TOKEN);
-    }
-    return { credArgs, secrets };
+    // Secrets must not ride ossutil's argv — /proc/<pid>/cmdline is world-
+    // readable for the lifetime of every upload. Write a 0600 config instead.
+    const dir = mkdtempSync(join(tmpdir(), 'uc-osscred-'));
+    const cfg = join(dir, 'config');
+    const lines = ['[Credentials]', `accessKeyID=${env.OSS_ACCESS_KEY_ID}`, `accessKeySecret=${env.OSS_ACCESS_KEY_SECRET}`];
+    if (env.OSS_STS_TOKEN) lines.push(`stsToken=${env.OSS_STS_TOKEN}`);
+    writeFileSync(cfg, lines.join('\n') + '\n', { mode: 0o600 });
+    process.on('exit', () => rmSync(dir, { recursive: true, force: true }));
+    return { credArgs: ['-c', cfg], secrets: [] };
   }
   if (env.OSS_CONFIG_FILE) {
     return { credArgs: ['-c', env.OSS_CONFIG_FILE], secrets: [] };
@@ -170,14 +172,14 @@ function parseNodePin(source) {
 }
 
 async function fetchText(url) {
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
   if (!res.ok) fail(`GET ${url} returned ${res.status}`);
   return res.text();
 }
 
 async function download(url, dest) {
   console.log(`downloading ${url}`);
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(600_000) });
   if (!res.ok) fail(`GET ${url} returned ${res.status}`);
   writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
 }
@@ -259,11 +261,15 @@ async function publish(ctx, root, opts) {
       // The tarball landed but its sidecar did not: finish the immutable pair
       // from the remote bytes, not the (differently-hashed) local rebuild.
       const tmp = mkdtempSync(join(tmpdir(), 'uc-reconcile-'));
-      const local = join(tmp, tarName);
-      fetchObject(ctx, releaseKey, local);
-      publishedSha = sha256File(local);
-      writeFileSync(`${local}.sha256`, `${publishedSha}  ${tarName}\n`);
-      cp(ctx, `${local}.sha256`, sidecarKey, IMMUTABLE_META);
+      try {
+        const local = join(tmp, tarName);
+        fetchObject(ctx, releaseKey, local);
+        publishedSha = sha256File(local);
+        writeFileSync(`${local}.sha256`, `${publishedSha}  ${tarName}\n`);
+        cp(ctx, `${local}.sha256`, sidecarKey, IMMUTABLE_META);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
       console.log(`v${version} tarball already on OSS — restored its missing .sha256 sidecar; reconciling the pointers`);
     }
   }
@@ -329,25 +335,29 @@ async function mirrorNode(ctx, root, opts) {
   const getShasums = async () => (shasums ??= await fetchText(shasumsUrl));
   let uploaded = 0;
   let skipped = 0;
-  for (const plat of NODE_PLATFORMS) {
-    const name = `node-v${version}-${plat}.tar.gz`;
-    const tarKey = `runtime/${name}`;
-    const haveTar = statExists(ctx, tarKey);
-    const haveSha = statExists(ctx, `${tarKey}.sha256`);
-    if (haveTar && haveSha) {
-      console.log(`${tarKey} already mirrored — skipping`);
-      skipped += 1;
-      continue;
+  try {
+    for (const plat of NODE_PLATFORMS) {
+      const name = `node-v${version}-${plat}.tar.gz`;
+      const tarKey = `runtime/${name}`;
+      const haveTar = statExists(ctx, tarKey);
+      const haveSha = statExists(ctx, `${tarKey}.sha256`);
+      if (haveTar && haveSha) {
+        console.log(`${tarKey} already mirrored — skipping`);
+        skipped += 1;
+        continue;
+      }
+      const expected = shasumFor(await getShasums(), name);
+      const local = join(dir, name);
+      await download(`${base}${name}`, local);
+      const actual = sha256File(local);
+      if (actual !== expected) fail(`checksum mismatch for ${name}: SHASUMS256.txt says ${expected}, download hashes to ${actual}`);
+      writeFileSync(`${local}.sha256`, `${actual}  ${name}\n`);
+      if (!haveTar) cp(ctx, local, tarKey, IMMUTABLE_META);
+      if (!haveSha) cp(ctx, `${local}.sha256`, `${tarKey}.sha256`, IMMUTABLE_META);
+      uploaded += 1;
     }
-    const expected = shasumFor(await getShasums(), name);
-    const local = join(dir, name);
-    await download(`${base}${name}`, local);
-    const actual = sha256File(local);
-    if (actual !== expected) fail(`checksum mismatch for ${name}: SHASUMS256.txt says ${expected}, download hashes to ${actual}`);
-    writeFileSync(`${local}.sha256`, `${actual}  ${name}\n`);
-    if (!haveTar) cp(ctx, local, tarKey, IMMUTABLE_META);
-    if (!haveSha) cp(ctx, `${local}.sha256`, `${tarKey}.sha256`, IMMUTABLE_META);
-    uploaded += 1;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
   console.log(`mirrored Node v${version}: ${uploaded} platform(s) uploaded, ${skipped} already present`);
 }
