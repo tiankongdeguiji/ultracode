@@ -12,6 +12,10 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 - Work in a new git worktree branched from `origin/main` (fetch first), not the primary checkout, and open the PR from that branch. A fresh worktree has no `node_modules` — run `npm ci` in it before testing.
 - Use the gitignored `agent_space/` for scratch (scripts, notes, experiment output); never commit it or reference it from tracked files — explain inline instead. Do NOT scratch in `.ultracode/` (the engine's runtime run store). Before removing a worktree, copy anything worth keeping from its `agent_space/` into the main checkout's.
 
+## Bench Harness
+
+- `bench/` is the SWE-bench Pro A/B benchmark (codex alone vs codex + ultracode); see `bench/README.md`. It is outside the CI typecheck gate — `npm run bench:check` typechecks it, and its pure logic is covered by offline `test/unit/bench-*.test.ts` which run in `npm test`. `bench/.cache/` and `bench/results/` are gitignored artifacts — never commit them. Live bench runs spend real tokens and are manual-only.
+
 ## Generated Plugin Bundles
 
 - `dist/` and the `dist-codex/`/`dist-qoder/` bundles are gitignored build outputs — never commit them. `npm run build:plugins` assembles bundles from canonical sources (`skill/`, `workflows/`, `hostpacks/<host>/`); `test/unit/dist.test.ts` rebuilds them before asserting, so they never go stale.

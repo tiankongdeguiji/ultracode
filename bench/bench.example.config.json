@@ -1,0 +1,17 @@
+{
+  "instances": { "ids": null, "count": 20, "seed": 7, "stratifyBy": "repo_language" },
+  "model": "gpt-5.2-codex",
+  "effort": "",
+  "auth": { "mode": "chatgpt" },
+  "arms": "both",
+  "timeouts": { "sessionSecs": 43200, "evalWatchdogSecs": 5400 },
+  "parallel": { "instances": 4, "evalWorkers": 8 },
+  "docker": { "cpus": 8, "memoryGb": 24, "keepImages": false },
+  "toolchain": { "nodeVersion": "22.14.0", "nodeDist": "npmmirror", "codexBin": "auto" },
+  "harness": {
+    "repo": "https://github.com/scaleapi/SWE-bench_Pro-os",
+    "pin": "ca10a60a5fcae51e6948ffe1485d4153d421e6c5"
+  },
+  "pipIndex": "https://mirrors.aliyun.com/pypi/simple",
+  "sanitizeGitHistory": true
+}
