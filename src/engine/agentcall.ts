@@ -589,6 +589,16 @@ export class AgentCallExecutor implements AgentExecutor {
     // can cancel any still pending — otherwise a kill stays armed 5s out against
     // a pid that has already closed and may be recycled (→ kill the wrong group).
     const escalationTimers: ReturnType<typeof setTimeout>[] = [];
+    const disarmAttemptControl = () => {
+      timer?.clear();
+      timer = undefined;
+      if (stallTimer) clearInterval(stallTimer);
+      stallTimer = undefined;
+      for (const pending of escalationTimers) clearTimeout(pending);
+      escalationTimers.length = 0;
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      onAbort = undefined;
+    };
     try {
       // Open the transcript once and writeSync to a persistent fd — not
       // appendFileSync (open+write+close) per NDJSON line, which serializes
@@ -682,6 +692,10 @@ export class AgentCallExecutor implements AgentExecutor {
         spawned.child.once('error', reject);
         spawned.child.once('exit', (c, s) => resolve([c, s]));
       });
+      const abortedAtExit = signal.aborted;
+      // The attempt outcome is fixed once the direct child exits. Descendant
+      // cleanup must not let a later timeout or stall tick reclassify it.
+      disarmAttemptControl();
       // An escaped helper may inherit the backend's stdout/stderr descriptors,
       // which prevents ChildProcess `close` even after the direct child exits.
       // Reap from `exit`, then give buffered output a bounded drain window.
@@ -711,7 +725,7 @@ export class AgentCallExecutor implements AgentExecutor {
           retryable: true,
           message: `no stream activity for ${spec.stallMs}ms (stall watchdog)`,
         };
-      } else if (signal.aborted) {
+      } else if (abortedAtExit) {
         exit = { ok: false, errorKind: 'interrupted', retryable: false, message: 'aborted' };
       }
       return { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, outputChars };
@@ -735,10 +749,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // Runs on both success and the spawn-error path — the error path is
       // retryable, so leaking the interval/timer/abort-listener would compound
       // across retries.
-      timer?.clear();
-      if (stallTimer) clearInterval(stallTimer);
-      for (const t of escalationTimers) clearTimeout(t);
-      if (onAbort) signal.removeEventListener('abort', onAbort);
+      disarmAttemptControl();
       // The normal path starts cleanup on direct-child `exit`. Retry here only
       // after an error or an incomplete sweep before dropping the recovery
       // record.

@@ -11,7 +11,12 @@ import { describe, expect, it } from 'vitest';
 import type { AgentEvent, AgentRequest, AgentSpec, BackendAdapter, ExitClass, SpawnPlan } from '../../src/backends/types.js';
 import { ZERO_USAGE } from '../../src/backends/types.js';
 import { AgentCallExecutor } from '../../src/engine/agentcall.js';
-import { findWorkerProcesses, readProcessIdentity, readProcStat } from '../../src/exec/procinfo.js';
+import {
+  findWorkerProcesses,
+  isSafeProcessId,
+  readProcessIdentity,
+  readProcStat,
+} from '../../src/exec/procinfo.js';
 import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { killWorkerGroups } from '../../src/exec/stop.js';
 
@@ -25,6 +30,7 @@ class EscapingAdapter implements BackendAdapter {
     private readonly pidFile: string,
     private readonly hang = false,
     private readonly inheritStdio = false,
+    private readonly ignoreTerm = false,
   ) {}
 
   probe() {
@@ -32,7 +38,12 @@ class EscapingAdapter implements BackendAdapter {
   }
 
   buildSpawn(_req: AgentRequest): SpawnPlan {
-    const escapedSource = 'setInterval(() => {}, 60_000)';
+    const escapedSource = [
+      this.ignoreTerm ? "process.on('SIGTERM', () => {})" : '',
+      'setInterval(() => {}, 60_000)',
+    ]
+      .filter(Boolean)
+      .join(';');
     const escapedStdio = this.inheritStdio ? "['ignore', 'inherit', 'inherit']" : "'ignore'";
     const source = [
       "const { spawn } = require('node:child_process')",
@@ -73,10 +84,24 @@ class EscapingAdapter implements BackendAdapter {
 async function waitForPid(file: string): Promise<number> {
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
-    if (existsSync(file)) return Number(readFileSync(file, 'utf8'));
+    try {
+      const pid = Number(readFileSync(file, 'utf8').trim());
+      if (isSafeProcessId(pid)) return pid;
+    } catch {
+      /* not written yet */
+    }
     await sleep(25);
   }
   throw new Error('escaped child pid was not written');
+}
+
+async function waitForFile(file: string): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (existsSync(file)) return;
+    await sleep(25);
+  }
+  throw new Error('readiness marker was not written');
 }
 
 async function waitUntilGone(pid: number): Promise<boolean> {
@@ -191,6 +216,34 @@ describe('escaped worker descendant cleanup', () => {
     }
   });
 
+  it('disarms attempt watchdogs before slow descendant cleanup', async () => {
+    if (process.platform !== 'linux') return;
+    const pidFile = join(mkdtempSync(join(tmpdir(), 'uc-cleanup-watchdog-')), 'pid');
+    const spec: AgentSpec = {
+      seq: 0,
+      prompt: 'finish while a stubborn escaped helper remains',
+      label: 'cleanup-watchdog',
+      backend: 'mock',
+      cwd: process.cwd(),
+      retries: 0,
+      timeoutMs: 250,
+    };
+
+    const pending = new AgentCallExecutor(new EscapingAdapter(pidFile, false, false, true)).execute(spec, SIGNAL);
+    const escapedPid = await waitForPid(pidFile);
+    try {
+      const outcome = await pending;
+      expect(outcome.ok).toBe(true);
+      expect(await waitUntilGone(escapedPid)).toBe(true);
+    } finally {
+      try {
+        process.kill(-escapedPid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+
   it('reaps the escaped session when an attempt timeout terminates the worker', async () => {
     if (process.platform !== 'linux') return;
     const pidFile = join(mkdtempSync(join(tmpdir(), 'uc-escaped-timeout-')), 'pid');
@@ -259,7 +312,7 @@ describe('escaped worker descendant cleanup', () => {
       env: {},
     });
     try {
-      await waitForPid(join(dir, 'ready-0'));
+      await waitForFile(join(dir, 'ready-0'));
       expect(await launcher.cleanupEscaped(1_000)).toBe(0);
       for (let generation = 0; generation <= 2; generation++) {
         expect(existsSync(join(dir, `ready-${generation}`))).toBe(true);

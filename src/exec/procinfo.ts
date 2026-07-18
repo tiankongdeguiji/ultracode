@@ -16,6 +16,10 @@ const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
 const WORKER_SCOPE_RE = /^[a-f0-9]{64}$/;
 const DARWIN_PS_BATCH_SIZE = 128;
 const MAX_DARWIN_PS_QUERIES = 64;
+const MAX_PROCESS_ID = 2_147_483_647;
+const TOKEN_SIGNAL_PASSES = 16;
+const TOKEN_SIGNAL_RESCAN_MS = 5;
+const TOKEN_SIGNAL_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 export interface ProcStat {
   /** Process-group id (field 5). A detached worker is its own group leader, so pgrp === pid. */
@@ -28,7 +32,13 @@ export interface TrackedProcess extends ProcStat {
   pid: number;
 }
 
+/** Whether a numeric value fits the positive PID range used by supported hosts. */
+export function isSafeProcessId(pid: number): boolean {
+  return Number.isSafeInteger(pid) && pid > 1 && pid <= MAX_PROCESS_ID;
+}
+
 export function readProcStat(pid: number): ProcStat | undefined {
+  if (!isSafeProcessId(pid)) return undefined;
   let raw: string;
   try {
     raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
@@ -43,14 +53,14 @@ export function readProcStat(pid: number): ProcStat | undefined {
   const rest = raw.slice(close + 1).trim().split(/\s+/);
   const pgrp = Number(rest[2]);
   const starttime = rest[19];
-  if (!Number.isInteger(pgrp) || starttime === undefined) return undefined;
+  if (!isSafeProcessId(pgrp) || starttime === undefined) return undefined;
   return { pgrp, starttime };
 }
 
 /** Read process-group identities on supported hosts in one bounded operation.
  *  Linux uses procfs; macOS batches `ps` under a fixed locale. */
 export function readProcessIdentities(pids: Iterable<number>): Map<number, ProcStat> {
-  const requested = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid > 1);
+  const requested = [...new Set(pids)].filter(isSafeProcessId);
   const found = new Map<number, ProcStat>();
   if (process.platform === 'linux') {
     for (const pid of requested) {
@@ -76,7 +86,7 @@ export function readProcessIdentities(pids: Iterable<number>): Map<number, ProcS
     const [pidText, pgrpText, ...started] = line.trim().split(/\s+/);
     const pid = Number(pidText);
     const pgrp = Number(pgrpText);
-    if (!Number.isInteger(pid) || !Number.isInteger(pgrp) || started.length === 0) continue;
+    if (!isSafeProcessId(pid) || !isSafeProcessId(pgrp) || started.length === 0) continue;
     found.set(pid, { pgrp, starttime: `darwin:${started.join('_')}` });
   }
   return found;
@@ -122,7 +132,7 @@ export function findWorkerProcessesForTokens(
   const candidates =
     candidatePids === undefined
       ? undefined
-      : [...new Set(candidatePids)].filter((pid) => Number.isInteger(pid) && pid > 1 && pid !== process.pid);
+      : [...new Set(candidatePids)].filter((pid) => isSafeProcessId(pid) && pid !== process.pid);
   const scopeValue = scope === undefined ? undefined : workerScopeValue(scope);
 
   if (process.platform === 'darwin') {
@@ -175,7 +185,7 @@ export function findWorkerProcessesForTokens(
         const processScopes = [
           ...commandAndEnv.matchAll(/(?:^|\s)ULTRACODE_WORKER_SCOPE=([a-f0-9]{64})(?=\s|$)/g),
         ].map((entry) => entry[1]);
-        if (!Number.isInteger(pid) || !Number.isInteger(pgrp) || !isWorkerToken(token)) continue;
+        if (!isSafeProcessId(pid) || !isSafeProcessId(pgrp) || !isWorkerToken(token)) continue;
         if (!processScopes.some((value) => value === scopeValue && WORKER_SCOPE_RE.test(value))) continue;
         found.push({
           pid,
@@ -204,7 +214,7 @@ export function findWorkerProcessesForTokens(
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
-    if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+    if (!isSafeProcessId(pid) || pid === process.pid) continue;
     const before = readProcStat(pid);
     if (!before) continue;
     let environ: string;
@@ -233,6 +243,7 @@ export function findWorkerProcesses(token: string, scope?: string): TrackedProce
 export interface WorkerSignalResult {
   processes: number;
   tokens: Set<string>;
+  identities: Set<string>;
 }
 
 /** Signal an already-discovered Linux snapshot after one final identity check. */
@@ -241,6 +252,7 @@ export function signalTrackedWorkerProcesses(
   signal: NodeJS.Signals,
 ): WorkerSignalResult {
   const signaledTokens = new Set<string>();
+  const signaledIdentities = new Set<string>();
   let processes = 0;
   for (const proc of tracked) {
     const live = readProcStat(proc.pid);
@@ -249,11 +261,12 @@ export function signalTrackedWorkerProcesses(
       process.kill(proc.pid, signal);
       processes++;
       signaledTokens.add(proc.token);
+      signaledIdentities.add(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`);
     } catch {
       /* raced with exit */
     }
   }
-  return { processes, tokens: signaledTokens };
+  return { processes, tokens: signaledTokens, identities: signaledIdentities };
 }
 
 /** Signal a token set using bounded, batched process-table sweeps. */
@@ -263,32 +276,35 @@ export function signalWorkerProcessTokens(
   scope?: string,
 ): WorkerSignalResult {
   const accepted = new Set([...tokens].filter(isWorkerToken));
-  const seen = new Set<string>();
   const signaledTokens = new Set<string>();
+  const signaledIdentities = new Set<string>();
   let processes = 0;
-  if (accepted.size === 0) return { processes, tokens: signaledTokens };
-  // A marked process can fork between discovery and signal delivery. Re-scan
-  // after every batch until no new process identity appears. SIGKILLed members
-  // cannot fork after delivery; graceful cleanup calls this function again on
-  // every bounded wait pass to catch later SIGTERM-handler forks.
-  for (let pass = 0; pass < 16; pass++) {
-    let discovered = false;
-    const batch: TrackedWorkerProcess[] = [];
-    for (const proc of findWorkerProcessesForTokens(accepted, scope)) {
-      const identity = `${proc.pid}:${proc.starttime}`;
-      if (seen.has(identity)) continue;
-      seen.add(identity);
-      discovered = true;
-      batch.push(proc);
-    }
+  if (accepted.size === 0) return { processes, tokens: signaledTokens, identities: signaledIdentities };
+  // Re-scan with a short bounded delay until two consecutive snapshots are
+  // empty. A process can fork or call setsid() between discovery and the final
+  // identity check, so only a successful signal is authoritative; a later
+  // pass must be allowed to rediscover the same PID under its new identity.
+  let emptyPasses = 0;
+  for (let pass = 0; pass < TOKEN_SIGNAL_PASSES; pass++) {
+    const found = findWorkerProcessesForTokens(accepted, scope);
+    emptyPasses = found.length === 0 ? emptyPasses + 1 : 0;
+    const batch = found.filter(
+      (proc) => !signaledIdentities.has(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`),
+    );
     const result = signalTrackedWorkerProcesses(batch, signal);
     processes += result.processes;
     for (const token of result.tokens) {
       signaledTokens.add(token);
     }
-    if (!discovered) break;
+    for (const identity of result.identities) {
+      signaledIdentities.add(identity);
+    }
+    if (emptyPasses >= 2) break;
+    if (pass + 1 < TOKEN_SIGNAL_PASSES) {
+      Atomics.wait(TOKEN_SIGNAL_WAIT, 0, 0, TOKEN_SIGNAL_RESCAN_MS);
+    }
   }
-  return { processes, tokens: signaledTokens };
+  return { processes, tokens: signaledTokens, identities: signaledIdentities };
 }
 
 /** Signal every currently-live process carrying `token`. Re-read procfs on

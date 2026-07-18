@@ -12,7 +12,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../../src/backends/ndjson.js';
 import { writeFileNoFollow, openAppendFdNoFollow } from '../../src/exec/safe-write.js';
-import { readProcessIdentity, readProcStat } from '../../src/exec/procinfo.js';
+import {
+  isSafeProcessId,
+  readProcessIdentities,
+  readProcessIdentity,
+  readProcStat,
+} from '../../src/exec/procinfo.js';
 import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { killWorkerGroups } from '../../src/exec/stop.js';
 import { PrefixReplayCache, type JournalRecord } from '../../src/engine/journal.js';
@@ -72,10 +77,13 @@ describe('readProcStat', () => {
 
   it('returns undefined for an impossible pid', () => {
     expect(readProcStat(2 ** 31)).toBeUndefined();
+    expect(isSafeProcessId(1e21)).toBe(false);
+    expect(isSafeProcessId(Number.MAX_SAFE_INTEGER + 1)).toBe(false);
   });
 
   it('reads a stable process-group identity on every supported host', () => {
-    const identity = readProcessIdentity(process.pid);
+    const identities = readProcessIdentities([1e21, process.pid]);
+    const identity = identities.get(process.pid);
     if (process.platform === 'linux' || process.platform === 'darwin') {
       expect(identity).toBeTruthy();
       expect(Number.isInteger(identity!.pgrp)).toBe(true);
@@ -121,6 +129,33 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
       expect(killWorkerGroups(runDir)).toBe(1);
       await sleep(150);
       expect(readProcessIdentity(pid)).toBeUndefined(); // gone
+    } finally {
+      worker.killTree('SIGKILL');
+    }
+  });
+
+  it('does not let one agent directory exhaust every recovery-record slot', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const runDir = tmp('uc-kill-fair-');
+    const noisyAgentDir = join(runDir, 'agents', '0000-noisy');
+    const victimAgentDir = join(runDir, 'agents', '0001-victim');
+    mkdirSync(noisyAgentDir, { recursive: true });
+    for (let attempt = 1; attempt <= 1_024; attempt++) {
+      writeFileSync(join(noisyAgentDir, `pgid.attempt${attempt}`), `999999999 - ${'a'.repeat(32)}`);
+    }
+    mkdirSync(victimAgentDir, { recursive: true });
+    const worker = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
+      cwd: process.cwd(),
+      env: {},
+      workerScope: runDir,
+    });
+    const pid = worker.child.pid!;
+    try {
+      const stat = readProcessIdentity(pid)!;
+      writeFileSync(join(victimAgentDir, 'pgid'), `${pid} ${stat.starttime} ${worker.workerToken}`);
+      expect(killWorkerGroups(runDir)).toBe(1);
+      await sleep(150);
+      expect(readProcessIdentity(pid)).toBeUndefined();
     } finally {
       worker.killTree('SIGKILL');
     }

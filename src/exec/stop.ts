@@ -4,16 +4,25 @@ import { closeSync, constants, existsSync, fstatSync, openSync, opendirSync, rea
 import { join } from 'node:path';
 import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, isRunnerAlive, reapOrphans } from '../store/runstore.js';
-import { findWorkerProcessesForTokens, isWorkerToken, signalWorkerProcessTokens } from './procinfo.js';
+import {
+  findWorkerProcessesForTokens,
+  isSafeProcessId,
+  isWorkerToken,
+  signalWorkerProcessTokens,
+} from './procinfo.js';
 
-const WORKER_RECORD_RE = /^pgid(?:\.attempt[1-9]\d*(?:-fresh)?)?$/;
-const MAX_WORKER_RECORDS = 1_024;
+// One initial attempt, five task retries, and two schema repairs are the
+// maximum ordinals the engine can create. `-fresh` shares that ordinal.
+const WORKER_RECORD_RE = /^pgid(?:\.attempt[1-8](?:-fresh)?)?$/;
+const MAX_WORKER_RECORDS = 2_048;
 const MAX_AGENT_ENTRIES = 2_048;
-const MAX_RECORD_ENTRIES = 8_192;
+const MAX_WORKER_RECORDS_PER_AGENT = 16;
+const MAX_RECORD_ENTRIES_PER_AGENT = 64;
 const MAX_WORKER_RECORD_BYTES = 512;
 
 function collectWorkerRecordPaths(agentsDir: string): string[] {
   const records: string[] = [];
+  const perAgentRecords: string[][] = [];
   let agents;
   try {
     agents = opendirSync(agentsDir);
@@ -21,10 +30,9 @@ function collectWorkerRecordPaths(agentsDir: string): string[] {
     return records;
   }
   let agentEntries = 0;
-  let recordEntries = 0;
   try {
     for (;;) {
-      if (records.length >= MAX_WORKER_RECORDS || agentEntries >= MAX_AGENT_ENTRIES) break;
+      if (agentEntries >= MAX_AGENT_ENTRIES) break;
       const agent = agents.readSync();
       if (!agent) break;
       agentEntries++;
@@ -36,13 +44,20 @@ function collectWorkerRecordPaths(agentsDir: string): string[] {
       } catch {
         continue;
       }
+      const agentRecords: string[] = [];
+      let recordEntries = 0;
       try {
         for (;;) {
-          if (records.length >= MAX_WORKER_RECORDS || recordEntries >= MAX_RECORD_ENTRIES) break;
+          if (
+            agentRecords.length >= MAX_WORKER_RECORDS_PER_AGENT ||
+            recordEntries >= MAX_RECORD_ENTRIES_PER_AGENT
+          ) {
+            break;
+          }
           const file = files.readSync();
           if (!file) break;
           recordEntries++;
-          if (WORKER_RECORD_RE.test(file.name)) records.push(join(agentDir, file.name));
+          if (WORKER_RECORD_RE.test(file.name)) agentRecords.push(join(agentDir, file.name));
         }
       } finally {
         try {
@@ -51,7 +66,7 @@ function collectWorkerRecordPaths(agentsDir: string): string[] {
           /* already closed */
         }
       }
-      if (recordEntries >= MAX_RECORD_ENTRIES) break;
+      if (agentRecords.length > 0) perAgentRecords.push(agentRecords);
     }
   } finally {
     try {
@@ -59,6 +74,20 @@ function collectWorkerRecordPaths(agentsDir: string): string[] {
     } catch {
       /* already closed */
     }
+  }
+  // Take one record from every agent before taking a second from any agent.
+  // A compromised worker can fill its own directory, but cannot consume the
+  // global recovery budget and hide another agent's cleanup record.
+  for (let offset = 0; records.length < MAX_WORKER_RECORDS; offset++) {
+    let added = false;
+    for (const agentRecords of perAgentRecords) {
+      const path = agentRecords[offset];
+      if (path === undefined) continue;
+      records.push(path);
+      added = true;
+      if (records.length >= MAX_WORKER_RECORDS) break;
+    }
+    if (!added) break;
   }
   return records;
 }
@@ -108,8 +137,7 @@ export function killWorkerGroups(runDir: string): number {
     const [pidStr, recordedStart, workerToken] = fields;
     const pid = Number(pidStr);
     if (
-      Number.isInteger(pid) &&
-      pid > 1 &&
+      isSafeProcessId(pid) &&
       pid !== process.pid &&
       recordedStart !== undefined &&
       isWorkerToken(workerToken)
