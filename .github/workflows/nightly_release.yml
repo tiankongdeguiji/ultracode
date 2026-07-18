@@ -13,21 +13,21 @@
 # allows oss:PutObject, oss:PutObjectAcl, oss:GetObject and oss:HeadObject on
 # the hongsheng-jhs bucket's ultracode/* prefix, and the repo secret
 # ALIBABA_CLOUD_ECS_METADATA must hold that RAM role name.
-# NOTE: instance-role credentials are ambient to EVERY process on the runner's
-# host (metadata endpoint), so this workflow uses a DEDICATED label. Register a
-# separate ECS runner as `ultracode-release-runner`; never reuse the
-# code_review runner or its instance — that workflow executes PR-triggered
-# agent jobs, and any PR-side code on the same host could mint bucket-write
-# credentials and poison the release channel. (Scoping the RAM role to the
-# ultracode/* prefix does not mitigate this: that prefix is the write target.)
+# ACCEPTED RISK: this job shares the code_review runner. Instance-role
+# credentials are ambient to every process on the host (metadata endpoint),
+# so PR-triggered review jobs running there could in principle mint
+# bucket-write credentials; scoping the RAM role to the ultracode/* prefix
+# does not change that (it is the write target). Hardening option if this
+# ever needs closing: move this job to a dedicated runner label on its own
+# ECS instance.
 # ---- End Prerequisites ----
 
 name: Nightly Release
 
 on:
   schedule:
-    # 02:00 Beijing — offset from the 16:00 UTC CI canary so nightly signals
-    # stay distinguishable
+    # 02:00 Beijing — offset from the 16:00 UTC CI canary to avoid queueing on
+    # the shared self-hosted runner
     - cron: '0 18 * * *'
   workflow_dispatch:
 
@@ -40,7 +40,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ultracode-release-runner
+    runs-on: ultracode-codereview-runner
     timeout-minutes: 45
     env:
       # RAM role name read by scripts/release-oss.mjs for ECS metadata credentials
