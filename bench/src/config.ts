@@ -57,6 +57,9 @@ export function validateForRun(cfg: BenchConfig): void {
   if (!cfg.model) {
     throw new Error('config.model is required for `run` (pin it via --model or bench.config.json; there is no default)');
   }
+  if (!cfg.effort) {
+    throw new Error('config.effort is required for `run` (pin it explicitly; an empty value silently uses the model default)');
+  }
   if (cfg.instances.ids !== null && cfg.instances.ids.length === 0) {
     throw new Error('config.instances.ids is an empty list — provide ids or set it to null for sampling');
   }

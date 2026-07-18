@@ -1,7 +1,7 @@
 {
   "instances": { "ids": null, "count": 20, "seed": 7, "stratifyBy": "repo_language" },
   "model": "gpt-5.2-codex",
-  "effort": "",
+  "effort": "low",
   "auth": { "mode": "chatgpt" },
   "arms": "both",
   "timeouts": { "sessionSecs": 43200, "evalWatchdogSecs": 5400 },

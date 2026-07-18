@@ -134,7 +134,7 @@ program.command('run')
     if (f.parallel !== undefined) cfg.parallel = { ...cfg.parallel, instances: numFlag('parallel', f.parallel) };
     const redo = f.redo ? f.redo.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
     const instances = manifestInstances(manifest);
-    out(`run ${manifest.runId}: ${instances.length} instances, arms=${cfg.arms}, model=${cfg.model}, parallel=${cfg.parallel.instances}`);
+    out(`run ${manifest.runId}: ${instances.length} instances, arms=${cfg.arms}, model=${cfg.model}, effort=${cfg.effort}, parallel=${cfg.parallel.instances}`);
     await runBatch(cfg, manifest, instances, { redo });
     out('batch complete — next: `npm run bench -- eval --run-id ' + manifest.runId + '`');
   });

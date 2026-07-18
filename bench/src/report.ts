@@ -7,7 +7,7 @@
  * are tolerated: instances missing metrics or eval verdicts drop out of the
  * affected aggregates and surface via the taxonomy/annotation sections.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { armDir, instancesFile, runDir, runManifestFile } from './config.js';
 import { readEvalResults } from './eval.js';
@@ -84,6 +84,8 @@ export interface ReportInputs {
   /** sanity-prefix verdicts keyed by instance id, when those evals ran */
   gold: Record<string, boolean> | null;
   nullcheck: Record<string, boolean> | null;
+  /** requested/default/effective reasoning effort provenance from run artifacts */
+  reasoningEffort?: ReasoningEffortAudit;
 }
 
 /* ------------------------------------------------------------ report shape -- */
@@ -152,11 +154,22 @@ export interface InstanceRow {
   annotations: string[];
 }
 
+export interface ReasoningEffortAudit {
+  /** null means the frozen config deliberately left the setting to Codex */
+  requested: string | null;
+  /** distinct defaults advertised for the pinned model by the per-arm model caches */
+  modelDefaults: string[];
+  /** inferred effective effort per rollout session, grouped by arm */
+  sessions: { a: Record<string, number>; b: Record<string, number> };
+}
+
 export interface ReportJson {
   runId: string;
   createdAt: string;
   model: string;
+  /** Frozen config value retained for backward-compatible consumers. */
   effort: string;
+  reasoningEffort: ReasoningEffortAudit;
   config: RunManifest['config'];
   reproducibility: {
     ultracodeSha: string;
@@ -314,11 +327,17 @@ function sanityCounts(verdicts: Record<string, boolean> | null): { evaluated: nu
 /** Pure core: aggregate a run picture into the machine + human report pair. */
 export function buildReport(inputs: ReportInputs): { json: ReportJson; md: string } {
   const { manifest, instances } = inputs;
+  const reasoningEffort = inputs.reasoningEffort ?? {
+    requested: manifest.config.effort || null,
+    modelDefaults: [],
+    sessions: { a: {}, b: {} },
+  };
   const json: ReportJson = {
     runId: manifest.runId,
     createdAt: manifest.createdAt,
     model: manifest.config.model,
     effort: manifest.config.effort,
+    reasoningEffort,
     config: manifest.config,
     reproducibility: {
       ultracodeSha: manifest.ultracodeSha,
@@ -359,12 +378,23 @@ const fmtDelta = (d: number | null): string =>
 
 function mdHeader(json: ReportJson): string {
   const cfg = json.config;
+  const effort = json.reasoningEffort;
+  const requested = effort.requested === null ? 'unset' : `\`${effort.requested}\``;
+  const defaults = effort.modelDefaults.length === 0
+    ? 'unknown'
+    : effort.modelDefaults.map((value) => `\`${value}\``).join(', ');
+  const sessionCounts = (arm: Arm): string => {
+    const entries = Object.entries(effort.sessions[arm]);
+    if (entries.length === 0) return 'none';
+    return entries.map(([value, count]) => `${value}×${count}`).join(', ');
+  };
   return [
     `# SWE-bench Pro A/B report — ${json.runId}`,
     '',
     `Run \`${json.runId}\` created ${json.createdAt}.`,
     '',
-    `- model: \`${json.model}\`${json.effort ? ` (effort: ${json.effort})` : ''}`,
+    `- model: \`${json.model}\``,
+    `- reasoning effort: requested ${requested}; model default(s): ${defaults}; inferred sessions: A ${sessionCounts('a')}, B ${sessionCounts('b')}`,
     `- arms: ${cfg.arms}; instances: ${json.reproducibility.datasetSize}; parallel instances: ${cfg.parallel.instances}`,
     `- session timeout: ${cfg.timeouts.sessionSecs}s; auth: ${cfg.auth.mode}; sanitizeGitHistory: ${cfg.sanitizeGitHistory}`,
     '',
@@ -497,6 +527,85 @@ function readJsonIfPresent<T>(path: string): T | null {
   }
 }
 
+function rolloutFiles(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  const out: string[] = [];
+  const walk = (path: string): void => {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) walk(child);
+      else if (entry.isFile() && /^rollout-.*\.jsonl$/.test(entry.name)) out.push(child);
+    }
+  };
+  walk(dir);
+  return out.sort();
+}
+
+function modelDefault(dir: string, model: string): string | null {
+  const cache = readJsonIfPresent<{ models?: unknown }>(join(dir, 'codex-home', 'models_cache.json'));
+  if (!Array.isArray(cache?.models)) return null;
+  for (const candidate of cache.models) {
+    if (candidate === null || typeof candidate !== 'object') continue;
+    const row = candidate as Record<string, unknown>;
+    if (row.slug === model && typeof row.default_reasoning_level === 'string') {
+      return row.default_reasoning_level;
+    }
+  }
+  return null;
+}
+
+function rolloutEffort(file: string): string | null {
+  let effort: string | null = null;
+  let content: string;
+  try {
+    content = readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (parsed === null || typeof parsed !== 'object') continue;
+    const record = parsed as Record<string, unknown>;
+    if (record.type !== 'turn_context' || record.payload === null || typeof record.payload !== 'object') continue;
+    const payload = record.payload as Record<string, unknown>;
+    if (typeof payload.effort === 'string') {
+      effort = payload.effort;
+      continue;
+    }
+    const collaboration = payload.collaboration_mode;
+    if (collaboration === null || typeof collaboration !== 'object') continue;
+    const settings = (collaboration as Record<string, unknown>).settings;
+    if (settings === null || typeof settings !== 'object') continue;
+    const nested = (settings as Record<string, unknown>).reasoning_effort;
+    if (typeof nested === 'string') effort = nested;
+  }
+  return effort;
+}
+
+function reasoningEffortFromDisk(manifest: RunManifest): ReasoningEffortAudit {
+  const requested = manifest.config.effort || null;
+  const defaults = new Set<string>();
+  const sessions: ReasoningEffortAudit['sessions'] = { a: {}, b: {} };
+  for (const iid of manifest.instanceIds) {
+    for (const arm of ['a', 'b'] as const) {
+      const dir = armDir(manifest.runId, iid, arm);
+      const fallback = modelDefault(dir, manifest.config.model);
+      if (fallback !== null) defaults.add(fallback);
+      for (const file of rolloutFiles(join(dir, 'codex-home', 'sessions'))) {
+        const effective = rolloutEffort(file) ?? requested ?? fallback ?? 'unknown';
+        sessions[arm][effective] = (sessions[arm][effective] ?? 0) + 1;
+      }
+    }
+  }
+  return { requested, modelDefaults: [...defaults].sort(), sessions };
+}
+
 /** repo_language by instance id from the instances cache; empty map when absent. */
 function languageMap(): Map<string, string> {
   const map = new Map<string, string>();
@@ -566,6 +675,7 @@ export function generateReport(runId: string): { jsonPath: string; mdPath: strin
     instances,
     gold: tryEvalResults(runId, 'gold'),
     nullcheck: tryEvalResults(runId, 'nullcheck'),
+    reasoningEffort: reasoningEffortFromDisk(manifest),
   });
   const jsonPath = join(runDir(runId), 'report.json');
   const mdPath = join(runDir(runId), 'report.md');

@@ -44,7 +44,7 @@ export interface BenchConfig {
   };
   /** codex model pin, e.g. "gpt-5.2-codex"; required by `run` (no silent default) */
   model: string;
-  /** model_reasoning_effort; '' = leave to codex default */
+  /** model_reasoning_effort; required for new runs so model-catalog defaults cannot drift */
   effort: string;
   auth: {
     /** 'chatgpt' copies ~/.codex/auth.json into each container; 'api-key' uses CODEX_API_KEY */
@@ -156,7 +156,7 @@ export interface UsageTuple {
   cachedInput: number;
   output: number;
   reasoning: number;
-  /** input + output + reasoning + round(0.1 * cachedInput) — mirrors src/backends/usage.ts */
+  /** input + output + round(0.1 * cachedInput); reasoning is a subset of output */
   total: number;
 }
 

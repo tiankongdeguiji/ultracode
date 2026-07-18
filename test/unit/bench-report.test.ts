@@ -96,7 +96,7 @@ const status = (over: Partial<ArmStatus> = {}): ArmStatus => ({
 const manifest = (instanceIds: string[]): RunManifest => ({
   runId: 'run-test',
   createdAt: '2026-07-18T00:00:00.000Z',
-  config: { ...DEFAULT_CONFIG, model: 'test-model' },
+  config: { ...DEFAULT_CONFIG, model: 'test-model', effort: 'high' },
   instanceIds,
   armOrder: {},
   ultracodeSha: 'UC_SHA_SENTINEL',
@@ -262,11 +262,26 @@ describe('buildReport', () => {
     expect(md).toContain(POWER_DISCLAIMER);
     expect(md).toContain('UC_SHA_SENTINEL');
     expect(md).toContain('CODEX_SHA_SENTINEL');
+    expect(md).toContain('reasoning effort: requested `high`');
     expect(md).toContain('| i1 | js |');
     expect(md).toContain('b:no-orchestration');
     expect(md).toContain('## Thesis cut — long-context stratum');
     expect(md).toContain('## Failure taxonomy');
     expect(md).not.toContain('## Sanity evals');
+  });
+
+  it('reports model-default and per-arm effective reasoning effort', () => {
+    const inputs = fixtures();
+    inputs.manifest.config.effort = '';
+    inputs.reasoningEffort = {
+      requested: null,
+      modelDefaults: ['low'],
+      sessions: { a: { low: 20 }, b: { low: 121 } },
+    };
+    const { json, md } = buildReport(inputs);
+    expect(json.reasoningEffort).toEqual(inputs.reasoningEffort);
+    expect(md).toContain('requested unset; model default(s): `low`');
+    expect(md).toContain('inferred sessions: A low×20, B low×121');
   });
 
   it('reports sanity evals when gold/nullcheck verdicts are present', () => {

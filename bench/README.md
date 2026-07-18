@@ -74,8 +74,8 @@ kept-worktree detection).
 
 ## Config
 
-See `bench.example.config.json`. Notable knobs: `model` (required, no default),
-`effort`, `auth.mode`, `arms` (a|b|both), `timeouts.sessionSecs` (default 43200 = 12 h
+See `bench.example.config.json`. Notable knobs: `model` and `effort` (both required,
+with no silent defaults), `auth.mode`, `arms` (a|b|both), `timeouts.sessionSecs` (default 43200 = 12 h
 per instance×arm; an explicit bench cap — the ultracode engine itself stays uncapped),
 `parallel.instances` (default 4), `instances.{ids,count,seed,stratifyBy}`,
 `sanitizeGitHistory`, optional `pricing` ($/M-token per model → USD column in the report).
