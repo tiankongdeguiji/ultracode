@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ultracode Memory"
+  short_description: "Portable Claude-compatible project memory"
+  default_prompt: "Use $ultracode-memory to migrate my Claude Code memory into this project."

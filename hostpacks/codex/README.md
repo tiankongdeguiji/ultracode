@@ -11,13 +11,17 @@ exists for marketplace distribution (deferred; internal-first).
 ## What's in the bundle
 
 - The `ultracode` **skill** (`skills/ultracode/`) — teaches Codex when and how to orchestrate.
+- The `ultracode-memory` **skill** — Claude-compatible project recall, auto-maintenance, and migration.
+- `.mcp.json` — workflow and memory tools from `ultracode mcp`.
+- `hooks/hooks.json` — injects portable memory at session start, resume, clear, and compaction.
 
 ## What `ultracode install codex` additionally writes
 
-Bundled MCP registration is deferred with marketplace distribution, so today
-the installer writes these directly into your Codex config:
+The plugin bundle carries portable MCP and hook declarations. The direct
+installer writes equivalent registrations into your existing Codex config:
 
 - An **AGENTS.md** trigger snippet — standing "ultracode mode", armed only by the keyword "ultracode".
+- Portable-memory startup/maintenance guidance and a **SessionStart hook** registration.
 - An **MCP server** registration (`~/.codex/config.toml` `[mcp_servers.ultracode]` block) pointing at `ultracode mcp`
   (`tool_timeout_sec = 3600`, `default_tools_approval_mode = "approve"` — headless Codex auto-rejects
   MCP calls otherwise). The 3600s timeout is the **quiet-monitor hold budget**: Codex never extends
@@ -32,11 +36,18 @@ the installer writes these directly into your Codex config:
 
 ```bash
 curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.sh | sh
-ultracode install codex   # writes skill + AGENTS.md + MCP registration
+ultracode install codex   # writes skills + AGENTS.md + MCP + memory hook
 ultracode doctor          # verify backend availability and auth topology
 ```
 
 Then in Codex: `ultracode: review this repo for auth bugs +500k`.
+
+For an existing Claude Code setup, plan and apply a non-destructive import:
+
+```bash
+ultracode memory migrate-claude
+ultracode memory migrate-claude --apply
+```
 
 ## Why Codex narrates while monitoring (and what tames it)
 

@@ -6,7 +6,7 @@
 [![license](https://img.shields.io/github/license/tiankongdeguiji/ultracode)](LICENSE)
 [![stars](https://img.shields.io/github/stars/tiankongdeguiji/ultracode)](https://github.com/tiankongdeguiji/ultracode/stargazers)
 
-**Say the word, get an agent fleet.** Portable **ultracode** — dynamic multi-agent workflow orchestration — for coding agents that don't ship it natively: OpenAI Codex CLI, Gemini CLI, and friends. Faithful to the Claude Code Workflow dialect, so the same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine.
+**Say the word, get an agent fleet — and keep what it learns.** Portable **ultracode** brings dynamic multi-agent workflows and Claude-compatible project memory to OpenAI Codex CLI, Gemini CLI, and friends. The same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine; the same `MEMORY.md` + topic-file model works across hosts.
 
 *Linux & macOS · one-line install.*
 
@@ -62,7 +62,7 @@ If `ultracode` isn't found afterwards, the installer has already printed the one
 The intended daily path — install the skill and the host wiring:
 
 ```bash
-ultracode install codex           # skill + AGENTS.md trigger + MCP registration
+ultracode install codex           # workflow + memory skills, AGENTS.md, MCP, memory hook
                                   # other hosts: `install qoder` · `install generic`
 ```
 
@@ -92,6 +92,25 @@ ultracode watch <runId>
 agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
 ```
+
+### Claude-compatible memory
+
+The install also gives the agent a machine-local memory system with Claude Code's project semantics: all git worktrees share one store, `MEMORY.md` is loaded up to 200 lines or 25KB, detailed topics load on demand, and `paths` rules apply only to matching files. Codex receives automatic `SessionStart` injection plus MCP tools; other hosts use the same CLI and skill contract.
+
+```bash
+ultracode memory info
+ultracode memory remember "API tests use Redis on port 6380" --topic debugging
+ultracode memory search "redis tests"
+```
+
+Migrate existing Claude Code auto memory, rules, and instruction files without changing the source:
+
+```bash
+ultracode memory migrate-claude           # read-only plan
+ultracode memory migrate-claude --apply   # non-destructive copy
+```
+
+Conflicts are retained under `claude-*` names and secret-like files are skipped. Full behavior and host limits: [`docs/memory.md`](docs/memory.md).
 
 ### Upgrading
 
@@ -150,16 +169,20 @@ npm install && npm run build && npm link
 | | `status <runId>` | show run status: phases, agents, budget (`--watch` polls until terminal) |
 | | `logs <runId>` | print run events (`--follow` tails) |
 | | `list` | recent runs in the run store (`--all` for every run) |
-| integrate | `install <codex\|qoder\|generic>` | skill + host trigger (AGENTS.md snippet / Qoder rule); codex user-scope also registers the MCP server |
+| memory | `memory context\|info\|search\|read` | inspect the Claude-compatible startup index, topics, and path-scoped rules |
+| | `memory remember\|forget\|mode` | maintain durable project learnings and the per-project auto-memory toggle |
+| | `memory migrate-claude [--apply]` | plan or apply a non-destructive Claude Code memory/rules/instructions import |
+| integrate | `install <codex\|qoder\|generic>` | workflow + memory skills and host trigger; Codex user scope also registers MCP and the memory hook |
 | | `update` | self-update from the release server (`--check` reports only; `--to <version>` pins a version) |
 | | `doctor` | probe backends: availability, versions, auth topology |
 | | `mode [on\|off]` | read or set the standing ultracode-mode marker (`.ultracode/mode`) |
 | | `sync` | mirror canonical `.ultracode/workflows` into `.claude/` and `.qoder/` copies |
-| | `mcp` | stdio MCP server: `workflow_start` / `workflow_status` (long-poll `until="terminal"` for a quiet monitor) / `workflow_result` (+ stop/list) |
+| | `mcp` | stdio MCP server: workflow lifecycle tools plus `memory_context`, `memory_recall`, `memory_remember`, `memory_forget`, and Claude migration |
 
 ## Docs
 
 - `docs/architecture.md` — why skill + engine + plugin are layered, the Qoder native-engine strategy, v1 scope, and what's proven end-to-end.
+- `docs/memory.md` — Claude-compatible storage, automatic recall, host adapters, migration, and security behavior.
 - `docs/threat-model.md` — trust model, sandbox honesty, concurrency & auth, the worker-writable run store.
 - `skill/ultracode/references/dialect.md` — the full workflow dialect reference; `portability.md` beside it covers the cross-engine subset.
 - `docs/design/judge.md` — design history: the synthesized architecture + milestone plan (3 architects + judge), grounded in source-level research (the Claude Code ultracode mechanism, Codex/Qoder CLI internals, MCP long-running-tool constraints, JS-sandbox tradeoffs).

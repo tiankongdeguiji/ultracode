@@ -119,10 +119,134 @@ program
     process.exit(listCommand(opts as never));
   });
 
+const memory = program
+  .command('memory')
+  .description('Claude-compatible project memory: inspect, recall, update, and migrate');
+
+memory
+  .command('info')
+  .description('show the current project memory location, mode, and topics')
+  .option('--cwd <dir>')
+  .option('--json')
+  .action(async (opts: { cwd?: string; json?: boolean }) => {
+    const { memoryInfoCommand } = await import('./memory.js');
+    process.exit(memoryInfoCommand(opts));
+  });
+
+memory
+  .command('context')
+  .description('print the startup memory index and unconditional rules')
+  .option('--cwd <dir>')
+  .option('--json')
+  .action(async (opts: { cwd?: string; json?: boolean }) => {
+    const { memoryContextCommand } = await import('./memory.js');
+    process.exit(memoryContextCommand(opts));
+  });
+
+memory
+  .command('search')
+  .argument('<query>')
+  .description('search MEMORY.md and detailed topic files')
+  .option('--cwd <dir>')
+  .option('--limit <n>')
+  .option('--json')
+  .action(async (query: string, opts: { cwd?: string; limit?: string; json?: boolean }) => {
+    const { memorySearchCommand } = await import('./memory.js');
+    process.exit(memorySearchCommand(query, opts));
+  });
+
+memory
+  .command('read')
+  .argument('<topic>')
+  .description('read one detailed memory topic (use memory for MEMORY.md)')
+  .option('--cwd <dir>')
+  .option('--json')
+  .action(async (topic: string, opts: { cwd?: string; json?: boolean }) => {
+    const { memoryReadCommand } = await import('./memory.js');
+    process.exit(memoryReadCommand(topic, opts));
+  });
+
+memory
+  .command('remember')
+  .argument('<text>')
+  .description('save one durable, verified project learning')
+  .option('--topic <name>', 'detailed topic file', 'general')
+  .option('--summary <text>', 'concise MEMORY.md index summary')
+  .option('--cwd <dir>')
+  .option('--allow-sensitive', 'allow content that resembles a secret (unsafe)')
+  .option('--json')
+  .action(async (
+    text: string,
+    opts: { topic?: string; summary?: string; cwd?: string; allowSensitive?: boolean; json?: boolean },
+  ) => {
+    const { memoryRememberCommand } = await import('./memory.js');
+    process.exit(memoryRememberCommand(text, opts));
+  });
+
+memory
+  .command('forget')
+  .argument('<topic>')
+  .description('delete one topic and its MEMORY.md index entry')
+  .option('--cwd <dir>')
+  .option('--yes', 'confirm destructive deletion')
+  .option('--json')
+  .action(async (topic: string, opts: { cwd?: string; yes?: boolean; json?: boolean }) => {
+    const { memoryForgetCommand } = await import('./memory.js');
+    process.exit(memoryForgetCommand(topic, opts));
+  });
+
+memory
+  .command('mode')
+  .argument('[value]', 'on | off (omit to print)')
+  .description('enable or disable auto memory for the current project')
+  .option('--cwd <dir>')
+  .action(async (value: string | undefined, opts: { cwd?: string }) => {
+    const { memoryModeCommand } = await import('./memory.js');
+    process.exit(memoryModeCommand(value, opts));
+  });
+
+memory
+  .command('rules')
+  .argument('<path>')
+  .description('load migrated Claude path-scoped rules matching a project file')
+  .option('--cwd <dir>')
+  .option('--json')
+  .action(async (path: string, opts: { cwd?: string; json?: boolean }) => {
+    const { memoryRulesCommand } = await import('./memory.js');
+    process.exit(memoryRulesCommand(path, opts));
+  });
+
+memory
+  .command('migrate-claude')
+  .description('plan or apply a non-destructive import of Claude Code auto memory and rules')
+  .option('--cwd <dir>')
+  .option('--from <dir>', 'explicit Claude project or memory directory')
+  .option('--apply', 'write the reviewed migration plan')
+  .option('--include-sensitive', 'copy memory that resembles secrets (unsafe)')
+  .option('--json')
+  .action(async (opts: {
+    cwd?: string;
+    from?: string;
+    apply?: boolean;
+    includeSensitive?: boolean;
+    json?: boolean;
+  }) => {
+    const { memoryMigrateClaudeCommand } = await import('./memory.js');
+    process.exit(memoryMigrateClaudeCommand(opts));
+  });
+
+memory
+  .command('hook', { hidden: true })
+  .description('Codex SessionStart hook adapter')
+  .action(async () => {
+    const { runMemoryHook } = await import('./memory.js');
+    process.exit(runMemoryHook());
+  });
+
 program
   .command('install')
   .argument('<host>', 'codex | qoder | generic')
-  .description('install the ultracode skill + AGENTS.md trigger snippet for a host')
+  .description('install workflow orchestration + portable memory skills and host wiring')
   .option('--project', 'install into the current project instead of the user scope')
   .option('--dry-run', 'show what would change without writing')
   .action(async (host: string, opts: { project?: boolean; dryRun?: boolean }) => {

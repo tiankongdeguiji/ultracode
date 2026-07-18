@@ -12,6 +12,7 @@ those sources, never the generated `dist-qoder/` tree.
 ## What's in the bundle
 
 - The `ultracode` **skill** (`skills/ultracode/`).
+- The `ultracode-memory` **skill** for portable project memory and Claude migration.
 - **uc-\* workflow templates** (`workflows/`) in the portable dialect.
 - **Effort-routing agents** (`agents/uc-xhigh.md`, `uc-verifier.md`) — Qoder's `budget`
   global is stubbed and per-call `effort` isn't portable, so budget rides `args.budgetTokens`
@@ -21,6 +22,7 @@ those sources, never the generated `dist-qoder/` tree.
 
 - The **always_on rule** (`.qoder/rules/ultracode-mode.md`) — the keyword "ultracode" → orchestrate.
   Qoder plugins cannot bundle rules, so the trigger is installer-written.
+- The same rule loads `ultracode memory context` at task start and teaches automatic durable-memory updates.
 
 ## Manual install (until marketplace)
 

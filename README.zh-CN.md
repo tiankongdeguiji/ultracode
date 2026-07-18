@@ -6,7 +6,7 @@
 [![license](https://img.shields.io/github/license/tiankongdeguiji/ultracode)](LICENSE)
 [![stars](https://img.shields.io/github/stars/tiankongdeguiji/ultracode)](https://github.com/tiankongdeguiji/ultracode/stargazers)
 
-**一句话，唤来一支智能体舰队。** 可移植的 **ultracode** 为 OpenAI Codex CLI、Gemini CLI 等编码 agent 补上动态多 agent 工作流编排能力。它兼容 Claude Code Workflow 方言，因此同一份 `*.workflow.js` 脚本可以在 Claude Code（原生）、Qoder（原生）和 ultracode 引擎上运行。
+**一句话，唤来一支智能体舰队，并让它记住所学。** 可移植的 **ultracode** 为 OpenAI Codex CLI、Gemini CLI 等编码 agent 补上动态多 agent 工作流和 Claude 兼容的项目记忆。同一份 `*.workflow.js` 可在 Claude Code（原生）、Qoder（原生）和 ultracode 引擎上运行；同一套 `MEMORY.md` 加主题文件的记忆也可跨宿主使用。
 
 *支持 Linux 与 macOS · 一行命令安装。*
 
@@ -62,7 +62,7 @@ ultracode doctor                  # 查看可用后端及其鉴权方式
 推荐的日常使用方式，是先安装 skill 和宿主集成：
 
 ```bash
-ultracode install codex           # skill + AGENTS.md 触发器 + MCP 注册
+ultracode install codex           # 工作流/记忆 skill + AGENTS.md + MCP + 记忆 hook
                                   # 其他宿主：`install qoder` · `install generic`
 ```
 
@@ -92,6 +92,25 @@ ultracode watch <runId>
 agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
 ```
+
+### Claude 兼容的项目记忆
+
+安装后，agent 会获得与 Claude Code 相同的项目语义：同一 Git 仓库的所有 worktree 共用一份记忆，`MEMORY.md` 启动时最多加载 200 行或 25KB，详细主题按需读取，带 `paths` 的规则只对匹配文件生效。Codex 通过 `SessionStart` hook 自动注入，并可直接调用 MCP 记忆工具；其他宿主使用同一套 CLI 与 skill 契约。
+
+```bash
+ultracode memory info
+ultracode memory remember "API 测试使用 6380 端口的 Redis" --topic debugging
+ultracode memory search "redis tests"
+```
+
+可以在不修改 Claude Code 原文件的前提下迁移已有自动记忆、规则和指令：
+
+```bash
+ultracode memory migrate-claude           # 只生成迁移计划
+ultracode memory migrate-claude --apply   # 非破坏性复制
+```
+
+冲突文件会以 `claude-*` 名称同时保留，疑似密钥的文件默认跳过。完整行为和宿主限制见 [`docs/memory.md`](docs/memory.md)。
 
 ### 升级
 
@@ -150,16 +169,20 @@ npm install && npm run build && npm link
 |  | `status <runId>` | 显示运行状态，包括阶段、agent 和预算；`--watch` 会持续轮询直到运行结束 |
 |  | `logs <runId>` | 输出运行事件；`--follow` 会持续跟踪新日志 |
 |  | `list` | 列出运行记录存储中的最近任务；使用 `--all` 查看全部记录 |
-| 集成 | `install <codex\|qoder\|generic>` | 安装 skill 和宿主触发器（AGENTS.md 片段或 Qoder 规则）；以用户级方式安装 Codex 时，还会注册 MCP 服务器 |
+| 记忆 | `memory context\|info\|search\|read` | 查看 Claude 兼容的启动索引、主题文件与路径规则 |
+|  | `memory remember\|forget\|mode` | 维护持久项目知识与项目级自动记忆开关 |
+|  | `memory migrate-claude [--apply]` | 规划或执行非破坏性的 Claude Code 记忆、规则与指令迁移 |
+| 集成 | `install <codex\|qoder\|generic>` | 安装工作流与记忆 skill 以及宿主触发器；Codex 用户级安装还会注册 MCP 和记忆 hook |
 |  | `update` | 从发布服务器自升级（`--check` 只检查不安装；`--to <version>` 指定目标版本） |
 |  | `doctor` | 探测各后端的可用性、版本和鉴权方式 |
 |  | `mode [on\|off]` | 读取或设置常驻的 ultracode 模式标记（`.ultracode/mode`） |
 |  | `sync` | 将 `.ultracode/workflows` 中的权威版本同步到 `.claude/` 和 `.qoder/` |
-|  | `mcp` | 启动 stdio MCP 服务器，提供 `workflow_start`、`workflow_status`（`until="terminal"` 长轮询，可充当安静的监视器）、`workflow_result`，以及 stop/list |
+|  | `mcp` | 启动 stdio MCP 服务器，提供工作流生命周期工具，以及 `memory_context`、`memory_recall`、`memory_remember`、`memory_forget` 和 Claude 迁移 |
 
 ## 文档
 
 - `docs/architecture.md`——介绍为何将 skill、引擎和插件分层设计，Qoder 原生引擎策略、v1 范围，以及已经完成的端到端验证。
+- `docs/memory.md`——介绍 Claude 兼容的存储、自动召回、宿主适配、迁移和安全行为。
 - `docs/threat-model.md`——说明信任模型、对沙箱能力的坦诚交代、并发与鉴权机制，以及 worker 可写的运行记录存储。
 - `skill/ultracode/references/dialect.md`——完整的工作流方言参考；同目录下的 `portability.md` 介绍跨引擎可移植子集。
 - `docs/design/judge.md`——记录设计过程：由 3 位架构师提出方案、再由评审综合形成架构与里程碑计划。相关设计建立在源码级研究之上，包括 Claude Code 的 ultracode 机制、Codex/Qoder CLI 内部实现、MCP 长时间运行工具的约束，以及 JS 沙箱的取舍。

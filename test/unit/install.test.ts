@@ -9,6 +9,7 @@ import {
   QODER_RULE,
   codexMcpToml,
   installForHost,
+  memorySkillSourceDir,
   planFor,
   skillSourceDir,
   upsertMarkerBlock,
@@ -20,7 +21,10 @@ function tmp(): string {
 
 describe('codex MCP registration', () => {
   it('writes the quiet-monitor hold budget and headless pre-approval', () => {
-    const block = codexMcpToml(['/usr/bin/node', '/x/main.js', 'mcp']);
+    const block = codexMcpToml(
+      ['/usr/bin/node', '/x/main.js', 'mcp'],
+      ['/usr/bin/node', '/x/main.js', 'memory', 'hook'],
+    );
     expect(block).toContain('[mcp_servers.ultracode]');
     expect(block).toContain('command = "/usr/bin/node"');
     expect(block).toContain('args = ["/x/main.js","mcp"]');
@@ -28,6 +32,9 @@ describe('codex MCP registration', () => {
     // doctrine waitSeconds=3300) — codex never extends tool timeouts on progress.
     expect(block).toContain('tool_timeout_sec = 3600');
     expect(block).toContain('default_tools_approval_mode = "approve"');
+    expect(block).toContain('[[hooks.SessionStart]]');
+    expect(block).toContain('startup|resume|clear|compact');
+    expect(block).toContain("'/usr/bin/node' '/x/main.js' 'memory' 'hook'");
   });
 
   it('installForHost replaces a stale pre-quiet-monitor block (tool_timeout_sec = 90) instead of appending', () => {
@@ -66,6 +73,13 @@ describe('skill source', () => {
     }
     // progressive-disclosure budget: body should stay well under ~5k tokens
     expect(skill.length).toBeLessThan(20_000);
+  });
+
+  it('packaged memory skill exists with migration guidance and UI metadata', () => {
+    const src = memorySkillSourceDir();
+    expect(readFileSync(join(src, 'SKILL.md'), 'utf8')).toMatch(/^---\nname: ultracode-memory\n/);
+    expect(readFileSync(join(src, 'references/migration.md'), 'utf8')).toContain('Claude Code migration mapping');
+    expect(readFileSync(join(src, 'agents/openai.yaml'), 'utf8')).toContain('$ultracode-memory');
   });
 });
 
@@ -176,8 +190,11 @@ describe('installForHost', () => {
     const actions = installForHost('codex', { userHome: home });
     expect(existsSync(join(home, '.agents/skills/ultracode/SKILL.md'))).toBe(true);
     expect(existsSync(join(home, '.agents/skills/ultracode/references/patterns.md'))).toBe(true);
-    expect(readFileSync(join(home, '.codex/AGENTS.md'), 'utf8')).toContain('STANDING mode');
-    expect(actions.map((a) => a.kind)).toEqual(['copy-skill', 'upsert-snippet']);
+    expect(existsSync(join(home, '.agents/skills/ultracode-memory/SKILL.md'))).toBe(true);
+    const agents = readFileSync(join(home, '.codex/AGENTS.md'), 'utf8');
+    expect(agents).toContain('STANDING mode');
+    expect(agents).toContain('ultracode memory (portable project memory)');
+    expect(actions.map((a) => a.kind)).toEqual(['copy-skill', 'copy-skill', 'upsert-snippet']);
   });
 
   it('codex project scope: skill → .agents/skills, snippet → project AGENTS.md (merged)', () => {
@@ -185,6 +202,7 @@ describe('installForHost', () => {
     writeFileSync(join(project, 'AGENTS.md'), '# Project conventions\n');
     installForHost('codex', { project: true, projectRoot: project });
     expect(existsSync(join(project, '.agents/skills/ultracode/SKILL.md'))).toBe(true);
+    expect(existsSync(join(project, '.agents/skills/ultracode-memory/SKILL.md'))).toBe(true);
     const agents = readFileSync(join(project, 'AGENTS.md'), 'utf8');
     expect(agents).toContain('# Project conventions');
     expect(agents).toContain(MARKER_BEGIN);

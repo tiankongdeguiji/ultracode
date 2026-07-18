@@ -20,4 +20,29 @@ export type {
   NormalizedUsage,
 } from './backends/types.js';
 export { BudgetAccount } from './budget/account.js';
+export {
+  forgetTopic,
+  isAutoMemoryEnabled,
+  MEMORY_INDEX_MAX_BYTES,
+  MEMORY_INDEX_MAX_LINES,
+  memoryContext,
+  memoryInfo,
+  readMemoryTopic,
+  remember,
+  resolveMemoryProject,
+  searchMemory,
+  setAutoMemoryEnabled,
+} from './memory/store.js';
+export type {
+  MemoryOptions,
+  MemoryProject,
+  MemorySearchHit,
+  RememberResult,
+} from './memory/store.js';
+export { migrateClaudeMemory, findClaudeMemoryDir } from './memory/migrate-claude.js';
+export type {
+  ClaudeMigrationFile,
+  ClaudeMigrationOptions,
+  ClaudeMigrationResult,
+} from './memory/migrate-claude.js';
 export * from './engine/errors.js';

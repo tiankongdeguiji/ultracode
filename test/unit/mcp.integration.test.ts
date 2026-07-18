@@ -21,9 +21,11 @@ const tsxLoader = createRequire(import.meta.url).resolve('tsx');
 // Spawned MCP servers must resolve their store from cwd, not an inherited
 // $ULTRACODE_HOME (ultracodeRoot prefers the override) — else the isolated-store
 // and restart tests would read a different store than they wrote.
-function childEnv(): Record<string, string> {
+function childEnv(memoryHome?: string): Record<string, string> {
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
   delete env.ULTRACODE_HOME;
+  if (memoryHome) env.ULTRACODE_MEMORY_HOME = memoryHome;
+  else delete env.ULTRACODE_MEMORY_HOME;
   return env;
 }
 
@@ -48,7 +50,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: childEnv(),
+      env: childEnv(join(projectDir, 'memory-home')),
     });
     await client.connect(transport);
   }, 30_000);
@@ -71,10 +73,21 @@ describe('MCP triad', () => {
     expect(effectiveWaitMs(9999)).toBe(3_600_000); // defensive ceiling = schema max
   });
 
-  it('lists exactly the triad tools; taskSupport never required/optional (required breaks Qoder)', async () => {
+  it('lists workflow and memory tools; taskSupport never required/optional (required breaks Qoder)', async () => {
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name).sort();
-    expect(names).toEqual(['workflow_list', 'workflow_result', 'workflow_start', 'workflow_status', 'workflow_stop']);
+    expect(names).toEqual([
+      'memory_context',
+      'memory_forget',
+      'memory_migrate_claude',
+      'memory_recall',
+      'memory_remember',
+      'workflow_list',
+      'workflow_result',
+      'workflow_start',
+      'workflow_status',
+      'workflow_stop',
+    ]);
     for (const t of tools.tools) {
       const support = (t as { execution?: { taskSupport?: string } }).execution?.taskSupport;
       // SDK stamps the spec-default 'forbidden' (plain calls only) — fine.
@@ -82,6 +95,48 @@ describe('MCP triad', () => {
       // augmented calls no host makes. Neither may ever appear.
       expect(support === undefined || support === 'forbidden').toBe(true);
     }
+  });
+
+  it('memory tools remember → context/search/read → confirmed forget', async () => {
+    const saved = (await client.callTool({
+      name: 'memory_remember',
+      arguments: {
+        memory: 'The MCP integration fixture uses port 6380 for Redis.',
+        topic: 'debugging',
+        summary: 'Redis uses port 6380.',
+      },
+    })) as { structuredContent?: { changed?: boolean; topic?: string }; isError?: boolean };
+    expect(saved.isError).toBeFalsy();
+    expect(saved.structuredContent).toMatchObject({ changed: true, topic: 'debugging' });
+
+    const context = (await client.callTool({ name: 'memory_context', arguments: {} })) as {
+      structuredContent?: { context?: string; empty?: boolean };
+    };
+    expect(context.structuredContent!.empty).toBe(false);
+    expect(context.structuredContent!.context).toContain('Redis uses port 6380.');
+
+    const search = (await client.callTool({
+      name: 'memory_recall',
+      arguments: { query: 'redis 6380' },
+    })) as { structuredContent?: { hits?: { topic: string }[] } };
+    expect(search.structuredContent!.hits?.[0]?.topic).toBe('debugging');
+
+    const read = (await client.callTool({
+      name: 'memory_recall',
+      arguments: { topic: 'debugging' },
+    })) as { structuredContent?: { content?: string } };
+    expect(read.structuredContent!.content).toContain('MCP integration fixture');
+
+    const rejected = (await client.callTool({
+      name: 'memory_forget',
+      arguments: { topic: 'debugging', confirm: 'other' },
+    })) as { isError?: boolean };
+    expect(rejected.isError).toBe(true);
+    const forgotten = (await client.callTool({
+      name: 'memory_forget',
+      arguments: { topic: 'debugging', confirm: 'debugging' },
+    })) as { structuredContent?: { removed?: boolean } };
+    expect(forgotten.structuredContent!.removed).toBe(true);
   });
 
   it('start → status(poll) → result: full round trip on the mock backend', async () => {
@@ -686,7 +741,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: { ...childEnv(), ULTRACODE_INSIDE_RUN: '1' },
+      env: { ...childEnv(join(projectDir, 'memory-home')), ULTRACODE_INSIDE_RUN: '1' },
     });
     await inside.connect(transport);
     try {
