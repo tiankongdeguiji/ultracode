@@ -5,7 +5,8 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 /** Per-attempt environment marker inherited by backend children and their tool
  *  sandboxes. Unlike a process group, it survives setsid()/new PID sessions. */
@@ -14,6 +15,7 @@ export const WORKER_SCOPE_ENV = 'ULTRACODE_WORKER_SCOPE';
 const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
 const WORKER_SCOPE_RE = /^[a-f0-9]{64}$/;
 const DARWIN_PS_BATCH_SIZE = 128;
+const MAX_DARWIN_PS_QUERIES = 64;
 
 export interface ProcStat {
   /** Process-group id (field 5). A detached worker is its own group leader, so pgrp === pid. */
@@ -91,19 +93,25 @@ export function isWorkerToken(value: string | undefined): value is string {
   return value !== undefined && WORKER_TOKEN_RE.test(value);
 }
 
-/** Stable, whitespace-free run marker used for exact environment matching. */
+/** Stable, whitespace-free filesystem identity used for run-scope matching. */
 export function workerScopeValue(scope: string): string {
-  return createHash('sha256').update(scope).digest('hex');
+  let identity: string;
+  try {
+    const stat = statSync(scope, { bigint: true });
+    identity = `${stat.dev}:${stat.ino}`;
+  } catch {
+    identity = resolve(scope);
+  }
+  return createHash('sha256').update(identity).digest('hex');
 }
 
-/** One Linux process carrying a tracked worker lifecycle token. */
+/** One process carrying a tracked worker lifecycle token. */
 export interface TrackedWorkerProcess extends TrackedProcess {
   token: string;
 }
 
-/** Find same-user Linux processes for a bounded token set with one process-table
- *  pass. Tokens follow Codex/bwrap descendants across setsid() and reparenting;
- *  every procfs read still fails closed. */
+/** Find marked processes for a bounded token set. Linux can scan procfs for
+ *  escaped descendants; macOS only verifies a supplied candidate PID set. */
 export function findWorkerProcessesForTokens(
   tokens: Iterable<string>,
   scope?: string,
@@ -122,13 +130,19 @@ export function findWorkerProcessesForTokens(
     // set from persisted records; it never performs a host-wide token sweep.
     if (scopeValue === undefined || candidates === undefined || candidates.length === 0) return [];
     const found: TrackedWorkerProcess[] = [];
+    const batches: number[][] = [];
     for (let offset = 0; offset < candidates.length; offset += DARWIN_PS_BATCH_SIZE) {
-      const batch = candidates.slice(offset, offset + DARWIN_PS_BATCH_SIZE);
+      batches.push(candidates.slice(offset, offset + DARWIN_PS_BATCH_SIZE));
+    }
+    let queries = 0;
+    while (batches.length > 0 && queries < MAX_DARWIN_PS_QUERIES) {
+      const batch = batches.shift()!;
+      queries++;
       let raw: string;
       try {
         raw = execFileSync(
           '/bin/ps',
-          ['eww', '-o', 'pid=', '-o', 'pgid=', '-o', 'lstart=', '-o', 'command=', '-p', batch.join(',')],
+          ['-E', '-c', '-o', 'pid=', '-o', 'pgid=', '-o', 'lstart=', '-o', 'command=', '-p', batch.join(',')],
           {
             encoding: 'utf8',
             env: { ...process.env, LC_ALL: 'C' },
@@ -137,7 +151,14 @@ export function findWorkerProcessesForTokens(
             maxBuffer: 256 * 1_024,
           },
         ).trim();
-      } catch {
+      } catch (err) {
+        // A large argv/environment can overflow a multi-process result. Split
+        // only maxBuffer failures, and cap total queries so hostile records
+        // cannot turn recovery into an unbounded number of `ps` executions.
+        if (batch.length > 1 && err instanceof Error && /maxBuffer|ENOBUFS/.test(err.message)) {
+          const middle = Math.ceil(batch.length / 2);
+          batches.unshift(batch.slice(middle), batch.slice(0, middle));
+        }
         continue;
       }
       for (const line of raw.split('\n')) {
@@ -148,10 +169,14 @@ export function findWorkerProcessesForTokens(
         const [, pidText = '', pgrpText = '', started = '', commandAndEnv = ''] = match;
         const pid = Number(pidText);
         const pgrp = Number(pgrpText);
-        const token = commandAndEnv.match(/(?:^|\s)ULTRACODE_WORKER_TOKEN=([a-f0-9]{32})(?=\s|$)/)?.[1];
-        const processScope = commandAndEnv.match(/(?:^|\s)ULTRACODE_WORKER_SCOPE=([a-f0-9]{64})(?=\s|$)/)?.[1];
+        const token = [...commandAndEnv.matchAll(/(?:^|\s)ULTRACODE_WORKER_TOKEN=([a-f0-9]{32})(?=\s|$)/g)]
+          .map((entry) => entry[1])
+          .find((value): value is string => isWorkerToken(value) && accepted.has(value));
+        const processScopes = [
+          ...commandAndEnv.matchAll(/(?:^|\s)ULTRACODE_WORKER_SCOPE=([a-f0-9]{64})(?=\s|$)/g),
+        ].map((entry) => entry[1]);
         if (!Number.isInteger(pid) || !Number.isInteger(pgrp) || !isWorkerToken(token)) continue;
-        if (!accepted.has(token) || processScope !== scopeValue || !WORKER_SCOPE_RE.test(processScope)) continue;
+        if (!processScopes.some((value) => value === scopeValue && WORKER_SCOPE_RE.test(value))) continue;
         found.push({
           pid,
           pgrp,
@@ -180,6 +205,8 @@ export function findWorkerProcessesForTokens(
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
     if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+    const before = readProcStat(pid);
+    if (!before) continue;
     let environ: string;
     try {
       environ = readFileSync(`/proc/${pid}/environ`, 'utf8');
@@ -191,8 +218,9 @@ export function findWorkerProcessesForTokens(
     const tokenEntry = environment.find((entry) => entry.startsWith(tokenPrefix));
     const token = tokenEntry?.slice(tokenPrefix.length);
     if (token === undefined || !accepted.has(token)) continue;
-    const stat = readProcStat(pid);
-    if (stat) found.push({ pid, token, ...stat });
+    const after = readProcStat(pid);
+    if (!after || after.starttime !== before.starttime || after.pgrp !== before.pgrp) continue;
+    found.push({ pid, token, ...after });
   }
   return found;
 }
@@ -205,6 +233,27 @@ export function findWorkerProcesses(token: string, scope?: string): TrackedProce
 export interface WorkerSignalResult {
   processes: number;
   tokens: Set<string>;
+}
+
+/** Signal an already-discovered Linux snapshot after one final identity check. */
+export function signalTrackedWorkerProcesses(
+  tracked: Iterable<TrackedWorkerProcess>,
+  signal: NodeJS.Signals,
+): WorkerSignalResult {
+  const signaledTokens = new Set<string>();
+  let processes = 0;
+  for (const proc of tracked) {
+    const live = readProcStat(proc.pid);
+    if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
+    try {
+      process.kill(proc.pid, signal);
+      processes++;
+      signaledTokens.add(proc.token);
+    } catch {
+      /* raced with exit */
+    }
+  }
+  return { processes, tokens: signaledTokens };
 }
 
 /** Signal a token set using bounded, batched process-table sweeps. */
@@ -224,19 +273,18 @@ export function signalWorkerProcessTokens(
   // every bounded wait pass to catch later SIGTERM-handler forks.
   for (let pass = 0; pass < 16; pass++) {
     let discovered = false;
+    const batch: TrackedWorkerProcess[] = [];
     for (const proc of findWorkerProcessesForTokens(accepted, scope)) {
       const identity = `${proc.pid}:${proc.starttime}`;
       if (seen.has(identity)) continue;
       seen.add(identity);
       discovered = true;
-      if (readProcStat(proc.pid)?.starttime !== proc.starttime) continue;
-      try {
-        process.kill(proc.pid, signal);
-        processes++;
-        signaledTokens.add(proc.token);
-      } catch {
-        /* raced with exit */
-      }
+      batch.push(proc);
+    }
+    const result = signalTrackedWorkerProcesses(batch, signal);
+    processes += result.processes;
+    for (const token of result.tokens) {
+      signaledTokens.add(token);
     }
     if (!discovered) break;
   }

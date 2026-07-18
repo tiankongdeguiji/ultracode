@@ -3,7 +3,7 @@
  * group. Codex's Linux sandbox uses new sessions, so kill(-pgid) alone cannot
  * contain every command it launches.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -89,6 +89,27 @@ async function waitUntilGone(pid: number): Promise<boolean> {
 }
 
 describe('escaped worker descendant cleanup', () => {
+  it('persists a token-only recovery record before the backend starts', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uc-token-first-'));
+    const recordFile = join(dir, 'record');
+    const observedFile = join(dir, 'observed');
+    const source = [
+      "const { readFileSync, writeFileSync } = require('node:fs')",
+      `writeFileSync(${JSON.stringify(observedFile)}, readFileSync(${JSON.stringify(recordFile)}, 'utf8'))`,
+    ].join(';');
+    const launcher = spawnAgentProcess(process.execPath, ['-e', source], {
+      cwd: process.cwd(),
+      env: {},
+      onWorkerToken: (token) => writeFileSync(recordFile, `- - ${token}`),
+    });
+    try {
+      await new Promise<void>((resolve) => launcher.child.once('close', () => resolve()));
+      expect(readFileSync(observedFile, 'utf8')).toBe(`- - ${launcher.workerToken}`);
+    } finally {
+      launcher.killTree('SIGKILL');
+    }
+  });
+
   it('reaps a same-group helper after the backend group leader exits', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return;
     const dir = mkdtempSync(join(tmpdir(), 'uc-group-helper-'));
@@ -296,8 +317,10 @@ describe('escaped worker descendant cleanup', () => {
     const victimRun = mkdtempSync(join(tmpdir(), 'uc-scope-victim-'));
     const attackerAgent = join(attackerRun, 'agents', '0000-forged');
     const victimAgent = join(victimRun, 'agents', '0000-real');
+    const victimAlias = join(mkdtempSync(join(tmpdir(), 'uc-scope-alias-')), 'run');
     mkdirSync(attackerAgent, { recursive: true });
     mkdirSync(victimAgent, { recursive: true });
+    symlinkSync(victimRun, victimAlias, 'dir');
     const launcher = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 60_000)'], {
       cwd: process.cwd(),
       env: {},
@@ -309,7 +332,7 @@ describe('escaped worker descendant cleanup', () => {
     try {
       expect(killWorkerGroups(attackerRun)).toBe(0);
       expect(readProcStat(pid)).toBeTruthy();
-      expect(killWorkerGroups(victimRun)).toBe(1);
+      expect(killWorkerGroups(victimAlias)).toBe(1);
       expect(await waitUntilGone(pid)).toBe(true);
     } finally {
       launcher.killTree('SIGKILL');

@@ -6,7 +6,7 @@
  * (stallMs / timeout) tighten in M7.
  */
 import { mkdirSync, writeFileSync, writeSync, closeSync, mkdtempSync, rmSync } from 'node:fs';
-import { openWriteFdNoFollow, writeFileNoFollow } from '../exec/safe-write.js';
+import { openWriteFdNoFollow, writeFileAtomicNoFollow, writeFileNoFollow } from '../exec/safe-write.js';
 import { readProcessIdentity } from '../exec/procinfo.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -602,6 +602,12 @@ export class AgentCallExecutor implements AgentExecutor {
         env: { ...scrubForeignBackendSecrets(process.env, spec.backend), ...plan.env, ULTRACODE_INSIDE_RUN: '1' },
         stdinData: plan.stdinData,
         workerScope: this.opts.workerScope,
+        // Create a token-only recovery record before spawn. If the runner is
+        // killed after the child starts but before identity lookup completes,
+        // Linux can still find the marked process through procfs.
+        onWorkerToken: processRecordFile
+          ? (token) => writeFileAtomicNoFollow(processRecordFile, `- - ${token}`)
+          : undefined,
       });
       proc = spawned;
       // Persist the worker's PGID so `ultracode stop` can kill the group if the
@@ -613,7 +619,10 @@ export class AgentCallExecutor implements AgentExecutor {
         // Keep an explicit placeholder when a very short-lived leader exits
         // before its identity can be read; whitespace splitting must retain the
         // token as field three for recovery of descendants it already launched.
-        writeFileNoFollow(processRecordFile, `${spawned.child.pid} ${stat?.starttime ?? '-'} ${spawned.workerToken}`);
+        writeFileAtomicNoFollow(
+          processRecordFile,
+          `${spawned.child.pid} ${stat?.starttime ?? '-'} ${spawned.workerToken}`,
+        );
       }
 
       // SIGTERM the tree, then escalate to SIGKILL if it survives — but track the

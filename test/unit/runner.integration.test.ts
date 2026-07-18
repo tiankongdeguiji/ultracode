@@ -14,7 +14,7 @@ import { readManifest, isTerminal } from '../../src/store/manifest.js';
 import { launchRunner } from '../../src/exec/daemonize.js';
 import { readJournal } from '../../src/engine/journal.js';
 import { findWorkerProcesses, readProcStat, WORKER_TOKEN_ENV } from '../../src/exec/procinfo.js';
-import { killWorkerGroups } from '../../src/exec/stop.js';
+import { killWorkerGroups, stopRun } from '../../src/exec/stop.js';
 
 const HELLO = `export const meta = { name: 'hello', description: 'd', phases: [{ title: 'Greet' }] }
 phase('Greet')
@@ -239,6 +239,48 @@ describe('detached runner', () => {
       ({ worker: workerPid, escaped: escapedPid } = await waitForRecordedPids(pidsFile));
 
       expect(await waitTerminal(runDir, 12_000)).toBe('stopped');
+      expect(await waitProcessGone(runnerPid)).toBe(true);
+      expect(await waitProcessGone(workerPid)).toBe(true);
+      expect(await waitProcessGone(escapedPid)).toBe(true);
+    } finally {
+      if (prevBin === undefined) delete process.env.ULTRACODE_CLAUDE_BIN;
+      else process.env.ULTRACODE_CLAUDE_BIN = prevBin;
+      if (prevGrace === undefined) delete process.env.ULTRACODE_HARD_STOP_GRACE_MS;
+      else process.env.ULTRACODE_HARD_STOP_GRACE_MS = prevGrace;
+      for (const pid of [runnerPid, workerPid, escapedPid]) {
+        if (pid <= 1) continue;
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      if (runDir) killWorkerGroups(runDir);
+    }
+  }, 20_000);
+
+  it('external stop escalation reaps a wedged runner and its escaped descendant', async () => {
+    if (process.platform !== 'linux') return;
+    const binDir = mkdtempSync(join(tmpdir(), 'uc-external-stop-bin-'));
+    const pidsFile = join(binDir, 'pids.json');
+    const fake = writeEscapingClaude(binDir, pidsFile);
+    const prevBin = process.env.ULTRACODE_CLAUDE_BIN;
+    const prevGrace = process.env.ULTRACODE_HARD_STOP_GRACE_MS;
+    process.env.ULTRACODE_CLAUDE_BIN = fake;
+    process.env.ULTRACODE_HARD_STOP_GRACE_MS = '30000';
+    let runDir: string | undefined;
+    let runnerPid = 0;
+    let workerPid = 0;
+    let escapedPid = 0;
+    try {
+      const run = makeRun(HANG_WITH_AGENT, { backend: 'claude' });
+      runDir = run.dir;
+      ({ pid: runnerPid } = await launchRunner(run.dir));
+      ({ worker: workerPid, escaped: escapedPid } = await waitForRecordedPids(pidsFile));
+
+      const stopped = await stopRun(run.root, run.runId);
+      expect(stopped).toMatchObject({ ok: true, status: 'stopped' });
+      expect(stopped.message).toContain('force-killed after 7s grace');
       expect(await waitProcessGone(runnerPid)).toBe(true);
       expect(await waitProcessGone(workerPid)).toBe(true);
       expect(await waitProcessGone(escapedPid)).toBe(true);
