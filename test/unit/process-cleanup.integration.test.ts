@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 import type { AgentEvent, AgentRequest, AgentSpec, BackendAdapter, ExitClass, SpawnPlan } from '../../src/backends/types.js';
 import { ZERO_USAGE } from '../../src/backends/types.js';
 import { AgentCallExecutor } from '../../src/engine/agentcall.js';
-import { readProcessIdentity, readProcStat } from '../../src/exec/procinfo.js';
+import { findWorkerProcesses, readProcessIdentity, readProcStat } from '../../src/exec/procinfo.js';
 import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { killWorkerGroups } from '../../src/exec/stop.js';
 
@@ -24,6 +24,7 @@ class EscapingAdapter implements BackendAdapter {
   constructor(
     private readonly pidFile: string,
     private readonly hang = false,
+    private readonly inheritStdio = false,
   ) {}
 
   probe() {
@@ -32,10 +33,11 @@ class EscapingAdapter implements BackendAdapter {
 
   buildSpawn(_req: AgentRequest): SpawnPlan {
     const escapedSource = 'setInterval(() => {}, 60_000)';
+    const escapedStdio = this.inheritStdio ? "['ignore', 'inherit', 'inherit']" : "'ignore'";
     const source = [
       "const { spawn } = require('node:child_process')",
       "const { writeFileSync } = require('node:fs')",
-      `const escaped = spawn(process.execPath, ['-e', ${JSON.stringify(escapedSource)}], { detached: true, stdio: 'ignore', env: process.env })`,
+      `const escaped = spawn(process.execPath, ['-e', ${JSON.stringify(escapedSource)}], { detached: true, stdio: ${escapedStdio}, env: process.env })`,
       `writeFileSync(${JSON.stringify(this.pidFile)}, String(escaped.pid))`,
       'escaped.unref()',
       this.hang ? 'setInterval(() => {}, 60_000)' : "process.stdout.write('done\\n')",
@@ -141,6 +143,33 @@ describe('escaped worker descendant cleanup', () => {
     }
   });
 
+  it('starts cleanup on direct-child exit when an escaped helper inherits stdio', async () => {
+    if (process.platform !== 'linux') return;
+    const pidFile = join(mkdtempSync(join(tmpdir(), 'uc-escaped-stdio-')), 'pid');
+    const spec: AgentSpec = {
+      seq: 0,
+      prompt: 'spawn an escaped helper with inherited stdio',
+      label: 'escape-stdio',
+      backend: 'mock',
+      cwd: process.cwd(),
+      retries: 0,
+    };
+
+    const pending = new AgentCallExecutor(new EscapingAdapter(pidFile, false, true)).execute(spec, SIGNAL);
+    const escapedPid = await waitForPid(pidFile);
+    try {
+      const outcome = await pending;
+      expect(outcome.ok).toBe(true);
+      expect(await waitUntilGone(escapedPid)).toBe(true);
+    } finally {
+      try {
+        process.kill(-escapedPid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+
   it('reaps the escaped session when an attempt timeout terminates the worker', async () => {
     if (process.platform !== 'linux') return;
     const pidFile = join(mkdtempSync(join(tmpdir(), 'uc-escaped-timeout-')), 'pid');
@@ -174,24 +203,33 @@ describe('escaped worker descendant cleanup', () => {
     if (process.platform !== 'linux') return;
     const dir = mkdtempSync(join(tmpdir(), 'uc-escaped-chain-'));
     const scriptFile = join(dir, 'chain.cjs');
-    const readyFile = join(dir, 'ready');
     writeFileSync(
       scriptFile,
       [
         "const { spawn } = require('node:child_process');",
-        "const { writeFileSync } = require('node:fs');",
+        "const { existsSync, writeFileSync } = require('node:fs');",
+        "const { join } = require('node:path');",
         'const generation = Number(process.argv[2]);',
-        `if (generation === 0) writeFileSync(${JSON.stringify(readyFile)}, '1');`,
+        `const markerDir = ${JSON.stringify(dir)};`,
+        "const marker = (kind, value) => join(markerDir, `${kind}-${value}`);",
         'let handled = false;',
         "process.on('SIGTERM', () => {",
         '  if (handled) return;',
         '  handled = true;',
+        "  writeFileSync(marker('term', generation), '1');",
         '  if (generation < 2) {',
         "    const child = spawn(process.execPath, [__filename, String(generation + 1)], { detached: true, stdio: 'ignore', env: process.env });",
         '    child.unref();',
+        "    const waiter = setInterval(() => {",
+        "      if (!existsSync(marker('ready', generation + 1))) return;",
+        '      clearInterval(waiter);',
+        '      process.exit(0);',
+        '    }, 5);',
+        '  } else {',
+        '    setTimeout(() => process.exit(0), 10);',
         '  }',
-        '  setTimeout(() => process.exit(0), 10);',
         '});',
+        "writeFileSync(marker('ready', generation), '1');",
         'setInterval(() => {}, 60_000);',
       ].join('\n'),
     );
@@ -200,10 +238,13 @@ describe('escaped worker descendant cleanup', () => {
       env: {},
     });
     try {
-      await waitForPid(readyFile);
-      const started = Date.now();
+      await waitForPid(join(dir, 'ready-0'));
       expect(await launcher.cleanupEscaped(1_000)).toBe(0);
-      expect(Date.now() - started).toBeLessThan(700);
+      for (let generation = 0; generation <= 2; generation++) {
+        expect(existsSync(join(dir, `ready-${generation}`))).toBe(true);
+        expect(existsSync(join(dir, `term-${generation}`))).toBe(true);
+      }
+      expect(findWorkerProcesses(launcher.workerToken)).toEqual([]);
     } finally {
       launcher.killTree('SIGKILL');
     }

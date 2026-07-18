@@ -4,7 +4,7 @@ import { closeSync, constants, existsSync, fstatSync, openSync, opendirSync, rea
 import { join } from 'node:path';
 import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, isRunnerAlive, reapOrphans } from '../store/runstore.js';
-import { isWorkerToken, readProcessIdentities, signalWorkerProcessTokens } from './procinfo.js';
+import { findWorkerProcessesForTokens, isWorkerToken, signalWorkerProcessTokens } from './procinfo.js';
 
 const WORKER_RECORD_RE = /^pgid(?:\.attempt[1-9]\d*(?:-fresh)?)?$/;
 const MAX_WORKER_RECORDS = 1_024;
@@ -93,12 +93,12 @@ function readWorkerRecord(path: string): string | undefined {
  *  one). `process.kill(-pid, …)` on a hostile value is catastrophic: `-1`
  *  broadcasts SIGKILL to every process the user owns, `-0` hits our own group.
  *  So we (a) refuse pid ≤ 1 and our own pid, and (b) bind a live group leader to
- *  the recorded kernel start-time. The third field is a high-entropy lifecycle
- *  token: on Linux it also finds descendants that escaped the PGID via setsid(). */
+ *  its recorded OS start-time, lifecycle token, and run scope. On Linux the
+ *  token also finds descendants that escaped the PGID via setsid(). */
 export function killWorkerGroups(runDir: string): number {
   const agentsDir = join(runDir, 'agents');
   if (!existsSync(agentsDir)) return 0;
-  const groupRecords = new Map<string, { path: string; pid: number; starttime: string }>();
+  const groupRecords = new Map<string, { path: string; pid: number; starttime: string; token: string }>();
   const tokenRecords = new Map<string, string>();
   for (const path of collectWorkerRecordPaths(agentsDir)) {
     const raw = readWorkerRecord(path);
@@ -107,20 +107,37 @@ export function killWorkerGroups(runDir: string): number {
     if (fields.length < 2 || fields.length > 3) continue;
     const [pidStr, recordedStart, workerToken] = fields;
     const pid = Number(pidStr);
-    if (Number.isInteger(pid) && pid > 1 && pid !== process.pid && recordedStart !== undefined) {
-      groupRecords.set(`${pid}:${recordedStart}`, { path, pid, starttime: recordedStart });
+    if (
+      Number.isInteger(pid) &&
+      pid > 1 &&
+      pid !== process.pid &&
+      recordedStart !== undefined &&
+      isWorkerToken(workerToken)
+    ) {
+      groupRecords.set(`${pid}:${recordedStart}:${workerToken}`, {
+        path,
+        pid,
+        starttime: recordedStart,
+        token: workerToken,
+      });
     }
     if (isWorkerToken(workerToken) && !tokenRecords.has(workerToken)) tokenRecords.set(workerToken, path);
   }
 
   const actedRecords = new Set<string>();
-  const identities = readProcessIdentities([...groupRecords.values()].map((record) => record.pid));
+  const verifiedLeaders = new Map(
+    findWorkerProcessesForTokens(
+      tokenRecords.keys(),
+      runDir,
+      [...groupRecords.values()].map((record) => record.pid),
+    ).map((proc) => [`${proc.pid}:${proc.starttime}:${proc.token}`, proc]),
+  );
   for (const record of groupRecords.values()) {
-    const live = identities.get(record.pid);
-    // Fail closed when the leader is gone or its OS start-time identity
-    // mismatches. Linux's scoped token sweep below is the recovery path for
-    // leaderless groups; macOS safely remains process-group-only.
-    if (!live || live.starttime !== record.starttime || live.pgrp !== record.pid) continue;
+    const live = verifiedLeaders.get(`${record.pid}:${record.starttime}:${record.token}`);
+    // A worker can forge public PID/start-time data in this untrusted file.
+    // Signal the group only when the exact leader also carries this record's
+    // lifecycle token and run scope in its initial environment.
+    if (!live || live.pgrp !== record.pid) continue;
     try {
       process.kill(-record.pid, 'SIGKILL');
       actedRecords.add(record.path);

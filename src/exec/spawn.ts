@@ -11,6 +11,7 @@ import {
   signalWorkerProcesses,
   WORKER_SCOPE_ENV,
   WORKER_TOKEN_ENV,
+  workerScopeValue,
 } from './procinfo.js';
 
 export interface SpawnedAgent {
@@ -33,7 +34,7 @@ export interface SpawnAgentOptions {
 export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentOptions): SpawnedAgent {
   const workerToken = randomBytes(16).toString('hex');
   const env: NodeJS.ProcessEnv = { ...opts.env, [WORKER_TOKEN_ENV]: workerToken };
-  if (opts.workerScope !== undefined) env[WORKER_SCOPE_ENV] = opts.workerScope;
+  if (opts.workerScope !== undefined) env[WORKER_SCOPE_ENV] = workerScopeValue(opts.workerScope);
   const child = spawn(bin, argv, {
     cwd: opts.cwd,
     env,
@@ -80,8 +81,15 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
         return false;
       }
     };
+    let groupTargetActive = groupAlive();
     const signalGroup = (signal: NodeJS.Signals): void => {
-      if (!pid) return;
+      if (!pid || !groupTargetActive) return;
+      if (!groupAlive()) {
+        // Never target this numeric PGID again after observing it absent: a
+        // later process group may reuse the id during the bounded sweep.
+        groupTargetActive = false;
+        return;
+      }
       try {
         process.kill(-pid, signal);
       } catch {
@@ -89,19 +97,21 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
       }
     };
     const tokenProcesses = () => findWorkerProcesses(workerToken, opts.workerScope);
-    if (!groupAlive() && tokenProcesses().length === 0) return 0;
+    if (!groupTargetActive && tokenProcesses().length === 0) return 0;
     const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
       for (;;) {
         signalGroup(signal);
         signalWorkerProcesses(workerToken, signal, opts.workerScope);
-        if (!groupAlive() && tokenProcesses().length === 0) return true;
+        if (groupTargetActive && !groupAlive()) groupTargetActive = false;
+        if (!groupTargetActive && tokenProcesses().length === 0) return true;
         if (Date.now() >= deadline) return false;
         await sleep(25);
       }
     };
     if (await sweepUntil('SIGTERM', Date.now() + graceMs)) return 0;
     if (await sweepUntil('SIGKILL', Date.now() + graceMs)) return 0;
-    return tokenProcesses().length + Number(groupAlive());
+    if (groupTargetActive && !groupAlive()) groupTargetActive = false;
+    return tokenProcesses().length + Number(groupTargetActive);
   };
 
   return { child, workerToken, killTree, cleanupEscaped };

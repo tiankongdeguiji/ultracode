@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { NdjsonSplitter } from '../../src/backends/ndjson.js';
 import { writeFileNoFollow, openAppendFdNoFollow } from '../../src/exec/safe-write.js';
 import { readProcessIdentity, readProcStat } from '../../src/exec/procinfo.js';
+import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { killWorkerGroups } from '../../src/exec/stop.js';
 import { PrefixReplayCache, type JournalRecord } from '../../src/engine/journal.js';
 import type { AgentSpec } from '../../src/backends/types.js';
@@ -105,6 +106,28 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
 
   it('kills a matching detached worker group with verified identity', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const runDir = tmp('uc-kill-matching-');
+    const agentDir = join(runDir, 'agents', 'worker');
+    mkdirSync(agentDir, { recursive: true });
+    const worker = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
+      cwd: process.cwd(),
+      env: {},
+      workerScope: runDir,
+    });
+    const pid = worker.child.pid!;
+    try {
+      const stat = readProcessIdentity(pid)!;
+      writeFileSync(join(agentDir, 'pgid'), `${pid} ${stat.starttime} ${worker.workerToken}`);
+      expect(killWorkerGroups(runDir)).toBe(1);
+      await sleep(150);
+      expect(readProcessIdentity(pid)).toBeUndefined(); // gone
+    } finally {
+      worker.killTree('SIGKILL');
+    }
+  });
+
+  it('rejects a forged record with an unrelated leader\'s exact public identity', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
       detached: true,
       stdio: 'ignore',
@@ -113,15 +136,10 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     const pid = child.pid!;
     try {
       const stat = readProcessIdentity(pid)!;
-      expect(killWorkerGroups(mk({ good: `${pid} ${stat.starttime}` }))).toBe(1);
-      await sleep(150);
-      expect(readProcessIdentity(pid)).toBeUndefined(); // gone
+      expect(killWorkerGroups(mk({ forged: `${pid} ${stat.starttime} ${'a'.repeat(32)}` }))).toBe(0);
+      expect(readProcessIdentity(pid)).toBeTruthy();
     } finally {
-      try {
-        process.kill(-pid, 'SIGKILL');
-      } catch {
-        /* already dead */
-      }
+      process.kill(-pid, 'SIGKILL');
     }
   });
 
@@ -158,7 +176,7 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     const pid = child.pid!;
     try {
       // Correct pid, wrong recorded start-time → identity check fails → not killed.
-      expect(killWorkerGroups(mk({ stale: `${pid} 999999999` }))).toBe(0);
+      expect(killWorkerGroups(mk({ stale: `${pid} 999999999 ${'b'.repeat(32)}` }))).toBe(0);
       expect(readProcessIdentity(pid)).toBeTruthy(); // still alive
     } finally {
       process.kill(-pid, 'SIGKILL');

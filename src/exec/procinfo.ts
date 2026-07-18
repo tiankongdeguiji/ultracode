@@ -4,6 +4,7 @@
  * descendants after they leave the original process group.
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 
 /** Per-attempt environment marker inherited by backend children and their tool
@@ -11,6 +12,8 @@ import { readdirSync, readFileSync } from 'node:fs';
 export const WORKER_TOKEN_ENV = 'ULTRACODE_WORKER_TOKEN';
 export const WORKER_SCOPE_ENV = 'ULTRACODE_WORKER_SCOPE';
 const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
+const WORKER_SCOPE_RE = /^[a-f0-9]{64}$/;
+const DARWIN_PS_BATCH_SIZE = 128;
 
 export interface ProcStat {
   /** Process-group id (field 5). A detached worker is its own group leader, so pgrp === pid. */
@@ -88,6 +91,11 @@ export function isWorkerToken(value: string | undefined): value is string {
   return value !== undefined && WORKER_TOKEN_RE.test(value);
 }
 
+/** Stable, whitespace-free run marker used for exact environment matching. */
+export function workerScopeValue(scope: string): string {
+  return createHash('sha256').update(scope).digest('hex');
+}
+
 /** One Linux process carrying a tracked worker lifecycle token. */
 export interface TrackedWorkerProcess extends TrackedProcess {
   token: string;
@@ -96,18 +104,77 @@ export interface TrackedWorkerProcess extends TrackedProcess {
 /** Find same-user Linux processes for a bounded token set with one process-table
  *  pass. Tokens follow Codex/bwrap descendants across setsid() and reparenting;
  *  every procfs read still fails closed. */
-export function findWorkerProcessesForTokens(tokens: Iterable<string>, scope?: string): TrackedWorkerProcess[] {
-  if (process.platform !== 'linux') return [];
+export function findWorkerProcessesForTokens(
+  tokens: Iterable<string>,
+  scope?: string,
+  candidatePids?: Iterable<number>,
+): TrackedWorkerProcess[] {
   const accepted = new Set([...tokens].filter(isWorkerToken));
   if (accepted.size === 0) return [];
+  const candidates =
+    candidatePids === undefined
+      ? undefined
+      : [...new Set(candidatePids)].filter((pid) => Number.isInteger(pid) && pid > 1 && pid !== process.pid);
+  const scopeValue = scope === undefined ? undefined : workerScopeValue(scope);
+
+  if (process.platform === 'darwin') {
+    // macOS has no procfs. Recovery only inspects the bounded candidate leader
+    // set from persisted records; it never performs a host-wide token sweep.
+    if (scopeValue === undefined || candidates === undefined || candidates.length === 0) return [];
+    const found: TrackedWorkerProcess[] = [];
+    for (let offset = 0; offset < candidates.length; offset += DARWIN_PS_BATCH_SIZE) {
+      const batch = candidates.slice(offset, offset + DARWIN_PS_BATCH_SIZE);
+      let raw: string;
+      try {
+        raw = execFileSync(
+          '/bin/ps',
+          ['eww', '-o', 'pid=', '-o', 'pgid=', '-o', 'lstart=', '-o', 'command=', '-p', batch.join(',')],
+          {
+            encoding: 'utf8',
+            env: { ...process.env, LC_ALL: 'C' },
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 1_000,
+            maxBuffer: 256 * 1_024,
+          },
+        ).trim();
+      } catch {
+        continue;
+      }
+      for (const line of raw.split('\n')) {
+        const match = line.match(
+          /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/,
+        );
+        if (!match) continue;
+        const [, pidText = '', pgrpText = '', started = '', commandAndEnv = ''] = match;
+        const pid = Number(pidText);
+        const pgrp = Number(pgrpText);
+        const token = commandAndEnv.match(/(?:^|\s)ULTRACODE_WORKER_TOKEN=([a-f0-9]{32})(?=\s|$)/)?.[1];
+        const processScope = commandAndEnv.match(/(?:^|\s)ULTRACODE_WORKER_SCOPE=([a-f0-9]{64})(?=\s|$)/)?.[1];
+        if (!Number.isInteger(pid) || !Number.isInteger(pgrp) || !isWorkerToken(token)) continue;
+        if (!accepted.has(token) || processScope !== scopeValue || !WORKER_SCOPE_RE.test(processScope)) continue;
+        found.push({
+          pid,
+          pgrp,
+          starttime: `darwin:${started.trim().replace(/\s+/g, '_')}`,
+          token,
+        });
+      }
+    }
+    return found;
+  }
+  if (process.platform !== 'linux') return [];
   let entries: string[];
-  try {
-    entries = readdirSync('/proc');
-  } catch {
-    return [];
+  if (candidates !== undefined) {
+    entries = candidates.map(String);
+  } else {
+    try {
+      entries = readdirSync('/proc');
+    } catch {
+      return [];
+    }
   }
   const tokenPrefix = `${WORKER_TOKEN_ENV}=`;
-  const scopeMarker = scope === undefined ? undefined : `${WORKER_SCOPE_ENV}=${scope}`;
+  const scopeMarker = scopeValue === undefined ? undefined : `${WORKER_SCOPE_ENV}=${scopeValue}`;
   const found: TrackedWorkerProcess[] = [];
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;

@@ -77,6 +77,21 @@ export interface AgentCallOptions {
 }
 
 export const USAGE_TICK_INTERVAL_MS = 1000;
+const STDIO_CLOSE_GRACE_MS = 250;
+
+function waitBounded(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (completed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(completed);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs).unref();
+    promise.then(() => finish(true));
+  });
+}
 
 /** Session ids arrive on the worker's own stdout stream — validate the shape
  *  before one re-enters an argv, where a forged leading-dash "id" would parse
@@ -569,6 +584,7 @@ export class AgentCallExecutor implements AgentExecutor {
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     let onAbort: (() => void) | undefined;
     let proc: SpawnedAgent | undefined;
+    let descendantsRemaining: number | undefined;
     // Delayed SIGKILL escalations scheduled after a SIGTERM. Tracked so `finally`
     // can cancel any still pending — otherwise a kill stays armed 5s out against
     // a pid that has already closed and may be recycled (→ kill the wrong group).
@@ -652,10 +668,19 @@ export class AgentCallExecutor implements AgentExecutor {
         stderrTail.push(chunk);
       });
 
+      const closePromise = new Promise<void>((resolve) => spawned.child.once('close', () => resolve()));
       const [code, sig] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
-        spawned.child.on('error', reject);
-        spawned.child.on('close', (c, s) => resolve([c, s]));
+        spawned.child.once('error', reject);
+        spawned.child.once('exit', (c, s) => resolve([c, s]));
       });
+      // An escaped helper may inherit the backend's stdout/stderr descriptors,
+      // which prevents ChildProcess `close` even after the direct child exits.
+      // Reap from `exit`, then give buffered output a bounded drain window.
+      descendantsRemaining = await spawned.cleanupEscaped();
+      if (!(await waitBounded(closePromise, STDIO_CLOSE_GRACE_MS))) {
+        spawned.child.stdout?.destroy();
+        spawned.child.stderr?.destroy();
+      }
 
       for (const line of splitter.end()) {
         if (transcriptFd !== undefined) writeSync(transcriptFd, line + '\n');
@@ -705,10 +730,10 @@ export class AgentCallExecutor implements AgentExecutor {
       if (stallTimer) clearInterval(stallTimer);
       for (const t of escalationTimers) clearTimeout(t);
       if (onAbort) signal.removeEventListener('abort', onAbort);
-      // `close` covers only the backend CLI and its stdio. Reap helpers left in
-      // its PGID plus Codex/bwrap sandboxes that escaped via setsid() before
-      // dropping the persistent recovery record.
-      const descendantsRemaining = (await proc?.cleanupEscaped()) ?? 0;
+      // The normal path starts cleanup on direct-child `exit`. Retry here only
+      // after an error or an incomplete sweep before dropping the recovery
+      // record.
+      if (descendantsRemaining !== 0) descendantsRemaining = (await proc?.cleanupEscaped()) ?? 0;
       if (transcriptFd !== undefined) closeSync(transcriptFd);
       try {
         sidecar?.close();
