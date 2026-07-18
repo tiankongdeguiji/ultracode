@@ -165,4 +165,4 @@ npm install && npm run build && npm link
 
 ## Status
 
-Not published to npm — `ultracode` installs via the OSS one-liner above and self-updates via `ultracode update`. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.
+`ultracode` installs via the OSS one-liner above and self-updates via `ultracode update`. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.

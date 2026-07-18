@@ -165,4 +165,4 @@ npm install && npm run build && npm link
 
 ## 项目状态
 
-目前尚未发布到 npm；`ultracode` 通过上面的 OSS 一行命令安装，并可通过 `ultracode update` 自升级。仅支持 Linux 和 macOS；由于依赖 POSIX 进程组，设计上不支持 Windows。完整范围与暂缓事项见 `docs/architecture.md`。
+`ultracode` 通过上面的 OSS 一行命令安装，并可通过 `ultracode update` 自升级。仅支持 Linux 和 macOS；由于依赖 POSIX 进程组，设计上不支持 Windows。完整范围与暂缓事项见 `docs/architecture.md`。
