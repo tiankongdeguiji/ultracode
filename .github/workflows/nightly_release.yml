@@ -1,0 +1,172 @@
+# Nightly Release
+#
+# Every night (or on manual dispatch — that is how the first publish happens,
+# and how a partially-failed release is reconciled), if package.json holds a
+# version with no v<version> tag yet: run the full CI gate on that exact HEAD,
+# tag it, upload the tarball + Node runtime mirror to OSS, then publish a
+# GitHub Release with generated notes. Releases are version-gated, not
+# commit-gated: maintainers bump via `npm version <bump> --no-git-tag-version`
+# and merge to main; CI never invents version numbers.
+#
+# ---- Ops Prerequisites ----
+# The runner must be an Alibaba Cloud ECS instance with a RAM role attached that
+# allows oss:PutObject, oss:PutObjectAcl, oss:GetObject and oss:HeadObject on
+# the hongsheng-jhs bucket's ultracode/* prefix, and the repo secret
+# ALIBABA_CLOUD_ECS_METADATA must hold that RAM role name.
+# ACCEPTED RISK (maintainer decision): this job shares the code_review
+# runner, whose PR-triggered jobs run untrusted PR code on the same host.
+# Instance-role credentials are ambient there (metadata endpoint) and cover
+# the MUTABLE pointer objects users execute (install.sh, latest.json) — i.e.
+# minted credentials mean installer RCE, not just bucket corruption — and
+# release immutability is script-enforced only (no OSS object lock; the role
+# also holds PutObjectAcl). Scoping the RAM role to ultracode/* does not
+# change any of this: that prefix is the write target. Hardening options
+# before the channel is broadly public: a dedicated release runner, OSS
+# versioning/object lock, and artifact signing (docs/architecture.md).
+# ---- End Prerequisites ----
+
+name: Nightly Release
+
+on:
+  schedule:
+    # 02:00 Beijing — offset from the 16:00 UTC CI canary to avoid queueing on
+    # the shared self-hosted runner
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# No cancel-in-progress: releases must not be killed mid-upload
+concurrency:
+  group: nightly-release
+
+jobs:
+  release:
+    # workflow_dispatch can target any ref — releases ship main, plus v* tags
+    # so a partial release can still be reconciled after main advances (the
+    # gate rejects a tag whose commit disagrees with the checked-out HEAD).
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ultracode-codereview-runner
+    timeout-minutes: 45
+    env:
+      # RAM role name read by scripts/release-oss.mjs for ECS metadata credentials
+      ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
+      # gh CLI auth for the GitHub Release
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # Full history: tag lookup + auto-generated notes need it. Unlike ci.yml
+      # this workflow intentionally keeps credential persistence — it pushes.
+      # Actions are pinned to full SHAs: this job holds release credentials,
+      # so movable tags must not decide what code runs here.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Scheduled runs skip when the version in package.json is already
+      # released (its v<version> tag exists). A manual dispatch ALWAYS
+      # proceeds — it is the reconcile path after a partial failure (tag or
+      # GitHub Release created but OSS incomplete). A tag that exists on a
+      # DIFFERENT commit is a hard error: reconciling would gate and build
+      # HEAD while shipping under a tag that names other code.
+      - name: Check for an unreleased version
+        id: gate
+        run: |
+          v=$(node -p "require('./package.json').version")
+          # Shape-validate before the value reaches $GITHUB_OUTPUT and later
+          # run: blocks (newlines/metacharacters here are the classic
+          # workflow-injection sink).
+          case "$v" in
+            *[!0-9A-Za-z.+-]*|'') echo "::error::package.json version has an unexpected shape: '$v'"; exit 1 ;;
+          esac
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+          tag_sha=$(git rev-parse -q --verify "v$v^{commit}" || true)
+          if [ -n "$tag_sha" ] && [ "$tag_sha" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::v$v is already tagged at $tag_sha but HEAD is $(git rev-parse HEAD) — bump the version, or re-run from the tagged commit"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = 'schedule' ] && [ -n "$tag_sha" ]; then
+            echo "v$v is already released, skipping"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.gate.outputs.skip != 'true'
+        run: npm ci
+
+      # The release must gate on the exact HEAD it ships
+      - if: steps.gate.outputs.skip != 'true'
+        run: npm run typecheck && npm run lint && npm test
+
+      # A tag on the exact HEAD the gate just ran on. An existing tag means a
+      # previous run tagged and then failed later — keep it and reconcile.
+      # (GITHUB_TOKEN pushes do not recursively trigger workflows.)
+      - name: Tag the release
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          UC_V: ${{ steps.gate.outputs.v }}
+        run: |
+          v="$UC_V"
+          if git rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
+            echo "v$v already tagged; reconcile re-run"
+          else
+            git tag "v$v"
+            git push origin "v$v"
+          fi
+
+      # No separate build step: publish() always rebuilds dist-release/ from
+      # the tree it is publishing.
+
+      # The binary runs with release-publishing credentials, so a pinned copy
+      # is ALWAYS installed and invoked by explicit path (OSSUTIL_BIN) — a
+      # preinstalled ossutil on the shared runner is never trusted. Bump the
+      # version and hash together.
+      # Installed OUTSIDE the checkout ($RUNNER_TEMP): anything untracked in
+      # the workspace would trip the publisher's clean-tree guard.
+      - name: Install pinned ossutil
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/ossutil-bin"
+          curl -fsSL https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64 \
+            -o "$RUNNER_TEMP/ossutil-bin/ossutil"
+          echo 'c0d1c40cb406ae2295a4d1e6a8a0aef8b4319d609c6b8acd742348c88734b697  '"$RUNNER_TEMP/ossutil-bin/ossutil" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/ossutil-bin/ossutil"
+          echo "OSSUTIL_BIN=$RUNNER_TEMP/ossutil-bin/ossutil" >> "$GITHUB_ENV"
+
+      - name: Mirror Node runtime (idempotent)
+        if: steps.gate.outputs.skip != 'true'
+        run: node scripts/release-oss.mjs --mirror-node
+
+      # Installers consume OSS, so it publishes first; the GitHub Release
+      # follows. --resume makes a reconcile re-run keep an already-uploaded
+      # tarball (immutable) and just refresh the pointers to it.
+      - name: Publish to OSS
+        if: steps.gate.outputs.skip != 'true'
+        run: node scripts/release-oss.mjs --resume
+
+      # Notes are auto-composed from PRs merged since the previous tag; they
+      # live on GitHub Releases only, not OSS. Release creation and asset
+      # upload are separate so a reconcile re-run can restore missing assets,
+      # and the assets are re-downloaded from OSS so the GitHub copy is always
+      # byte-identical to what installers fetch (a --resume publish keeps the
+      # original remote tarball, not the local rebuild).
+      - name: GitHub Release with generated notes
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          UC_V: ${{ steps.gate.outputs.v }}
+        run: |
+          v="$UC_V"
+          gh release view "v$v" >/dev/null 2>&1 || gh release create "v$v" --generate-notes
+          mkdir -p .gh-assets
+          base='https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode'
+          curl -fsSL -o ".gh-assets/ultracode-$v.tar.gz" "$base/releases/v$v/ultracode-$v.tar.gz"
+          curl -fsSL -o ".gh-assets/ultracode-$v.tar.gz.sha256" "$base/releases/v$v/ultracode-$v.tar.gz.sha256"
+          gh release upload "v$v" --clobber \
+            ".gh-assets/ultracode-$v.tar.gz" \
+            ".gh-assets/ultracode-$v.tar.gz.sha256"

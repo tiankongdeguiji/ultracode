@@ -8,7 +8,7 @@
 
 **Say the word, get an agent fleet.** Portable **ultracode** — dynamic multi-agent workflow orchestration — for coding agents that don't ship it natively: OpenAI Codex CLI, Gemini CLI, and friends. Faithful to the Claude Code Workflow dialect, so the same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine.
 
-*Linux & macOS · build from source.*
+*Linux & macOS · one-line install.*
 
 Type `ultracode` in your coding agent and it stops working in one context: the **skill** has your agent author a deterministic JS workflow; the **engine** runs each `agent()` as a subprocess.
 
@@ -51,9 +51,11 @@ One agent, one context window, one linear transcript — that's the ceiling. `ul
 ## Quick start
 
 ```bash
-npm install && npm run build && npm link   # build, then link a global `ultracode`
+curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.sh | sh
 ultracode doctor                  # which backends are available + auth modes
 ```
+
+If `ultracode` isn't found afterwards, the installer has already printed the one-line `PATH` fix for your shell.
 
 ### Use with your coding agent
 
@@ -91,6 +93,14 @@ agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
 ```
 
+### Upgrading
+
+```bash
+ultracode update                  # self-update; --check reports without installing
+```
+
+Re-running the install one-liner does the same for a default-location install. After upgrading, re-run `ultracode install <host>` so host integrations pick up the new engine path.
+
 ### Driving the engine directly
 
 The skill normally does this for you; the same surface is there for authoring and debugging workflows by hand. A workflow is a small deterministic JS script:
@@ -117,6 +127,16 @@ ultracode run my.workflow.js --backend codex    # foreground live panel; --detac
 ultracode resume <runId> [--script edited.js]   # unchanged journal prefix replays free
 ```
 
+### Build from source
+
+If you need to develop ultracode, build from source:
+
+```bash
+git clone https://github.com/tiankongdeguiji/ultracode.git
+cd ultracode
+npm install && npm run build && npm link
+```
+
 ## Commands
 
 | | Command | What it does |
@@ -131,6 +151,7 @@ ultracode resume <runId> [--script edited.js]   # unchanged journal prefix repla
 | | `logs <runId>` | print run events (`--follow` tails) |
 | | `list` | recent runs in the run store (`--all` for every run) |
 | integrate | `install <codex\|qoder\|generic>` | skill + host trigger (AGENTS.md snippet / Qoder rule); codex user-scope also registers the MCP server |
+| | `update` | self-update from the release server (`--check` reports only; `--to <version>` pins a version) |
 | | `doctor` | probe backends: availability, versions, auth topology |
 | | `mode [on\|off]` | read or set the standing ultracode-mode marker (`.ultracode/mode`) |
 | | `sync` | mirror canonical `.ultracode/workflows` into `.claude/` and `.qoder/` copies |
@@ -146,4 +167,4 @@ ultracode resume <runId> [--script edited.js]   # unchanged journal prefix repla
 
 ## Status
 
-Not published to npm. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.
+`ultracode` installs via the OSS one-liner above and self-updates via `ultracode update`. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.

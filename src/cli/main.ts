@@ -131,6 +131,16 @@ program
   });
 
 program
+  .command('update')
+  .description('update ultracode from the release server')
+  .option('--check', 'report whether an update is available without installing; exit 1 if one is')
+  .option('--to <version>', 'install a specific version instead of the latest')
+  .action(async (opts: { check?: boolean; to?: string }) => {
+    const { updateCommand } = await import('./update.js');
+    process.exit(await updateCommand(opts));
+  });
+
+program
   .command('mode')
   .argument('[value]', 'on | off (omit to print)')
   .description('read or set the standing ultracode-mode marker (.ultracode/mode)')

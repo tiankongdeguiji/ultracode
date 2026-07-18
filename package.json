@@ -1,6 +1,6 @@
 {
   "name": "ultracode",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "description": "Portable ultracode: dynamic multi-agent workflow orchestration for Codex, Qoder, Claude Code, Gemini CLI and other coding agents",
   "type": "module",
   "license": "Apache-2.0",
@@ -26,6 +26,9 @@
     "lint": "eslint src test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:plugins": "node scripts/build-plugins.mjs",
+    "build:release": "node scripts/build-release.mjs",
+    "release:oss": "node scripts/release-oss.mjs",
+    "release:oss:dry": "node scripts/release-oss.mjs --dry-run",
     "version": "node scripts/sync-version.mjs && git add src/version.ts package.json package-lock.json"
   },
   "dependencies": {
@@ -37,6 +40,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "^0.28.1",
     "eslint": "^9.17.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",

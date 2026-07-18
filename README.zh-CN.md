@@ -8,7 +8,7 @@
 
 **一句话，唤来一支智能体舰队。** 可移植的 **ultracode** 为 OpenAI Codex CLI、Gemini CLI 等编码 agent 补上动态多 agent 工作流编排能力。它兼容 Claude Code Workflow 方言，因此同一份 `*.workflow.js` 脚本可以在 Claude Code（原生）、Qoder（原生）和 ultracode 引擎上运行。
 
-*支持 Linux 与 macOS · 需从源码构建。*
+*支持 Linux 与 macOS · 一行命令安装。*
 
 在编码 agent 中输入 `ultracode`，它就不再局限于单个上下文：**skill** 引导你的 agent 生成一份确定性的 JS 工作流，**引擎** 则把每个 `agent()` 作为独立子进程运行。
 
@@ -51,9 +51,11 @@ ultracode engine: sandboxed script + scheduler + journal
 ## 快速开始
 
 ```bash
-npm install && npm run build && npm link   # 构建项目，并链接出全局 `ultracode` 命令
-ultracode doctor                           # 查看可用后端及其鉴权方式
+curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.sh | sh
+ultracode doctor                  # 查看可用后端及其鉴权方式
 ```
+
+如果安装后提示找不到 `ultracode`，安装器已为你的 shell 打印出对应的一行 `PATH` 配置。
 
 ### 配合编码 agent 使用
 
@@ -91,6 +93,14 @@ agents 13/15 · 2 running | tokens 2.0m | elapsed 6m05s
 ↑/↓ select · ⏎ details · esc clear · q detach · ctrl-c detach
 ```
 
+### 升级
+
+```bash
+ultracode update                  # 自升级；--check 只检查、不安装
+```
+
+对于安装在默认位置的情况，重新执行上面的一行安装命令效果相同。升级后请重新执行 `ultracode install <host>`，让宿主集成指向新的引擎路径。
+
 ### 直接使用引擎
 
 通常这些步骤都会由 skill 自动完成；为了方便手动编写和调试工作流，引擎也提供了同一套接口。一份工作流就是一小段确定性的 JS 脚本：
@@ -117,6 +127,16 @@ ultracode run my.workflow.js --backend codex    # 前台显示实时面板；使
 ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journal 前缀
 ```
 
+### 从源码构建
+
+如需参与开发 ultracode，可从源码构建：
+
+```bash
+git clone https://github.com/tiankongdeguiji/ultracode.git
+cd ultracode
+npm install && npm run build && npm link
+```
+
 ## 命令
 
 |  | 命令 | 功能 |
@@ -131,6 +151,7 @@ ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journ
 |  | `logs <runId>` | 输出运行事件；`--follow` 会持续跟踪新日志 |
 |  | `list` | 列出运行记录存储中的最近任务；使用 `--all` 查看全部记录 |
 | 集成 | `install <codex\|qoder\|generic>` | 安装 skill 和宿主触发器（AGENTS.md 片段或 Qoder 规则）；以用户级方式安装 Codex 时，还会注册 MCP 服务器 |
+|  | `update` | 从发布服务器自升级（`--check` 只检查不安装；`--to <version>` 指定目标版本） |
 |  | `doctor` | 探测各后端的可用性、版本和鉴权方式 |
 |  | `mode [on\|off]` | 读取或设置常驻的 ultracode 模式标记（`.ultracode/mode`） |
 |  | `sync` | 将 `.ultracode/workflows` 中的权威版本同步到 `.claude/` 和 `.qoder/` |
@@ -146,4 +167,4 @@ ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journ
 
 ## 项目状态
 
-目前尚未发布到 npm。仅支持 Linux 和 macOS；由于依赖 POSIX 进程组，暂不支持 Windows。完整范围与暂缓事项见 `docs/architecture.md`。
+`ultracode` 通过上面的 OSS 一行命令安装，并可通过 `ultracode update` 自升级。仅支持 Linux 和 macOS；由于依赖 POSIX 进程组，设计上不支持 Windows。完整范围与暂缓事项见 `docs/architecture.md`。

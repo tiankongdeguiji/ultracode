@@ -15,7 +15,7 @@ On **Qoder**, the native Workflow tool ships the same engine already — the pac
 
 ## v1 scope (shipped)
 
-In: engine (sandbox, dialect, journal/resume, budget, watchdogs), 5 backends (mock/codex/qoder/claude/gemini), CLI, MCP triad, codex+qoder+generic installers, worktree isolation, one-level nested workflows. Deferred: Windows, cursor/copilot/opencode/amp adapters, npm publish + marketplace repos (internal-first), MCP Tasks (unsupported by target hosts). Per-cut rationale: `docs/design/judge.md` (MILESTONES / V1 CUTS).
+In: engine (sandbox, dialect, journal/resume, budget, watchdogs), 5 backends (mock/codex/qoder/claude/gemini), CLI, MCP triad, codex+qoder+generic installers, worktree isolation, one-level nested workflows. Deferred: Windows, cursor/copilot/opencode/amp adapters, npm publish + marketplace repos (internal-first), MCP Tasks (unsupported by target hosts), release signing for the OSS install channel (a detached minisign/cosign signature over tarball + latest.json with the public key pinned in install.sh/update.ts — today's checksums authenticate the bucket's content against corruption, not against bucket compromise). Per-cut rationale: `docs/design/judge.md` (MILESTONES / V1 CUTS).
 
 ## What's proven
 

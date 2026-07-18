@@ -31,7 +31,7 @@ the installer writes these directly into your Codex config:
 ## Manual install (until marketplace)
 
 ```bash
-npm i -g ultracode        # or: npm link from a checkout
+curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.sh | sh
 ultracode install codex   # writes skill + AGENTS.md + MCP registration
 ultracode doctor          # verify backend availability and auth topology
 ```
