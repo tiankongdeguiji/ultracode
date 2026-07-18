@@ -291,11 +291,12 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
     chmodSync(stub, 0o755);
     const log = join(stubDir, 'stub-log.jsonl');
     writeFileSync(log, '');
-    // Runtime objects exist so the missing-runtime warning path stays quiet
-    // (mirror-mode tests opt out to exercise the download path).
+    // Runtime tarball+sidecar pairs exist so the fail-closed runtime
+    // preflight stays quiet (mirror-mode tests opt out to exercise it).
     if (opts.prefillRuntime !== false) {
       for (const plat of PLATFORMS) {
         remoteObjects[`oss://hongsheng-jhs/ultracode/runtime/node-v22.14.0-${plat}.tar.gz`] ??= '';
+        remoteObjects[`oss://hongsheng-jhs/ultracode/runtime/node-v22.14.0-${plat}.tar.gz.sha256`] ??= '';
       }
     }
     const objects = join(stubDir, 'stub-objects.json');
@@ -350,20 +351,41 @@ describe('release-oss publish + --resume against a stub ossutil', () => {
     expect(r.output).toContain('--force');
   });
 
-  it('--resume with a complete remote pair uploads only the pointers, advertising the REMOTE sha', async () => {
+  it('--resume with a verified remote pair uploads only the pointers, advertising the REMOTE sha', async () => {
     const { dir, sha256 } = makeRoot();
-    const remoteSha = 'a'.repeat(64);
+    const remoteBytes = 'remote-bytes';
+    const remoteSha = createHash('sha256').update(remoteBytes).digest('hex');
     const { env, log } = stubEnv({
-      [REMOTE_TAR]: 'remote-bytes',
+      [REMOTE_TAR]: remoteBytes,
       [REMOTE_SHA]: `${remoteSha}  ultracode-1.2.3.tar.gz\n`,
     });
     const out = await runAsync(['--resume', '--root', dir], env);
-    expect(out).toMatch(/already on OSS — keeping it/);
+    expect(out).toMatch(/keeping it and reconciling/);
     const dests = uploads(log).map((a) => a[3]);
     expect(dests).toEqual(['oss://hongsheng-jhs/ultracode/install.sh', 'oss://hongsheng-jhs/ultracode/latest.json']);
     const latest = JSON.parse(readFileSync(join(dir, 'dist-release/latest.json'), 'utf8'));
     expect(latest.sha256).toBe(remoteSha);
     expect(latest.sha256).not.toBe(sha256);
+  });
+
+  it('--resume repairs a sidecar that does not match the remote tarball bytes', async () => {
+    const { dir } = makeRoot();
+    const remoteBytes = 'remote-bytes';
+    const remoteSha = createHash('sha256').update(remoteBytes).digest('hex');
+    // An interleaved earlier publish left tarball B + sidecar A.
+    const { env, log } = stubEnv({
+      [REMOTE_TAR]: remoteBytes,
+      [REMOTE_SHA]: `${'a'.repeat(64)}  ultracode-1.2.3.tar.gz\n`,
+    });
+    const out = await runAsync(['--resume', '--root', dir], env);
+    expect(out).toMatch(/repaired its mismatched \.sha256 sidecar/);
+    const dests = uploads(log).map((a) => a[3]);
+    expect(dests).toEqual([
+      REMOTE_SHA,
+      'oss://hongsheng-jhs/ultracode/install.sh',
+      'oss://hongsheng-jhs/ultracode/latest.json',
+    ]);
+    expect(JSON.parse(readFileSync(join(dir, 'dist-release/latest.json'), 'utf8')).sha256).toBe(remoteSha);
   });
 
   it('--force overwrites an existing release with the local artifacts', async () => {

@@ -38,6 +38,15 @@ warn() {
   printf 'ultracode installer: warning: %s\n' "$1" >&2
 }
 
+assert_safe_path() {
+  # These values are interpolated into the receipt JSON and the generated
+  # shim (inside double quotes) — reject the characters that would break
+  # either rather than trying to escape them.
+  case "$2" in
+    *'"'*|*'\'*|*'$'*|*'`'*) die "$1 must not contain double quotes, backslashes, dollar signs, or backticks" ;;
+  esac
+}
+
 apply_defaults() {
   : "${UC_BASE_URL:=https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode}"
   : "${UC_VERSION:=}"
@@ -51,6 +60,19 @@ apply_defaults() {
   # characters that would break that.
   case "$UC_BASE_URL" in
     *'"'*|*'\'*) die 'UC_BASE_URL must not contain double quotes or backslashes' ;;
+  esac
+  assert_safe_path UC_INSTALL_DIR "$UC_INSTALL_DIR"
+  assert_safe_path UC_BIN_DIR "$UC_BIN_DIR"
+  [ -z "$UC_NODE" ] || assert_safe_path UC_NODE "$UC_NODE"
+  # Relative override paths would bake cwd-dependent symlink targets and shim
+  # paths — resolve them against the invoking cwd once, here.
+  case "$UC_INSTALL_DIR" in
+    /*) ;;
+    *) UC_INSTALL_DIR="$PWD/$UC_INSTALL_DIR" ;;
+  esac
+  case "$UC_BIN_DIR" in
+    /*) ;;
+    *) UC_BIN_DIR="$PWD/$UC_BIN_DIR" ;;
   esac
 }
 

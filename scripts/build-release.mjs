@@ -10,7 +10,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { assertSemver } from './semver.mjs';
@@ -24,6 +24,12 @@ const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 // A malformed version would name the stage, the tarball, and the shipped
 // package.json — validate before anything is written.
 assertSemver(version);
+
+// outDir is wiped below — refuse an argument that would take the source tree
+// (or an ancestor of it) with it.
+if (root === outDir || (root + sep).startsWith(outDir + sep)) {
+  throw new Error(`refusing outDir ${outDir}: it equals or contains the source root ${root}`);
+}
 
 rmSync(outDir, { recursive: true, force: true });
 const stage = join(outDir, `ultracode-${version}`);

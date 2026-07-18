@@ -272,6 +272,39 @@ describe.skipIf(!hasCurl)('install.sh', () => {
     expect(existsSync(join(home, '.local/bin/ultracode'))).toBe(false);
   }, 30_000);
 
+  it('relative UC_INSTALL_DIR/UC_BIN_DIR are absolutized against the invoking cwd', () => {
+    const home = makeHome();
+    const origin = makeOrigin();
+    addRelease(origin, '9.9.9');
+    // Relative overrides would otherwise bake cwd-dependent symlink targets.
+    const res = spawnSync('sh', [script], {
+      cwd: home,
+      encoding: 'utf8',
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        TMPDIR: join(home, 'tmp'),
+        UC_BASE_URL: `file://${origin}`,
+        UC_INSTALL_DIR: 'inst',
+        UC_BIN_DIR: 'bin',
+        UC_NODE: process.execPath,
+      },
+    });
+    expect(res.status, res.stderr).toBe(0);
+    expect(readlinkSync(join(home, 'inst/app/current'))).toBe(join(home, 'inst/app/9.9.9'));
+    const run = spawnSync(join(home, 'bin/ultracode'), { encoding: 'utf8', env: { HOME: home, PATH: process.env.PATH ?? '' } });
+    expect(run.stdout.trim()).toBe('9.9.9');
+  }, 30_000);
+
+  it('rejects install paths carrying shim/JSON-breaking metacharacters', () => {
+    const home = makeHome();
+    const origin = makeOrigin();
+    addRelease(origin, '9.9.9');
+    const res = runInstall(home, origin, { UC_INSTALL_DIR: join(home, 'has"quote') });
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toContain('UC_INSTALL_DIR must not contain');
+  }, 30_000);
+
   it('dies when app/current exists but is not a symlink', () => {
     const home = makeHome();
     const origin = makeOrigin();

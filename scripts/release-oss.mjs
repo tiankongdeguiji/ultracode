@@ -254,7 +254,11 @@ async function publish(ctx, root, opts) {
   if (ctx.dryRun) {
     console.log(`dry-run: skipping runtime presence check for Node v${pin}`);
   } else {
-    const missing = NODE_PLATFORMS.filter((p) => !statExists(ctx, `runtime/node-v${pin}-${p}.tar.gz`));
+    // install.sh fetches the tarball AND its sidecar — a half-mirrored
+    // platform breaks fresh installs just the same.
+    const missing = NODE_PLATFORMS.filter(
+      (p) => !statExists(ctx, `runtime/node-v${pin}-${p}.tar.gz`) || !statExists(ctx, `runtime/node-v${pin}-${p}.tar.gz.sha256`),
+    );
     if (missing.length > 0 && !opts.skipRuntimeCheck) {
       // Fail closed: shipping a release whose no-preexisting-node install
       // path is broken, then being boxed in by the immutability guard, is a
@@ -281,28 +285,30 @@ async function publish(ctx, root, opts) {
       );
     }
     // Resume after a partial publish. Rebuilds are not byte-reproducible (tar
-    // mtimes), so the remote pair IS the release — never re-upload it; the
-    // pointers must advertise the sha the sidecar on OSS records.
+    // mtimes), so the remote TARBALL is the release — never re-upload it. Its
+    // sidecar is only trusted after hashing the remote bytes: an interleaved
+    // earlier publish can leave a mismatched pair, and blindly advertising
+    // the sidecar's sha would keep every install checksum-failing.
     uploadImmutables = false;
-    if (statExists(ctx, sidecarKey)) {
-      const remote = (catObject(ctx, sidecarKey).trim().split(/\s+/)[0] ?? '').toLowerCase();
-      if (!/^[0-9a-f]{64}$/.test(remote)) fail(`remote ${sidecarKey} is not a well-formed sha256 sidecar`);
-      publishedSha = remote;
-      console.log(`v${version} tarball already on OSS — keeping it and reconciling the pointers`);
-    } else {
-      // The tarball landed but its sidecar did not: finish the immutable pair
-      // from the remote bytes, not the (differently-hashed) local rebuild.
-      const tmp = mkdtempSync(join(tmpdir(), 'uc-reconcile-'));
-      try {
-        const local = join(tmp, tarName);
-        fetchObject(ctx, releaseKey, local);
-        publishedSha = sha256File(local);
+    const tmp = mkdtempSync(join(tmpdir(), 'uc-reconcile-'));
+    try {
+      const local = join(tmp, tarName);
+      fetchObject(ctx, releaseKey, local);
+      publishedSha = sha256File(local);
+      const remoteSidecar = statExists(ctx, sidecarKey)
+        ? (catObject(ctx, sidecarKey).trim().split(/\s+/)[0] ?? '').toLowerCase()
+        : null;
+      if (remoteSidecar === publishedSha) {
+        console.log(`v${version} tarball already on OSS — keeping it and reconciling the pointers`);
+      } else {
         writeFileSync(`${local}.sha256`, `${publishedSha}  ${tarName}\n`);
         cp(ctx, `${local}.sha256`, sidecarKey, IMMUTABLE_META);
-      } finally {
-        rmSync(tmp, { recursive: true, force: true });
+        console.log(
+          `v${version} tarball already on OSS — ${remoteSidecar === null ? 'restored its missing' : 'repaired its mismatched'} .sha256 sidecar; reconciling the pointers`,
+        );
       }
-      console.log(`v${version} tarball already on OSS — restored its missing .sha256 sidecar; reconciling the pointers`);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
     }
   }
 

@@ -87,4 +87,22 @@ describe('release artifact', () => {
     expect(status).not.toBe(0);
     expect(stderr).toMatch(/version missing or invalid/);
   });
+
+  it('build-release refuses an outDir that equals or contains the source root', () => {
+    // The script wipes outDir before staging — pointing it at the repo (or an
+    // ancestor) must abort before rmSync, with the tree left intact.
+    for (const outDir of [root, join(root, '..')]) {
+      let status = 0;
+      let stderr = '';
+      try {
+        execFileSync(process.execPath, [join(root, 'scripts/build-release.mjs'), root, outDir], { stdio: 'pipe' });
+      } catch (e) {
+        status = (e as { status?: number }).status ?? -1;
+        stderr = String((e as { stderr?: unknown }).stderr ?? '');
+      }
+      expect(status).not.toBe(0);
+      expect(stderr).toMatch(/refusing outDir/);
+    }
+    expect(existsSync(join(root, 'package.json'))).toBe(true);
+  });
 });
