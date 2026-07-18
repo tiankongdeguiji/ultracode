@@ -7,7 +7,7 @@
  */
 import { mkdirSync, writeFileSync, writeSync, closeSync, mkdtempSync, rmSync } from 'node:fs';
 import { openWriteFdNoFollow, writeFileNoFollow } from '../exec/safe-write.js';
-import { readProcStat } from '../exec/procinfo.js';
+import { readProcessIdentity } from '../exec/procinfo.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../backends/ndjson.js';
@@ -590,10 +590,10 @@ export class AgentCallExecutor implements AgentExecutor {
       // Record `<pid> <starttime> <worker-token>`: start-time binds the PGID to
       // this process instance; the token finds descendants that leave the PGID.
       if (processRecordFile && spawned.child.pid) {
-        const stat = readProcStat(spawned.child.pid);
+        const stat = readProcessIdentity(spawned.child.pid);
         // Keep an explicit placeholder when a very short-lived leader exits
-        // before procfs can be read; whitespace splitting must retain the token
-        // as field three for recovery of any descendants it already launched.
+        // before its identity can be read; whitespace splitting must retain the
+        // token as field three for recovery of descendants it already launched.
         writeFileNoFollow(processRecordFile, `${spawned.child.pid} ${stat?.starttime ?? '-'} ${spawned.workerToken}`);
       }
 

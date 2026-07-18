@@ -142,6 +142,45 @@ describe('escaped worker descendant cleanup', () => {
     }
   });
 
+  it('re-signals token descendants spawned during graceful cleanup', async () => {
+    if (process.platform !== 'linux') return;
+    const dir = mkdtempSync(join(tmpdir(), 'uc-escaped-chain-'));
+    const scriptFile = join(dir, 'chain.cjs');
+    const readyFile = join(dir, 'ready');
+    writeFileSync(
+      scriptFile,
+      [
+        "const { spawn } = require('node:child_process');",
+        "const { writeFileSync } = require('node:fs');",
+        'const generation = Number(process.argv[2]);',
+        `if (generation === 0) writeFileSync(${JSON.stringify(readyFile)}, '1');`,
+        'let handled = false;',
+        "process.on('SIGTERM', () => {",
+        '  if (handled) return;',
+        '  handled = true;',
+        '  if (generation < 2) {',
+        "    const child = spawn(process.execPath, [__filename, String(generation + 1)], { detached: true, stdio: 'ignore', env: process.env });",
+        '    child.unref();',
+        '  }',
+        '  setTimeout(() => process.exit(0), 10);',
+        '});',
+        'setInterval(() => {}, 60_000);',
+      ].join('\n'),
+    );
+    const launcher = spawnAgentProcess(process.execPath, [scriptFile, '0'], {
+      cwd: process.cwd(),
+      env: {},
+    });
+    try {
+      await waitForPid(readyFile);
+      const started = Date.now();
+      expect(await launcher.cleanupEscaped(1_000)).toBe(0);
+      expect(Date.now() - started).toBeLessThan(700);
+    } finally {
+      launcher.killTree('SIGKILL');
+    }
+  });
+
   it('uses the persisted token after the recorded process-group leader is gone', async () => {
     if (process.platform !== 'linux') return;
     const runDir = mkdtempSync(join(tmpdir(), 'uc-escaped-recovery-'));

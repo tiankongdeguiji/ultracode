@@ -4,7 +4,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, isRunnerAlive, reapOrphans } from '../store/runstore.js';
-import { isWorkerToken, readProcStat, signalWorkerProcesses } from './procinfo.js';
+import { isWorkerToken, readProcessIdentity, signalWorkerProcesses } from './procinfo.js';
 
 /** Kill recorded worker process groups and token-tracked Linux descendants —
  *  used when the runner could not finish its own detached-agent cleanup.
@@ -39,13 +39,12 @@ export function killWorkerGroups(runDir: string): number {
       const pid = Number(pidStr);
       let acted = false;
       if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) {
-        const live = readProcStat(pid);
-        // Linux fails closed when the leader is gone or its identity mismatches;
-        // the token sweep below is the safe recovery path for leaderless groups.
-        // Platforms without procfs retain the guarded best-effort PGID fallback.
+        const live = readProcessIdentity(pid);
+        // Fail closed when the leader is gone or its OS start-time identity
+        // mismatches. Linux's token sweep below is the recovery path for
+        // leaderless groups; macOS safely remains process-group-only.
         const groupVerified =
-          process.platform !== 'linux' ||
-          (live !== undefined && recordedStart !== undefined && live.starttime === recordedStart && live.pgrp === pid);
+          live !== undefined && recordedStart !== undefined && live.starttime === recordedStart && live.pgrp === pid;
         if (groupVerified) {
           try {
             process.kill(-pid, 'SIGKILL');

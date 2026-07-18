@@ -62,19 +62,16 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
 
   const cleanupEscaped = async (graceMs = 500): Promise<number> => {
     if (findWorkerProcesses(workerToken).length === 0) return 0;
-    signalWorkerProcesses(workerToken, 'SIGTERM');
-    const gracefulDeadline = Date.now() + graceMs;
-    while (Date.now() < gracefulDeadline) {
-      if (findWorkerProcesses(workerToken).length === 0) return 0;
-      await sleep(25);
-    }
-    signalWorkerProcesses(workerToken, 'SIGKILL');
-    const killDeadline = Date.now() + graceMs;
-    while (Date.now() < killDeadline) {
-      const remaining = findWorkerProcesses(workerToken);
-      if (remaining.length === 0) return 0;
-      await sleep(25);
-    }
+    const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
+      for (;;) {
+        signalWorkerProcesses(workerToken, signal);
+        if (findWorkerProcesses(workerToken).length === 0) return true;
+        if (Date.now() >= deadline) return false;
+        await sleep(25);
+      }
+    };
+    if (await sweepUntil('SIGTERM', Date.now() + graceMs)) return 0;
+    if (await sweepUntil('SIGKILL', Date.now() + graceMs)) return 0;
     return findWorkerProcesses(workerToken).length;
   };
 

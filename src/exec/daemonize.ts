@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readManifest } from '../store/manifest.js';
+import { WORKER_TOKEN_ENV } from './procinfo.js';
 
 /**
  * Resolve how to re-invoke ourselves. Built (dist/): plain node + main.js.
@@ -35,10 +36,14 @@ export interface LaunchResult {
 export async function launchRunner(dir: string, opts: { startTimeoutMs?: number } = {}): Promise<LaunchResult> {
   const entry = resolveRunnerEntry();
   const logFd = openSync(join(dir, 'runner.log'), 'a');
+  const env = { ...process.env };
+  // An explicitly allowed nested run starts a new lifecycle. Carrying its
+  // caller's worker token would let the outer attempt reap this detached runner.
+  delete env[WORKER_TOKEN_ENV];
   const child = spawn(entry[0]!, [...entry.slice(1), '__runner', '--run-dir', dir], {
     detached: true,
     stdio: ['ignore', logFd, logFd],
-    env: process.env,
+    env,
   });
   closeSync(logFd);
   const pid = child.pid;

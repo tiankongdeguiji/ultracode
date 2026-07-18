@@ -13,7 +13,8 @@ import { createRunDir, getRun, isPidAlive } from '../../src/store/runstore.js';
 import { readManifest, isTerminal } from '../../src/store/manifest.js';
 import { launchRunner } from '../../src/exec/daemonize.js';
 import { readJournal } from '../../src/engine/journal.js';
-import { readProcStat } from '../../src/exec/procinfo.js';
+import { findWorkerProcesses, readProcStat, WORKER_TOKEN_ENV } from '../../src/exec/procinfo.js';
+import { killWorkerGroups } from '../../src/exec/stop.js';
 
 const HELLO = `export const meta = { name: 'hello', description: 'd', phases: [{ title: 'Greet' }] }
 phase('Greet')
@@ -43,6 +44,13 @@ await new Promise(() => {})
 return 'unreachable'
 `;
 
+const CRASH_WITH_AGENT = `export const meta = { name: 'crash-agent', description: 'd' }
+agent('spawn an escaped helper', { label: 'escape' }).catch(() => {})
+setTimeout(() => { throw new Error('timer callback crash') }, 750)
+await new Promise(() => {})
+return 'unreachable'
+`;
+
 async function waitTerminal(dir: string, timeoutMs = 15_000): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -60,6 +68,33 @@ async function waitProcessGone(pid: number, timeoutMs = 5_000): Promise<boolean>
     await sleep(50);
   }
   return false;
+}
+
+function writeEscapingClaude(binDir: string, pidsFile: string): string {
+  const fake = join(binDir, 'fake-claude.cjs');
+  const escapedSource = "process.on('SIGTERM', () => {}); setInterval(() => {}, 60_000)";
+  writeFileSync(
+    fake,
+    [
+      '#!/usr/bin/env node',
+      "const { spawn } = require('node:child_process');",
+      "const { writeFileSync } = require('node:fs');",
+      "process.on('SIGTERM', () => {});",
+      `const escaped = spawn(process.execPath, ['-e', ${JSON.stringify(escapedSource)}], { detached: true, stdio: 'ignore', env: process.env });`,
+      `writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify({ worker: process.pid, escaped: escaped.pid }));`,
+      'escaped.unref();',
+      'setInterval(() => {}, 60_000);',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  return fake;
+}
+
+async function waitForRecordedPids(file: string): Promise<{ worker: number; escaped: number }> {
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(file) && Date.now() < deadline) await sleep(50);
+  if (!existsSync(file)) throw new Error('fake backend did not record its process ids');
+  return JSON.parse(readFileSync(file, 'utf8'));
 }
 
 const TIMEOUT_PROBE = (opts: string) => `export const meta = { name: 'timeout-probe', description: 'd' }
@@ -188,39 +223,23 @@ describe('detached runner', () => {
   it('hard-stop reaps an active backend descendant that escaped into a new session', async () => {
     if (process.platform !== 'linux') return;
     const binDir = mkdtempSync(join(tmpdir(), 'uc-hard-stop-bin-'));
-    const fake = join(binDir, 'fake-claude.cjs');
     const pidsFile = join(binDir, 'pids.json');
-    const escapedSource = "process.on('SIGTERM', () => {}); setInterval(() => {}, 60_000)";
-    writeFileSync(
-      fake,
-      [
-        '#!/usr/bin/env node',
-        "const { spawn } = require('node:child_process');",
-        "const { writeFileSync } = require('node:fs');",
-        "process.on('SIGTERM', () => {});",
-        `const escaped = spawn(process.execPath, ['-e', ${JSON.stringify(escapedSource)}], { detached: true, stdio: 'ignore', env: process.env });`,
-        `writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify({ worker: process.pid, escaped: escaped.pid }));`,
-        'escaped.unref();',
-        'setInterval(() => {}, 60_000);',
-      ].join('\n'),
-      { mode: 0o755 },
-    );
+    const fake = writeEscapingClaude(binDir, pidsFile);
     const prevBin = process.env.ULTRACODE_CLAUDE_BIN;
     const prevGrace = process.env.ULTRACODE_HARD_STOP_GRACE_MS;
     process.env.ULTRACODE_CLAUDE_BIN = fake;
     process.env.ULTRACODE_HARD_STOP_GRACE_MS = '1500';
+    let runDir: string | undefined;
+    let runnerPid = 0;
     let workerPid = 0;
     let escapedPid = 0;
     try {
-      const { dir } = makeRun(HANG_WITH_AGENT, { backend: 'claude', wallClockMs: 500 });
-      const { pid } = await launchRunner(dir);
-      const deadline = Date.now() + 5_000;
-      while (!existsSync(pidsFile) && Date.now() < deadline) await sleep(50);
-      expect(existsSync(pidsFile)).toBe(true);
-      ({ worker: workerPid, escaped: escapedPid } = JSON.parse(readFileSync(pidsFile, 'utf8')));
+      ({ dir: runDir } = makeRun(HANG_WITH_AGENT, { backend: 'claude', wallClockMs: 500 }));
+      ({ pid: runnerPid } = await launchRunner(runDir));
+      ({ worker: workerPid, escaped: escapedPid } = await waitForRecordedPids(pidsFile));
 
-      expect(await waitTerminal(dir, 12_000)).toBe('stopped');
-      expect(await waitProcessGone(pid)).toBe(true);
+      expect(await waitTerminal(runDir, 12_000)).toBe('stopped');
+      expect(await waitProcessGone(runnerPid)).toBe(true);
       expect(await waitProcessGone(workerPid)).toBe(true);
       expect(await waitProcessGone(escapedPid)).toBe(true);
     } finally {
@@ -228,7 +247,7 @@ describe('detached runner', () => {
       else process.env.ULTRACODE_CLAUDE_BIN = prevBin;
       if (prevGrace === undefined) delete process.env.ULTRACODE_HARD_STOP_GRACE_MS;
       else process.env.ULTRACODE_HARD_STOP_GRACE_MS = prevGrace;
-      for (const pid of [workerPid, escapedPid]) {
+      for (const pid of [runnerPid, workerPid, escapedPid]) {
         if (pid <= 1) continue;
         try {
           process.kill(-pid, 'SIGKILL');
@@ -236,8 +255,44 @@ describe('detached runner', () => {
           /* already gone */
         }
       }
+      if (runDir) killWorkerGroups(runDir);
     }
   }, 20_000);
+
+  it('uncaught timer callback cleanup reaps active backend descendants before the runner crashes', async () => {
+    if (process.platform !== 'linux') return;
+    const binDir = mkdtempSync(join(tmpdir(), 'uc-fatal-bin-'));
+    const pidsFile = join(binDir, 'pids.json');
+    const fake = writeEscapingClaude(binDir, pidsFile);
+    const prevBin = process.env.ULTRACODE_CLAUDE_BIN;
+    process.env.ULTRACODE_CLAUDE_BIN = fake;
+    let runDir: string | undefined;
+    let runnerPid = 0;
+    let workerPid = 0;
+    let escapedPid = 0;
+    try {
+      ({ dir: runDir } = makeRun(CRASH_WITH_AGENT, { backend: 'claude' }));
+      ({ pid: runnerPid } = await launchRunner(runDir));
+      ({ worker: workerPid, escaped: escapedPid } = await waitForRecordedPids(pidsFile));
+
+      expect(await waitProcessGone(runnerPid)).toBe(true);
+      expect(await waitProcessGone(workerPid)).toBe(true);
+      expect(await waitProcessGone(escapedPid)).toBe(true);
+      expect(readFileSync(join(runDir, 'runner.log'), 'utf8')).toContain('timer callback crash');
+    } finally {
+      if (prevBin === undefined) delete process.env.ULTRACODE_CLAUDE_BIN;
+      else process.env.ULTRACODE_CLAUDE_BIN = prevBin;
+      for (const pid of [runnerPid, workerPid, escapedPid]) {
+        if (pid <= 1) continue;
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      if (runDir) killWorkerGroups(runDir);
+    }
+  }, 15_000);
 
   it('tolerates a non-positive or fractional maxConcurrency in an inherited config.json (falls back to default, no orphan)', async () => {
     // Old-version or hand-edited run dirs can carry maxConcurrency: 0 or 2.5 —
@@ -309,6 +364,31 @@ describe('detached runner', () => {
       else process.env.ULTRACODE_CLAUDE_BIN = prev;
     }
   }, 40_000);
+
+  it('starts a detached runner outside an inherited worker-token lifecycle', async () => {
+    if (process.platform !== 'linux') return;
+    const enclosingToken = 'a'.repeat(32);
+    const previous = process.env[WORKER_TOKEN_ENV];
+    let runnerPid = 0;
+    let runDir: string | undefined;
+    process.env[WORKER_TOKEN_ENV] = enclosingToken;
+    try {
+      ({ dir: runDir } = makeRun(SLOW));
+      ({ pid: runnerPid } = await launchRunner(runDir));
+      expect(findWorkerProcesses(enclosingToken).some((proc) => proc.pid === runnerPid)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env[WORKER_TOKEN_ENV];
+      else process.env[WORKER_TOKEN_ENV] = previous;
+      if (runnerPid > 1) {
+        try {
+          process.kill(runnerPid, 'SIGTERM');
+        } catch {
+          /* already gone */
+        }
+      }
+      if (runDir && runnerPid > 1) await waitTerminal(runDir, 10_000);
+    }
+  }, 20_000);
 
   it('run survives launcher death by construction (launcher already exited: we are polling from a different process)', async () => {
     // The launcher (this test) returns from launchRunner immediately after

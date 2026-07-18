@@ -202,17 +202,25 @@ program
   .requiredOption('--run-dir <dir>')
   .action(async (opts: { runDir: string }) => {
     const { runnerMain } = await import('./runner.js');
-    try {
-      process.exit(await runnerMain(opts.runDir));
-    } catch (err) {
+    const { killWorkerGroups } = await import('../exec/stop.js');
+    const cleanupWorkers = () => {
       try {
-        const { killWorkerGroups } = await import('../exec/stop.js');
         killWorkerGroups(opts.runDir);
       } catch {
         /* fatal path: best-effort worker containment */
       }
+    };
+    // Observe synchronous callback crashes without replacing Node's default
+    // uncaught-exception behavior, which still prints the error and exits.
+    process.on('uncaughtExceptionMonitor', cleanupWorkers);
+    try {
+      process.exit(await runnerMain(opts.runDir));
+    } catch (err) {
+      cleanupWorkers();
       process.stderr.write(`runner fatal: ${(err as Error)?.stack ?? err}\n`);
       process.exit(1);
+    } finally {
+      process.removeListener('uncaughtExceptionMonitor', cleanupWorkers);
     }
   });
 
