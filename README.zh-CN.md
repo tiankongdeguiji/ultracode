@@ -55,6 +55,8 @@ curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.
 ultracode doctor                  # 查看可用后端及其鉴权方式
 ```
 
+如果安装后提示找不到 `ultracode`，安装器已为你的 shell 打印出对应的一行 `PATH` 配置。
+
 ### 配合编码 agent 使用
 
 推荐的日常使用方式，是先安装 skill 和宿主集成：

@@ -18,6 +18,7 @@ import {
   mkdtempSync,
   readFileSync,
   readlinkSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -191,6 +192,21 @@ describe.skipIf(!hasCurl)('install.sh', () => {
     expect(existsSync(join(home2, '.ultracode/app/9.9.10'))).toBe(false);
     expect(readlinkSync(join(home2, '.ultracode/app/current'))).toBe(join(home2, '.ultracode/app/9.9.9'));
     expect(runShim(home2).stdout.trim()).toBe('9.9.9');
+  }, 30_000);
+
+  it('a receipted install whose payload vanished is reinstalled, not trusted', () => {
+    const home = makeHome();
+    const origin = makeOrigin();
+    addRelease(origin, '9.9.9');
+    expect(runInstall(home, origin).status).toBe(0);
+    // Gut the payload but leave the receipt: a re-run must not flip current
+    // onto a broken target and report success.
+    const mainJs = join(home, '.ultracode/app/9.9.9/dist/cli/main.js');
+    rmSync(mainJs);
+    const res = runInstall(home, origin);
+    expect(res.status, res.stderr).toBe(0);
+    expect(existsSync(mainJs)).toBe(true);
+    expect(runShim(home).stdout.trim()).toBe('9.9.9');
   }, 30_000);
 
   it('receiptless partial install is wiped and replaced', () => {

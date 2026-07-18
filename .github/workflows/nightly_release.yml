@@ -40,6 +40,8 @@ concurrency:
 
 jobs:
   release:
+    # workflow_dispatch can target any ref — releases only ever ship main
+    if: github.ref == 'refs/heads/main'
     runs-on: ultracode-codereview-runner
     timeout-minutes: 45
     env:
@@ -50,25 +52,34 @@ jobs:
     steps:
       # Full history: tag lookup + auto-generated notes need it. Unlike ci.yml
       # this workflow intentionally keeps credential persistence — it pushes.
-      - uses: actions/checkout@v4
+      # Actions are pinned to full SHAs: this job holds release credentials,
+      # so movable tags must not decide what code runs here.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       # Scheduled runs skip when the version in package.json is already
-      # released (its v<version> tag exists on the remote). A manual dispatch
-      # ALWAYS proceeds — it is the reconcile path after a partial failure
-      # (tag or GitHub Release created but OSS incomplete).
+      # released (its v<version> tag exists). A manual dispatch ALWAYS
+      # proceeds — it is the reconcile path after a partial failure (tag or
+      # GitHub Release created but OSS incomplete). A tag that exists on a
+      # DIFFERENT commit is a hard error: reconciling would gate and build
+      # HEAD while shipping under a tag that names other code.
       - name: Check for an unreleased version
         id: gate
         run: |
           v=$(node -p "require('./package.json').version")
           echo "v=$v" >> "$GITHUB_OUTPUT"
-          if [ "$GITHUB_EVENT_NAME" = 'schedule' ] && [ -n "$(git ls-remote --tags origin "refs/tags/v$v")" ]; then
+          tag_sha=$(git rev-parse -q --verify "v$v^{commit}" || true)
+          if [ -n "$tag_sha" ] && [ "$tag_sha" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::v$v is already tagged at $tag_sha but HEAD is $(git rev-parse HEAD) — bump the version, or re-run from the tagged commit"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = 'schedule' ] && [ -n "$tag_sha" ]; then
             echo "v$v is already released, skipping"
             echo 'skip=true' >> "$GITHUB_OUTPUT"
           else
@@ -100,19 +111,19 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         run: npm run build:release
 
-      # The binary runs with release-publishing credentials, so its checksum is
-      # pinned — bump the version and hash together.
-      - name: Ensure ossutil
+      # The binary runs with release-publishing credentials, so a pinned copy
+      # is ALWAYS installed and invoked by explicit path (OSSUTIL_BIN) — a
+      # preinstalled ossutil on the shared runner is never trusted. Bump the
+      # version and hash together.
+      - name: Install pinned ossutil
         if: steps.gate.outputs.skip != 'true'
         run: |
-          if ! command -v ossutil >/dev/null 2>&1; then
-            mkdir -p "$GITHUB_WORKSPACE/.ossutil-bin"
-            curl -fsSL https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64 \
-              -o "$GITHUB_WORKSPACE/.ossutil-bin/ossutil"
-            echo 'c0d1c40cb406ae2295a4d1e6a8a0aef8b4319d609c6b8acd742348c88734b697  '"$GITHUB_WORKSPACE/.ossutil-bin/ossutil" | sha256sum -c -
-            chmod +x "$GITHUB_WORKSPACE/.ossutil-bin/ossutil"
-            echo "$GITHUB_WORKSPACE/.ossutil-bin" >> "$GITHUB_PATH"
-          fi
+          mkdir -p "$GITHUB_WORKSPACE/.ossutil-bin"
+          curl -fsSL https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64 \
+            -o "$GITHUB_WORKSPACE/.ossutil-bin/ossutil"
+          echo 'c0d1c40cb406ae2295a4d1e6a8a0aef8b4319d609c6b8acd742348c88734b697  '"$GITHUB_WORKSPACE/.ossutil-bin/ossutil" | sha256sum -c -
+          chmod +x "$GITHUB_WORKSPACE/.ossutil-bin/ossutil"
+          echo "OSSUTIL_BIN=$GITHUB_WORKSPACE/.ossutil-bin/ossutil" >> "$GITHUB_ENV"
 
       - name: Mirror Node runtime (idempotent)
         if: steps.gate.outputs.skip != 'true'
@@ -126,12 +137,20 @@ jobs:
         run: node scripts/release-oss.mjs --resume
 
       # Notes are auto-composed from PRs merged since the previous tag; they
-      # live on GitHub Releases only, not OSS. view-or-create keeps reconcile
-      # re-runs idempotent.
+      # live on GitHub Releases only, not OSS. Release creation and asset
+      # upload are separate so a reconcile re-run can restore missing assets,
+      # and the assets are re-downloaded from OSS so the GitHub copy is always
+      # byte-identical to what installers fetch (a --resume publish keeps the
+      # original remote tarball, not the local rebuild).
       - name: GitHub Release with generated notes
         if: steps.gate.outputs.skip != 'true'
         run: |
           v='${{ steps.gate.outputs.v }}'
-          gh release view "v$v" >/dev/null 2>&1 || gh release create "v$v" --generate-notes \
-            "dist-release/ultracode-$v.tar.gz" \
-            "dist-release/ultracode-$v.tar.gz.sha256"
+          gh release view "v$v" >/dev/null 2>&1 || gh release create "v$v" --generate-notes
+          mkdir -p .gh-assets
+          base='https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode'
+          curl -fsSL -o ".gh-assets/ultracode-$v.tar.gz" "$base/releases/v$v/ultracode-$v.tar.gz"
+          curl -fsSL -o ".gh-assets/ultracode-$v.tar.gz.sha256" "$base/releases/v$v/ultracode-$v.tar.gz.sha256"
+          gh release upload "v$v" --clobber \
+            ".gh-assets/ultracode-$v.tar.gz" \
+            ".gh-assets/ultracode-$v.tar.gz.sha256"

@@ -60,8 +60,25 @@ require_curl() {
 
 uc_fetch() {
   # -f matters: OSS 403/404 XML error pages must become hard failures, not
-  # poisoned tarballs or manifests on disk.
-  curl -fsSL --retry 3 --retry-delay 1 -o "$1" "$2" || die "download failed: $2"
+  # poisoned tarballs or manifests on disk. Timeouts bound a stalled
+  # connection ($3 overrides the total cap for large tarballs).
+  curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time "${3:-120}" -o "$1" "$2" \
+    || die "download failed: $2"
+}
+
+link_swap() {
+  # Point symlink $2 at $1. GNU mv -T renames over the old link atomically —
+  # a concurrent shim launch never observes a missing link; BSD mv (macOS)
+  # has no -T, so it falls back to ln -sfn's tiny unlink+create window.
+  uc_ls_tmp="$(dirname "$2")/.lnk.$$"
+  rm -f "$uc_ls_tmp"
+  ln -s "$1" "$uc_ls_tmp"
+  if mv -T "$uc_ls_tmp" "$2" 2>/dev/null; then
+    :
+  else
+    rm -f "$uc_ls_tmp"
+    ln -sfn "$1" "$2"
+  fi
 }
 
 detect_platform() {
@@ -141,7 +158,7 @@ provision_node() {
   uc_node_dir="$UC_INSTALL_DIR/runtime/$uc_node_name"
   if [ ! -x "$uc_node_dir/bin/node" ]; then
     info "no usable Node >= 20 found; provisioning Node v$UC_NODE_VERSION"
-    uc_fetch "$UC_TMP/$uc_node_name.tar.gz" "$UC_BASE_URL/runtime/$uc_node_name.tar.gz"
+    uc_fetch "$UC_TMP/$uc_node_name.tar.gz" "$UC_BASE_URL/runtime/$uc_node_name.tar.gz" 600
     uc_fetch "$UC_TMP/$uc_node_name.tar.gz.sha256" "$UC_BASE_URL/runtime/$uc_node_name.tar.gz.sha256"
     uc_node_expected=$(awk 'NR==1{print $1}' "$UC_TMP/$uc_node_name.tar.gz.sha256")
     uc_node_actual=$(sha256_of "$UC_TMP/$uc_node_name.tar.gz")
@@ -168,7 +185,7 @@ provision_node() {
       mv "$uc_node_stage" "$uc_node_dir"
     fi
   fi
-  ln -sfn "$uc_node_dir" "$UC_INSTALL_DIR/runtime/current"
+  link_swap "$uc_node_dir" "$UC_INSTALL_DIR/runtime/current"
   UC_NODE_BIN="$uc_node_dir/bin/node"
   node_ok "$UC_NODE_BIN" || die "provisioned Node runtime at $UC_NODE_BIN is not runnable on this machine"
 }
@@ -200,7 +217,7 @@ choose_node() {
 download_app() {
   UC_TARBALL_PATH="$UC_TMP/ultracode-$UC_RESOLVED_VERSION.tar.gz"
   uc_fetch "$UC_TARBALL_PATH" \
-    "$UC_BASE_URL/releases/v$UC_RESOLVED_VERSION/ultracode-$UC_RESOLVED_VERSION.tar.gz"
+    "$UC_BASE_URL/releases/v$UC_RESOLVED_VERSION/ultracode-$UC_RESOLVED_VERSION.tar.gz" 600
   uc_app_actual=$(sha256_of "$UC_TARBALL_PATH")
   if [ "$uc_app_actual" != "$UC_EXPECTED_SHA" ]; then
     die "sha256 mismatch for ultracode-$UC_RESOLVED_VERSION.tar.gz (expected $UC_EXPECTED_SHA, got $uc_app_actual) — corrupted download; re-run the installer"
@@ -225,7 +242,7 @@ EOF
 
 install_app() {
   if [ -e "$UC_APP_TARGET" ] || [ -L "$UC_APP_TARGET" ]; then
-    warn "removing receiptless partial install at $UC_APP_TARGET"
+    warn "removing incomplete install at $UC_APP_TARGET"
     rm -rf "$UC_APP_TARGET"
   fi
   mkdir -p "$UC_TMP/app-extract"
@@ -254,7 +271,7 @@ flip_current() {
   elif [ -e "$uc_current" ]; then
     die "$uc_current exists but is not a symlink; move it aside and re-run the installer"
   fi
-  ln -sfn "$UC_APP_TARGET" "$uc_current"
+  link_swap "$UC_APP_TARGET" "$uc_current"
 }
 
 write_shim() {
@@ -341,10 +358,11 @@ main() {
   resolve_version
   UC_APP_TARGET="$UC_INSTALL_DIR/app/$UC_RESOLVED_VERSION"
   choose_node
-  if [ -f "$UC_APP_TARGET/.install-receipt.json" ]; then
-    # A receipted dir is a valid same-version install — a detached runner may
-    # be executing from it right now, so keep it and skip the download; the
-    # symlink and shim below still get refreshed.
+  if [ -f "$UC_APP_TARGET/.install-receipt.json" ] && [ -f "$UC_APP_TARGET/dist/cli/main.js" ]; then
+    # A receipted dir WITH its payload is a valid same-version install — a
+    # detached runner may be executing from it right now, so keep it and skip
+    # the download; the symlink and shim below still get refreshed. A receipt
+    # whose payload vanished is treated as incomplete and reinstalled.
     info "ultracode $UC_RESOLVED_VERSION is already installed; keeping the existing copy"
   else
     info "installing ultracode $UC_RESOLVED_VERSION ($UC_OS-$UC_ARCH) into $UC_INSTALL_DIR"

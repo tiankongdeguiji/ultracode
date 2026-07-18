@@ -55,6 +55,8 @@ curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.
 ultracode doctor                  # which backends are available + auth modes
 ```
 
+If `ultracode` isn't found afterwards, the installer has already printed the one-line `PATH` fix for your shell.
+
 ### Use with your coding agent
 
 The intended daily path — install the skill and the host wiring:

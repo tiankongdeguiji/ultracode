@@ -176,6 +176,27 @@ describe('update CLI', () => {
     expect(() => compareVersions('nope', '1.2.3')).toThrow(/semver/);
   });
 
+  it('compareVersions: SemVer prerelease identifier and build-metadata semantics', () => {
+    expect(compareVersions('1.2.3-rc.10', '1.2.3-rc.2')).toBe(1);
+    expect(compareVersions('1.2.3-rc.2', '1.2.3-rc.10')).toBe(-1);
+    expect(compareVersions('1.2.3-alpha', '1.2.3-alpha.1')).toBe(-1);
+    expect(compareVersions('1.2.3-1', '1.2.3-alpha')).toBe(-1);
+    expect(compareVersions('1.2.3-alpha.beta', '1.2.3-alpha.beta')).toBe(0);
+    expect(compareVersions('1.2.3+build.1', '1.2.3')).toBe(0);
+    expect(compareVersions('1.2.3-rc.1+build.7', '1.2.3-rc.1')).toBe(0);
+  });
+
+  it('full update hands the running node to the installer as UC_NODE', async () => {
+    const origin = makeOrigin('{ "version": "99.0.0" }');
+    // Stub install.sh records the UC_NODE the updater passed down.
+    writeFileSync(join(origin, 'install.sh'), '#!/bin/sh\nprintf %s "$UC_NODE" > "$UC_INSTALL_DIR/node-used"\n');
+    const installDir = mkdtempSync(join(tmpdir(), 'uc-update-idir-'));
+    const { deps } = makeInstalled({ baseUrl: `file://${origin}`, installDir, binDir: '/y' });
+    const code = await updateCommand({}, deps);
+    expect(code).toBe(0);
+    expect(readFileSync(join(installDir, 'node-used'), 'utf8')).toBe(process.execPath);
+  });
+
   it('--to the running version is a friendly no-op', async () => {
     const { deps } = makeInstalled({ baseUrl: 'file:///nowhere', installDir: '/x', binDir: '/y' });
     const out = capture('stdout');

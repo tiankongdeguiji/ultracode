@@ -22,9 +22,14 @@ import { VERSION } from '../version.js';
 
 const DEFAULT_BASE_URL = 'https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode';
 
-const SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$/;
+const SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
-/** Numeric triple compare; any prerelease suffix sorts older than its plain triple. */
+/**
+ * SemVer 2.0.0 precedence: numeric triple, then dot-split prerelease
+ * identifiers (numeric identifiers compare numerically and sort below
+ * alphanumeric ones, so rc.10 > rc.2); a prerelease sorts below its plain
+ * triple; build metadata is accepted and ignored.
+ */
 export function compareVersions(a: string, b: string): number {
   const pa = SEMVER_RE.exec(a);
   const pb = SEMVER_RE.exec(b);
@@ -33,9 +38,28 @@ export function compareVersions(a: string, b: string): number {
     const d = Number(pa[i]) - Number(pb[i]);
     if (d !== 0) return Math.sign(d);
   }
-  if (pa[4] === pb[4]) return 0;
-  if (pa[4] && pb[4]) return pa[4] < pb[4] ? -1 : 1;
-  return pa[4] ? -1 : 1;
+  const ra = pa[4];
+  const rb = pb[4];
+  if (ra === undefined || rb === undefined) return ra === rb ? 0 : ra !== undefined ? -1 : 1;
+  const ia = ra.split('.');
+  const ib = rb.split('.');
+  for (let i = 0; i < Math.max(ia.length, ib.length); i++) {
+    const x = ia[i];
+    const y = ib[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) {
+      const d = Number(x) - Number(y);
+      if (d !== 0) return Math.sign(d);
+    } else if (nx !== ny) {
+      return nx ? -1 : 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
 }
 
 /** Written by install.sh into the versioned app dir; proves an OSS install and pins its layout. */
@@ -144,6 +168,9 @@ async function performUpdate(
         UC_BASE_URL: base,
         UC_INSTALL_DIR: receipt.installDir,
         UC_BIN_DIR: receipt.binDir,
+        // The node running this CLI is the shim-selected one — hand it to the
+        // installer so a host whose node lives off PATH doesn't re-provision.
+        UC_NODE: env.UC_NODE ?? process.execPath,
       },
     });
     if (res.error) throw res.error;
