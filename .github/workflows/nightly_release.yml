@@ -1,0 +1,140 @@
+# Nightly Release
+#
+# Every night (or on manual dispatch — that is how the first publish happens,
+# and how a partially-failed release is reconciled), if main has commits since
+# the last v* tag: run the full CI gate on that exact HEAD, bump the patch
+# version, tag, upload the tarball + Node runtime mirror to OSS, then publish
+# a GitHub Release with generated notes.
+#
+# ---- Ops Prerequisites ----
+# The runner must be an Alibaba Cloud ECS instance with a RAM role attached that
+# allows oss:PutObject, oss:PutObjectAcl, oss:GetObject and oss:HeadObject on
+# the hongsheng-jhs bucket's ultracode/* prefix, and the repo secret
+# ALIBABA_CLOUD_ECS_METADATA must hold that RAM role name.
+# NOTE: instance-role credentials are ambient to EVERY job on that runner. The
+# code_review workflow runs PR-triggered agent jobs on the same label today —
+# prefer a dedicated release runner (or scope the RAM role to this bucket
+# prefix only, as above) so PR-side code can never write the release channel.
+# ---- End Prerequisites ----
+
+name: Nightly Release
+
+on:
+  schedule:
+    # 02:00 Beijing — offset from the 16:00 UTC CI canary to avoid queueing on
+    # the shared self-hosted runner
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# No cancel-in-progress: releases must not be killed mid-upload
+concurrency:
+  group: nightly-release
+
+jobs:
+  release:
+    runs-on: ultracode-codereview-runner
+    timeout-minutes: 45
+    env:
+      # RAM role name read by scripts/release-oss.mjs for ECS metadata credentials
+      ALIBABA_CLOUD_ECS_METADATA: ${{ secrets.ALIBABA_CLOUD_ECS_METADATA }}
+      # gh CLI auth for the GitHub Release
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # Full history: tag lookup + auto-generated notes need it. Unlike ci.yml
+      # this workflow intentionally keeps credential persistence — it pushes.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Scheduled runs skip when HEAD is already tagged (this also prevents the
+      # nightly bump commit from re-triggering a release the next night). A
+      # manual dispatch ALWAYS proceeds — it is the reconcile path after a
+      # partial failure (tag or GitHub Release created but OSS incomplete).
+      - name: Check for new commits
+        id: gate
+        run: |
+          last=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          if [ "$GITHUB_EVENT_NAME" = 'schedule' ] && [ -n "$last" ] && [ "$(git rev-list "$last"..HEAD --count)" -eq 0 ]; then
+            echo 'no commits since '"$last"', skipping'
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - if: steps.gate.outputs.skip != 'true'
+        run: npm ci
+
+      # The release must gate on the exact HEAD it ships
+      - if: steps.gate.outputs.skip != 'true'
+        run: npm run typecheck && npm run lint && npm test
+
+      # GITHUB_TOKEN pushes do not recursively trigger workflows; the gate
+      # already ran on this tree. An already-tagged HEAD means a previous run
+      # bumped and then failed later — keep that version and reconcile.
+      - name: Bump version and tag
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          if git describe --tags --exact-match --match 'v*' HEAD >/dev/null 2>&1; then
+            echo 'HEAD is already tagged; skipping bump (reconcile re-run)'
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            npm version patch -m 'chore: bump version to %s'
+            git push origin HEAD:main --follow-tags
+          fi
+
+      - name: Capture released version
+        id: version
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          v=$(node -p "require('./package.json').version")
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build release tarball
+        if: steps.gate.outputs.skip != 'true'
+        run: npm run build:release
+
+      # The binary runs with release-publishing credentials, so its checksum is
+      # pinned — bump the version and hash together.
+      - name: Ensure ossutil
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          if ! command -v ossutil >/dev/null 2>&1; then
+            mkdir -p "$GITHUB_WORKSPACE/.ossutil-bin"
+            curl -fsSL https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64 \
+              -o "$GITHUB_WORKSPACE/.ossutil-bin/ossutil"
+            echo 'c0d1c40cb406ae2295a4d1e6a8a0aef8b4319d609c6b8acd742348c88734b697  '"$GITHUB_WORKSPACE/.ossutil-bin/ossutil" | sha256sum -c -
+            chmod +x "$GITHUB_WORKSPACE/.ossutil-bin/ossutil"
+            echo "$GITHUB_WORKSPACE/.ossutil-bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Mirror Node runtime (idempotent)
+        if: steps.gate.outputs.skip != 'true'
+        run: node scripts/release-oss.mjs --mirror-node
+
+      # Installers consume OSS, so it publishes first; the GitHub Release
+      # follows. --resume makes a reconcile re-run keep an already-uploaded
+      # tarball (immutable) and just refresh the pointers to it.
+      - name: Publish to OSS
+        if: steps.gate.outputs.skip != 'true'
+        run: node scripts/release-oss.mjs --resume
+
+      # Notes are auto-composed from PRs merged since the previous tag; they
+      # live on GitHub Releases only, not OSS. view-or-create keeps reconcile
+      # re-runs idempotent.
+      - name: GitHub Release with generated notes
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          v='${{ steps.version.outputs.v }}'
+          gh release view "v$v" >/dev/null 2>&1 || gh release create "v$v" --generate-notes \
+            "dist-release/ultracode-$v.tar.gz" \
+            "dist-release/ultracode-$v.tar.gz.sha256"

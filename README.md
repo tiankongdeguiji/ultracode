@@ -8,7 +8,7 @@
 
 **Say the word, get an agent fleet.** Portable **ultracode** — dynamic multi-agent workflow orchestration — for coding agents that don't ship it natively: OpenAI Codex CLI, Gemini CLI, and friends. Faithful to the Claude Code Workflow dialect, so the same `*.workflow.js` script runs on Claude Code (native), Qoder (native), and this engine.
 
-*Linux & macOS · build from source.*
+*Linux & macOS · one-line install.*
 
 Type `ultracode` in your coding agent and it stops working in one context: the **skill** has your agent author a deterministic JS workflow; the **engine** runs each `agent()` as a subprocess.
 
@@ -51,9 +51,19 @@ One agent, one context window, one linear transcript — that's the ceiling. `ul
 ## Quick start
 
 ```bash
-npm install && npm run build && npm link   # build, then link a global `ultracode`
+curl -fsSL https://hongsheng-jhs.oss-cn-hangzhou.aliyuncs.com/ultracode/install.sh | sh
 ultracode doctor                  # which backends are available + auth modes
 ```
+
+The installer needs only `curl`: it fetches a self-contained ~360 KB tarball, verifies checksums, and — if no Node >= 20 is present — provisions a Node runtime from the same bucket. From source instead: `npm install && npm run build && npm link`.
+
+### Upgrading
+
+```bash
+ultracode update                  # self-update; --check reports without installing
+```
+
+Re-running the install one-liner does the same. The installer puts `ultracode` in `~/.local/bin`, which must be on your `PATH`. Old versions are retained under `~/.ultracode/app/` on purpose — running detached workflows and host MCP registrations pin the versioned path. After upgrading, re-run `ultracode install <host>` so host integrations pick up the new engine path; an old version's directory is safe to delete only after that, once no detached runs from it remain.
 
 ### Use with your coding agent
 
@@ -131,6 +141,7 @@ ultracode resume <runId> [--script edited.js]   # unchanged journal prefix repla
 | | `logs <runId>` | print run events (`--follow` tails) |
 | | `list` | recent runs in the run store (`--all` for every run) |
 | integrate | `install <codex\|qoder\|generic>` | skill + host trigger (AGENTS.md snippet / Qoder rule); codex user-scope also registers the MCP server |
+| | `update` | self-update from the release server (`--check` reports only; `--to <version>` pins a version) |
 | | `doctor` | probe backends: availability, versions, auth topology |
 | | `mode [on\|off]` | read or set the standing ultracode-mode marker (`.ultracode/mode`) |
 | | `sync` | mirror canonical `.ultracode/workflows` into `.claude/` and `.qoder/` copies |
@@ -146,4 +157,4 @@ ultracode resume <runId> [--script edited.js]   # unchanged journal prefix repla
 
 ## Status
 
-Not published to npm. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.
+Not published to npm — `ultracode` installs via the OSS one-liner above and self-updates via `ultracode update`. Linux and macOS only — Windows is unsupported by design (POSIX process groups). Scope and deferred items: `docs/architecture.md`.

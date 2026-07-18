@@ -8,3 +8,5 @@ agent_space/
 # fully generated plugin bundles (npm run build:plugins; sources in skill/, workflows/, hostpacks/)
 dist-codex/
 dist-qoder/
+# release artifact staging (npm run build:release)
+dist-release/
