@@ -1,7 +1,24 @@
 {
   "name": "ultracode",
-  "description": "Dynamic multi-agent workflow orchestration (ultracode) for Codex: skill + MCP workflow engine",
-  "author": "ultracode",
+  "description": "Portable multi-agent workflows and Claude-compatible project memory for Codex.",
+  "author": {
+    "name": "ultracode"
+  },
   "license": "Apache-2.0",
-  "keywords": ["workflow", "orchestration", "multi-agent", "ultracode", "subagents"]
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "keywords": ["workflow", "orchestration", "multi-agent", "memory", "claude", "ultracode"],
+  "interface": {
+    "displayName": "Ultracode",
+    "shortDescription": "Agent workflows and portable project memory",
+    "longDescription": "Run durable multi-agent workflows and carry Claude-compatible project memory, rules, and migrated learnings across Codex sessions.",
+    "developerName": "ultracode",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Use ultracode to orchestrate this task.",
+      "Recall what this project knows about the current issue.",
+      "Migrate my Claude Code memory into ultracode."
+    ]
+  }
 }

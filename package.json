@@ -1,7 +1,7 @@
 {
   "name": "ultracode",
   "version": "0.2.0",
-  "description": "Portable ultracode: dynamic multi-agent workflow orchestration for Codex, Qoder, Claude Code, Gemini CLI and other coding agents",
+  "description": "Portable multi-agent workflows and Claude-compatible project memory for Codex, Qoder, Claude Code, Gemini CLI and other coding agents",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
@@ -36,6 +36,7 @@
     "acorn": "^8.14.0",
     "ajv": "^8.17.0",
     "commander": "^13.0.0",
+    "minimatch": "^10.2.5",
     "zod": "^4.0.0"
   },
   "devDependencies": {

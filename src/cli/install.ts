@@ -7,14 +7,18 @@ export async function installCommand(
 ): Promise<number> {
   try {
     // How this machine launches `ultracode mcp` — dev checkout or built dist.
-    const mcpCommand = [...resolveRunnerEntry(), 'mcp'];
-    const actions = installForHost(host, { ...opts, mcpCommand });
+    const runner = resolveRunnerEntry();
+    const mcpCommand = [...runner, 'mcp'];
+    const memoryHookCommand = [...runner, 'memory', 'hook'];
+    const actions = installForHost(host, { ...opts, mcpCommand, memoryHookCommand });
     for (const a of actions) {
       const prefix = opts.dryRun ? 'would ' : '';
       process.stdout.write(`${a.changed ? '✓' : '·'} ${prefix}${a.detail}: ${a.path}\n`);
     }
     if (!opts.dryRun) {
-      process.stdout.write(`\nDone. Say "ultracode: <task>" in ${host} to orchestrate — the keyword is the only trigger.\n`);
+      process.stdout.write(
+        `\nDone. Say "ultracode: <task>" in ${host} to orchestrate, or "remember <fact>" to use portable project memory.\n`,
+      );
     }
     return 0;
   } catch (err) {

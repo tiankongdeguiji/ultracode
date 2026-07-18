@@ -6,7 +6,8 @@
  * first (unlink does not follow) + O_NOFOLLOW (ELOOP on a symlink leaf) closes
  * the follow. Directory-component symlinks are out of scope (would need openat).
  */
-import { closeSync, constants, openSync, rmSync, writeSync } from 'node:fs';
+import { closeSync, constants, fsyncSync, openSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const WRITE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | NOFOLLOW;
@@ -31,5 +32,22 @@ export function writeFileNoFollow(path: string, data: string): void {
     writeSync(fd, data);
   } finally {
     closeSync(fd);
+  }
+}
+
+/** Atomically replace a file without following a pre-planted symlink leaf. */
+export function writeFileAtomicNoFollow(path: string, data: string): void {
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  const fd = openWriteFdNoFollow(temporary);
+  try {
+    writeSync(fd, data);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    renameSync(temporary, path);
+  } finally {
+    rmSync(temporary, { force: true });
   }
 }

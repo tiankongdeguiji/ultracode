@@ -24,9 +24,13 @@ const manifest = (from, to) => {
   writeFileSync(to, JSON.stringify({ ...template, version }, null, 2) + '\n');
 };
 
-// Codex: skill only (MCP registration + AGENTS.md are written by the installer).
+// Codex: skills + MCP + memory SessionStart hook. The installer remains the
+// direct-install path and also writes AGENTS.md guidance.
 rmSync(join(root, 'dist-codex'), { recursive: true, force: true });
 copy('skill/ultracode', join(root, 'dist-codex/skills/ultracode'));
+copy('skill/ultracode-memory', join(root, 'dist-codex/skills/ultracode-memory'));
+copy('hostpacks/codex/hooks', join(root, 'dist-codex/hooks'));
+copy('hostpacks/codex/.mcp.json', join(root, 'dist-codex/.mcp.json'));
 copy('hostpacks/codex/README.md', join(root, 'dist-codex/README.md'));
 copy('LICENSE', join(root, 'dist-codex/LICENSE'));
 manifest('hostpacks/codex/plugin.json', join(root, 'dist-codex/.codex-plugin/plugin.json'));
@@ -34,6 +38,7 @@ manifest('hostpacks/codex/plugin.json', join(root, 'dist-codex/.codex-plugin/plu
 // Qoder: skill + uc-* templates + effort-routing agents.
 rmSync(join(root, 'dist-qoder'), { recursive: true, force: true });
 copy('skill/ultracode', join(root, 'dist-qoder/skills/ultracode'));
+copy('skill/ultracode-memory', join(root, 'dist-qoder/skills/ultracode-memory'));
 copy('workflows', join(root, 'dist-qoder/workflows'));
 copy('hostpacks/qoder/agents', join(root, 'dist-qoder/agents'));
 copy('hostpacks/qoder/README.md', join(root, 'dist-qoder/README.md'));

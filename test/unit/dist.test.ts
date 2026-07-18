@@ -27,12 +27,16 @@ describe('plugin bundles', () => {
 
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
-  it('codex bundle: valid manifest + README + skill + license present', () => {
+  it('codex bundle: valid manifest + skills + memory hook/MCP + license present', () => {
     const manifest = JSON.parse(readFileSync(join(root, 'dist-codex/.codex-plugin/plugin.json'), 'utf8'));
     expect(manifest.name).toBe('ultracode');
     expect(manifest.version).toBe(pkg.version);
     expect(existsSync(join(root, 'dist-codex/README.md'))).toBe(true);
     expect(existsSync(join(root, 'dist-codex/skills/ultracode/SKILL.md'))).toBe(true);
+    expect(existsSync(join(root, 'dist-codex/skills/ultracode-memory/SKILL.md'))).toBe(true);
+    expect(existsSync(join(root, 'dist-codex/hooks/hooks.json'))).toBe(true);
+    expect(existsSync(join(root, 'dist-codex/.mcp.json'))).toBe(true);
+    expect(manifest.mcpServers).toBe('./.mcp.json');
     // The manifest declares a license, so the standalone bundle must carry the
     // text — byte-identical to the root LICENSE (a truncated copy must fail).
     expect(readFileSync(join(root, 'dist-codex/LICENSE'), 'utf8')).toBe(readFileSync(join(root, 'LICENSE'), 'utf8'));
@@ -45,6 +49,7 @@ describe('plugin bundles', () => {
     for (const f of [
       'dist-qoder/README.md',
       'dist-qoder/skills/ultracode/SKILL.md',
+      'dist-qoder/skills/ultracode-memory/SKILL.md',
       'dist-qoder/workflows/uc-review.workflow.js',
       'dist-qoder/workflows/uc-research.workflow.js',
       'dist-qoder/agents/uc-xhigh.md',

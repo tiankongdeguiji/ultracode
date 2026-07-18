@@ -1,6 +1,6 @@
 /**
- * ultracode MCP server (stdio): the workflow_start / workflow_status /
- * workflow_result / workflow_stop / workflow_list triad(+2).
+ * ultracode MCP server (stdio): durable workflow lifecycle plus portable
+ * project-memory context, recall, maintenance, and Claude migration tools.
  *
  * Design constraints (source-verified across Codex/Qoder/Gemini hosts):
  *  - No host extends tool timeouts on progress (codex 0.144.5 never sets
@@ -25,6 +25,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { VERSION } from '../version.js';
 import { parseBudget } from '../budget/parse.js';
+import { errorMessage } from '../engine/errors.js';
 import { startDetachedRun } from '../exec/start.js';
 import { stopRun } from '../exec/stop.js';
 import { EVENT_PAGE_BYTES, readEventsFrom, type TimestampedEvent } from '../store/events.js';
@@ -33,16 +34,20 @@ import { getRun, recentRuns } from '../store/runstore.js';
 import { ultracodeRoot } from '../store/layout.js';
 import { renderEvent } from '../cli/lifecycle.js';
 import { readFileSync, existsSync, lstatSync } from 'node:fs';
+import { startupMemoryContext } from '../memory/hook.js';
+import { migrateClaudeMemory } from '../memory/migrate-claude.js';
+import { pathRulesContext } from '../memory/rules.js';
+import { forgetTopic, readMemoryTopic, remember, searchMemory } from '../memory/store.js';
 
 // Codex injects only the first 512 chars of server instructions; guarded in
 // bytes (the stricter reading) by test/unit/mcp.integration.test.ts.
 export const INSTRUCTIONS =
-  'Dynamic multi-agent workflow orchestration. workflow_start returns a runId in <1s; the run ' +
-  'survives this server. Park on workflow_status until="terminal": wakes only when the run ends, ' +
-  'rolling the last 40 log lines into each response. waitSeconds is the wake interval, not a ' +
-  'safety knob; pass 3300 where `ultracode install codex` pinned a 3600s tool timeout. Timed-out ' +
-  'polls are harmless: re-poll the same runId; workflow_result when terminal. Scripts follow the ' +
-  'skill dialect.';
+  'Ultracode workflows and portable project memory. Workflows: workflow_start returns a durable ' +
+  'runId; park on workflow_status until="terminal" (3300s with the installed Codex config), then ' +
+  'workflow_result. Timed-out polls are harmless. Memory: call memory_context at task start if no ' +
+  'hook context arrived; memory_recall for details or path rules; memory_remember only for durable, ' +
+  'verified learnings or explicit user requests. Never store secrets. Current prompt, AGENTS.md, ' +
+  'and repository files override memory.';
 
 /** Explicit waitSeconds ceiling — sized to the codex hostpack's tool_timeout_sec=3600; doctrine keeps holds ≥60s under the host's actual timeout. */
 const MAX_WAIT_SECONDS = 3600;
@@ -160,7 +165,7 @@ export function createServer(baseCwd: string): McpServer {
           monitor: `call workflow_status {runId: '${result.runId}', until: 'terminal', waitSeconds: 3300}; 3300 assumes \`ultracode install codex\` pinned a 3600s tool timeout — else use your MCP tool timeout − 60; re-issue until terminal and park silently between wakes ('phase' wakes per milestone if commentary is wanted)`,
         });
       } catch (err) {
-        return fail((err as Error).message);
+        return fail(errorMessage(err));
       }
     },
   );
@@ -441,6 +446,126 @@ export function createServer(baseCwd: string): McpServer {
         })),
         hidden,
       });
+    },
+  );
+
+  server.registerTool(
+    'memory_context',
+    {
+      description:
+        'Load the current project startup memory: the first 200 lines or 25KB of MEMORY.md, plus migrated unconditional Claude rules and the path-rule index. Call once at task start only when a SessionStart hook did not already inject <ultracode-memory> context.',
+      inputSchema: { cwd: z.string().optional() },
+    },
+    async (input) => {
+      try {
+        const context = startupMemoryContext({ cwd: input.cwd ?? baseCwd });
+        return ok({ context, empty: context.length === 0 });
+      } catch (err) {
+        return fail(errorMessage(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    'memory_recall',
+    {
+      description:
+        'Recall detailed project memory. Pass exactly one of query (search all memory topics), topic (read the full topic; use "memory" for MEMORY.md), or path (load migrated Claude path-scoped rules for that project-relative file).',
+      inputSchema: {
+        query: z.string().optional(),
+        topic: z.string().optional(),
+        path: z.string().optional(),
+        limit: z.number().int().positive().max(100).optional(),
+        cwd: z.string().optional(),
+      },
+    },
+    async (input) => {
+      const provided = [input.query, input.topic, input.path].filter((value) => value !== undefined);
+      if (provided.length !== 1) return fail('memory_recall requires exactly one of query, topic, or path');
+      try {
+        const cwd = input.cwd ?? baseCwd;
+        if (input.query !== undefined) return ok({ hits: searchMemory(input.query, { cwd, limit: input.limit }) });
+        if (input.topic !== undefined) return ok(readMemoryTopic(input.topic, { cwd }));
+        return ok({ path: input.path, context: pathRulesContext(input.path!, { cwd }) });
+      } catch (err) {
+        return fail(errorMessage(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    'memory_remember',
+    {
+      description:
+        'Save a durable, verified project learning into a detailed topic and update the concise MEMORY.md index. Use only when the user explicitly asks to remember something, or after a reusable fact was verified from repository evidence. Never store secrets, transient task state, guesses, or current external facts.',
+      inputSchema: {
+        memory: z.string().min(1),
+        topic: z.string().optional(),
+        summary: z.string().optional(),
+        cwd: z.string().optional(),
+      },
+    },
+    async (input) => {
+      try {
+        const result = remember(input.memory, {
+          cwd: input.cwd ?? baseCwd,
+          topic: input.topic,
+          summary: input.summary,
+        });
+        return ok({
+          changed: result.changed,
+          topic: result.topic,
+          topicPath: result.topicPath,
+          projectRoot: result.project.root,
+        });
+      } catch (err) {
+        return fail(errorMessage(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    'memory_forget',
+    {
+      description:
+        'Delete one detailed memory topic and its MEMORY.md index entry. Destructive: call only after an explicit user request, and repeat the exact topic in confirm.',
+      inputSchema: {
+        topic: z.string(),
+        confirm: z.string(),
+        cwd: z.string().optional(),
+      },
+    },
+    async (input) => {
+      if (input.confirm !== input.topic) return fail('memory_forget confirmation must exactly match topic');
+      try {
+        return ok(forgetTopic(input.topic, { cwd: input.cwd ?? baseCwd }));
+      } catch (err) {
+        return fail(errorMessage(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    'memory_migrate_claude',
+    {
+      description:
+        'Plan or apply a non-destructive import of the current project\'s Claude Code MEMORY.md, topic files, and .claude/rules. Defaults to a read-only plan; apply=true never deletes or overwrites either side and writes conflicts under claude-* names. Secret-like files are skipped.',
+      inputSchema: {
+        source: z.string().optional(),
+        apply: z.boolean().optional(),
+        cwd: z.string().optional(),
+      },
+    },
+    async (input) => {
+      try {
+        return ok(migrateClaudeMemory({
+          cwd: input.cwd ?? baseCwd,
+          source: input.source,
+          apply: input.apply,
+        }) as unknown as Record<string, unknown>);
+      } catch (err) {
+        return fail(errorMessage(err));
+      }
     },
   );
 

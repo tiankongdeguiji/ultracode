@@ -67,3 +67,10 @@ export class WorkflowAgentCapError extends UltracodeError {
     super(`Workflow reached max agents (${cap})`, 'agent-cap');
   }
 }
+
+/** A portable-memory operation was unsafe, invalid, or could not be completed. */
+export class MemoryError extends UltracodeError {
+  constructor(message: string) {
+    super(message, 'memory');
+  }
+}
