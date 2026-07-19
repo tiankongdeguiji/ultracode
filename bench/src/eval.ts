@@ -62,7 +62,9 @@ export async function prepareHarness(cfg: BenchConfig): Promise<void> {
     // heal clones made before the --no-cone fix (cone mode dropped the dirs)
     exec('git', ['-C', dir, 'sparse-checkout', 'set', '--no-cone', ...SPARSE_PATHS]);
     if (!existsSync(join(dir, 'run_scripts'))) {
-      throw new Error(`harness checkout at ${dir} is missing run_scripts/ — delete it and re-run prep`);
+      throw new Error(
+        `harness checkout at ${dir} is missing run_scripts/ — delete it and re-run \`npm run bench -- --suite swebench-pro prep\``,
+      );
     }
   }
   const venv = venvDir();
@@ -186,7 +188,9 @@ export async function runEval(
     const watchdog = setInterval(() => stopStaleEvalContainers(cfg.timeouts.evalWatchdogSecs), WATCHDOG_INTERVAL_MS);
     child.once('error', (err) => {
       clearInterval(watchdog);
-      reject(new Error(`failed to spawn ${python}: ${err.message} — did \`prepare\` build the venv?`));
+      reject(new Error(
+        `failed to spawn ${python}: ${err.message} — did \`npm run bench -- --suite swebench-pro prep\` build the venv?`,
+      ));
     });
     child.once('close', (code) => {
       clearInterval(watchdog);

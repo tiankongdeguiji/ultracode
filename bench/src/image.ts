@@ -68,7 +68,7 @@ export async function buildOverlay(inst: BenchInstance): Promise<string> {
   const context = toolchainDir();
   if (!existsSync(join(context, 'manifest.json'))) {
     throw new Error(
-      `toolchain context is not prepared (${join(context, 'manifest.json')} is missing) — run \`npm run bench -- prep\` first`,
+      `toolchain context is not prepared (${join(context, 'manifest.json')} is missing) — run \`npm run bench -- --suite swebench-pro prep\` first`,
     );
   }
   await ensureBaseImage(inst.dockerhubTag);

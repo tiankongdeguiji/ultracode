@@ -739,7 +739,9 @@ export async function preflightFeatureBench(
       { env: allowlistedEnvironment(process.env) },
     )).stdout.trim();
     if (!/^[^\s@]+@sha256:[0-9a-f]{64}$/u.test(digest)) {
-      throw new Error(`FeatureBench image ${image} is not locally resolved to one immutable digest; rerun prep`);
+      throw new Error(
+        `FeatureBench image ${image} is not locally resolved to one immutable digest; rerun \`npm run bench -- --suite featurebench prep\``,
+      );
     }
     imageDigests[taskId] = digest;
   }

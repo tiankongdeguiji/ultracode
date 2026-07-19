@@ -246,7 +246,9 @@ export async function prepareToolchain(cfg: BenchConfig): Promise<void> {
 export function toolchainInfo(): { codexVersion: string; codexSha256: string; ultracodeVersion: string } {
   const file = join(toolchainDir(), 'manifest.json');
   if (!existsSync(file)) {
-    throw new Error(`toolchain manifest missing at ${file} — run the bench prep step (prepareToolchain) before starting a run`);
+    throw new Error(
+      `toolchain manifest missing at ${file} — run \`npm run bench -- --suite swebench-pro prep\` before starting a run`,
+    );
   }
   const m = JSON.parse(readFileSync(file, 'utf8')) as ToolchainManifest;
   return { codexVersion: m.codexVersion, codexSha256: m.codexSha256, ultracodeVersion: m.ultracodeVersion };

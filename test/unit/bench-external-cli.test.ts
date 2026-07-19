@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { artifactKey, sha256File } from '../../bench/src/external-common.js';
 import {
+  EXTERNAL_USAGE,
   generateExternalReport,
   featureBenchSourceProvenance,
   loadExternalManifest,
@@ -169,7 +170,22 @@ describe('external CLI parsing', () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       await runExternalCli(['--help']);
-      expect(stdout.mock.calls.flat().join('')).toContain('npm run bench -- prep --suite');
+      const output = stdout.mock.calls.flat().join('');
+      expect(output).toBe(`${EXTERNAL_USAGE}\n`);
+      expect(output).toContain(
+        'npm run bench -- --suite <swe-marathon|featurebench> prep',
+      );
+      expect(output).toContain(
+        'npm run bench -- --suite <swe-marathon|featurebench> run --run-id <id>',
+      );
+      expect(output).toContain(
+        'npm run bench -- --suite <swe-marathon|featurebench> report --run-id <id>',
+      );
+      expect(output.match(/npm run bench -- [^\n]+/gu)).toEqual([
+        expect.stringMatching(/^npm run bench -- --suite /u),
+        expect.stringMatching(/^npm run bench -- --suite /u),
+        expect.stringMatching(/^npm run bench -- --suite /u),
+      ]);
       expect(stderr).not.toHaveBeenCalled();
 
       stdout.mockClear();

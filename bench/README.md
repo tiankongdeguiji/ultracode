@@ -27,23 +27,24 @@ vs the model's window — which is the instrument for the "exceeds one context" 
 
 ## Quickstart
 
-All suites use `npm run bench -- <command> [options] [--suite <suite>]`.
-Omitting the selector defaults to SWE-bench Pro, so the commands below preserve
-their existing behavior. Explicit `--suite swebench-pro` is equivalent; for
-example, `npm run bench -- fetch` and
-`npm run bench -- fetch --suite swebench-pro` select the same lifecycle.
+All lifecycle commands use
+`npm run bench -- --suite <swebench-pro|swe-marathon|featurebench> <command> [options]`.
+The suite selector is mandatory, including for SWE-bench Pro. During migration,
+the dispatcher also accepts a single valid selector after the command and the
+`--suite=<value>` spelling, but suite-first is the canonical documented form.
 
 ```bash
-npm run bench -- fetch                      # cache the 731-row dataset from HuggingFace
-npm run bench -- prep                       # node + codex + ultracode toolchain, eval harness clone + venv
+npm run bench -- --suite swebench-pro fetch  # cache the 731-row dataset from HuggingFace
+npm run bench -- --suite swebench-pro prep   # node + codex + ultracode toolchain, eval harness clone + venv
 cp bench/bench.example.config.json bench/bench.config.json   # then set "model"
 
 # smoke the official eval pipeline first — zero agent tokens, expect ~100% resolved:
-npm run bench -- run --run-id pilot1 --count 20 --seed 7 --model <model>   # agent sessions (the expensive part)
-npm run bench -- eval --run-id pilot1 --gold
-npm run bench -- eval --run-id pilot1       # score both arms' patches
-npm run bench -- report --run-id pilot1     # report.md + report.json
-npm run bench -- status --run-id pilot1     # progress / taxonomy at any time
+npm run bench -- --suite swebench-pro run --run-id pilot1 \
+  --count 20 --seed 7 --model <model>  # agent sessions (the expensive part)
+npm run bench -- --suite swebench-pro eval --run-id pilot1 --gold
+npm run bench -- --suite swebench-pro eval --run-id pilot1    # score both arms' patches
+npm run bench -- --suite swebench-pro report --run-id pilot1  # report.md + report.json
+npm run bench -- --suite swebench-pro status --run-id pilot1  # progress / taxonomy at any time
 ```
 
 `run` is resumable: `--resume` skips finished instance×arms; `--redo id1,id2` forces
@@ -53,13 +54,12 @@ first launch, so a resumed run never re-samples.
 ## Suite routing
 
 The public dispatcher selects a suite; it does not combine suite lifecycles or
-artifacts. A selector is required for SWE-Marathon and FeatureBench. If it is
-omitted, the command is always routed to SWE-bench Pro and no suite is inferred
-from a run ID or path.
+artifacts. A selector is required for every lifecycle command, and no suite is
+inferred from a command, run ID, or path.
 
 | Suite | Commands | Run manifest |
 | --- | --- | --- |
-| SWE-bench Pro (default, or `--suite swebench-pro`) | `fetch`, `prep`, `run`, `eval`, `report`, `status`, `clean` | `bench/results/<runId>/run.json` |
+| SWE-bench Pro (`--suite swebench-pro`) | `fetch`, `prep`, `run`, `eval`, `report`, `status`, `clean` | `bench/results/<runId>/run.json` |
 | SWE-Marathon (`--suite swe-marathon`) | `prep`, `run`, `report` | `bench/results/external/swe-marathon/<runId>/external-run.json` |
 | FeatureBench (`--suite featurebench`) | `prep`, `run`, `report` | `bench/results/external/featurebench/<runId>/external-run.json` |
 
@@ -69,17 +69,17 @@ surface leaves the SWE-bench Pro manifest, selection, evaluation, and
 frozen-result semantics unchanged:
 
 ```bash
-npm run bench -- prep --suite swe-marathon
-npm run bench -- run --suite swe-marathon --run-id marathon-a1 \
+npm run bench -- --suite swe-marathon prep
+npm run bench -- --suite swe-marathon run --run-id marathon-a1 \
   --model <model> --effort <effort> --arm a \
   --task-id zstd-decoder --task-id wasm-simd
-npm run bench -- report --suite swe-marathon --run-id marathon-a1
+npm run bench -- --suite swe-marathon report --run-id marathon-a1
 
-npm run bench -- prep --suite featurebench
-npm run bench -- run --suite featurebench --run-id feature-b1 \
+npm run bench -- --suite featurebench prep
+npm run bench -- --suite featurebench run --run-id feature-b1 \
   --model <model> --effort <effort> --arm b \
   --task-id <featurebench-instance-id>
-npm run bench -- report --suite featurebench --run-id feature-b1
+npm run bench -- --suite featurebench report --run-id feature-b1
 ```
 
 `--run-id`, `--model`, `--effort`, `--arm`, and at least one repeatable
@@ -181,11 +181,12 @@ are annotations, not failures: `no-orchestration` (keyword never armed / host so
 
 - `docker pull` rate limits: pulls retry with backoff; pre-pull with `docker login` if
   anonymous limits bite. Eval falls back to the locally-present image.
-- Linux images may use glibc or musl. `prep` ships both pinned Node builds and the
-  matching musl C++ runtime (from `node:<nodeVersion>-alpine3.20`); `node-sel`
-  chooses at container start. Truly incompatible images self-report as
-  `toolchain-incompatible`.
-- Auth expiry mid-batch (chatgpt mode): re-login on the host, then `run --resume`.
+- Linux images may use glibc or musl. SWE-bench Pro preparation ships both
+  pinned Node builds and the matching musl C++ runtime (from
+  `node:<nodeVersion>-alpine3.20`); `node-sel` chooses at container start. Truly
+  incompatible images self-report as `toolchain-incompatible`.
+- Auth expiry mid-batch (chatgpt mode): re-login on the host, then run
+  `npm run bench -- --suite swebench-pro run --resume` with the original run options.
 - A wedged eval container: the watchdog stops eval containers older than
   `timeouts.evalWatchdogSecs`; the harness records the instance unresolved.
 - Everything a session produced lives under `results/<runId>/instances/<iid>/<arm>/`

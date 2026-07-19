@@ -1,8 +1,9 @@
 /**
- * Bench CLI: `npm run bench -- <command>`. Commands mirror the run lifecycle —
- * fetch (dataset cache), prep (toolchain + eval harness), run (agent sessions),
- * eval (official harness), report, status, clean. `run` freezes its config +
- * instance selection into results/<runId>/run.json so resumes never re-sample.
+ * SWE-bench Pro driver behind `npm run bench -- --suite swebench-pro <command>`.
+ * Commands mirror the run lifecycle — fetch (dataset cache), prep (toolchain +
+ * eval harness), run (agent sessions), eval (official harness), report, status,
+ * clean. `run` freezes its config + instance selection into
+ * results/<runId>/run.json so resumes never re-sample.
  */
 import { Command, CommanderError } from 'commander';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -99,7 +100,9 @@ function manifestInstances(m: RunManifest): BenchInstance[] {
   const byId = new Map(loadInstances().map((i) => [i.instanceId, i]));
   return m.instanceIds.map((id) => {
     const inst = byId.get(id);
-    if (!inst) throw new Error(`instance ${id} from run.json is missing from the dataset cache — re-run \`bench fetch\``);
+    if (!inst) {
+      throw new Error(`instance ${id} from run.json is missing from the dataset cache — re-run \`npm run bench -- --suite swebench-pro fetch\``);
+    }
     return inst;
   });
 }
@@ -107,7 +110,8 @@ function manifestInstances(m: RunManifest): BenchInstance[] {
 function createSwebenchProProgram(): Command {
   const program = new Command();
   program
-    .name('bench')
+    .name('npm run bench -- --suite swebench-pro')
+    .usage('<command> [options]')
     .description('SWE-bench Pro A/B harness: codex alone vs codex + ultracode')
     .exitOverride()
     .configureOutput({ writeErr: () => undefined });
@@ -141,7 +145,7 @@ function createSwebenchProProgram(): Command {
       const instances = manifestInstances(manifest);
       out(`run ${manifest.runId}: ${instances.length} instances, arms=${cfg.arms}, model=${cfg.model}, effort=${cfg.effort}, parallel=${cfg.parallel.instances}`);
       await runBatch(cfg, manifest, instances, { redo });
-      out('batch complete — next: `npm run bench -- eval --run-id ' + manifest.runId + '`');
+      out('batch complete — next: `npm run bench -- --suite swebench-pro eval --run-id ' + manifest.runId + '`');
     });
 
   program.command('eval')
@@ -176,7 +180,7 @@ function createSwebenchProProgram(): Command {
         const ok = Object.values(results).filter(Boolean).length;
         out(`${prefix}: ${ok}/${instances.length} resolved`);
       }
-      out('next: `npm run bench -- report --run-id ' + f.runId + '`');
+      out('next: `npm run bench -- --suite swebench-pro report --run-id ' + f.runId + '`');
     });
 
   program.command('report').description('aggregate statuses, metrics, and eval verdicts into report.md/json')

@@ -103,7 +103,7 @@ export async function fetchInstances(): Promise<number> {
 export function loadInstances(): BenchInstance[] {
   const file = instancesFile();
   if (!existsSync(file)) {
-    throw new Error(`instance cache not found at ${file} — run \`npm run bench -- fetch\` first`);
+    throw new Error(`instance cache not found at ${file} — run \`npm run bench -- --suite swebench-pro fetch\` first`);
   }
   return JSON.parse(readFileSync(file, 'utf8')) as BenchInstance[];
 }

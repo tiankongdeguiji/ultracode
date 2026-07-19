@@ -116,15 +116,15 @@ clones, or local cache directories.
 The intended host flow is:
 
 ```bash
-npm run bench -- prep --suite featurebench
-npm run bench -- run --suite featurebench --run-id <fresh-id> \
+npm run bench -- --suite featurebench prep
+npm run bench -- --suite featurebench run --run-id <fresh-id> \
   --model <model> --effort <effort> --arm <a|b> \
   --task-id <instance-id> [--task-id <instance-id> ...]
-npm run bench -- report --suite featurebench --run-id <fresh-id>
+npm run bench -- --suite featurebench report --run-id <fresh-id>
 ```
 
-The explicit selector routes these commands to FeatureBench; omitting it selects
-SWE-bench Pro. Routing is the only shared layer. The suite manifest remains at
+The mandatory selector routes these commands to FeatureBench. Routing is the
+only shared layer. The suite manifest remains at
 `bench/results/external/featurebench/<runId>/external-run.json`, separate from
 SWE-bench Pro's `bench/results/<runId>/run.json` and SWE-Marathon's external
 namespace.

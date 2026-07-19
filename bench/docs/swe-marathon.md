@@ -92,15 +92,15 @@ file into the isolated worker home.
 The supported command-line lifecycle is:
 
 ```bash
-npm run bench -- prep --suite swe-marathon
-npm run bench -- run --suite swe-marathon --run-id <fresh-id> \
+npm run bench -- --suite swe-marathon prep
+npm run bench -- --suite swe-marathon run --run-id <fresh-id> \
   --model <model> --effort <effort> --arm <a|b> \
   --task-id <task> [--task-id <task> ...]
-npm run bench -- report --suite swe-marathon --run-id <fresh-id>
+npm run bench -- --suite swe-marathon report --run-id <fresh-id>
 ```
 
-The explicit selector routes these commands to SWE-Marathon; omitting it selects
-SWE-bench Pro. Routing is the only shared layer. The suite manifest remains at
+The mandatory selector routes these commands to SWE-Marathon. Routing is the
+only shared layer. The suite manifest remains at
 `bench/results/external/swe-marathon/<runId>/external-run.json`, separate from
 SWE-bench Pro's `bench/results/<runId>/run.json` and FeatureBench's external
 namespace.

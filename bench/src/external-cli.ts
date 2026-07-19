@@ -1223,9 +1223,9 @@ export async function generateExternalReport(
 }
 
 export const EXTERNAL_USAGE = `Usage:
-  npm run bench -- prep --suite <swe-marathon|featurebench>
-  npm run bench -- run --suite <suite> --run-id <id> --model <model> --effort <effort> --arm <a|b> --task-id <id> [--task-id <id> ...]
-  npm run bench -- report --suite <suite> --run-id <id>`;
+  npm run bench -- --suite <swe-marathon|featurebench> prep
+  npm run bench -- --suite <swe-marathon|featurebench> run --run-id <id> --model <model> --effort <effort> --arm <a|b> --task-id <id> [--task-id <id> ...]
+  npm run bench -- --suite <swe-marathon|featurebench> report --run-id <id>`;
 
 /** Execute one parsed CLI command. */
 export async function runExternalCli(argv: string[]): Promise<void> {

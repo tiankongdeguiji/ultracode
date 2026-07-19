@@ -659,7 +659,9 @@ function armInputsFromDisk(
 export function generateReport(runId: string): { jsonPath: string; mdPath: string } {
   const manifest = readJsonIfPresent<RunManifest>(runManifestFile(runId));
   if (manifest === null) {
-    throw new Error(`no readable run manifest at ${runManifestFile(runId)} — has \`run\` been started for ${runId}?`);
+    throw new Error(
+      `no readable run manifest at ${runManifestFile(runId)} — has \`npm run bench -- --suite swebench-pro run\` been started for ${runId}?`,
+    );
   }
   const languages = languageMap();
   const evalA = tryEvalResults(runId, 'armA');

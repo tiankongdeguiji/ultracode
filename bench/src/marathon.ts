@@ -417,7 +417,11 @@ function verifyRunnablePlan(plan: MarathonRunPlan): void {
   ];
   if (plan.arm === 'b') requiredPaths.push(join(plan.paths.bridgeDir, 'arm_b_codex.py'), plan.paths.skillDir);
   const missing = requiredPaths.filter((path) => !existsSync(path));
-  if (missing.length) throw new Error(`SWE-Marathon prep is incomplete; missing: ${missing.join(', ')}`);
+  if (missing.length) {
+    throw new Error(
+      `SWE-Marathon prep is incomplete; missing: ${missing.join(', ')} — run \`npm run bench -- --suite swe-marathon prep\``,
+    );
+  }
 }
 
 function privateResultsDirectory(path: string): void {
@@ -499,7 +503,9 @@ export async function preflightMarathon(
     argv: ['image', 'inspect', '--format', '{{ index .RepoDigests 0 }}', taskImage],
   }, env);
   if (!/^[^\s@]+@sha256:[0-9a-f]{64}$/u.test(imageDigest)) {
-    throw new Error(`SWE-Marathon image ${taskImage} is not locally resolved to one immutable digest; rerun prep`);
+    throw new Error(
+      `SWE-Marathon image ${taskImage} is not locally resolved to one immutable digest; rerun \`npm run bench -- --suite swe-marathon prep\``,
+    );
   }
   if (imageDigest !== taskImage) {
     throw new Error(`SWE-Marathon local image identity drifted: expected ${taskImage}, got ${imageDigest}`);

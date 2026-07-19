@@ -11,6 +11,7 @@ export type BenchSuite = 'swebench-pro' | 'swe-marathon' | 'featurebench';
 /** Fully validated routing outcome for one user argv vector. */
 export type BenchCliRoute =
   | { kind: 'root-help' }
+  | { kind: 'missing-suite'; showUsage: boolean }
   | { kind: 'missing-command' }
   | { kind: 'suite'; suite: BenchSuite; command: string; argv: string[] };
 
@@ -26,11 +27,10 @@ const SUITES = new Set<BenchSuite>(['swebench-pro', 'swe-marathon', 'featurebenc
 
 /** Unified usage text shown only when no suite parser owns the request. */
 export const BENCH_USAGE = `Usage:
-  npm run bench -- <command> [options] [--suite <suite>]
-  npm run bench -- --suite <suite> <command> [options]
+  npm run bench -- --suite <swebench-pro|swe-marathon|featurebench> <command> [options]
 
 Suites and commands:
-  swebench-pro  fetch | prep | run | eval | report | status | clean  (default)
+  swebench-pro  fetch | prep | run | eval | report | status | clean
   swe-marathon  prep | run | report
   featurebench  prep | run | report
 
@@ -39,9 +39,9 @@ Run manifests:
   external      bench/results/external/<suite>/<runId>/external-run.json
 
 Examples:
-  npm run bench -- prep --suite swe-marathon
-  npm run bench -- run --suite featurebench --run-id <id> --model <model> --effort <effort> --arm <a|b> --task-id <id>
-  npm run bench -- report --suite featurebench --run-id <id>`;
+  npm run bench -- --suite swebench-pro run --run-id <id>
+  npm run bench -- --suite swe-marathon prep
+  npm run bench -- --suite featurebench report --run-id <id>`;
 
 interface SuiteSelector {
   index: number;
@@ -89,13 +89,16 @@ export function parseBenchCliRoute(argv: readonly string[]): BenchCliRoute {
     throw new Error(`--suite value '${selector.value}' is unknown; expected swebench-pro, swe-marathon, or featurebench`);
   }
 
-  const suite = (selector?.value ?? 'swebench-pro') as BenchSuite;
   const routedArgv = removeSelector(argv, selector);
-  if (selector === undefined && routedArgv.length === 1 && HELP_COMMANDS.has(routedArgv[0]!)) {
-    return { kind: 'root-help' };
+  if (selector === undefined) {
+    if (routedArgv.length === 1 && HELP_COMMANDS.has(routedArgv[0]!)) {
+      return { kind: 'root-help' };
+    }
+    return { kind: 'missing-suite', showUsage: routedArgv.length === 0 };
   }
   if (routedArgv.length === 0) return { kind: 'missing-command' };
 
+  const suite = selector.value as BenchSuite;
   const command = routedArgv[0]!;
   if (suite !== 'swebench-pro') {
     if (!EXTERNAL_COMMANDS.has(command) && !HELP_COMMANDS.has(command)) {
@@ -115,6 +118,10 @@ export async function runBenchCli(
   if (route.kind === 'root-help') {
     process.stdout.write(`${BENCH_USAGE}\n`);
     return;
+  }
+  if (route.kind === 'missing-suite') {
+    if (route.showUsage) process.stdout.write(`${BENCH_USAGE}\n`);
+    throw new Error('--suite is required; expected swebench-pro, swe-marathon, or featurebench');
   }
   if (route.kind === 'missing-command') {
     process.stdout.write(`${BENCH_USAGE}\n`);
