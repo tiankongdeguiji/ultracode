@@ -27,6 +27,12 @@ vs the model's window — which is the instrument for the "exceeds one context" 
 
 ## Quickstart
 
+All suites use `npm run bench -- <command> [options] [--suite <suite>]`.
+Omitting the selector defaults to SWE-bench Pro, so the commands below preserve
+their existing behavior. Explicit `--suite swebench-pro` is equivalent; for
+example, `npm run bench -- fetch` and
+`npm run bench -- fetch --suite swebench-pro` select the same lifecycle.
+
 ```bash
 npm run bench -- fetch                      # cache the 731-row dataset from HuggingFace
 npm run bench -- prep                       # node + codex + ultracode toolchain, eval harness clone + venv
@@ -44,33 +50,45 @@ npm run bench -- status --run-id pilot1     # progress / taxonomy at any time
 re-runs; the instance selection and config are frozen in `results/<runId>/run.json` at
 first launch, so a resumed run never re-samples.
 
-## External suites
+## Suite routing
 
-SWE-Marathon and FeatureBench keep their own pinned runners, task containers, and
-official verifiers. They use a separate entry point so the SWE-bench Pro manifest,
-selection, evaluation, and frozen-result semantics above remain unchanged:
+The public dispatcher selects a suite; it does not combine suite lifecycles or
+artifacts. A selector is required for SWE-Marathon and FeatureBench. If it is
+omitted, the command is always routed to SWE-bench Pro and no suite is inferred
+from a run ID or path.
+
+| Suite | Commands | Run manifest |
+| --- | --- | --- |
+| SWE-bench Pro (default, or `--suite swebench-pro`) | `fetch`, `prep`, `run`, `eval`, `report`, `status`, `clean` | `bench/results/<runId>/run.json` |
+| SWE-Marathon (`--suite swe-marathon`) | `prep`, `run`, `report` | `bench/results/external/swe-marathon/<runId>/external-run.json` |
+| FeatureBench (`--suite featurebench`) | `prep`, `run`, `report` | `bench/results/external/featurebench/<runId>/external-run.json` |
+
+SWE-Marathon and FeatureBench keep their own pinned runners, task containers,
+official verifiers, preparation, resume rules, and reporting. The shared routing
+surface leaves the SWE-bench Pro manifest, selection, evaluation, and
+frozen-result semantics unchanged:
 
 ```bash
-npm run bench:external -- prep --suite swe-marathon
-npm run bench:external -- run --suite swe-marathon --run-id marathon-a1 \
+npm run bench -- prep --suite swe-marathon
+npm run bench -- run --suite swe-marathon --run-id marathon-a1 \
   --model <model> --effort <effort> --arm a \
   --task-id zstd-decoder --task-id wasm-simd
-npm run bench:external -- report --suite swe-marathon --run-id marathon-a1
+npm run bench -- report --suite swe-marathon --run-id marathon-a1
 
-npm run bench:external -- prep --suite featurebench
-npm run bench:external -- run --suite featurebench --run-id feature-b1 \
+npm run bench -- prep --suite featurebench
+npm run bench -- run --suite featurebench --run-id feature-b1 \
   --model <model> --effort <effort> --arm b \
   --task-id <featurebench-instance-id>
-npm run bench:external -- report --suite featurebench --run-id feature-b1
+npm run bench -- report --suite featurebench --run-id feature-b1
 ```
 
 `--run-id`, `--model`, `--effort`, `--arm`, and at least one repeatable
 `--task-id` are mandatory, with no model or effort fallback. Suite,
 auth-mechanism, source, platform, task, and toolchain preflight completes before
 the driver atomically writes private
-`results/external/<suite>/<runId>/external-run.json`. The suite namespace keeps
-external manifests and generated reports disjoint from both legacy runs and the
-other external suite. Repeating an exact manifest resumes native work and skips
+`results/external/<suite>/<runId>/external-run.json`. These preserved namespaces
+keep external manifests and generated reports disjoint from SWE-bench Pro and
+from the other external suite. Repeating an exact manifest resumes native work and skips
 only tasks whose receipt still identifies a currently valid exact native-verifier
 score; changed inputs or provenance are rejected.
 

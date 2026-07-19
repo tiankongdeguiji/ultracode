@@ -10,13 +10,15 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { artifactKey, sha256File } from '../../bench/src/external-common.js';
 import {
   generateExternalReport,
+  featureBenchSourceProvenance,
   loadExternalManifest,
   marathonRuntimeEnvironment,
   parseExternalCliArgs,
+  runExternalCli,
 } from '../../bench/src/external-cli.js';
 import type {
   ExternalRunManifest,
@@ -104,6 +106,13 @@ function receipt(
 }
 
 describe('external CLI parsing', () => {
+  it('attests the FeatureBench adapter and extracted host policy together', () => {
+    expect(featureBenchSourceProvenance()).toEqual({
+      featureBenchAdapterSha256: sha256File(join(process.cwd(), 'bench/src/featurebench.ts')),
+      featureBenchHostPolicySha256: sha256File(join(process.cwd(), 'bench/src/featurebench-host.ts')),
+    });
+  });
+
   it('requires every fresh-run identity and accepts repeated literal task ids', () => {
     expect(parseExternalCliArgs([
       'run',
@@ -128,6 +137,21 @@ describe('external CLI parsing', () => {
     ])).toThrow('--model is required');
   });
 
+  it('preserves comma-form task ids alongside repeated task-id flags', () => {
+    expect(parseExternalCliArgs([
+      'run',
+      '--suite', 'swe-marathon',
+      '--run-id', 'trial-1',
+      '--model', 'gpt-test',
+      '--effort', 'high',
+      '--arm', 'a',
+      '--task-id', 'zstd-decoder',
+      '--task-ids', 'openssl-cert-chain,sqlite-indexing',
+    ])).toMatchObject({
+      taskIds: ['zstd-decoder', 'openssl-cert-chain', 'sqlite-indexing'],
+    });
+  });
+
   it('rejects unsafe suite, run, task, option, and duplicate inputs', () => {
     const base = [
       'run', '--suite', 'featurebench', '--run-id', 'trial-1', '--model', 'gpt-test',
@@ -138,6 +162,26 @@ describe('external CLI parsing', () => {
     expect(() => parseExternalCliArgs(['report', '--suite', 'unknown', '--run-id', 'trial-1'])).toThrow('--suite');
     expect(() => parseExternalCliArgs(['report', '--suite', 'featurebench', '--run-id', '../escape'])).toThrow('invalid run id');
     expect(() => parseExternalCliArgs(['prep', '--suite', 'featurebench', '--model', 'ignored'])).toThrow('unknown option');
+  });
+
+  it('handles help without owning final error formatting', async () => {
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await runExternalCli(['--help']);
+      expect(stdout.mock.calls.flat().join('')).toContain('npm run bench -- prep --suite');
+      expect(stderr).not.toHaveBeenCalled();
+
+      stdout.mockClear();
+      await expect(runExternalCli(['report', '--suite', 'featurebench'])).rejects.toThrow(
+        '--run-id is required',
+      );
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr).not.toHaveBeenCalled();
+    } finally {
+      stdout.mockRestore();
+      stderr.mockRestore();
+    }
   });
 
   it('canonicalizes Marathon auth paths and resolves effective workflow waits', () => {
@@ -168,14 +212,28 @@ describe('external CLI parsing', () => {
 });
 
 describe('external reports', () => {
-  it('loads only the suite-namespaced external run directory', () => {
+  it('keeps identical run ids in all three suite-specific manifest namespaces', () => {
     const { root, runDir } = makeRun('featurebench', [FEATURE_TASK]);
     const marathon = makeRun('swe-marathon', ['zstd-decoder'], 'a', root);
-    put(join(root, 'external-run-1', 'external-run.json'), '{}\n');
+    const proManifest = join(root, 'external-run-1', 'run.json');
+    put(proManifest, '{}\n');
     expect(loadExternalManifest('external-run-1', 'featurebench', root).directory).toBe(runDir);
     expect(loadExternalManifest('external-run-1', 'swe-marathon', root).directory).toBe(marathon.runDir);
-    expect(runDir).toContain(join('external', 'featurebench', 'external-run-1'));
-    expect(marathon.runDir).toContain(join('external', 'swe-marathon', 'external-run-1'));
+    expect(proManifest).toBe(join(root, 'external-run-1', 'run.json'));
+    expect(join(runDir, 'external-run.json')).toBe(join(
+      root,
+      'external',
+      'featurebench',
+      'external-run-1',
+      'external-run.json',
+    ));
+    expect(join(marathon.runDir, 'external-run.json')).toBe(join(
+      root,
+      'external',
+      'swe-marathon',
+      'external-run-1',
+      'external-run.json',
+    ));
   });
 
   it('reports effective effort, host/workers, token context, and verified false outcomes', async () => {

@@ -20,7 +20,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { BENCH_ROOT, loadConfig, resultsDir, toolchainDir } from './config.js';
 import {
   artifactKey,
@@ -573,6 +573,14 @@ function toolchainProvenance(): Record<string, string> {
   };
 }
 
+/** Hash every tracked TypeScript module that defines FeatureBench adapter policy. */
+export function featureBenchSourceProvenance(): Record<string, string> {
+  return {
+    featureBenchAdapterSha256: sha256File(join(EXTERNAL_SOURCE_DIR, 'featurebench.ts')),
+    featureBenchHostPolicySha256: sha256File(join(EXTERNAL_SOURCE_DIR, 'featurebench-host.ts')),
+  };
+}
+
 interface ExternalPreflight {
   pins: Record<string, string>;
   provenance: Record<string, string>;
@@ -659,7 +667,7 @@ async function preflightExternalRun(inputs: ExternalRunInputs): Promise<External
       effort: inputs.effort,
     });
     provenance.featureBenchPatchSha256 = sha256File(FEATUREBENCH_PATCH);
-    provenance.featureBenchAdapterSha256 = sha256File(join(EXTERNAL_SOURCE_DIR, 'featurebench.ts'));
+    Object.assign(provenance, featureBenchSourceProvenance());
     provenance.featureBenchRunnerSha256 = sha256File(join(BENCH_ROOT, '.cache/featurebench/.venv/bin/fb'));
     provenance.featureBenchPythonSha256 = sha256File(join(BENCH_ROOT, '.cache/featurebench/.venv/bin/python'));
     provenance.featureBenchEnvironmentSha256 = sha256Tree(
@@ -1215,12 +1223,12 @@ export async function generateExternalReport(
 }
 
 export const EXTERNAL_USAGE = `Usage:
-  npm run bench:external -- prep --suite <swe-marathon|featurebench>
-  npm run bench:external -- run --suite <suite> --run-id <id> --model <model> --effort <effort> --arm <a|b> --task-id <id> [--task-id <id> ...]
-  npm run bench:external -- report --suite <suite> --run-id <id>`;
+  npm run bench -- prep --suite <swe-marathon|featurebench>
+  npm run bench -- run --suite <suite> --run-id <id> --model <model> --effort <effort> --arm <a|b> --task-id <id> [--task-id <id> ...]
+  npm run bench -- report --suite <suite> --run-id <id>`;
 
 /** Execute one parsed CLI command. */
-export async function main(argv = process.argv.slice(2)): Promise<void> {
+export async function runExternalCli(argv: string[]): Promise<void> {
   const args = parseExternalCliArgs(argv);
   if (args.command === 'help') {
     out(EXTERNAL_USAGE);
@@ -1239,12 +1247,4 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const { jsonPath, markdownPath } = await generateExternalReport(args.runId, args.suite);
   out(`wrote ${jsonPath}`);
   out(`wrote ${markdownPath}`);
-}
-
-const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;
-if (invokedPath === import.meta.url) {
-  main().catch((error: unknown) => {
-    process.stderr.write(`${basename(process.argv[1] ?? 'bench:external')}: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 1;
-  });
 }

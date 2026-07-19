@@ -1,8 +1,9 @@
 # SWE-Marathon adapter
 
 This adapter runs reproducible Codex versus Codex + ultracode trials through
-upstream Harbor. It is separate from the SWE-bench Pro CLI because
-SWE-Marathon owns its task containers and verifier lifecycle.
+upstream Harbor. It is selected through the shared `npm run bench` dispatcher,
+but SWE-Marathon still owns its task containers and native preparation,
+execution, verification, resume, and reporting lifecycle.
 
 ## Reproducibility contract
 
@@ -91,15 +92,21 @@ file into the isolated worker home.
 The supported command-line lifecycle is:
 
 ```bash
-npm run bench:external -- prep --suite swe-marathon
-npm run bench:external -- run --suite swe-marathon --run-id <fresh-id> \
+npm run bench -- prep --suite swe-marathon
+npm run bench -- run --suite swe-marathon --run-id <fresh-id> \
   --model <model> --effort <effort> --arm <a|b> \
   --task-id <task> [--task-id <task> ...]
-npm run bench:external -- report --suite swe-marathon --run-id <fresh-id>
+npm run bench -- report --suite swe-marathon --run-id <fresh-id>
 ```
 
+The explicit selector routes these commands to SWE-Marathon; omitting it selects
+SWE-bench Pro. Routing is the only shared layer. The suite manifest remains at
+`bench/results/external/swe-marathon/<runId>/external-run.json`, separate from
+SWE-bench Pro's `bench/results/<runId>/run.json` and FeatureBench's external
+namespace.
+
 Model and effort are mandatory CLI inputs; environment variables are not used
-as fallbacks by the unified driver. Each task becomes one sequential Harbor job
+as fallbacks by the suite driver. Each task becomes one sequential Harbor job
 under the private run directory. Repeating the exact command with the same run
 ID skips receipt-complete tasks and invokes Harbor's native `job resume` for an
 incomplete job. Input or provenance drift is rejected. The lower-level adapter

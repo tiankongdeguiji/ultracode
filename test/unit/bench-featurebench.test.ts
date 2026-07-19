@@ -10,8 +10,15 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ARM_B_PREFIX } from '../../bench/src/prompt.js';
+
+const { requireFeatureBenchHost } = vi.hoisted(() => ({
+  requireFeatureBenchHost: vi.fn(),
+}));
+
+vi.mock('../../bench/src/featurebench-host.js', () => ({ requireFeatureBenchHost }));
+
 import {
   FEATUREBENCH_DATASET,
   FEATUREBENCH_DATASET_REVISION,
@@ -42,6 +49,7 @@ function tempDir(): string {
 afterEach(async () => {
   const { rmSync } = await import('node:fs');
   for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
+  requireFeatureBenchHost.mockClear();
 });
 
 function options(overrides: Partial<FeatureBenchRunOptions> = {}): FeatureBenchRunOptions {
@@ -193,6 +201,7 @@ describe('FeatureBench preparation', () => {
     };
 
     await prepareFeatureBench({ sourceDir, executor });
+    expect(requireFeatureBenchHost).toHaveBeenCalledOnce();
     const clone = calls.find((call) => call[0] === 'git' && call[1] === 'clone');
     expect(clone?.slice(0, 4)).toEqual([
       'git', 'clone', '--no-checkout', 'https://github.com/LiberCoders/FeatureBench.git',
@@ -405,6 +414,7 @@ describe('FeatureBench runtime privacy', () => {
       });
       expect(result.evaluation?.argv[0]).toBe('eval');
       expect(Object.keys(result.verifierReports)).toEqual(options().taskIds);
+      expect(requireFeatureBenchHost).toHaveBeenCalledOnce();
     } finally {
       if (oldApiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = oldApiKey;

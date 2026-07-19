@@ -30,8 +30,7 @@
     "release:oss": "node scripts/release-oss.mjs",
     "release:oss:dry": "node scripts/release-oss.mjs --dry-run",
     "version": "node scripts/sync-version.mjs && git add src/version.ts package.json package-lock.json",
-    "bench": "tsx bench/src/cli.ts",
-    "bench:external": "node --import tsx bench/src/external-cli.ts",
+    "bench": "tsx bench/src/bench-cli.ts",
     "bench:check": "tsc -p bench/tsconfig.json"
   },
   "dependencies": {

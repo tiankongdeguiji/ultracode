@@ -30,6 +30,7 @@ import {
   validateFeatureBenchTaskId,
   validatePortableComponent,
 } from './external-common.js';
+import { requireFeatureBenchHost } from './featurebench-host.js';
 import { ARM_B_PREFIX } from './prompt.js';
 
 export const FEATUREBENCH_REPOSITORY = 'https://github.com/LiberCoders/FeatureBench.git';
@@ -475,9 +476,7 @@ async function requireExactTrackedPatch(
  * accepted; any other dirty checkout or preimage drift is rejected.
  */
 export async function prepareFeatureBench(options: FeatureBenchPrepOptions): Promise<string> {
-  if (process.platform !== 'linux' || process.arch !== 'x64') {
-    throw new Error(`FeatureBench requires a Linux x64 host, got ${process.platform}-${process.arch}`);
-  }
+  requireFeatureBenchHost();
   const executor = options.executor ?? execute;
   const requestedSourceDir = resolve(options.sourceDir);
   const patchPath = resolve(options.patchPath ?? FEATUREBENCH_PATCH);
@@ -670,9 +669,7 @@ export async function preflightFeatureBench(
   executor: FeatureBenchExecutor = execute,
 ): Promise<FeatureBenchPreflight> {
   validateFeatureBenchRun(options);
-  if (process.platform !== 'linux' || process.arch !== 'x64') {
-    throw new Error(`FeatureBench requires a Linux x64 host, got ${process.platform}-${process.arch}`);
-  }
+  requireFeatureBenchHost();
   requireFile(options.codexBin, 'codexBin', true);
   const sourceDir = resolve(options.sourceDir);
   const head = (await executor('git', ['-C', sourceDir, 'rev-parse', 'HEAD'])).stdout.trim();

@@ -1,8 +1,10 @@
 # FeatureBench adapter
 
 `bench/src/featurebench.ts` is a deliberately narrow adapter for a reproducible
-FeatureBench Codex experiment. It is separate from the SWE-bench Pro CLI because
-FeatureBench owns inference image selection, patch capture, and evaluation.
+FeatureBench Codex experiment. It is selected through the shared
+`npm run bench` dispatcher, but FeatureBench still owns native preparation,
+inference image selection, execution, patch capture, verification, resume, and
+reporting.
 
 ## Reproducibility contract
 
@@ -114,12 +116,18 @@ clones, or local cache directories.
 The intended host flow is:
 
 ```bash
-npm run bench:external -- prep --suite featurebench
-npm run bench:external -- run --suite featurebench --run-id <fresh-id> \
+npm run bench -- prep --suite featurebench
+npm run bench -- run --suite featurebench --run-id <fresh-id> \
   --model <model> --effort <effort> --arm <a|b> \
   --task-id <instance-id> [--task-id <instance-id> ...]
-npm run bench:external -- report --suite featurebench --run-id <fresh-id>
+npm run bench -- report --suite featurebench --run-id <fresh-id>
 ```
+
+The explicit selector routes these commands to FeatureBench; omitting it selects
+SWE-bench Pro. Routing is the only shared layer. The suite manifest remains at
+`bench/results/external/featurebench/<runId>/external-run.json`, separate from
+SWE-bench Pro's `bench/results/<runId>/run.json` and SWE-Marathon's external
+namespace.
 
 The CLI requires `--model`, `--effort`, and `--run-id` (used as `runOwner`)
 explicitly; none has a fallback. Set
