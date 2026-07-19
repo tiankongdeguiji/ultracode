@@ -44,6 +44,63 @@ npm run bench -- status --run-id pilot1     # progress / taxonomy at any time
 re-runs; the instance selection and config are frozen in `results/<runId>/run.json` at
 first launch, so a resumed run never re-samples.
 
+## External suites
+
+SWE-Marathon and FeatureBench keep their own pinned runners, task containers, and
+official verifiers. They use a separate entry point so the SWE-bench Pro manifest,
+selection, evaluation, and frozen-result semantics above remain unchanged:
+
+```bash
+npm run bench:external -- prep --suite swe-marathon
+npm run bench:external -- run --suite swe-marathon --run-id marathon-a1 \
+  --model <model> --effort <effort> --arm a \
+  --task-id zstd-decoder --task-id wasm-simd
+npm run bench:external -- report --suite swe-marathon --run-id marathon-a1
+
+npm run bench:external -- prep --suite featurebench
+npm run bench:external -- run --suite featurebench --run-id feature-b1 \
+  --model <model> --effort <effort> --arm b \
+  --task-id <featurebench-instance-id>
+npm run bench:external -- report --suite featurebench --run-id feature-b1
+```
+
+`--run-id`, `--model`, `--effort`, `--arm`, and at least one repeatable
+`--task-id` are mandatory, with no model or effort fallback. Suite,
+auth-mechanism, source, platform, task, and toolchain preflight completes before
+the driver atomically writes private
+`results/external/<suite>/<runId>/external-run.json`. The suite namespace keeps
+external manifests and generated reports disjoint from both legacy runs and the
+other external suite. Repeating an exact manifest resumes native work and skips
+only tasks whose receipt still identifies a currently valid exact native-verifier
+score; changed inputs or provenance are rejected.
+
+FeatureBench requires `FEATUREBENCH_CREDENTIAL_BROKER_URL` plus a dedicated
+Docker-internal `FEATUREBENCH_RESTRICTED_NETWORK` with only the named, labeled
+credential-broker container attached; reusable host ChatGPT credentials are
+never mounted into task containers. SWE-Marathon selects exactly one runtime auth
+mechanism, `CODEX_AUTH_JSON_PATH` or `OPENAI_API_KEY`; an auth-file path is
+canonicalized before child use. The manifest freezes only that mechanism and the
+effective Arm B workflow-wait seconds, never an API key, auth-file contents, or
+auth-file path. Both native runners receive allowlisted environments rather than
+the complete host environment.
+
+Provenance includes deterministic Python-environment tree attestations that ignore
+only interpreter-created `__pycache__/*.pyc` artifacts. FeatureBench additionally
+attests the shared prompt source and exact `ARM_B_PREFIX` value, recording whether
+the selected arm used the prefix or the verbatim upstream prompt.
+
+`report` reads preserved Codex rollouts plus only the exact suite-native verifier
+paths recorded in the host-owned receipt and writes private `report.json` and
+`report.md` files. Each receipt entry binds the verifier file's SHA-256; lexical
+escapes, symlinked path ancestors, out-of-root targets, and later content drift are
+rejected. Reports distinguish requested
+from observed effective effort, host from worker sessions, explicit compactions
+from inferred prompt resets, and verified scores from missing results. A score is
+never inferred from agent success or absence: without attributable native verifier
+output it remains `unverified` with a JSON `null` value. See
+[`docs/swe-marathon.md`](docs/swe-marathon.md) and
+[`docs/featurebench.md`](docs/featurebench.md) for suite-specific constraints.
+
 ## How a session runs
 
 Per instance×arm the driver builds a COPY-only overlay image over the instance's

@@ -14,7 +14,7 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 
 ## Bench Harness
 
-- `bench/` is the SWE-bench Pro A/B benchmark (codex alone vs codex + ultracode); see `bench/README.md`. It is outside the CI typecheck gate — `npm run bench:check` typechecks it, and its pure logic is covered by offline `test/unit/bench-*.test.ts` which run in `npm test`. `bench/.cache/` and `bench/results/` are gitignored artifacts — never commit them. Live bench runs spend real tokens and are manual-only.
+- `bench/` is the SWE-bench Pro A/B benchmark (codex alone vs codex + ultracode); see `bench/README.md`. The pinned SWE-Marathon and FeatureBench adapters use the separate `npm run bench:external -- prep|run|report --suite ...` lifecycle and must not change the original harness's manifests or frozen results. It is outside the CI typecheck gate — `npm run bench:check` typechecks it, and its pure logic is covered by offline `test/unit/bench-*.test.ts` which run in `npm test`. `bench/.cache/` and `bench/results/` are gitignored artifacts — never commit them. Live bench runs spend real tokens and are manual-only.
 
 ## Generated Plugin Bundles
 
