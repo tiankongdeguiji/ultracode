@@ -12,8 +12,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../../src/backends/ndjson.js';
 import { writeFileNoFollow, openAppendFdNoFollow } from '../../src/exec/safe-write.js';
-import { readProcStat } from '../../src/exec/procinfo.js';
+import {
+  isSafeProcessId,
+  readProcessIdentities,
+  readProcessIdentity,
+  readProcStat,
+} from '../../src/exec/procinfo.js';
+import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { killWorkerGroups } from '../../src/exec/stop.js';
+import { workerRecordDir, workerRecordPath } from '../../src/exec/worker-record.js';
 import { PrefixReplayCache, type JournalRecord } from '../../src/engine/journal.js';
 import type { AgentSpec } from '../../src/backends/types.js';
 
@@ -71,6 +78,20 @@ describe('readProcStat', () => {
 
   it('returns undefined for an impossible pid', () => {
     expect(readProcStat(2 ** 31)).toBeUndefined();
+    expect(isSafeProcessId(1e21)).toBe(false);
+    expect(isSafeProcessId(Number.MAX_SAFE_INTEGER + 1)).toBe(false);
+  });
+
+  it('reads a stable process-group identity on every supported host', () => {
+    const identities = readProcessIdentities([1e21, process.pid]);
+    const identity = identities.get(process.pid);
+    if (process.platform === 'linux' || process.platform === 'darwin') {
+      expect(identity).toBeTruthy();
+      expect(Number.isInteger(identity!.pgrp)).toBe(true);
+      expect(identity!.starttime.length).toBeGreaterThan(0);
+    } else {
+      expect(identity).toBeUndefined();
+    }
   });
 });
 
@@ -92,8 +113,63 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     expect(killWorkerGroups(mk({ a: String(process.pid), b: 'not-a-number', c: '' }))).toBe(0);
   });
 
-  it('kills a matching detached worker group (linux)', async () => {
-    if (process.platform !== 'linux') return;
+  it('kills a matching detached worker group with verified identity', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const runDir = tmp('uc-kill-matching-');
+    const agentDir = join(runDir, 'agents', 'worker');
+    mkdirSync(agentDir, { recursive: true });
+    const worker = spawnAgentProcess(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1e9)', 'x'.repeat(1_024)],
+      {
+        cwd: process.cwd(),
+        env: {},
+        workerScope: runDir,
+      },
+    );
+    const pid = worker.child.pid!;
+    try {
+      const stat = readProcessIdentity(pid)!;
+      writeFileSync(join(agentDir, 'pgid'), `${pid} ${stat.starttime} ${worker.workerToken}`);
+      expect(killWorkerGroups(runDir)).toBe(1);
+      await sleep(150);
+      expect(readProcessIdentity(pid)).toBeUndefined(); // gone
+    } finally {
+      worker.killTree('SIGKILL');
+    }
+  });
+
+  it('does not let worker-created directories hide a sibling recovery record', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const runDir = tmp('uc-kill-fair-');
+    const noisyAgentDir = join(runDir, 'agents', '0000-noisy');
+    mkdirSync(noisyAgentDir, { recursive: true });
+    for (let attempt = 1; attempt <= 1_024; attempt++) {
+      writeFileSync(join(noisyAgentDir, `pgid.attempt${attempt}`), `999999999 - ${'a'.repeat(32)}`);
+    }
+    for (let index = 0; index < 2_048; index++) {
+      mkdirSync(join(runDir, 'agents', `junk-${String(index).padStart(4, '0')}`));
+    }
+    mkdirSync(workerRecordDir(runDir, 1), { recursive: true });
+    const worker = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
+      cwd: process.cwd(),
+      env: {},
+      workerScope: runDir,
+    });
+    const pid = worker.child.pid!;
+    try {
+      const stat = readProcessIdentity(pid)!;
+      writeFileSync(workerRecordPath(runDir, 1, 1), `${pid} ${stat.starttime} ${worker.workerToken}`);
+      expect(killWorkerGroups(runDir)).toBe(1);
+      await sleep(150);
+      expect(readProcessIdentity(pid)).toBeUndefined();
+    } finally {
+      worker.killTree('SIGKILL');
+    }
+  });
+
+  it('rejects a forged record with an unrelated leader\'s exact public identity', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
       detached: true,
       stdio: 'ignore',
@@ -101,21 +177,39 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     child.unref();
     const pid = child.pid!;
     try {
-      const stat = readProcStat(pid)!;
-      expect(killWorkerGroups(mk({ good: `${pid} ${stat.starttime}` }))).toBe(1);
-      await sleep(150);
-      expect(readProcStat(pid)).toBeUndefined(); // gone
+      const stat = readProcessIdentity(pid)!;
+      expect(killWorkerGroups(mk({ forged: `${pid} ${stat.starttime} ${'a'.repeat(32)}` }))).toBe(0);
+      expect(readProcessIdentity(pid)).toBeTruthy();
     } finally {
-      try {
-        process.kill(-pid, 'SIGKILL');
-      } catch {
-        /* already dead */
-      }
+      process.kill(-pid, 'SIGKILL');
     }
   });
 
-  it('skips a start-time mismatch — a recycled/forged pid is not killed (linux)', async () => {
-    if (process.platform !== 'linux') return;
+  it('ignores non-exact and oversized recovery record files', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    const pid = child.pid!;
+    const runDir = tmp('uc-kill-bounded-');
+    const agentDir = join(runDir, 'agents', 'a');
+    mkdirSync(agentDir, { recursive: true });
+    try {
+      const stat = readProcessIdentity(pid)!;
+      const valid = `${pid} ${stat.starttime}`;
+      writeFileSync(join(agentDir, 'pgid.attempt1.extra'), valid);
+      writeFileSync(join(agentDir, 'pgid.attempt2'), valid.padEnd(513, ' '));
+      expect(killWorkerGroups(runDir)).toBe(0);
+      expect(readProcessIdentity(pid)).toBeTruthy();
+    } finally {
+      process.kill(-pid, 'SIGKILL');
+    }
+  });
+
+  it('skips a start-time mismatch — a recycled or forged pid is not killed', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
       detached: true,
       stdio: 'ignore',
@@ -124,15 +218,15 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     const pid = child.pid!;
     try {
       // Correct pid, wrong recorded start-time → identity check fails → not killed.
-      expect(killWorkerGroups(mk({ stale: `${pid} 999999999` }))).toBe(0);
-      expect(readProcStat(pid)).toBeTruthy(); // still alive
+      expect(killWorkerGroups(mk({ stale: `${pid} 999999999 ${'b'.repeat(32)}` }))).toBe(0);
+      expect(readProcessIdentity(pid)).toBeTruthy(); // still alive
     } finally {
       process.kill(-pid, 'SIGKILL');
     }
   });
 
-  it('fails closed on an empty recorded start-time — a PID-only forged pgid is not killed (linux)', async () => {
-    if (process.platform !== 'linux') return;
+  it('fails closed on an empty recorded start-time — a PID-only forged pgid is not killed', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
       detached: true,
       stdio: 'ignore',
@@ -141,10 +235,10 @@ describe('killWorkerGroups (the pgid file is untrusted worker-writable input)', 
     const pid = child.pid!;
     try {
       // A worker overwrote its pgid file with just a live victim PID (no
-      // start-time). With /proc available we require a matching start-time, so
-      // this must NOT be killed.
+      // start-time). Supported hosts require a matching identity, so this must
+      // NOT be killed.
       expect(killWorkerGroups(mk({ forged: `${pid}` }))).toBe(0);
-      expect(readProcStat(pid)).toBeTruthy(); // still alive
+      expect(readProcessIdentity(pid)).toBeTruthy(); // still alive
     } finally {
       process.kill(-pid, 'SIGKILL');
     }

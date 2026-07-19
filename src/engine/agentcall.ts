@@ -6,8 +6,8 @@
  * (stallMs / timeout) tighten in M7.
  */
 import { mkdirSync, writeFileSync, writeSync, closeSync, mkdtempSync, rmSync } from 'node:fs';
-import { openWriteFdNoFollow, writeFileNoFollow } from '../exec/safe-write.js';
-import { readProcStat } from '../exec/procinfo.js';
+import { openWriteFdNoFollow, writeFileAtomicNoFollow, writeFileNoFollow } from '../exec/safe-write.js';
+import { readProcessIdentity } from '../exec/procinfo.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../backends/ndjson.js';
@@ -20,8 +20,9 @@ import {
   schemaPromptSuffix,
 } from '../backends/structured.js';
 import { validateWithSchema } from './ajv.js';
-import { spawnAgentProcess, TailBuffer } from '../exec/spawn.js';
+import { spawnAgentProcess, TailBuffer, type SpawnedAgent } from '../exec/spawn.js';
 import { chainedTimeout } from '../exec/timers.js';
+import { workerRecordDir, workerRecordPath } from '../exec/worker-record.js';
 import type {
   AgentEvent,
   AgentExecutor,
@@ -72,9 +73,26 @@ export interface AgentCallOptions {
   attemptTimeoutMs?: number;
   /** min gap between live usage ticks per agent (0 = every change; for tests) */
   usageTickIntervalMs?: number;
+  /** Stable run-dir scope inherited by workers and checked during recovery. */
+  workerScope?: string;
 }
 
 export const USAGE_TICK_INTERVAL_MS = 1000;
+const STDIO_CLOSE_GRACE_MS = 250;
+
+function waitBounded(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (completed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(completed);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs).unref();
+    promise.then(() => finish(true));
+  });
+}
 
 /** Session ids arrive on the worker's own stdout stream — validate the shape
  *  before one re-enters an argv, where a forged leading-dash "id" would parse
@@ -486,7 +504,16 @@ export class AgentCallExecutor implements AgentExecutor {
     const { onStreamEvent, resumedSession = false, stderrSuffix = '', timeoutOverrideMs } = opts;
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
+    const recoveryDir = this.opts.workerScope ? workerRecordDir(this.opts.workerScope, spec.seq) : artifactDir;
+    if (recoveryDir && recoveryDir !== artifactDir) mkdirSync(recoveryDir, { recursive: true });
     const transcriptFile = artifactDir ? join(artifactDir, 'transcript.jsonl') : undefined;
+    // One record per physical spawn: a stubborn escaped process from an earlier
+    // retry must not be hidden when the next attempt writes its own identity.
+    const processRecordFile = this.opts.workerScope
+      ? workerRecordPath(this.opts.workerScope, spec.seq, attempt, stderrSuffix)
+      : artifactDir
+        ? join(artifactDir, `pgid.attempt${attempt}${stderrSuffix}`)
+        : undefined;
 
     // Schema temp file (codex --output-schema wants a path). Inserted before
     // the trailing '-' stdin positional when present.
@@ -563,38 +590,66 @@ export class AgentCallExecutor implements AgentExecutor {
     let timer: { clear(): void } | undefined;
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     let onAbort: (() => void) | undefined;
+    let proc: SpawnedAgent | undefined;
+    let descendantsRemaining: number | undefined;
     // Delayed SIGKILL escalations scheduled after a SIGTERM. Tracked so `finally`
     // can cancel any still pending — otherwise a kill stays armed 5s out against
     // a pid that has already closed and may be recycled (→ kill the wrong group).
     const escalationTimers: ReturnType<typeof setTimeout>[] = [];
+    const disarmAttemptControl = () => {
+      timer?.clear();
+      timer = undefined;
+      if (stallTimer) clearInterval(stallTimer);
+      stallTimer = undefined;
+      for (const pending of escalationTimers) clearTimeout(pending);
+      escalationTimers.length = 0;
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      onAbort = undefined;
+    };
     try {
       // Open the transcript once and writeSync to a persistent fd — not
       // appendFileSync (open+write+close) per NDJSON line, which serializes
       // every concurrent agent's IO behind blocking syscalls on the hot path.
       if (transcriptFile) transcriptFd = openWriteFdNoFollow(transcriptFile);
-      const proc = spawnAgentProcess(plan.bin, argv, {
+      const spawned = spawnAgentProcess(plan.bin, argv, {
         cwd: spec.cwd,
         // Scrub OTHER backends' credentials so a prompt-injected worker can't
         // exfiltrate them. ULTRACODE_INSIDE_RUN marks spawned workers so an
         // ultracode MCP server inherited by a worker refuses workflow_start.
         env: { ...scrubForeignBackendSecrets(process.env, spec.backend), ...plan.env, ULTRACODE_INSIDE_RUN: '1' },
         stdinData: plan.stdinData,
+        workerScope: this.opts.workerScope,
+        // Create a token-only recovery record before spawn. If the runner is
+        // killed after the child starts but before identity lookup completes,
+        // Linux can still find the marked process through procfs.
+        onWorkerToken: processRecordFile
+          ? (token) => writeFileAtomicNoFollow(processRecordFile, `- - ${token}`)
+          : undefined,
       });
+      proc = spawned;
       // Persist the worker's PGID so `ultracode stop` can kill the group if the
       // runner is unresponsive and gets SIGKILL'd (detached workers survive it).
-      // Record `<pid> <starttime>`: the kernel start-time binds the pgid to this
-      // exact process instance so a later forced stop can't be redirected to a
-      // recycled — or worker-forged — PID (see stop.ts killWorkerGroups).
-      if (artifactDir && proc.child.pid) {
-        const stat = readProcStat(proc.child.pid);
-        writeFileNoFollow(join(artifactDir, 'pgid'), `${proc.child.pid} ${stat?.starttime ?? ''}`);
+      // Record `<pid> <starttime> <worker-token>`: start-time binds the PGID to
+      // this process instance; the token finds descendants that leave the PGID.
+      if (processRecordFile && spawned.child.pid) {
+        const stat = readProcessIdentity(spawned.child.pid);
+        // Keep an explicit placeholder when a very short-lived leader exits
+        // before its identity can be read; whitespace splitting must retain the
+        // token as field three for recovery of descendants it already launched.
+        writeFileAtomicNoFollow(
+          processRecordFile,
+          `${spawned.child.pid} ${stat?.starttime ?? '-'} ${spawned.workerToken}`,
+        );
       }
 
       // SIGTERM the tree, then escalate to SIGKILL if it survives — but track the
       // escalation so `finally` can cancel it if the child closes first.
+      let terminationStarted = false;
       const killWithEscalation = () => {
-        proc.killTree('SIGTERM');
-        escalationTimers.push(setTimeout(() => proc.killTree('SIGKILL'), 5_000).unref());
+        if (terminationStarted) return;
+        terminationStarted = true;
+        spawned.killTree('SIGTERM');
+        escalationTimers.push(setTimeout(() => spawned.killTree('SIGKILL'), 5_000).unref());
       };
 
       // Timeouts are user-opt-in: no per-call timeoutMs and no run-level
@@ -625,24 +680,37 @@ export class AgentCallExecutor implements AgentExecutor {
       onAbort = () => killWithEscalation();
       signal.addEventListener('abort', onAbort, { once: true });
 
-      proc.child.stdout?.setEncoding('utf8');
-      proc.child.stderr?.setEncoding('utf8');
-      proc.child.stdout?.on('data', (chunk: string) => {
+      spawned.child.stdout?.setEncoding('utf8');
+      spawned.child.stderr?.setEncoding('utf8');
+      spawned.child.stdout?.on('data', (chunk: string) => {
         lastActivityAt = Date.now();
         for (const line of splitter.push(chunk)) {
           if (transcriptFd !== undefined) writeSync(transcriptFd, line + '\n');
           consume(parser.push(line));
         }
       });
-      proc.child.stderr?.on('data', (chunk: string) => {
+      spawned.child.stderr?.on('data', (chunk: string) => {
         lastActivityAt = Date.now();
         stderrTail.push(chunk);
       });
 
+      const closePromise = new Promise<void>((resolve) => spawned.child.once('close', () => resolve()));
       const [code, sig] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve, reject) => {
-        proc.child.on('error', reject);
-        proc.child.on('close', (c, s) => resolve([c, s]));
+        spawned.child.once('error', reject);
+        spawned.child.once('exit', (c, s) => resolve([c, s]));
       });
+      const abortedAtExit = signal.aborted;
+      // The attempt outcome is fixed once the direct child exits. Descendant
+      // cleanup must not let a later timeout or stall tick reclassify it.
+      disarmAttemptControl();
+      // An escaped helper may inherit the backend's stdout/stderr descriptors,
+      // which prevents ChildProcess `close` even after the direct child exits.
+      // Reap from `exit`, then give buffered output a bounded drain window.
+      descendantsRemaining = await spawned.cleanupEscaped();
+      if (!(await waitBounded(closePromise, STDIO_CLOSE_GRACE_MS))) {
+        spawned.child.stdout?.destroy();
+        spawned.child.stderr?.destroy();
+      }
 
       for (const line of splitter.end()) {
         if (transcriptFd !== undefined) writeSync(transcriptFd, line + '\n');
@@ -664,7 +732,7 @@ export class AgentCallExecutor implements AgentExecutor {
           retryable: true,
           message: `no stream activity for ${spec.stallMs}ms (stall watchdog)`,
         };
-      } else if (signal.aborted) {
+      } else if (abortedAtExit) {
         exit = { ok: false, errorKind: 'interrupted', retryable: false, message: 'aborted' };
       }
       return { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, outputChars };
@@ -688,17 +756,18 @@ export class AgentCallExecutor implements AgentExecutor {
       // Runs on both success and the spawn-error path — the error path is
       // retryable, so leaking the interval/timer/abort-listener would compound
       // across retries.
-      timer?.clear();
-      if (stallTimer) clearInterval(stallTimer);
-      for (const t of escalationTimers) clearTimeout(t);
-      if (onAbort) signal.removeEventListener('abort', onAbort);
+      disarmAttemptControl();
+      // The normal path starts cleanup on direct-child `exit`. Retry here only
+      // after an error or an incomplete sweep before dropping the recovery
+      // record.
+      if (descendantsRemaining !== 0) descendantsRemaining = (await proc?.cleanupEscaped()) ?? 0;
       if (transcriptFd !== undefined) closeSync(transcriptFd);
       try {
         sidecar?.close();
       } catch {
         /* display-only */
       }
-      if (artifactDir) rmSync(join(artifactDir, 'pgid'), { force: true });
+      if (processRecordFile && descendantsRemaining === 0) rmSync(processRecordFile, { force: true });
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }
   }

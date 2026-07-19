@@ -238,6 +238,7 @@ Default root: `<project>/.ultracode/` (git-ignorable), overridable `$ULTRACODE_H
         ├── args.json
         ├── journal.jsonl           # hash-chain cache records (§1.4)
         ├── events.jsonl            # append-only progress stream (§1.5)
+        ├── worker-records/<seq>/pgid.attempt*  # fixed-address crash recovery
         ├── output.json             # final {result, logs, failures, agentCount, totalTokens, totalToolCalls, durationMs, error?}
         ├── runner.pid
         └── agents/<seq>-<label>/{prompt.md, schema.json, transcript.jsonl, stderr.log, result.json}
@@ -250,7 +251,7 @@ Default root: `<project>/.ultracode/` (git-ignorable), overridable `$ULTRACODE_H
 - **Single-writer**: only the runner process writes inside its run dir. CLI/MCP are pure readers. No locks needed for readers; `manifest.json` is atomic-swapped; `events.jsonl`/`journal.jsonl` are O_APPEND single-`write()` lines (atomic under PIPE_BUF-sized records).
 - **Liveness**: runner refreshes `heartbeatAt` every 5s. Readers report `orphaned` only when `status==='running'` but the recorded pid is dead (or, on Linux where `/proc` exposes start-time, a recycled PID — macOS detects a dead pid but not a recycled live one); a stale heartbeat alone keeps a live-but-wedged runner `running`, so `stop` can still signal it; `ultracode list` offers `--reap` to finalize orphans (`status:'orphaned', error:'runner died without finalizing'`), which also unblocks resume.
 - **runId** from `crypto.randomBytes` (host-side; the determinism ban applies to scripts, not the engine). Distinct dirs ⇒ no cross-run contention. Worktrees live at `.ultracode/worktrees/<runId>/<seq>/` on branch `ultracode/<runId>/<seq>`, branched from the default branch; removed post-run if clean, kept (path recorded in result.json) if the agent left changes.
-- **Stop**: SIGTERM to runner → runner aborts the run AbortController, sends SIGTERM to each child's **process group** (children spawned with `detached:true` + `kill(-pgid)`), waits 5s, SIGKILL, marks `stopped`, flushes partial `output.json`.
+- **Stop**: SIGTERM to runner → runner aborts the run AbortController, sends SIGTERM to each child's **process group** and, on Linux, every process carrying that attempt's lifecycle token; escalates survivors to SIGKILL and marks `stopped`. A successful unwind flushes partial `output.json`; a hard stop or external SIGKILL can leave only the terminal manifest. The token sweep is required because Codex/bwrap tool sandboxes can create a new session and leave the worker PGID.
 
 ### 3.3 Resume semantics
 
@@ -313,7 +314,7 @@ script: await agent(prompt, {schema, label})
   → hostapi: caps check (lifetime<1000) → budget gate → semaphore.acquire()
   → journal.nextCachedResult(chainKey)  ── hit → resolve instantly from old run's result.json
   → miss (prefix broken from here on):
-      adapter.checkSchema → adapter.buildSpawn → spawn.ts (own pgid, cwd=worktree if isolation)
+      adapter.checkSchema → adapter.buildSpawn → spawn.ts (own pgid + Linux lifecycle token, cwd=worktree if isolation)
       stdout → ndjson splitter → adapter.createParser() → AgentEvent[]
         → events.jsonl (agent_usage/agent_retry/agent_model/agent_tool ticks), transcript.jsonl (raw)
       exit → adapter.classifyExit → retryable? (retries/stallMs budget) → respawn or fail
@@ -340,7 +341,7 @@ script ends → output.json + manifest(status) → events.jsonl run_completed �
 - node:vm is not a hostile-code boundary; a malicious script that escapes could reach the runner process (which can spawn agent CLIs). Trust model assumes review-before-run; if unreviewed third-party workflow distribution ever becomes a goal, the sandbox tier must be revisited (SES-in-worker or subprocess-per-script).
 - Usage/cost normalization is lossy: cursor (and sometimes copilot) omit token counts, forcing chars/4 estimates; budget enforcement across mixed backends is therefore approximate. Surfaced via estimated:true rather than hidden, but '+500k' directives will be soft targets on those backends.
 - Backend CLI drift is the structural maintenance burden (8 adapters × fast-moving CLIs): flag renames (--experimental-json→--json precedent), envelope changes, exit-code changes. Mitigate with probe() version gates, golden fixtures in CI, and adapter-local quirk tables keyed by version range.
-- Detached-runner model has no supervisor: a SIGKILL'd runner leaves live child agent CLIs running (their process groups survive). The reaper marks the run orphaned but child cleanup on hard-kill is best-effort (pgid recorded in agents/*/result.json for manual kill).
+- Detached-runner model has no daemon supervisor. Before every physical backend spawn, the runner writes a token-only `agents/*/pgid.attempt*` recovery record, then atomically enriches it with the PGID and OS start-time identity after spawn. A normal settle removes the record only after same-group and escaped-descendant cleanup. A hard-stop, fatal runner exit, or later `ultracode stop` replays a bounded set of small regular records only when the live group leader's identity, token, and filesystem-backed run-scope digest all match. Linux token discovery also covers token-only records, leaderless groups, and descendants that called `setsid()`; each target must carry the expected scope, so copying a readable token across runs grants no authority. If identity lookup loses a short-lived leader, the persisted start-time is `-`: Linux can still recover by token, while macOS fails closed because it checks only recorded leader environments through `ps` and does not perform a host-wide token sweep.
 - Explicit waitSeconds is honored up to 3600s, so a hold longer than the host's actual tool timeout dies client-side (survivable — the model re-polls, but each death wastes a turn); doctrine pins per-host numbers (codex hostpack 3600→3300, stock codex 300→240, Qoder/Gemini 600→540) and the omitted-waitSeconds default stays 25s so a naive poll is safe everywhere, with the tool description telling the model to just re-call on timeout.
 
 ## OPEN QUESTIONS

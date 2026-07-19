@@ -18,6 +18,7 @@ import { MockExecutor } from '../backends/mock.js';
 import { createExecutorForBackend } from '../engine/agentcall.js';
 import { readProcStat } from '../exec/procinfo.js';
 import { chainedTimeout } from '../exec/timers.js';
+import { killWorkerGroupsUntilGone } from '../exec/stop.js';
 import { Semaphore, defaultConcurrency, isPositiveInt } from '../engine/semaphore.js';
 import { BudgetAccount } from '../budget/account.js';
 import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
@@ -39,7 +40,7 @@ function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger', at
       ex =
         backend === 'mock'
           ? new MockExecutor({ attemptTimeoutMs })
-          : (createExecutorForBackend(backend, { artifactDir, permission, attemptTimeoutMs }) ??
+          : (createExecutorForBackend(backend, { artifactDir, permission, attemptTimeoutMs, workerScope: dir }) ??
             (() => {
               throw new Error(`backend '${backend}' is not implemented yet`);
             })());
@@ -93,12 +94,19 @@ export async function runnerMain(dir: string): Promise<number> {
   let hardStopTimer: ReturnType<typeof setTimeout> | undefined;
   const armHardStop = (reason: string) => {
     if (hardStopTimer) return;
-    hardStopTimer = setTimeout(() => {
+    hardStopTimer = setTimeout(async () => {
       events.write({
         type: 'workflow_log',
         message: `hard stop: runner did not unwind ${HARD_STOP_GRACE_MS}ms after ${reason} — force-exiting`,
       });
       try {
+        const killedWorkers = await killWorkerGroupsUntilGone(dir);
+        if (killedWorkers > 0) {
+          events.write({
+            type: 'workflow_log',
+            message: `hard stop reaped ${killedWorkers} worker record(s)`,
+          });
+        }
         writeManifest(dir, {
           ...manifest,
           status: 'stopped',

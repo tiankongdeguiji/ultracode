@@ -202,11 +202,32 @@ program
   .requiredOption('--run-dir <dir>')
   .action(async (opts: { runDir: string }) => {
     const { runnerMain } = await import('./runner.js');
+    const { killActiveWorkers } = await import('../exec/spawn.js');
+    const { killWorkerGroupsUntilGone } = await import('../exec/stop.js');
+    const cleanupWorkers = () => {
+      try {
+        // Fatal monitors cannot await and must not parse worker-writable disk
+        // state. In-memory identities cover workers active in this runner.
+        killActiveWorkers();
+      } catch {
+        /* fatal path: best-effort worker containment */
+      }
+    };
+    // Observe synchronous callback crashes without replacing Node's default
+    // uncaught-exception behavior, which still prints the error and exits.
+    process.on('uncaughtExceptionMonitor', cleanupWorkers);
     try {
       process.exit(await runnerMain(opts.runDir));
     } catch (err) {
+      try {
+        await killWorkerGroupsUntilGone(opts.runDir);
+      } catch {
+        /* fatal path: best-effort worker containment */
+      }
       process.stderr.write(`runner fatal: ${(err as Error)?.stack ?? err}\n`);
       process.exit(1);
+    } finally {
+      process.removeListener('uncaughtExceptionMonitor', cleanupWorkers);
     }
   });
 

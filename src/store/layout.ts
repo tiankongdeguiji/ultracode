@@ -2,7 +2,7 @@
  * On-disk layout. Project-local by default:
  *   <cwd>/.ultracode/runs/<wf_...>/{manifest.json, script.js, args.json,
  *     config.json, journal.jsonl, events.jsonl, output.json, runner.log,
- *     agents/<seq>-<slug>/...}
+ *     worker-records/<seq>/..., agents/<seq>-<slug>/...}
  * Overridable via $ULTRACODE_HOME or --home. Deliberately OUTSIDE .qoder/
  * and .claude/ (namespace defensiveness).
  */
