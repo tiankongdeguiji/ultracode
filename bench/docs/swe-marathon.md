@@ -1,11 +1,10 @@
-# SWE-Marathon adapter
+# SWE-Marathon
 
-This adapter runs reproducible Codex versus Codex + ultracode trials through
-upstream Harbor. It is selected through the shared `npm run bench` dispatcher,
-but SWE-Marathon still owns its task containers and native preparation,
-execution, verification, resume, and reporting lifecycle.
+SWE-Marathon is a suite-owned adapter around the upstream Harbor verifier. Its
+native verifier is the only score authority; the benchmark control plane binds
+the exact Harbor config and result bytes but never recomputes a reward.
 
-## Reproducibility contract
+## Pinned inputs
 
 | Component | Pin |
 | --- | --- |
@@ -13,152 +12,81 @@ execution, verification, resume, and reporting lifecycle.
 | Harbor | `0.17.1` |
 | Python | `3.13.5` |
 
-`prepareMarathon()` checks out the exact commit, runs the locked `uv` sync
-under Python 3.13.5, verifies the resulting Harbor version, prepares the
-normal bench toolchain, and pulls each task's digest-pinned image. Its default checkout is
-`bench/.cache/swe-marathon`; generated checkouts, environments, and trial
-results remain ignored artifacts.
+`prep` creates content-addressed inputs below `bench/.cache/swe-marathon/`.
+It prepares the shared Codex/Node/Ultracode toolchain, checks out the exact
+source revision, performs the frozen `uv` sync, applies the tracked Harbor
+ownership-label patch, and pulls every runnable digest-pinned task image.
 
-The run contract is intentionally conservative:
+Runs use the common suite-qualified namespace (with `suite` equal to
+`swe-marathon`):
 
-- one selected task per Harbor job;
-- one concurrent trial and one concurrent agent phase;
-- one attempt and zero Harbor retries;
-- the task's official verifier always runs;
-- server-side web search is disabled;
-- every bench toolchain bind mount is read-only.
-- Linux x64 is required because the mounted Codex and Node executables run in
-  Linux amd64 task containers.
+```text
+bench/results/<suite>/<runId>/
+  manifest.json
+  run-state.json
+  verifier-receipt.json
+  report.json
+  report.md
+  native/tasks/<artifactKey>/
+```
 
-Task ids are checked against the selected upstream pin as well as a strict
-lowercase slug grammar, so a path or an unknown task cannot become a Harbor
-selection.
+One run contains one arm. Every selected task is one sequential native Harbor
+job with one attempt and zero retries. `<runDir>/native/tasks` is passed as
+Harbor's `--jobs-dir`; the collision-resistant artifact key is its job name.
+Resume validates exact job fields before using Harbor's native `job resume`.
+Redo invalidates that task's receipt bindings before resetting its job tree.
 
-## Arms
+Before execution, common prepared inputs are re-attested once. Each task TOML
+and Docker image identity is then re-attested immediately before that task is
+launched, making the work linear in the number of tasks.
 
-Arm A uses Harbor's built-in `codex` adapter and mounts only the pinned bench
-Codex executable. Arm B uses the tracked
-`bench/external/swe-marathon/arm_b_codex.py` bridge, the canonical `ultracode`
-prompt prefix, the tracked skill, and the read-only Node and ultracode runtime
-from `bench/.cache/toolchain`.
+## Arms and evidence
 
-The bridge does not choose a model or reasoning effort. Harbor supplies those
-from the run plan. It registers the MCP server, keeps the host Codex home
-separate from the worker home, waits for workflow terminal states while the
-Harbor agent lifecycle remains open, merges all available host and worker
-rollouts, and preserves the complete ultracode store. A workflow wait deadline
-is fail-closed: the bridge stops and awaits stragglers, preserves artifacts, and
-then raises so Harbor cannot begin official verification against a moving tree.
-Arm B also fails before verification if the host did not start any ultracode
-run, if the worker session store or ultracode run store is absent, or if Harbor
-reports a nonzero return code while waiting or preserving those required
-telemetry artifacts. After Harbor downloads the logs, `arm_b_metrics.json` records
-per-session context and token metrics.
-Mock workflows are explicitly non-billable and contribute zero billable
-workflow tokens.
+Arm A uses Harbor's built-in `codex` agent. Arm B uses
+`bench/suites/swe-marathon/arm_b_codex.py`, the same exact prefix asset used by
+other suites, and the read-only shared toolchain. The bridge chooses neither
+model nor effort. It waits for detached workflows, preserves worker rollouts
+and the run store, and writes only `arm_b_lifecycle.json`. Shared TypeScript
+metrics code is the sole public token aggregator.
 
-## Cohorts and exclusions
+Reporting indexes only the manifest-declared job and its single direct-child
+trial. It validates task, job, trial, arm, model, effort, one-attempt/no-retry
+policy, and a finite reward in `[0,1]`. Nested lookalikes are ignored. A task is
+resolved only when the native reward is exactly `1`.
 
-The following four tasks are a **post-hoc context-pressure stress cohort**, not
-a pre-registered representative benchmark sample:
+The four CUA tasks without authoritative verifier results are not runnable:
+`excel-clone`, `mastodon-clone`, `s3-clone`, and `slack-clone`. The
+`find-network-alignments`, `kubernetes-rust-rewrite`, `nextjs-vite-rewrite`, and
+`rust-java-lsp` cohort is post-hoc stress evidence, not a representative sample.
 
-- `find-network-alignments`
-- `kubernetes-rust-rewrite`
-- `nextjs-vite-rewrite`
-- `rust-java-lsp`
+## Authentication and lifecycle
 
-They were selected after observing unusually high Arm A context pressure.
-Results for this cohort should therefore be described as stress evidence and
-must not be presented as an unbiased confirmatory estimate.
+Choose the configured authentication mechanism on every run:
 
-The exploratory CUA runs for `excel-clone`, `mastodon-clone`, `s3-clone`, and
-`slack-clone` did not complete official verification. They are excluded from
-the adapter's runnable task set and from reported A/B results.
+- `chatgpt`: set `CODEX_AUTH_JSON_PATH` to a current-user-owned regular file
+  with mode `0600`.
+- `api-key`: set `OPENAI_API_KEY`.
 
-## Usage
+Credentials are copied or forwarded only into an ephemeral `0700` runtime home
+and never enter argv, manifests, reports, or the persistent run directory.
+Task code shares the credential's security domain, so use a disposable,
+narrowly scoped account with restricted egress.
 
-Authentication is runtime-only. Put either `CODEX_AUTH_JSON_PATH` or
-`OPENAI_API_KEY` in the environment of the Node process that calls the adapter.
-`runMarathon()` selects exactly one mechanism and passes an allowlisted
-environment to Harbor. Unrelated host tokens, cloud credentials, SSH agent
-sockets, and package-manager credentials are excluded. Planning functions never
-include auth, and Harbor argv never contains an auth setting.
-`CODEX_AUTH_JSON_PATH` is validated as a regular file and normalized to its
-absolute path before Harbor changes directory. The Harbor Python process also
-runs with bytecode writes disabled. `OPENAI_API_KEY` remains supported: Harbor
-creates and links the host Codex `auth.json` before the Arm B bridge copies that
-file into the isolated worker home.
-
-The supported command-line lifecycle is:
+Harbor containers receive the complete benchmark ownership label tuple from
+the pinned patch. Cleanup discovers containers by all labels, reinspects the
+full tuple, and refuses to remove anything that does not match exactly.
 
 ```bash
 npm run bench -- --suite swe-marathon prep
-npm run bench -- --suite swe-marathon run --run-id <fresh-id> \
-  --model <model> --effort <effort> --arm <a|b> \
-  --task-id <task> [--task-id <task> ...]
-npm run bench -- --suite swe-marathon report --run-id <fresh-id>
+
+npm run bench -- --suite swe-marathon run --run-id marathon-a1 \
+  --model <model> --effort <effort> --arm a \
+  --task-id zstd-decoder
+
+npm run bench -- --suite swe-marathon run --run-id marathon-a1 --resume
+npm run bench -- --suite swe-marathon report --run-id marathon-a1
 ```
 
-The mandatory selector routes these commands to SWE-Marathon. Routing is the
-only shared layer. The suite manifest remains at
-`bench/results/external/swe-marathon/<runId>/external-run.json`, separate from
-SWE-bench Pro's `bench/results/<runId>/run.json` and FeatureBench's external
-namespace.
-
-Model and effort are mandatory CLI inputs; environment variables are not used
-as fallbacks by the suite driver. Each task becomes one sequential Harbor job
-under the private run directory. Repeating the exact command with the same run
-ID skips receipt-complete tasks and invokes Harbor's native `job resume` for an
-incomplete job. Input or provenance drift is rejected. The lower-level adapter
-API retains explicit argument or environment injection for programmatic callers.
-Resume validation compares Harbor 0.17.1's exact `task.path`, `agent.name`,
-`agent.model_name`, and `agent.kwargs.reasoning_effort` fields; unrelated config
-text cannot satisfy an immutable input check.
-
-Before manifest creation, the driver re-attests checkout HEAD/origin/dirtiness,
-exact Python and Harbor binaries, task config and image digests, the Arm B
-bridge, Codex, Node, and ultracode. It rehashes again immediately before each
-launch. Reports trust only the exact direct-child Harbor trial `result.json`
-recorded in the host-owned native receipt; recursively discovered reward files
-are never score authority.
-
-Model, effort, and host paths can be arguments or environment variables:
-
-| Setting | Environment variable |
-| --- | --- |
-| model | `SWE_MARATHON_MODEL` |
-| reasoning effort | `SWE_MARATHON_EFFORT` |
-| upstream checkout | `SWE_MARATHON_REPO_DIR` |
-| results directory | `SWE_MARATHON_RESULTS_DIR` |
-| bench toolchain | `SWE_MARATHON_TOOLCHAIN_DIR` |
-| Python bridge directory | `SWE_MARATHON_BRIDGE_DIR` |
-| ultracode skill directory | `SWE_MARATHON_SKILL_DIR` |
-| `uv` executable | `SWE_MARATHON_UV_BIN` |
-| Harbor executable | `SWE_MARATHON_HARBOR_BIN` |
-| Arm B post-host wait | `SWE_MARATHON_WORKFLOW_WAIT_SECONDS` |
-
-The pure functions are useful for review or scheduling without executing
-anything:
-
-```ts
-import {
-  planMarathonPrep,
-  planMarathonRun,
-  prepareMarathon,
-  runMarathon,
-} from '../src/marathon.js';
-
-const prepPlan = planMarathonPrep();
-const runPlan = planMarathonRun(
-  { taskName: 'kubernetes-rust-rewrite', arm: 'b' },
-  process.env,
-);
-
-await prepareMarathon();
-await runMarathon({ taskName: 'kubernetes-rust-rewrite', arm: 'b' });
-```
-
-For an explicit argument-based run, pass `model`, `effort`, any path overrides,
-and a unique `jobName` in the `runMarathon()` options. Run Arm A and Arm B as
-separate jobs; the one-task default avoids concurrent trials competing for the
-same local CPU, memory, or account limits.
+Arm A and Arm B comparisons use separate run IDs. Preparation and execution
+require Linux x64 and a Linux amd64 Docker daemon. Native/live runs are manual
+and are never part of the offline test suite.

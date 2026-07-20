@@ -1,194 +1,160 @@
-# bench/ — SWE-bench Pro A/B harness: codex alone vs codex + ultracode
+# Benchmark harness
 
-Does multi-agent orchestration help on long-horizon software-engineering tasks that
-strain a single context window? This harness runs [SWE-bench Pro](https://github.com/scaleapi/SWE-bench_Pro-os)
-(public set, 731 tasks, 11 repos, python/js/go) two ways per instance and compares:
+This harness compares stock Codex (Arm A) with Codex plus Ultracode (Arm B)
+across three pinned software-engineering suites. Each suite keeps its official
+native runner and verifier while sharing one strict control plane for manifests,
+state, receipts, metrics, failures, and reports.
 
-- **arm A** — stock `codex exec` on the task prompt
-- **arm B** — the same prompt prefixed with the `ultracode` keyword, with the ultracode
-  MCP server + skill installed, so the codex host session orchestrates parallel codex
-  workers through a workflow
+## Requirements
 
-Scoring uses the **official** eval harness (pinned commit, local-Docker mode): an
-instance is resolved iff every `fail_to_pass` and `pass_to_pass` test passes. Alongside
-resolved rate the harness records a per-session token 4-tuple (input/cached/output/reasoning),
-wall-clock, and **context pressure** — compaction events and the context high-water mark
-vs the model's window — which is the instrument for the "exceeds one context" thesis.
+- Linux or macOS for the CLI; native container suites have stricter host checks
+- Node 20 or newer and dependencies installed with `npm ci`
+- Git and Docker
+- Suite preparation dependencies documented in the suite guides
 
-## Prerequisites
+Copy `bench/bench.example.config.json` to the ignored, operator-owned
+`bench/bench.config.json`, set its mode to `0600`, and fill in the requested
+models, efforts, task sets, and public authentication identities. Runtime
+credentials and endpoint names are supplied through the environment and never
+belong in either config file.
 
-- Linux with Docker (tested 26.x), ~5 GB disk per instance (base image + overlay), plenty of RAM
-- `codex` CLI on PATH (the static binary is copied into the containers; pinned + hashed in the toolchain manifest)
-- Node >= 20 (`npm ci` at the repo root), `python3` + venv, `git`, `xz`
-- codex auth: either `~/.codex/auth.json` (default `auth.mode: "chatgpt"`) or `CODEX_API_KEY`
-  (`auth.mode: "api-key"`). API-key mode is the parallel-safe choice; a ChatGPT-plan login
-  works but concurrent token refresh across parallel containers can race, and plan rate
-  limits will throttle a batch — smoke one instance first.
+## Unified CLI
 
-## Quickstart
-
-All lifecycle commands use
-`npm run bench -- --suite <swebench-pro|swe-marathon|featurebench> <command> [options]`.
-The suite selector is mandatory, including for SWE-bench Pro. During migration,
-the dispatcher also accepts a single valid selector after the command and the
-`--suite=<value>` spelling, but suite-first is the canonical documented form.
+There is one public entrypoint and the suite selector must come first:
 
 ```bash
-npm run bench -- --suite swebench-pro fetch  # cache the 731-row dataset from HuggingFace
-npm run bench -- --suite swebench-pro prep   # node + codex + ultracode toolchain, eval harness clone + venv
-cp bench/bench.example.config.json bench/bench.config.json   # then set "model"
-
-# smoke the official eval pipeline first — zero agent tokens, expect ~100% resolved:
-npm run bench -- --suite swebench-pro run --run-id pilot1 \
-  --count 20 --seed 7 --model <model>  # agent sessions (the expensive part)
-npm run bench -- --suite swebench-pro eval --run-id pilot1 --gold
-npm run bench -- --suite swebench-pro eval --run-id pilot1    # score both arms' patches
-npm run bench -- --suite swebench-pro report --run-id pilot1  # report.md + report.json
-npm run bench -- --suite swebench-pro status --run-id pilot1  # progress / taxonomy at any time
+npm run bench -- --suite <swebench-pro|swe-marathon|featurebench> <command> [options]
+npm run bench -- --help
+npm run bench -- --suite featurebench --help
+npm run bench -- --suite featurebench run --help
 ```
 
-`run` is resumable: `--resume` skips finished instance×arms; `--redo id1,id2` forces
-re-runs; the instance selection and config are frozen in `results/<runId>/run.json` at
-first launch, so a resumed run never re-samples.
+`--suite=<name>` is also accepted in the same leading position. Commands are
+not inferred from run IDs, paths, or existing artifacts, and there are no
+alternate suite entrypoints or old-layout readers.
 
-## Suite routing
-
-The public dispatcher selects a suite; it does not combine suite lifecycles or
-artifacts. A selector is required for every lifecycle command, and no suite is
-inferred from a command, run ID, or path.
-
-| Suite | Commands | Run manifest |
+| Suite | Commands | Native authority |
 | --- | --- | --- |
-| SWE-bench Pro (`--suite swebench-pro`) | `fetch`, `prep`, `run`, `eval`, `report`, `status`, `clean` | `bench/results/<runId>/run.json` |
-| SWE-Marathon (`--suite swe-marathon`) | `prep`, `run`, `report` | `bench/results/external/swe-marathon/<runId>/external-run.json` |
-| FeatureBench (`--suite featurebench`) | `prep`, `run`, `report` | `bench/results/external/featurebench/<runId>/external-run.json` |
+| SWE-bench Pro | `fetch`, `prep`, `run`, `eval`, `report`, `status`, `clean` | Pinned official SWE-bench Pro evaluator |
+| SWE-Marathon | `prep`, `run`, `report` | Pinned Harbor reward |
+| FeatureBench | `prep`, `run`, `report` | Pinned `fb infer` and official `fb eval` |
 
-SWE-Marathon and FeatureBench keep their own pinned runners, task containers,
-official verifiers, preparation, resume rules, and reporting. The shared routing
-surface leaves the SWE-bench Pro manifest, selection, evaluation, and
-frozen-result semantics unchanged:
+Every run uses the same persistent envelope:
+
+```text
+bench/results/<suite>/<runId>/
+  manifest.json
+  run-state.json
+  verifier-receipt.json
+  report.json
+  report.md
+  native/
+```
+
+The manifest is strict schema version 2 and immutable. Resume re-attests the
+prepared inputs and control-plane policy hashes, then accepts only that manifest
+identity. Native output is authoritative only when its exact path, SHA-256,
+scope, invocation, role, and native record key are stored in the host-owned
+receipt. Missing or malformed verifier evidence remains unverified; agent
+success and file absence never become a score.
+
+Suite preparation publishes immutable content-addressed directories. In
+particular, SWE-bench Pro records a complete transitive, artifact-hashed Python
+lock, rebuilds the evaluator environment under hash enforcement, and binds the
+patched evaluator tree, environment tree, Python executable, and resolved lock
+to the prepared identity. A later `prep` changes only the current pointer used
+by fresh runs; resume loads the exact identity frozen by its manifest.
+
+## Typical flows
 
 ```bash
+# SWE-bench Pro
+npm run bench -- --suite swebench-pro fetch
+npm run bench -- --suite swebench-pro prep
+npm run bench -- --suite swebench-pro run --run-id pro-pilot \
+  --model <model> --effort <effort> --arm both --count 20 --seed 7
+npm run bench -- --suite swebench-pro eval --run-id pro-pilot --resume
+npm run bench -- --suite swebench-pro report --run-id pro-pilot
+
+# SWE-Marathon: exactly one arm per run
 npm run bench -- --suite swe-marathon prep
 npm run bench -- --suite swe-marathon run --run-id marathon-a1 \
-  --model <model> --effort <effort> --arm a \
-  --task-id zstd-decoder --task-id wasm-simd
+  --model <model> --effort <effort> --arm a --task-id zstd-decoder
 npm run bench -- --suite swe-marathon report --run-id marathon-a1
 
+# FeatureBench: exactly one arm per run
 npm run bench -- --suite featurebench prep
+FEATUREBENCH_CREDENTIAL_BROKER_URL=https://broker.internal/v1 \
+FEATUREBENCH_RESTRICTED_NETWORK=featurebench-private \
 npm run bench -- --suite featurebench run --run-id feature-b1 \
-  --model <model> --effort <effort> --arm b \
-  --task-id <featurebench-instance-id>
+  --model <model> --effort <effort> --arm b --task-id <featurebench-task>
 npm run bench -- --suite featurebench report --run-id feature-b1
 ```
 
-`--run-id`, `--model`, `--effort`, `--arm`, and at least one repeatable
-`--task-id` are mandatory, with no model or effort fallback. Suite,
-auth-mechanism, source, platform, task, and toolchain preflight completes before
-the driver atomically writes private
-`results/external/<suite>/<runId>/external-run.json`. These preserved namespaces
-keep external manifests and generated reports disjoint from SWE-bench Pro and
-from the other external suite. Repeating an exact manifest resumes native work and skips
-only tasks whose receipt still identifies a currently valid exact native-verifier
-score; changed inputs or provenance are rejected.
+Preparation and native execution can use network access and spend substantial
+resources. Unit tests and the default CI suite are offline; live benchmark runs
+are always manual.
 
-FeatureBench requires `FEATUREBENCH_CREDENTIAL_BROKER_URL` plus a dedicated
-Docker-internal `FEATUREBENCH_RESTRICTED_NETWORK` with only the named, labeled
-credential-broker container attached; reusable host ChatGPT credentials are
-never mounted into task containers. SWE-Marathon selects exactly one runtime auth
-mechanism, `CODEX_AUTH_JSON_PATH` or `OPENAI_API_KEY`; an auth-file path is
-canonicalized before child use. The manifest freezes only that mechanism and the
-effective Arm B workflow-wait seconds, never an API key, auth-file contents, or
-auth-file path. Both native runners receive allowlisted environments rather than
-the complete host environment.
+## Arms and prompt policy
 
-Provenance includes deterministic Python-environment tree attestations that ignore
-only interpreter-created `__pycache__/*.pyc` artifacts. FeatureBench additionally
-attests the shared prompt source and exact `ARM_B_PREFIX` value, recording whether
-the selected arm used the prefix or the verbatim upstream prompt.
+Arm A is the native stock-Codex control. Arm B uses the exact bytes in
+`bench/suites/shared/arm-b-prefix.txt` and the prepared Ultracode toolchain.
+Every suite manifest binds the prompt policy and tracked native patch/assets.
+SWE-Marathon and FeatureBench freeze one arm per run; paired comparisons use
+separate run identities. SWE-bench Pro can freeze both arms in one run because
+its native layout provides a task-by-arm execution namespace.
 
-`report` reads preserved Codex rollouts plus only the exact suite-native verifier
-paths recorded in the host-owned receipt and writes private `report.json` and
-`report.md` files. Each receipt entry binds the verifier file's SHA-256; lexical
-escapes, symlinked path ancestors, out-of-root targets, and later content drift are
-rejected. Reports distinguish requested
-from observed effective effort, host from worker sessions, explicit compactions
-from inferred prompt resets, and verified scores from missing results. A score is
-never inferred from agent success or absence: without attributable native verifier
-output it remains `unverified` with a JSON `null` value. See
-[`docs/swe-marathon.md`](docs/swe-marathon.md) and
-[`docs/featurebench.md`](docs/featurebench.md) for suite-specific constraints.
+## Authentication and isolation
 
-## How a session runs
+Authentication is resolved only at launch, using an allowlisted child
+environment. Manifests store the mechanism and hashes of operator-provided
+public identities, never API keys, auth-file paths or contents, broker URLs, or
+runtime Docker names.
 
-Per instance×arm the driver builds a COPY-only overlay image over the instance's
-`jefzda/sweap-images` base, bind-mounts `results/<runId>/instances/<iid>/<arm>` at
-`/bench`, and starts `bench/entrypoint.sh`, which:
+- SWE-bench Pro and SWE-Marathon support their documented ChatGPT or API-key
+  runtime mechanisms. Use narrowly scoped benchmark accounts.
+- FeatureBench task containers receive no reusable credential. They attach to
+  a dedicated internal Docker network whose only pre-existing endpoint is a
+  separately managed, labeled HTTPS credential broker. A host-wide policy lock
+  covers network preflight, native execution, official evaluation, and cleanup.
 
-1. audits + sanitizes git history (the images ship full history — `origin/master`
-   reaches the gold fix; remotes/foreign branches/tags/reflog are stripped, audit saved)
-2. commits a **pre-session snapshot** (images carry untracked runtime state — redis AOFs,
-   caches — which must not leak into the patch)
-3. seeds an isolated `CODEX_HOME` from the arm template (arm B additionally gets the
-   skill, the arming AGENTS.md, and an `[mcp_servers.ultracode.env]` table — codex spawns
-   MCP servers with a sanitized env, so `ULTRACODE_HOME`/`CODEX_HOME` must ride the config)
-4. runs `codex exec` under `timeout` with `--dangerously-bypass-approvals-and-sandbox`
-   (the container is the sandbox; codex's Landlock sandbox is unavailable in Docker on
-   older kernels) — same flags for both arms
-5. arm B: waits for detached ultracode runs to reach a terminal state after the host
-   session exits (they outlive it by design), stopping stragglers at the deadline
-6. captures the patch: `git add -A`, un-stages pre-dirty paths, diffs against the
-   snapshot, strips binary hunks (mirroring the official harness), and records a
-   `git apply --check` verdict against the pristine base tree
+All native containers receive the complete `ultracode.benchmark.*` ownership
+label tuple. Cleanup discovers by that tuple, reinspects the full identity, and
+refuses to delete ambiguous or unowned resources.
 
-Tokens for **both** arms come from one collector reading every codex rollout file under
-the session's `CODEX_HOME` (arm B: host + all workers), taking the last cumulative
-`token_count` per session — never mixed with engine-side numbers. The ultracode run
-store (`/bench/uc`) is kept as the arm-B cross-check (engine totals, agent counts,
-kept-worktree detection).
+Native host processes receive a high-entropy lifecycle token and run-scope
+identity before launch. Run state retains the token, direct-child identity, and
+recovery outcome; resume conservatively reaps token-bearing descendants before
+closing an interrupted invocation.
 
-## Config
+## Metrics and reporting
 
-See `bench.example.config.json`. Notable knobs: `model` and `effort` (both required,
-with no silent defaults), `auth.mode`, `arms` (a|b|both), `timeouts.sessionSecs` (default 43200 = 12 h
-per instance×arm; an explicit bench cap — the ultracode engine itself stays uncapped),
-`parallel.instances` (default 4), `instances.{ids,count,seed,stratifyBy}`,
-`sanitizeGitHistory`, optional `pricing` ($/M-token per model → USD column in the report).
+One normalized metrics implementation reads native rollouts and workflow
+artifacts declared by each suite adapter. It keeps host and worker sessions,
+mock and billable backends, token categories, cost, context pressure,
+compactions, timings, failures, and annotations distinct.
 
-## Failure taxonomy
+Reports keep official/native analysis separate from policy-adjusted analysis:
 
-Recorded per instance×arm in `status.json`, aggregated in the report: `empty-patch`,
-`unapplyable-diff`, `timeout`, `agent-crash`, `patch-too-large`, `toolchain-incompatible`,
-`no-app-dir`, `image-failed`, `eval-fail`, `harness-error` (infra kinds drop the pair
-from the primary comparison; agent-avoidable kinds count as losses). Arm-B degeneracies
-are annotations, not failures: `no-orchestration` (keyword never armed / host soloed),
-`mock-backend`, `monitor-abandoned`, `unmerged-workspace`, `cwd-mismatch`.
+- SWE-bench Pro reports official arm rates, paired McNemar analysis, and thesis
+  strata.
+- SWE-Marathon reports the official mean Harbor reward.
+- FeatureBench uses official per-task `pass_rate` as the common task score and
+  preserves the separate official `resolved` boolean. Its native headline is
+  run-level `attempt_1.pass_rate`; `resolved_rate` is exposed separately.
 
-## Disclosed limitations
+See [SWE-Marathon](docs/swe-marathon.md) and
+[FeatureBench](docs/featurebench.md) for their native contracts. The repository
+threat model documents the broader worker and workflow trust assumptions.
 
-- **No egress restriction**: sessions need API access, so full network is open. Mitigations:
-  `web_search` disabled in both arms, git history sanitized (audit file kept per instance),
-  and transcripts are archived for cheat auditing. Both arms share the condition.
-- **Arm A's environment differs by more than the keyword**: it has no MCP tools or skill
-  in context at all (by design — it is the stock-codex control).
-- **Arm B is structurally more tokens.** The headline is resolved rate reported next to
-  cost; a cost-matched control (best-of-k with a non-oracle judge) is future work.
-- Binary-file solutions are stripped from patches — same behavior as the official harness.
-- At N=20 the paired McNemar test only detects very large effects; the pilot validates
-  plumbing and direction, not significance (the report prints this disclaimer itself).
+## Offline checks
 
-## Troubleshooting
+```bash
+npm run bench:check
+npx vitest run test/unit/bench-*.test.ts
+npm run typecheck
+npm run lint
+```
 
-- `docker pull` rate limits: pulls retry with backoff; pre-pull with `docker login` if
-  anonymous limits bite. Eval falls back to the locally-present image.
-- Linux images may use glibc or musl. SWE-bench Pro preparation ships both
-  pinned Node builds and the matching musl C++ runtime (from
-  `node:<nodeVersion>-alpine3.20`); `node-sel` chooses at container start. Truly
-  incompatible images self-report as `toolchain-incompatible`.
-- Auth expiry mid-batch (chatgpt mode): re-login on the host, then run
-  `npm run bench -- --suite swebench-pro run --resume` with the original run options.
-- A wedged eval container: the watchdog stops eval containers older than
-  `timeouts.evalWatchdogSecs`; the harness records the instance unresolved.
-- Everything a session produced lives under `results/<runId>/instances/<iid>/<arm>/`
-  (prompt, host JSONL, rollouts, ultracode run store, patch, logs, metrics) — nothing
-  of value is inside the container when it dies.
+Do not commit `bench/.cache/`, `bench/results/`, `bench/bench.config.json`, native
+source clones, runtime homes, credentials, or generated plugin bundles.

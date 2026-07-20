@@ -1,0 +1,4 @@
+{"type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","model":"gpt-test"}}
+{"type":"turn_context","payload":{"effort":"high"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":10},"last_token_usage":{"input_tokens":800,"output_tokens":80},"model_context_window":100000}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"cached_input_tokens":300,"output_tokens":120,"reasoning_output_tokens":20},"last_token_usage":{"input_tokens":900,"output_tokens":90},"model_context_window":100000}}}

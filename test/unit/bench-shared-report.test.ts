@@ -1,0 +1,379 @@
+/** Common report envelope, evidence binding, failure policy, and Pro hook tests. */
+import { describe, expect, it } from 'vitest';
+import {
+  FAILURE_CODES,
+  type FailureCode,
+} from '../../bench/src/shared/contracts.js';
+import {
+  AGENT_AVOIDABLE_FAILURES,
+  INFRASTRUCTURE_FAILURES,
+  UNATTRIBUTED_FAILURES,
+  failureCategory,
+  failureObservationSchema,
+  taskArmScope,
+  taskDisposition,
+  type FailureObservation,
+} from '../../bench/src/shared/failure.js';
+import type { NormalizedMetrics } from '../../bench/src/shared/metrics.js';
+import {
+  buildBenchReport,
+  renderBenchReportMarkdown,
+  type TaskReportInput,
+  type TaskResult,
+} from '../../bench/src/shared/report.js';
+import { swebenchProAnalysisHook } from '../../bench/src/suites/swebench-pro/analysis.js';
+
+const HASH = 'a'.repeat(64);
+const OTHER_HASH = 'b'.repeat(64);
+const INVOCATION = '11111111-1111-4111-8111-111111111111';
+
+function failure(
+  code: FailureCode,
+  arm: 'a' | 'b' = 'b',
+  over: Partial<FailureObservation> = {},
+): FailureObservation {
+  return failureObservationSchema.parse({
+    code,
+    scope: taskArmScope('task-one', arm),
+    phase: code.startsWith('verifier-') ? 'verifier' : 'session',
+    terminal: true,
+    evidence: code === 'agent-timeout' ? 'native' : 'harness',
+    ...over,
+  });
+}
+
+const unverified = {
+  verification: 'unverified' as const,
+  score: null,
+  resolved: null,
+  artifact: null,
+};
+
+function metrics(): NormalizedMetrics {
+  const usage = {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    nonCachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    rawTokenCount: 0,
+    cachedInputWeight: 0.1,
+    discountedTokenEquivalent: 0,
+  };
+  return {
+    schemaVersion: 2,
+    requested: { model: 'gpt-test', effort: 'high' },
+    effectiveEffort: { verification: 'unverified', values: {}, unknownSessions: 0, matchesRequested: null },
+    sessions: { total: 0, host: 0, worker: 0, unknown: 0, items: [] },
+    tokens: {
+      total: usage,
+      byBillingClass: { billable: usage, mock: usage, 'non-billable': usage, unknown: usage },
+    },
+    pricing: { currency: 'USD', verification: 'unpriced', billableCost: null },
+    context: {
+      highWaterMark: 0,
+      windows: [],
+      maximumPressureRatio: null,
+      pressuredSessions: 0,
+      explicitCompactions: 0,
+      inferredPromptResets: 0,
+    },
+    workflows: { count: 0, agentCount: 0, failureCount: 0, workspacesKept: 0, items: [] },
+    timing: {
+      runElapsedMs: 0,
+      calendarSpanMs: 0,
+      criticalPathMs: 0,
+      summedTaskMs: 0,
+      nativeRunnerMs: 0,
+      verifierMs: 0,
+      detachedWorkflowWaitMs: 0,
+    },
+    annotations: [],
+    failures: [],
+  };
+}
+
+function manifest() {
+  return {
+    schemaVersion: 2,
+    kind: 'ultracode-benchmark-run',
+    suite: 'swebench-pro',
+    runId: 'run-one',
+    createdAt: '2026-07-20T00:00:00.000Z',
+    experiment: { model: 'gpt-test', requestedEffort: 'high', arm: 'both', taskIds: ['task-one'] },
+    limits: {
+      hostTaskTimeoutMs: null,
+      hostVerifierTimeoutMs: null,
+      taskConcurrency: 1,
+      verifierConcurrency: 1,
+    },
+    metricsPolicy: {
+      parserContractVersion: 2,
+      cachedInputWeight: 0.1,
+      compactionRule: 'max-event-record',
+      resetMinDropTokens: 16_000,
+      resetRetainedFraction: 0.5,
+      workflowDedupeRule: 'run-id',
+      implementationSha256: HASH,
+    },
+    pricing: null,
+    provenance: {
+      controlPlane: {
+        manifestPolicySha256: HASH,
+        metricsPolicySha256: HASH,
+        failurePolicySha256: HASH,
+        reportPolicySha256: HASH,
+        adapterPolicySha256: HASH,
+      },
+      marker: 'frozen-provenance',
+    },
+    artifacts: {
+      nativeRoot: 'native',
+      runState: 'run-state.json',
+      verifierReceipt: 'verifier-receipt.json',
+      reportJson: 'report.json',
+      reportMarkdown: 'report.md',
+      executions: [
+        { taskId: 'task-one', arm: 'a', key: 'unused', nativeRoot: 'native/a' },
+        { taskId: 'task-one', arm: 'b', key: 'unused', nativeRoot: 'native/b' },
+      ],
+    },
+    suiteConfig: { frozen: true },
+  } as const;
+}
+
+function state() {
+  return {
+    schemaVersion: 2,
+    kind: 'ultracode-benchmark-run-state',
+    suite: 'swebench-pro',
+    runId: 'run-one',
+    manifestSha256: HASH,
+    revision: 0,
+    invocations: [],
+    attempts: [],
+  } as const;
+}
+
+function receipt() {
+  return {
+    schemaVersion: 2,
+    kind: 'ultracode-benchmark-verifier-receipt',
+    suite: 'swebench-pro',
+    runId: 'run-one',
+    manifestSha256: HASH,
+    revision: 1,
+    updatedAt: '2026-07-20T00:01:00.000Z',
+    bindings: [{
+      invocationId: INVOCATION,
+      scope: { kind: 'task-arm', taskId: 'task-one', arm: 'a' },
+      role: 'native-result',
+      path: 'native/a/verdict.json',
+      sha256: OTHER_HASH,
+      nativeRecordKey: 'task-one:a',
+    }],
+  } as const;
+}
+
+function taskInputs(): TaskReportInput[] {
+  return [
+    {
+      taskId: 'task-one',
+      arm: 'a',
+      nativeVerifier: {
+        verification: 'verified',
+        score: 1,
+        resolved: true,
+        artifact: { path: 'native/a/verdict.json' as never, sha256: OTHER_HASH, nativeRecordKey: 'task-one:a' },
+      },
+      failures: [],
+      annotations: [],
+      attemptRunning: false,
+    },
+    {
+      taskId: 'task-one',
+      arm: 'b',
+      nativeVerifier: unverified,
+      failures: [failure('empty-patch')],
+      annotations: [],
+      attemptRunning: false,
+    },
+  ];
+}
+
+function build(over: Record<string, unknown> = {}) {
+  return buildBenchReport({
+    manifest: manifest() as never,
+    manifestSha256: HASH,
+    runState: state() as never,
+    runStateSha256: OTHER_HASH,
+    verifierReceipt: receipt() as never,
+    verifierReceiptSha256: OTHER_HASH,
+    metrics: metrics(),
+    taskResults: taskInputs(),
+    generatedAt: new Date('2026-07-20T00:02:00.000Z'),
+    currentPolicyHashes: {
+      metricsPolicySha256: HASH,
+      failurePolicySha256: HASH,
+      reportPolicySha256: HASH,
+      adapterPolicySha256: HASH,
+    },
+    analysisHook: swebenchProAnalysisHook,
+    ...over,
+  });
+}
+
+describe('shared failure and disposition policy', () => {
+  it('classifies every registered code exactly once', () => {
+    const policyCodes = [...AGENT_AVOIDABLE_FAILURES, ...INFRASTRUCTURE_FAILURES, ...UNATTRIBUTED_FAILURES];
+    expect(new Set(policyCodes)).toEqual(new Set(FAILURE_CODES));
+    expect(FAILURE_CODES.map(failureCategory)).toEqual([
+      ...AGENT_AVOIDABLE_FAILURES.map(() => 'agent-avoidable' as const),
+      ...INFRASTRUCTURE_FAILURES.map(() => 'infrastructure' as const),
+      ...UNATTRIBUTED_FAILURES.map(() => 'unattributed' as const),
+    ]);
+  });
+
+  it('requires native proof for agent-owned timeouts', () => {
+    expect(() => failureObservationSchema.parse({
+      ...failure('agent-timeout'),
+      evidence: 'driver',
+    })).toThrow(/requires native/);
+  });
+
+  it('gives native evidence authority and otherwise applies one precedence order', () => {
+    const verified = { verification: 'verified' as const };
+    expect(taskDisposition(verified, [failure('verifier-process-failed')], false)).toBe('included-native');
+    expect(taskDisposition(unverified, [failure('empty-patch')], false)).toBe('agent-loss');
+    expect(taskDisposition(unverified, [failure('empty-patch'), failure('driver-watchdog')], false))
+      .toBe('infrastructure-excluded');
+    expect(taskDisposition(unverified, [], true)).toBe('pending');
+    expect(taskDisposition(unverified, [failure('unknown-terminal')], false)).toBe('unverified-excluded');
+  });
+});
+
+describe('common report evidence envelope', () => {
+  it('binds exact native evidence and leaves missing verifier output null/unverified', () => {
+    const report = build();
+    expect(report).toMatchObject({
+      schemaVersion: 2,
+      kind: 'ultracode-benchmark-report',
+      suite: 'swebench-pro',
+      runId: 'run-one',
+      generatedAt: '2026-07-20T00:02:00.000Z',
+    });
+    expect(report.taskResults[0]).toMatchObject({
+      disposition: 'included-native',
+      nativeVerifier: {
+        verification: 'verified',
+        score: 1,
+        resolved: true,
+        artifact: { path: 'native/a/verdict.json', sha256: OTHER_HASH, nativeRecordKey: 'task-one:a' },
+      },
+    });
+    expect(report.taskResults[1]).toMatchObject({
+      disposition: 'agent-loss',
+      nativeVerifier: { verification: 'unverified', score: null, resolved: null, artifact: null },
+    });
+    expect(report.reproducibility.provenance).toEqual(manifest().provenance);
+    expect(report.analysis.policyAdjusted.paired).toMatchObject({ paired: 1, aOnly: 1, bOnly: 0 });
+    expect(report.analysis.native.paired.paired).toBe(0);
+    expect(renderBenchReportMarkdown(report)).toContain(`native/a/verdict.json | ${OTHER_HASH}`);
+  });
+
+  it('rejects unbound evidence, task-order drift, and policy drift', () => {
+    const unbound = taskInputs();
+    unbound[0]!.nativeVerifier = {
+      ...unbound[0]!.nativeVerifier,
+      artifact: { path: 'native/a/other.json' as never, sha256: OTHER_HASH, nativeRecordKey: 'task-one:a' },
+    };
+    expect(() => build({ taskResults: unbound })).toThrow(/not bound/);
+    expect(() => build({ taskResults: [...taskInputs()].reverse() })).toThrow(/order/);
+    expect(() => build({
+      currentPolicyHashes: {
+        metricsPolicySha256: OTHER_HASH,
+        failurePolicySha256: HASH,
+        reportPolicySha256: HASH,
+        adapterPolicySha256: HASH,
+      },
+    })).toThrow(/metricsPolicySha256 drifted/);
+  });
+
+  it('rejects score-like fields on an unverified native result', () => {
+    const inputs = taskInputs();
+    inputs[1]!.nativeVerifier = { verification: 'unverified', score: 0, resolved: false, artifact: null };
+    expect(() => build({ taskResults: inputs })).toThrow(/must be null/);
+  });
+});
+
+describe('SWE-bench Pro analysis hook', () => {
+  const result = (taskId: string, arm: 'a' | 'b', resolved: boolean): TaskResult => ({
+    taskId,
+    arm,
+    nativeVerifier: {
+      verification: 'verified',
+      score: resolved ? 1 : 0,
+      resolved,
+      artifact: { path: `native/${taskId}/${arm}.json`, sha256: HASH, nativeRecordKey: `${taskId}:${arm}` },
+    },
+    disposition: 'included-native',
+    failures: [],
+    annotations: [],
+  });
+
+  it('preserves Wilson, exact McNemar, paired denominators, and the context thesis cut', () => {
+    const taskResults = [
+      result('task-one', 'a', false),
+      result('task-one', 'b', true),
+      result('task-two', 'a', true),
+      result('task-two', 'b', false),
+    ];
+    const observedMetrics = metrics();
+    observedMetrics.sessions.items = [{
+      scope: { taskId: 'task-one', arm: 'a' },
+      sessionId: INVOCATION,
+      path: 'native/rollout.jsonl',
+      role: 'host',
+      backend: 'codex',
+      billingClass: 'billable',
+      model: 'gpt-test',
+      effectiveEffort: 'high',
+      usage: observedMetrics.tokens.total,
+      explicitCompactions: 1,
+      inferredPromptResets: 0,
+      contextHighWaterMark: 90,
+      contextWindow: 100,
+      contextPressureRatio: 0.9,
+      underContextPressure: true,
+      annotations: [],
+    }, {
+      scope: { taskId: 'task-two', arm: 'a' },
+      sessionId: '22222222-2222-4222-8222-222222222222',
+      path: 'native/rollout-two.jsonl',
+      role: 'host',
+      backend: 'codex',
+      billingClass: 'billable',
+      model: 'gpt-test',
+      effectiveEffort: 'high',
+      usage: observedMetrics.tokens.total,
+      explicitCompactions: 0,
+      inferredPromptResets: 0,
+      contextHighWaterMark: 10,
+      contextWindow: 100,
+      contextPressureRatio: 0.1,
+      underContextPressure: false,
+      annotations: [],
+    }];
+    const analysis = swebenchProAnalysisHook.analyze({
+      suite: 'swebench-pro',
+      manifest: manifest() as never,
+      metrics: observedMetrics,
+      taskResults,
+    });
+    expect(analysis.native.arms.a).toMatchObject({ evaluated: 2, resolved: 1, rate: 0.5 });
+    expect(analysis.native.arms.a.wilson95.lo).toBeGreaterThan(0);
+    expect(analysis.native.paired).toMatchObject({ paired: 2, aOnly: 1, bOnly: 1, mcnemarExactP: 1 });
+    expect(analysis.native.thesisCut.inside).toMatchObject({ paired: 1, aRate: 0, bRate: 1, delta: 1 });
+    expect(analysis.native.thesisCut.outside).toMatchObject({ paired: 1, aRate: 1, bRate: 0, delta: -1 });
+  });
+});

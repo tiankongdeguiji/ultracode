@@ -1,0 +1,8 @@
+{
+  "task-epsilon": {
+    "n_attempt": 1,
+    "featurebench_eval_completed": true,
+    "resolved": false,
+    "pass_rate": 0.755
+  }
+}

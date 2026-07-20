@@ -1,0 +1,458 @@
+/** Content-addressed preparation of the pinned FeatureBench source and CPU inputs. */
+import { randomBytes } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import type { BenchPathRoots } from '../../shared/contracts.js';
+import type { ToolchainConfig } from '../../shared/config.js';
+import {
+  ensureRealDirectoryWithin,
+  isPortableComponent,
+  readPrivateJson,
+  readRegularFileWithinRoot,
+  writePrivateFileAtomic,
+  writePrivateJsonAtomic,
+} from '../../shared/paths.js';
+import { allowlistedEnvironment, runBenchProcess, type BenchProcessOptions } from '../../shared/process.js';
+import {
+  canonicalJson,
+  pythonEnvironmentSha256,
+  sha256CanonicalJson,
+  sha256File,
+  sha256Tree,
+  type SourceProvenance,
+} from '../../shared/provenance.js';
+import { loadPreparedToolchain, prepareSharedToolchain, type PreparedToolchain } from '../../shared/toolchain.js';
+import {
+  FEATUREBENCH_DATASET,
+  FEATUREBENCH_DATASET_REVISION,
+  FEATUREBENCH_PYTHON_VERSION,
+  FEATUREBENCH_REPOSITORY,
+  FEATUREBENCH_SOURCE_REVISION,
+  FEATUREBENCH_SPLIT,
+  featureBenchCacheRoot,
+  featureBenchCurrentFile,
+  featureBenchPreparedDir,
+} from './config.js';
+import { requireFeatureBenchHost } from './host.js';
+
+const CONTENT_MANIFEST = 'content-manifest.json';
+const PREPARED_IDENTITY = 'prepared-identity.json';
+export const FEATUREBENCH_DATASET_MAP = '.git/ultracode-benchmark-dataset-map.json';
+
+export interface FeatureBenchExecOptions {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  stream?: boolean;
+  timeoutMs?: number;
+  workerScope?: string;
+  onLifecycleToken?: (token: string) => void;
+  onLifecycleStarted?: (token: string, pid: number | null, processStartIdentity: string | null) => void;
+  onLifecycleRecovered?: (token: string, recovery: 'complete' | 'failed') => void;
+}
+
+export interface FeatureBenchExecResult { stdout: string; stderr: string }
+
+export type FeatureBenchExecutor = (
+  command: string,
+  argv: readonly string[],
+  options?: FeatureBenchExecOptions,
+) => Promise<FeatureBenchExecResult>;
+
+export interface FeatureBenchTaskInput {
+  taskId: string;
+  sourceSha256: string;
+  imageRequested: string;
+  imageResolvedDigest: string;
+  imageLocalId: string;
+  imagePlatform: string;
+}
+
+interface FeatureBenchContentManifest {
+  schemaVersion: 2;
+  kind: 'ultracode-featurebench-inputs';
+  payloadSha256: string;
+  source: SourceProvenance;
+  pythonVersion: string;
+  environmentSha256: string;
+  fbSha256: string;
+  patchSha256: string;
+  datasetMapSha256: string;
+  tasks: FeatureBenchTaskInput[];
+  toolchainPayloadSha256: string;
+}
+
+export interface PreparedFeatureBenchInputs {
+  directory: string;
+  sourceDirectory: string;
+  environmentDirectory: string;
+  pythonBinary: string;
+  fbBinary: string;
+  source: SourceProvenance;
+  pythonVersion: string;
+  environmentSha256: string;
+  patchSha256: string;
+  datasetMapSha256: string;
+  tasks: FeatureBenchTaskInput[];
+  toolchain: PreparedToolchain;
+}
+
+export interface FeatureBenchPrepPlan {
+  repository: string;
+  revision: string;
+  dataset: string;
+  datasetRevision: string;
+  split: string;
+  pythonVersion: string;
+  patch: string;
+}
+
+export function planFeatureBenchPreparation(roots: BenchPathRoots): FeatureBenchPrepPlan {
+  return {
+    repository: FEATUREBENCH_REPOSITORY,
+    revision: FEATUREBENCH_SOURCE_REVISION,
+    dataset: FEATUREBENCH_DATASET,
+    datasetRevision: FEATUREBENCH_DATASET_REVISION,
+    split: FEATUREBENCH_SPLIT,
+    pythonVersion: FEATUREBENCH_PYTHON_VERSION,
+    patch: join(roots.benchRoot, 'suites', 'featurebench', 'codex-chatgpt.patch'),
+  };
+}
+
+async function execute(
+  command: string,
+  argv: readonly string[],
+  options: FeatureBenchExecOptions = {},
+): Promise<FeatureBenchExecResult> {
+  const processOptions: BenchProcessOptions = {
+    cwd: options.cwd ?? process.cwd(),
+    env: options.env ?? allowlistedEnvironment(process.env),
+    tailBytes: 64 * 1_024 * 1_024,
+  };
+  if (options.stream !== undefined) processOptions.stream = options.stream;
+  if (options.timeoutMs !== undefined) processOptions.timeoutMs = options.timeoutMs;
+  if (options.workerScope !== undefined) processOptions.workerScope = options.workerScope;
+  if (options.onLifecycleToken !== undefined) processOptions.onLifecycleToken = options.onLifecycleToken;
+  if (options.onLifecycleStarted !== undefined) processOptions.onLifecycleStarted = options.onLifecycleStarted;
+  if (options.onLifecycleRecovered !== undefined) processOptions.onLifecycleRecovered = options.onLifecycleRecovered;
+  const result = await runBenchProcess(command, argv, processOptions);
+  return { stdout: result.stdout, stderr: result.stderr };
+}
+
+async function command(
+  executor: FeatureBenchExecutor,
+  file: string,
+  argv: readonly string[],
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<string> {
+  return (await executor(file, argv, { cwd, env })).stdout.trim();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export interface FeatureBenchDatasetMap {
+  dataset: typeof FEATUREBENCH_DATASET;
+  revision: typeof FEATUREBENCH_DATASET_REVISION;
+  split: typeof FEATUREBENCH_SPLIT;
+  tasks: Record<string, string>;
+}
+
+/** Validate the complete pinned task/image inventory generated by datasets. */
+export function parseFeatureBenchDatasetMap(value: unknown): FeatureBenchDatasetMap {
+  if (!isRecord(value)
+    || value.dataset !== FEATUREBENCH_DATASET
+    || value.revision !== FEATUREBENCH_DATASET_REVISION
+    || value.split !== FEATUREBENCH_SPLIT
+    || !isRecord(value.tasks)) {
+    throw new Error('FeatureBench prepared dataset map does not match the pinned dataset');
+  }
+  const tasks: Record<string, string> = {};
+  for (const [taskId, image] of Object.entries(value.tasks)) {
+    if (!isPortableComponent(taskId) || taskId.includes('..')
+      || typeof image !== 'string' || image.length === 0 || /[\0\r\n]/.test(image)) {
+      throw new Error('FeatureBench prepared dataset map contains an invalid task or image');
+    }
+    tasks[taskId] = image;
+  }
+  if (Object.keys(tasks).length === 0) throw new Error('FeatureBench prepared dataset map is empty');
+  return { dataset: FEATUREBENCH_DATASET, revision: FEATUREBENCH_DATASET_REVISION, split: FEATUREBENCH_SPLIT, tasks };
+}
+
+const DATASET_MEMBERSHIP_SCRIPT = `import json
+from datasets import load_dataset
+rows = load_dataset(${JSON.stringify(FEATUREBENCH_DATASET)}, split=${JSON.stringify(FEATUREBENCH_SPLIT)}, revision=${JSON.stringify(FEATUREBENCH_DATASET_REVISION)})
+tasks = {}
+for row in rows:
+    settings = row.get("repo_settings", {})
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    tasks[str(row["instance_id"])] = settings.get("image_name") or settings.get("docker_image")
+print(json.dumps({"dataset": ${JSON.stringify(FEATUREBENCH_DATASET)}, "revision": ${JSON.stringify(FEATUREBENCH_DATASET_REVISION)}, "split": ${JSON.stringify(FEATUREBENCH_SPLIT)}, "tasks": tasks}, sort_keys=True))`;
+
+function normalizePatchTargetHashes(patch: string): string {
+  return patch.trimEnd().replace(/^(index [0-9a-f]{40}\.\.)[0-9a-f]{40}( \d+)$/gmu, '$1<derived-target>$2');
+}
+
+async function requireExactPatch(
+  executor: FeatureBenchExecutor,
+  sourceDirectory: string,
+  patch: string,
+): Promise<void> {
+  await command(executor, 'git', ['-C', sourceDirectory, 'apply', '--reverse', '--check', patch], sourceDirectory);
+  const actual = await command(executor, 'git', ['-C', sourceDirectory, 'diff', '--binary', '--full-index'], sourceDirectory);
+  const expected = readFileSync(patch, 'utf8');
+  if (normalizePatchTargetHashes(actual) !== normalizePatchTargetHashes(expected)) {
+    throw new Error('FeatureBench checkout contains changes beyond the exact tracked patch');
+  }
+  const untracked = await command(
+    executor,
+    'git',
+    ['-C', sourceDirectory, 'ls-files', '--others', '--exclude-standard', '-z'],
+    sourceDirectory,
+  );
+  const ignored = await command(
+    executor,
+    'git',
+    ['-C', sourceDirectory, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'],
+    sourceDirectory,
+  );
+  const paths = (raw: string): string[] => raw.split(raw.includes('\0') ? '\0' : /\r?\n/u).filter(Boolean);
+  const unexpected = [...new Set([...paths(untracked), ...paths(ignored)])]
+    .filter((path) => !path.startsWith('.venv/'))
+    .sort();
+  if (unexpected.length > 0) throw new Error(`FeatureBench checkout contains unexpected files: ${unexpected.join(', ')}`);
+}
+
+interface ImageInspect {
+  Id?: unknown;
+  Os?: unknown;
+  Architecture?: unknown;
+  RepoDigests?: unknown;
+}
+
+function repositoryName(image: string): string {
+  const tail = image.slice(image.lastIndexOf('/') + 1);
+  return tail.includes(':') ? image.slice(0, image.length - tail.length + tail.lastIndexOf(':')) : image;
+}
+
+function parseImageInspect(stdout: string, requested: string): Omit<FeatureBenchTaskInput, 'taskId' | 'sourceSha256' | 'imageRequested'> {
+  let rows: ImageInspect[];
+  try { rows = JSON.parse(stdout) as ImageInspect[]; } catch {
+    throw new Error(`Docker returned malformed image inspection for ${requested}`);
+  }
+  const image = rows.length === 1 ? rows[0] : undefined;
+  const repo = repositoryName(requested);
+  const digests = Array.isArray(image?.RepoDigests)
+    ? image.RepoDigests.filter((value): value is string => typeof value === 'string' && value.startsWith(`${repo}@sha256:`))
+    : [];
+  if (typeof image?.Id !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(image.Id)
+    || typeof image.Os !== 'string' || typeof image.Architecture !== 'string' || digests.length !== 1) {
+    throw new Error(`local Docker image identity does not uniquely attest ${requested}`);
+  }
+  return {
+    imageResolvedDigest: digests[0]!,
+    imageLocalId: image.Id,
+    imagePlatform: `${image.Os}/${image.Architecture}`,
+  };
+}
+
+function sourceTreeSha256(sourceDirectory: string): string {
+  return sha256Tree(sourceDirectory, {
+    exclude: ['.git', '.venv'],
+    excludePythonCacheArtifacts: true,
+  });
+}
+
+function contentManifest(directory: string): FeatureBenchContentManifest {
+  const value = readPrivateJson(directory, join(directory, CONTENT_MANIFEST)) as Partial<FeatureBenchContentManifest>;
+  const sha = (candidate: unknown): candidate is string => typeof candidate === 'string' && /^[a-f0-9]{64}$/.test(candidate);
+  if (value.schemaVersion !== 2 || value.kind !== 'ultracode-featurebench-inputs'
+    || !sha(value.payloadSha256) || !sha(value.environmentSha256) || !sha(value.fbSha256)
+    || !sha(value.patchSha256) || !sha(value.datasetMapSha256) || !sha(value.toolchainPayloadSha256)
+    || value.pythonVersion !== FEATUREBENCH_PYTHON_VERSION || value.source === undefined
+    || value.source.repository !== FEATUREBENCH_REPOSITORY || value.source.revision !== FEATUREBENCH_SOURCE_REVISION
+    || !sha(value.source.treeSha256) || !Array.isArray(value.tasks) || value.tasks.length === 0
+    || value.tasks.some((task) => !isPortableComponent(task.taskId)
+      || task.taskId.includes('..') || typeof task.imageRequested !== 'string'
+      || task.imageRequested.length === 0 || /[\0\r\n]/.test(task.imageRequested)
+      || !sha(task.sourceSha256)
+      || !/^[^\s@]+@sha256:[a-f0-9]{64}$/.test(task.imageResolvedDigest)
+      || !/^sha256:[a-f0-9]{64}$/.test(task.imageLocalId)
+      || !/^linux\/[a-z0-9_]+$/.test(task.imagePlatform))) {
+    throw new Error('prepared FeatureBench content manifest is malformed or incompatible');
+  }
+  return value as FeatureBenchContentManifest;
+}
+
+/** Load and re-attest one immutable published FeatureBench input directory. */
+export function loadPreparedFeatureBenchInputs(directory: string): PreparedFeatureBenchInputs {
+  const resolved = resolve(directory);
+  const manifest = contentManifest(resolved);
+  const payloadSha256 = sha256Tree(resolved, { exclude: [CONTENT_MANIFEST], excludePythonCacheArtifacts: true });
+  const identity: Partial<FeatureBenchContentManifest> = { ...manifest };
+  delete identity.payloadSha256;
+  if (payloadSha256 !== manifest.payloadSha256 || resolved !== resolve(resolved, '..', payloadSha256)
+    || canonicalJson(readPrivateJson(resolved, join(resolved, PREPARED_IDENTITY))) !== canonicalJson(identity)) {
+    throw new Error('prepared FeatureBench payload identity drifted');
+  }
+  const sourceDirectory = join(resolved, 'source');
+  const environmentDirectory = join(sourceDirectory, '.venv');
+  const pythonBinary = join(environmentDirectory, 'bin', 'python');
+  const fbBinary = join(environmentDirectory, 'bin', 'fb');
+  const mapPath = join(sourceDirectory, ...FEATUREBENCH_DATASET_MAP.split('/'));
+  const parsedMap = parseFeatureBenchDatasetMap(JSON.parse(
+    readRegularFileWithinRoot(sourceDirectory, FEATUREBENCH_DATASET_MAP).toString('utf8'),
+  ));
+  if (sourceTreeSha256(sourceDirectory) !== manifest.source.treeSha256
+    || pythonEnvironmentSha256(environmentDirectory) !== manifest.environmentSha256
+    || sha256File(fbBinary) !== manifest.fbSha256 || sha256File(mapPath) !== manifest.datasetMapSha256
+    || canonicalJson(Object.keys(parsedMap.tasks)) !== canonicalJson(manifest.tasks.map((task) => task.taskId))
+    || manifest.tasks.some((task) => task.imageRequested !== parsedMap.tasks[task.taskId]
+      || !task.imageResolvedDigest.startsWith(`${repositoryName(task.imageRequested)}@sha256:`)
+      || task.sourceSha256 !== sha256CanonicalJson({
+        dataset: FEATUREBENCH_DATASET,
+        revision: FEATUREBENCH_DATASET_REVISION,
+        split: FEATUREBENCH_SPLIT,
+        taskId: task.taskId,
+        imageRequested: task.imageRequested,
+      }))) {
+    throw new Error('prepared FeatureBench source, environment, or dataset map drifted');
+  }
+  return {
+    directory: resolved,
+    sourceDirectory,
+    environmentDirectory,
+    pythonBinary,
+    fbBinary,
+    source: manifest.source,
+    pythonVersion: manifest.pythonVersion,
+    environmentSha256: manifest.environmentSha256,
+    patchSha256: manifest.patchSha256,
+    datasetMapSha256: manifest.datasetMapSha256,
+    tasks: manifest.tasks,
+    toolchain: loadPreparedToolchain(join(resolved, '..', '..', 'toolchains', manifest.toolchainPayloadSha256)),
+  };
+}
+
+export function loadCurrentPreparedFeatureBenchInputs(roots: BenchPathRoots): PreparedFeatureBenchInputs {
+  const current = readPrivateJson(featureBenchCacheRoot(roots), featureBenchCurrentFile(roots)) as {
+    schemaVersion?: unknown;
+    identity?: unknown;
+  };
+  if (current.schemaVersion !== 2 || typeof current.identity !== 'string' || !/^[a-f0-9]{64}$/.test(current.identity)) {
+    throw new Error('FeatureBench current preparation pointer is malformed');
+  }
+  return loadPreparedFeatureBenchInputs(featureBenchPreparedDir(roots, current.identity));
+}
+
+/** Build and publish exact pinned native inputs. This is the only networked path. */
+export async function prepareFeatureBenchInputs(
+  roots: BenchPathRoots,
+  toolchainConfig: ToolchainConfig,
+  executor: FeatureBenchExecutor = execute,
+): Promise<PreparedFeatureBenchInputs> {
+  requireFeatureBenchHost();
+  const plan = planFeatureBenchPreparation(roots);
+  const cache = ensureRealDirectoryWithin(roots.cacheRoot, featureBenchCacheRoot(roots));
+  const stage = join(cache, `.stage-${process.pid}-${randomBytes(12).toString('hex')}`);
+  mkdirSync(stage, { mode: 0o700 });
+  const sourceDirectory = join(stage, 'source');
+  try {
+    const daemon = await command(executor, 'docker', ['info', '--format', '{{.OSType}}/{{.Architecture}}'], roots.benchRoot);
+    if (!['linux/x86_64', 'linux/amd64'].includes(daemon)) {
+      throw new Error(`FeatureBench requires a Linux amd64 Docker daemon, got ${daemon || '(empty)'}`);
+    }
+    const toolchain = await prepareSharedToolchain(toolchainConfig, roots);
+    await command(executor, 'git', ['clone', '--no-checkout', plan.repository, sourceDirectory], roots.benchRoot);
+    await command(executor, 'git', ['-C', sourceDirectory, 'checkout', '--detach', plan.revision], sourceDirectory);
+    const head = await command(executor, 'git', ['-C', sourceDirectory, 'rev-parse', 'HEAD'], sourceDirectory);
+    if (head !== plan.revision) throw new Error(`FeatureBench source pin mismatch after prep: ${head}`);
+    const dirty = await command(executor, 'git', ['-C', sourceDirectory, 'status', '--porcelain=v1', '--untracked-files=all'], sourceDirectory);
+    if (dirty) throw new Error('FeatureBench pinned checkout is not a clean patch preimage');
+    await command(executor, 'git', ['-C', sourceDirectory, 'apply', '--check', plan.patch], sourceDirectory);
+    await command(executor, 'git', ['-C', sourceDirectory, 'apply', plan.patch], sourceDirectory);
+    const env = allowlistedEnvironment(process.env);
+    env.PYTHONDONTWRITEBYTECODE = '1';
+    await command(executor, 'uv', ['sync', '--frozen', '--python', plan.pythonVersion], sourceDirectory, env);
+    const pythonBinary = join(sourceDirectory, '.venv', 'bin', 'python');
+    const fbBinary = join(sourceDirectory, '.venv', 'bin', 'fb');
+    const pythonVersion = await command(executor, pythonBinary, ['--version'], sourceDirectory, env);
+    if (pythonVersion !== `Python ${plan.pythonVersion}`) throw new Error(`unexpected FeatureBench Python version: ${pythonVersion}`);
+    await command(executor, fbBinary, ['pull', '--mode', plan.split], sourceDirectory, env);
+    const rawMap = await command(executor, pythonBinary, ['-c', DATASET_MEMBERSHIP_SCRIPT], sourceDirectory, env);
+    const datasetMap = parseFeatureBenchDatasetMap(JSON.parse(rawMap) as unknown);
+    const mapPath = join(sourceDirectory, ...FEATUREBENCH_DATASET_MAP.split('/'));
+    writePrivateFileAtomic(join(sourceDirectory, '.git'), mapPath, `${canonicalJson(datasetMap)}\n`);
+    await requireExactPatch(executor, sourceDirectory, plan.patch);
+
+    const tasks: FeatureBenchTaskInput[] = [];
+    for (const [taskId, imageRequested] of Object.entries(datasetMap.tasks)) {
+      const inspect = await command(executor, 'docker', ['image', 'inspect', imageRequested], roots.benchRoot);
+      tasks.push({
+        taskId,
+        sourceSha256: sha256CanonicalJson({
+          dataset: plan.dataset,
+          revision: plan.datasetRevision,
+          split: plan.split,
+          taskId,
+          imageRequested,
+        }),
+        imageRequested,
+        ...parseImageInspect(inspect, imageRequested),
+      });
+    }
+    const source: SourceProvenance = {
+      repository: plan.repository,
+      revision: plan.revision,
+      treeSha256: sourceTreeSha256(sourceDirectory),
+    };
+    const environmentDirectory = join(sourceDirectory, '.venv');
+    const manifestWithoutPayload = {
+      schemaVersion: 2 as const,
+      kind: 'ultracode-featurebench-inputs' as const,
+      source,
+      pythonVersion: plan.pythonVersion,
+      environmentSha256: pythonEnvironmentSha256(environmentDirectory),
+      fbSha256: sha256File(fbBinary),
+      patchSha256: sha256File(plan.patch),
+      datasetMapSha256: sha256File(mapPath),
+      tasks,
+      toolchainPayloadSha256: toolchain.provenance.payloadSha256,
+    };
+    writePrivateJsonAtomic(stage, join(stage, PREPARED_IDENTITY), manifestWithoutPayload);
+    const payloadSha256 = sha256Tree(stage, { excludePythonCacheArtifacts: true });
+    writePrivateJsonAtomic(stage, join(stage, CONTENT_MANIFEST), { ...manifestWithoutPayload, payloadSha256 });
+    const target = featureBenchPreparedDir(roots, payloadSha256);
+    if (existsSync(target)) rmSync(stage, { recursive: true, force: true });
+    else {
+      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+      renameSync(stage, target);
+    }
+    writePrivateJsonAtomic(cache, featureBenchCurrentFile(roots), { schemaVersion: 2, identity: payloadSha256 });
+    return loadPreparedFeatureBenchInputs(target);
+  } catch (error) {
+    rmSync(stage, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** Re-attest the patched checkout immediately before native execution. */
+export async function reattestPreparedFeatureBench(
+  prepared: PreparedFeatureBenchInputs,
+  roots: BenchPathRoots,
+  executor: FeatureBenchExecutor = execute,
+): Promise<void> {
+  const loaded = loadPreparedFeatureBenchInputs(prepared.directory);
+  const plan = planFeatureBenchPreparation(roots);
+  const head = await command(executor, 'git', ['-C', loaded.sourceDirectory, 'rev-parse', 'HEAD'], loaded.sourceDirectory);
+  if (head !== plan.revision) throw new Error('FeatureBench source revision drifted before launch');
+  await requireExactPatch(executor, loaded.sourceDirectory, plan.patch);
+}

@@ -29,7 +29,7 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 
 ## CI Gate
 
-- Before pushing, pass the gate locally: `npm run typecheck && npm run lint && npm test` (CI runs exactly this on ubuntu + macos). `typecheck` covers `src/` only — `test/` is not typechecked, so verify test-side types by hand.
+- Before pushing, pass the gate locally: `npm run typecheck && npm run lint && npm test` (CI runs exactly this on ubuntu + macos). `typecheck` covers `src/` and `bench/src/`; tests are not typechecked, so verify test-side types by hand.
 - No formatter — match style by hand: single quotes, semicolons, trailing commas, 2-space indent, numeric separators (`20_000`), `_`-prefix intentionally-unused args (ESLint enforces).
 
 ## Commits & PRs

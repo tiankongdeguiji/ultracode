@@ -1,5 +1,8 @@
-/** Offline contracts for the SWE-Marathon planner and tracked Arm B bridge. */
+/** Offline contracts for the suite-owned SWE-Marathon adapter. */
 import {
+  chmodSync,
+  cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -7,234 +10,95 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { BenchPathRoots } from '../../bench/src/shared/contracts.js';
+import { artifactKey } from '../../bench/src/shared/paths.js';
+import type { SweMarathonManifest } from '../../bench/src/shared/manifest.js';
+import { sweMarathonAdapter } from '../../bench/src/suites/swe-marathon/adapter.js';
+import {
+  assertMarathonRuntimeBinding,
+  cleanupMarathonRuntimeHome,
+  cleanupMarathonRuntimeHomes,
+  createMarathonRuntimeHome,
+} from '../../bench/src/suites/swe-marathon/auth.js';
 import {
   CONTEXT_PRESSURE_STRESS_TASKS,
   EXCLUDED_CUA_TASKS,
-  SWE_MARATHON_HARBOR,
-  SWE_MARATHON_PIN,
-  SWE_MARATHON_PYTHON,
-  SWE_MARATHON_REPO,
-  marathonChildEnvironment,
-  planMarathonPrep,
-  planMarathonRun,
-  validateHarborResumeConfig,
-  validateMarathonTaskName,
-} from '../../bench/src/marathon.js';
-
-const PATHS = {
-  repoDir: '/tmp/marathon-repo',
-  resultsDir: '/tmp/marathon-results',
-  toolchainDir: '/tmp/marathon-toolchain',
-  bridgeDir: '/tmp/marathon-bridge',
-  skillDir: '/tmp/marathon-skill',
-};
+  SWE_MARATHON_HARBOR_VERSION,
+  SWE_MARATHON_PYTHON_VERSION,
+  SWE_MARATHON_REPOSITORY,
+  SWE_MARATHON_SOURCE_REVISION,
+  validateMarathonTaskId,
+} from '../../bench/src/suites/swe-marathon/config.js';
+import {
+  planMarathonPreparation,
+  taskImageReference,
+  type PreparedMarathonInputs,
+} from '../../bench/src/suites/swe-marathon/prepare.js';
+import {
+  reattestTasksLinearly,
+  type MarathonCommonAttestation,
+} from '../../bench/src/suites/swe-marathon/provenance.js';
+import {
+  hasCompleteHarborReceipt,
+  planHarborRun,
+  sweMarathonAnalysisHook,
+} from '../../bench/src/suites/swe-marathon/runner.js';
+import { indexSweMarathonMetrics } from '../../bench/src/suites/swe-marathon/telemetry.js';
+import {
+  indexHarborEvidence,
+  validateHarborJobConfig,
+  type HarborExecutionIdentity,
+} from '../../bench/src/suites/swe-marathon/verifier.js';
 
 const temporaryDirectories: string[] = [];
 
 function temporaryDirectory(): string {
-  const directory = mkdtempSync(join(tmpdir(), 'uc-marathon-test-'));
+  const directory = mkdtempSync(join(tmpdir(), 'uc-marathon-v2-test-'));
   temporaryDirectories.push(directory);
   return directory;
 }
 
+function put(path: string, value: string): void {
+  mkdirSync(resolve(path, '..'), { recursive: true });
+  writeFileSync(path, value);
+}
+
 afterEach(() => {
-  for (const directory of temporaryDirectories.splice(0)) {
-    rmSync(directory, { recursive: true, force: true });
-  }
+  for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-describe('SWE-Marathon prep planning', () => {
-  it('pins the upstream checkout, Harbor, and Python with argv-only commands', () => {
-    const plan = planMarathonPrep({ ...PATHS, uvBin: '/opt/uv' });
-
-    expect(plan).toEqual({
-      repo: SWE_MARATHON_REPO,
-      pin: SWE_MARATHON_PIN,
-      python: SWE_MARATHON_PYTHON,
-      harbor: SWE_MARATHON_HARBOR,
-      paths: PATHS,
-      clone: {
-        file: 'git',
-        argv: ['clone', '--filter=blob:none', '--no-checkout', SWE_MARATHON_REPO, PATHS.repoDir],
-      },
-      fetch: {
-        file: 'git',
-        argv: ['-C', PATHS.repoDir, 'fetch', '--depth=1', 'origin', SWE_MARATHON_PIN],
-      },
-      checkout: {
-        file: 'git',
-        argv: ['-C', PATHS.repoDir, 'checkout', '--detach', SWE_MARATHON_PIN],
-      },
-      sync: {
-        file: '/opt/uv',
-        argv: ['sync', '--python', '3.13.5', '--frozen'],
-        cwd: PATHS.repoDir,
-      },
-      verifyPin: { file: 'git', argv: ['-C', PATHS.repoDir, 'rev-parse', 'HEAD'] },
-      verifyPython: { file: `${PATHS.repoDir}/.venv/bin/python`, argv: ['--version'] },
-      verifyHarbor: { file: `${PATHS.repoDir}/.venv/bin/harbor`, argv: ['--version'] },
-      prepareBenchToolchain: true,
-    });
-  });
-});
-
-describe('SWE-Marathon run planning', () => {
-  it('builds the exact conservative Arm A Harbor plan', () => {
-    const plan = planMarathonRun({
-      ...PATHS,
-      taskName: 'zstd-decoder',
-      arm: 'a',
-      model: 'model-from-argument',
-      effort: 'high',
-      jobName: 'trial-a',
-    });
-
-    expect(plan.mounts).toEqual([
-      {
-        type: 'bind',
-        source: `${PATHS.toolchainDir}/codex`,
-        target: '/usr/local/bin/codex',
-        read_only: true,
-      },
-    ]);
-    expect(plan.command).toEqual({
-      file: `${PATHS.repoDir}/.venv/bin/harbor`,
-      cwd: PATHS.repoDir,
-      argv: [
-        'run',
-        '--path', 'tasks',
-        '--include-task-name', 'zstd-decoder',
-        '--agent', 'codex',
-        '--model', 'model-from-argument',
-        '--agent-kwarg', 'reasoning_effort=high',
-        '--agent-kwarg', 'web_search=disabled',
-        '--allow-agent-host', 'api.openai.com',
-        '--allow-agent-host', 'chatgpt.com',
-        '--allow-agent-host', 'auth.openai.com',
-        '--env', 'docker',
-        '--mounts', JSON.stringify(plan.mounts),
-        '--n-concurrent', '1',
-        '--n-concurrent-agents', '1',
-        '--n-attempts', '1',
-        '--max-retries', '0',
-        '--jobs-dir', PATHS.resultsDir,
-        '--job-name', 'trial-a',
-        '--yes',
-      ],
-    });
-    expect(plan).toMatchObject({
-      officialVerification: true,
-      attempts: 1,
-      retries: 0,
-      concurrentTrials: 1,
+describe('SWE-Marathon configuration and preparation', () => {
+  it('pins source, Python, Harbor, and suite-owned native assets', () => {
+    const root = temporaryDirectory();
+    const roots: BenchPathRoots = { benchRoot: root, cacheRoot: join(root, '.cache'), resultsRoot: join(root, 'results') };
+    expect(planMarathonPreparation(roots)).toEqual({
+      repository: SWE_MARATHON_REPOSITORY,
+      revision: SWE_MARATHON_SOURCE_REVISION,
+      pythonVersion: SWE_MARATHON_PYTHON_VERSION,
+      harborVersion: SWE_MARATHON_HARBOR_VERSION,
+      ownershipPatch: join(root, 'suites/swe-marathon/harbor-ownership.patch'),
+      bridge: join(root, 'suites/swe-marathon/arm_b_codex.py'),
     });
   });
 
-  it('changes only the adapter inputs and required read-only mounts for Arm B', () => {
-    const common = {
-      ...PATHS,
-      taskName: 'kubernetes-rust-rewrite',
-      model: 'model-from-argument',
-      effort: 'xhigh',
-      jobName: 'trial',
-    };
-    const armA = planMarathonRun({ ...common, arm: 'a' });
-    const armB = planMarathonRun({ ...common, arm: 'b', workflowWaitSeconds: 900 });
-
-    expect(armB.command.argv).toContain('arm_b_codex:ArmBCodex');
-    expect(armB.command.argv).toContain('workflow_wait_seconds=900');
-    expect(armB.command.argv).toContain(PATHS.skillDir);
-    expect(armB.mounts.map((entry) => entry.target)).toEqual([
-      '/usr/local/bin/codex',
-      '/opt/bench/node-sel',
-      '/opt/bench/node',
-      '/opt/bench/node-musl',
-      '/opt/bench/node-musl-runtime',
-      '/opt/bench/ultracode',
-    ]);
-    expect(armB.mounts.every((entry) => entry.read_only)).toBe(true);
-    expect(armA.command.argv).not.toContain('arm_b_codex:ArmBCodex');
-    expect(armA.mounts).toHaveLength(1);
+  it('accepts only immutable task image declarations', () => {
+    const digest = `registry.example/task@sha256:${'a'.repeat(64)}`;
+    expect(taskImageReference(`[environment]\ndocker_image = "${digest}"\n`)).toBe(digest);
+    expect(() => taskImageReference('docker_image = "registry.example/task:latest"\n')).toThrow(/immutable/);
   });
 
-  it('resolves model, effort, and paths from an explicit environment', () => {
-    const plan = planMarathonRun(
-      { taskName: 'wasm-simd', arm: 'a' },
-      {
-        SWE_MARATHON_MODEL: 'model-from-environment',
-        SWE_MARATHON_EFFORT: 'medium',
-        SWE_MARATHON_REPO_DIR: PATHS.repoDir,
-        SWE_MARATHON_RESULTS_DIR: PATHS.resultsDir,
-        SWE_MARATHON_TOOLCHAIN_DIR: PATHS.toolchainDir,
-      },
-    );
-    expect(plan).toMatchObject({
-      model: 'model-from-environment',
-      effort: 'medium',
-      paths: {
-        repoDir: PATHS.repoDir,
-        resultsDir: PATHS.resultsDir,
-        toolchainDir: PATHS.toolchainDir,
-      },
-    });
-  });
-
-  it('never serializes child authentication into a plan or argv', () => {
-    const sensitiveValue = 'sensitive-value';
-    const sensitivePath = '/private/runtime-auth';
-    const plan = planMarathonRun(
-      { ...PATHS, taskName: 'wasm-simd', arm: 'b' },
-      {
-        SWE_MARATHON_MODEL: 'model-from-environment',
-        SWE_MARATHON_EFFORT: 'high',
-        OPENAI_API_KEY: sensitiveValue,
-        CODEX_AUTH_JSON_PATH: sensitivePath,
-      },
-    );
-    const serialized = JSON.stringify(plan);
-    expect(serialized).not.toContain(sensitiveValue);
-    expect(serialized).not.toContain(sensitivePath);
-    expect(plan.command.argv).not.toContain('--agent-env');
-  });
-
-  it('rejects path-like job names and plans Harbor native resume', () => {
-    expect(() => planMarathonRun({
-      ...PATHS,
-      taskName: 'wasm-simd',
-      arm: 'a',
-      model: 'gpt-test',
-      effort: 'high',
-      jobName: '../escape',
-    })).toThrow('portable filesystem component');
-    expect(planMarathonRun({
-      ...PATHS,
-      taskName: 'wasm-simd',
-      arm: 'a',
-      model: 'gpt-test',
-      effort: 'high',
-      jobName: 'trial-a',
-      resume: true,
-    }).command.argv).toEqual([
-      'job', 'resume', '--path', `${PATHS.resultsDir}/trial-a`,
-    ]);
-  });
-});
-
-describe('SWE-Marathon task policy', () => {
   it.each(['../zstd-decoder', '/tmp/task', 'zstd/decoder', '--help', 'Zstd-Decoder', 'not-a-real-task'])(
-    'rejects unsafe or unknown id %s',
-    (taskName) => {
-      expect(() => validateMarathonTaskName(taskName)).toThrow();
-    },
+    'rejects unsafe or unknown task %s',
+    (taskId) => expect(() => validateMarathonTaskId(taskId)).toThrow(),
   );
 
-  it.each(EXCLUDED_CUA_TASKS)('excludes unverified CUA task %s', (taskName) => {
-    expect(() => validateMarathonTaskName(taskName)).toThrow('CUA result is unverified');
+  it.each(EXCLUDED_CUA_TASKS)('rejects task %s without authoritative CUA evidence', (taskId) => {
+    expect(() => validateMarathonTaskId(taskId)).toThrow(/no authoritative CUA/);
   });
 
-  it('labels the four post-hoc context-pressure tasks explicitly', () => {
+  it('keeps the post-hoc context-pressure cohort explicit', () => {
     expect(CONTEXT_PRESSURE_STRESS_TASKS).toEqual([
       'find-network-alignments',
       'kubernetes-rust-rewrite',
@@ -244,131 +108,275 @@ describe('SWE-Marathon task policy', () => {
   });
 });
 
-describe('SWE-Marathon resume and child environment', () => {
-  const plan = planMarathonRun({
-    ...PATHS,
-    taskName: 'wasm-simd',
-    arm: 'b',
-    model: 'openai/gpt-test',
-    effort: 'high',
-    jobName: 'trial-b',
+describe('SWE-Marathon command and provenance boundaries', () => {
+  it('parses one arm, repeated tasks, resume, and task-at-a-time redo', () => {
+    expect(sweMarathonAdapter.commands.run.parse([
+      '--run-id', 'marathon-a1', '--arm', 'a', '--task-id', 'wasm-simd', '--task-id', 'zstd-decoder',
+      '--resume', '--redo', 'wasm-simd',
+    ])).toMatchObject({
+      runId: 'marathon-a1',
+      arm: 'a',
+      taskIds: ['wasm-simd', 'zstd-decoder'],
+      resume: true,
+      redo: ['wasm-simd'],
+    });
+    expect(() => sweMarathonAdapter.commands.run.parse(['--run-id', 'r1', '--arm', 'both'])).toThrow(/a or b/);
   });
 
-  function resumeConfig(overrides: {
-    taskPath?: string;
-    agentName?: string;
-    modelName?: string;
-    effort?: string;
-  } = {}): Record<string, unknown> {
-    return {
-      task: {
-        path: overrides.taskPath ?? 'tasks/wasm-simd',
-        git_url: null,
-        source: 'tasks',
+  it('attests common inputs once and each task once in launch order', async () => {
+    const calls: string[] = [];
+    const common = { preparedIdentity: 'a'.repeat(64), prepared: {} as PreparedMarathonInputs };
+    const results = await reattestTasksLinearly(['wasm-simd', 'zstd-decoder'], {
+      attestCommon() { calls.push('common'); return common; },
+      async attestTask(_common, taskId) {
+        calls.push(`task:${taskId}`);
+        return {
+          taskId,
+          configRelativePath: `tasks/${taskId}/task.toml`,
+          configSha256: 'b'.repeat(64),
+          imageRequested: `image@sha256:${'c'.repeat(64)}`,
+          imageResolvedDigest: `image@sha256:${'c'.repeat(64)}`,
+          imageLocalId: 'sha256:image',
+          imagePlatform: 'linux/amd64',
+        };
       },
-      agent: {
-        name: overrides.agentName ?? 'arm_b_codex:ArmBCodex',
-        model_name: overrides.modelName ?? 'openai/gpt-test',
-        kwargs: {
-          reasoning_effort: overrides.effort ?? 'high',
-          web_search: 'disabled',
-        },
-      },
-      unrelated_distractors: [
-        'tasks/wasm-simd',
-        'arm_b_codex:ArmBCodex',
-        'openai/gpt-test',
-        'high',
-      ],
-    };
-  }
-
-  function writeResumeConfig(config: Record<string, unknown>): string {
-    const jobRoot = temporaryDirectory();
-    writeFileSync(join(jobRoot, 'config.json'), `${JSON.stringify(config, null, 2)}\n`);
-    return jobRoot;
-  }
-
-  it('accepts the exact Harbor 0.17.1 task and agent fields', () => {
-    const jobRoot = writeResumeConfig(resumeConfig());
-    expect(() => validateHarborResumeConfig(jobRoot, plan)).not.toThrow();
+    }, async (task) => { calls.push(`launch:${task.taskId}`); return task.taskId; });
+    expect(results).toEqual(['wasm-simd', 'zstd-decoder']);
+    expect(calls).toEqual([
+      'common',
+      'task:wasm-simd',
+      'launch:wasm-simd',
+      'task:zstd-decoder',
+      'launch:zstd-decoder',
+    ]);
   });
 
-  it.each([
-    ['task.path', { taskPath: 'tasks/zstd-decoder' }],
-    ['agent.name', { agentName: 'codex' }],
-    ['agent.model_name', { modelName: 'openai/wrong-model' }],
-    ['agent.kwargs.reasoning_effort', { effort: 'medium' }],
-  ])('rejects an exact %s mismatch even when expected strings occur elsewhere', (field, overrides) => {
-    const jobRoot = writeResumeConfig(resumeConfig(overrides));
-    expect(() => validateHarborResumeConfig(jobRoot, plan)).toThrow(`field ${field}`);
-  });
-
-  it('canonicalizes validated auth paths and disables Python bytecode writes', () => {
+  it('keeps authentication runtime-only in a disposable private home', () => {
     const root = temporaryDirectory();
-    const authDirectory = join(root, 'auth');
-    const authPath = join(authDirectory, 'auth.json');
-    mkdirSync(authDirectory);
-    writeFileSync(authPath, '{"tokens":{}}\n', { mode: 0o600 });
-    const sourcePath = relative(process.cwd(), authPath);
-
-    const env = marathonChildEnvironment(
-      { PATH: '/usr/bin', CODEX_AUTH_JSON_PATH: sourcePath },
-      '/opt/bridge',
-      'b',
-      '/tmp/runtime-home',
-    );
-
-    expect(env).toMatchObject({
-      CODEX_AUTH_JSON_PATH: resolve(sourcePath),
-      HOME: '/tmp/runtime-home',
-      XDG_CONFIG_HOME: '/tmp/runtime-home/.config',
-      HARBOR_TELEMETRY: 'off',
-      PYTHONDONTWRITEBYTECODE: '1',
-      PYTHONPATH: '/opt/bridge',
-    });
-  });
-
-  it('retains API-key auth and rejects a non-file auth path', () => {
-    expect(marathonChildEnvironment(
-      { OPENAI_API_KEY: 'test-api-key' },
-      '/opt/bridge',
-      'a',
-      '/tmp/runtime-home',
-    )).toMatchObject({
-      OPENAI_API_KEY: 'test-api-key',
-      PYTHONDONTWRITEBYTECODE: '1',
-    });
-
-    const directory = temporaryDirectory();
-    expect(() => marathonChildEnvironment(
-      { CODEX_AUTH_JSON_PATH: directory },
-      '/opt/bridge',
-      'a',
-      '/tmp/runtime-home',
-    )).toThrow('must be a regular file');
+    const auth = join(root, 'auth.json');
+    writeFileSync(auth, '{"tokens":{}}\n', { mode: 0o600 });
+    chmodSync(auth, 0o600);
+    const config = {
+      model: 'gpt-test', requestedEffort: 'high', arm: 'a' as const, taskIds: ['zstd-decoder'],
+      auth: { mechanism: 'chatgpt' as const, publicIdentity: 'test' }, workflowWaitMs: 1_000,
+      timeouts: { taskMs: 60_000, verifierMs: 1_000 },
+    };
+    const source = { PATH: '/usr/bin', CODEX_AUTH_JSON_PATH: auth };
+    expect(() => assertMarathonRuntimeBinding(config, source)).not.toThrow();
+    const runtime = createMarathonRuntimeHome(config, '/bridge', {
+      ULTRACODE_BENCHMARK_SCHEMA: '2',
+      ULTRACODE_BENCHMARK_SUITE: 'swe-marathon',
+      ULTRACODE_BENCHMARK_RUN: 'pilot1',
+      ULTRACODE_BENCHMARK_TASK: 'zstd-decoder',
+      ULTRACODE_BENCHMARK_ARM: 'a',
+      ULTRACODE_BENCHMARK_PURPOSE: 'session',
+      ULTRACODE_BENCHMARK_OWNERSHIP: '1',
+      ULTRACODE_BENCHMARK_RUNTIME: 'a'.repeat(64),
+    }, source);
+    expect(runtime.environment.CODEX_AUTH_JSON_PATH).toBe(join(runtime.directory, 'auth.json'));
+    expect(runtime.environment.PYTHONPATH).toBe('/bridge');
+    expect(JSON.stringify(runtime.environment)).not.toContain('{"tokens"');
+    expect(cleanupMarathonRuntimeHome('pilot1', 'zstd-decoder', 'a', 'b'.repeat(64))).toBe(0);
+    expect(existsSync(runtime.directory)).toBe(true);
+    expect(cleanupMarathonRuntimeHomes('foreign', 'zstd-decoder', 'a')).toBe(0);
+    expect(cleanupMarathonRuntimeHomes('pilot1', 'zstd-decoder', 'a')).toBe(1);
+    runtime.cleanup();
+    expect(existsSync(runtime.directory)).toBe(false);
   });
 });
 
-describe('tracked Arm B bridge', () => {
-  it('propagates model selection dynamically and marks mock workflows non-billable', () => {
-    const source = readFileSync(
-      resolve('bench/external/swe-marathon/arm_b_codex.py'),
-      'utf8',
+function nativeFixture(reward = 0.75): {
+  root: string;
+  identity: HarborExecutionIdentity;
+  manifest: SweMarathonManifest;
+  trial: string;
+} {
+  const root = temporaryDirectory();
+  const taskId = 'zstd-decoder';
+  const key = artifactKey(taskId);
+  const jobRelativeRoot = `native/tasks/${key}`;
+  const job = join(root, ...jobRelativeRoot.split('/'));
+  const trial = join(job, 'trial-1');
+  const agent = { name: 'arm_b_codex:ArmBCodex', model_name: 'openai/gpt-test', kwargs: {
+    reasoning_effort: 'high', web_search: 'disabled',
+  } };
+  put(join(job, 'config.json'), `${JSON.stringify({ task: { path: `tasks/${taskId}` }, agent, n_attempts: 1, max_retries: 0 })}\n`);
+  put(join(job, 'result.json'), '{"status":"complete"}\n');
+  put(join(trial, 'config.json'), `${JSON.stringify({ trial_name: 'trial-1', task: { path: `tasks/${taskId}` }, agent })}\n`);
+  put(join(trial, 'result.json'), `${JSON.stringify({
+    task_name: taskId,
+    trial_name: 'trial-1',
+    verifier_result: { rewards: { reward } },
+  })}\n`);
+  const identity = { taskId, arm: 'b' as const, model: 'openai/gpt-test', requestedEffort: 'high', jobRelativeRoot };
+  const manifest = {
+    experiment: { model: identity.model, requestedEffort: identity.requestedEffort, arm: 'b', taskIds: [taskId] },
+    suiteConfig: { workflowWaitMs: 3_300_000 },
+    artifacts: { executions: [{ taskId, arm: 'b', key, nativeRoot: jobRelativeRoot }] },
+  } as unknown as SweMarathonManifest;
+  return { root, identity, manifest, trial };
+}
+
+describe('native Harbor evidence', () => {
+  it('accepts the sanitized Harbor 0.17.1 direct-child golden', () => {
+    const root = temporaryDirectory();
+    const taskId = 'zstd-decoder';
+    const jobRelativeRoot = `native/tasks/${artifactKey(taskId)}`;
+    cpSync(
+      resolve('test/fixtures/bench/swe-marathon/harbor-0.17.1'),
+      join(root, ...jobRelativeRoot.split('/')),
+      { recursive: true },
     );
-    expect(source).toContain('ARM_B_PREFIX + instruction');
-    expect(source).toContain('arm_b_metrics.json');
-    expect(source).toContain('backend != "mock"');
-    expect(source).toContain('self.model_name.split');
-    expect(source).toContain('self._resolved_flags.get("reasoning_effort")');
-    expect(source).toContain('workflow wait expired; stopping');
-    expect(source).toContain('Arm B did not start an ultracode run');
-    expect(source).toContain("ultracode run\\\\n');");
-    expect(source).toContain('process.exitCode = 1');
-    expect(source.match(/result\.return_code != 0/g)).toHaveLength(2);
-    expect(source).toContain('test -d {self._WORKER_CODEX_HOME}/sessions');
-    expect(source).toContain('test -d {self._ULTRACODE_HOME}/runs');
-    expect(source).toContain('raise RuntimeError');
-    expect(source).toContain('max(event_compactions, record_compactions)');
+    const indexed = indexHarborEvidence(root, {
+      taskId,
+      arm: 'b',
+      model: 'openai/gpt-test',
+      requestedEffort: 'high',
+      jobRelativeRoot,
+    }, '5a9db8e2-7768-4f7e-8dad-cabfa11a48f8');
+    expect(indexed.nativeResult).toMatchObject({ verification: 'verified', score: 0.75, resolved: false });
+  });
+
+  it('validates exact job fields rather than matching distractor strings', () => {
+    const { identity } = nativeFixture();
+    const exact = {
+      task: { path: 'tasks/zstd-decoder' },
+      agent: { name: 'arm_b_codex:ArmBCodex', model_name: 'openai/gpt-test', kwargs: {
+        reasoning_effort: 'high', web_search: 'disabled',
+      } },
+      n_attempts: 1,
+      max_retries: 0,
+    };
+    expect(() => validateHarborJobConfig(exact, identity)).not.toThrow();
+    expect(() => validateHarborJobConfig({ ...exact, task: { path: 'tasks/wasm-simd' }, distractor: exact }, identity))
+      .toThrow(/task.path mismatch/);
+  });
+
+  it('binds job and direct-child trial evidence and preserves the native reward', () => {
+    const { root, identity } = nativeFixture(0.75);
+    const indexed = indexHarborEvidence(root, identity, '5a9db8e2-7768-4f7e-8dad-cabfa11a48f8');
+    expect(indexed.nativeResult).toMatchObject({ verification: 'verified', score: 0.75, resolved: false });
+    expect(indexed.bindings.map((binding) => [binding.role, binding.nativeRecordKey])).toEqual([
+      ['native-config', 'job-config'],
+      ['run-metadata', 'job-result'],
+      ['native-config', 'trial-config:trial-1'],
+      ['native-result', 'zstd-decoder/trial-1/verifier_result.rewards.reward'],
+    ]);
+    expect(hasCompleteHarborReceipt(
+      indexed.bindings,
+      '5a9db8e2-7768-4f7e-8dad-cabfa11a48f8',
+      identity.taskId,
+      identity.arm,
+    )).toBe(true);
+    expect(hasCompleteHarborReceipt(
+      indexed.bindings.filter((binding) => binding.role !== 'run-metadata'),
+      '5a9db8e2-7768-4f7e-8dad-cabfa11a48f8',
+      identity.taskId,
+      identity.arm,
+    )).toBe(false);
+  });
+
+  it('requires explicit one-attempt and zero-retry Harbor policy fields', () => {
+    const { identity } = nativeFixture();
+    const config = {
+      task: { path: `tasks/${identity.taskId}` },
+      agent: { name: 'arm_b_codex:ArmBCodex', model_name: identity.model, kwargs: {
+        reasoning_effort: identity.requestedEffort, web_search: 'disabled',
+      } },
+    };
+    expect(() => validateHarborJobConfig(config, identity)).toThrow(/one attempt/);
+  });
+
+  it('ignores nested lookalikes and accepts resolved only for reward exactly one', () => {
+    const fixture = nativeFixture(1);
+    put(join(fixture.trial, 'nested', 'result.json'), `${JSON.stringify({
+      task_name: fixture.identity.taskId,
+      trial_name: 'nested',
+      verifier_result: { rewards: { reward: 0 } },
+    })}\n`);
+    expect(indexHarborEvidence(fixture.root, fixture.identity, '5a9db8e2-7768-4f7e-8dad-cabfa11a48f8').nativeResult)
+      .toMatchObject({ score: 1, resolved: true });
+  });
+
+  it.each([-0.01, 1.01, Number.NaN])('leaves out-of-range native reward %s unverified', (reward) => {
+    const fixture = nativeFixture(reward);
+    expect(indexHarborEvidence(fixture.root, fixture.identity, '5a9db8e2-7768-4f7e-8dad-cabfa11a48f8').nativeResult)
+      .toEqual({ verification: 'unverified', score: null, resolved: null, artifact: null });
+  });
+});
+
+describe('Harbor plan, telemetry, and bridge assets', () => {
+  it('uses one task per native job and the run native/tasks directory', () => {
+    const fixture = nativeFixture();
+    const roots = { benchRoot: '/bench', cacheRoot: '/bench/.cache', resultsRoot: '/bench/results' };
+    const common = { prepared: {
+      harborBinary: '/prepared/environment/bin/harbor',
+      sourceDirectory: '/prepared/source',
+      toolchain: { directory: '/prepared/toolchain' },
+    } } as unknown as MarathonCommonAttestation;
+    const plan = planHarborRun(roots, fixture.root, fixture.manifest, common, fixture.identity.taskId, false);
+    expect(plan.argv).toContain('arm_b_codex:ArmBCodex');
+    expect(plan.argv.slice(plan.argv.indexOf('--jobs-dir'), plan.argv.indexOf('--jobs-dir') + 2))
+      .toEqual(['--jobs-dir', join(fixture.root, 'native/tasks')]);
+    expect(plan.argv.slice(plan.argv.indexOf('--n-attempts'), plan.argv.indexOf('--n-attempts') + 4))
+      .toEqual(['--n-attempts', '1', '--max-retries', '0']);
+    expect(plan.argv[plan.argv.indexOf('--job-name') + 1]).toBe(artifactKey(fixture.identity.taskId));
+  });
+
+  it('indexes telemetry only beneath the validated trial root', () => {
+    const fixture = nativeFixture();
+    const host = '11111111-1111-4111-8111-111111111111';
+    const worker = '22222222-2222-4222-8222-222222222222';
+    put(join(fixture.trial, 'agent', 'arm_b_lifecycle.json'), `${JSON.stringify({ schema_version: 2, host_session_id: host })}\n`);
+    put(join(fixture.trial, 'agent', 'sessions', `rollout-${host}.jsonl`), '{}\n');
+    put(join(fixture.trial, 'agent', 'sessions', `rollout-${worker}.jsonl`), '{}\n');
+    put(join(fixture.trial, 'agent', 'ultracode', 'runs', 'wf-1', 'config.json'), '{"backend":"mock"}\n');
+    put(join(fixture.trial, 'agent', 'ultracode', 'runs', 'wf-1', 'manifest.json'), '{"status":"completed"}\n');
+    put(join(fixture.trial, 'agent', 'ultracode', 'runs', 'wf-1', 'output.json'), '{"agentCount":1}\n');
+    put(join(fixture.trial, 'agent', 'ultracode', 'runs', 'wf-1', 'agents', 'a1', 'result.json'),
+      `${JSON.stringify({ sessionId: worker, backend: 'mock' })}\n`);
+    put(join(fixture.root, 'lookalike', 'sessions', 'rollout-33333333-3333-4333-8333-333333333333.jsonl'), '{}\n');
+    const indexed = indexSweMarathonMetrics(fixture.manifest, fixture.root);
+    expect(indexed.rollouts).toHaveLength(2);
+    expect(indexed.rollouts.map((rollout) => [rollout.roleHint, rollout.billingClass])).toEqual([
+      ['host', 'billable'],
+      ['worker', 'mock'],
+    ]);
+    expect(indexed.workflows).toMatchObject([{ workflowId: 'wf-1', billingClass: 'mock' }]);
+  });
+
+  it('keeps native and policy-adjusted reward analysis separately named', () => {
+    const fixture = nativeFixture();
+    const result = sweMarathonAnalysisHook.analyze({
+      suite: 'swe-marathon',
+      manifest: fixture.manifest,
+      metrics: {} as never,
+      taskResults: [{
+        taskId: fixture.identity.taskId,
+        arm: 'b',
+        nativeVerifier: { verification: 'verified', score: 0.75, resolved: false, artifact: null },
+        disposition: 'included-native',
+        failures: [],
+        annotations: [],
+      }],
+    });
+    expect(result).toEqual({
+      suite: 'swe-marathon',
+      native: { meanReward: 0.75, verifiedTasks: 1, requestedTasks: 1 },
+      policyAdjusted: { meanReward: 0.75, includedTasks: 1 },
+    });
+  });
+
+  it('uses the canonical shared prefix and lifecycle-only bridge metadata', () => {
+    const bridge = readFileSync(resolve('bench/suites/swe-marathon/arm_b_codex.py'), 'utf8');
+    const prefix = readFileSync(resolve('bench/suites/shared/arm-b-prefix.txt'), 'utf8');
+    const ownership = readFileSync(resolve('bench/suites/swe-marathon/harbor-ownership.patch'), 'utf8');
+    expect(prefix).toBe('ultracode\n\n');
+    expect(bridge).toContain('ARM_B_PREFIX_PATH = Path(__file__).resolve().parents[1] / "shared" / "arm-b-prefix.txt"');
+    expect(bridge).toContain('ARM_B_PREFIX + instruction');
+    expect(bridge).toContain('arm_b_lifecycle.json');
+    expect(bridge).not.toContain('arm_b_metrics.json');
+    expect(bridge).not.toContain('total_token_usage');
+    expect(ownership).toContain('ultracode.benchmark.ownership');
   });
 });

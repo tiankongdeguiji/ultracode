@@ -1,0 +1,9 @@
+{
+  "task_name": "zstd-decoder",
+  "trial_name": "trial-1",
+  "verifier_result": {
+    "rewards": {
+      "reward": 0.75
+    }
+  }
+}

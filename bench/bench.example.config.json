@@ -1,17 +1,84 @@
 {
-  "instances": { "ids": null, "count": 20, "seed": 7, "stratifyBy": "repo_language" },
-  "model": "gpt-5.2-codex",
-  "effort": "low",
-  "auth": { "mode": "chatgpt" },
-  "arms": "both",
-  "timeouts": { "sessionSecs": 43200, "evalWatchdogSecs": 5400 },
-  "parallel": { "instances": 4, "evalWorkers": 8 },
-  "docker": { "cpus": 8, "memoryGb": 24, "keepImages": false },
-  "toolchain": { "nodeVersion": "22.14.0", "nodeDist": "npmmirror", "codexBin": "auto" },
-  "harness": {
-    "repo": "https://github.com/scaleapi/SWE-bench_Pro-os",
-    "pin": "ca10a60a5fcae51e6948ffe1485d4153d421e6c5"
+  "schemaVersion": 2,
+  "toolchain": {
+    "nodeVersion": "22.14.0",
+    "nodeDistribution": "npmmirror",
+    "codexBinary": "auto"
   },
-  "pipIndex": "https://mirrors.aliyun.com/pypi/simple",
-  "sanitizeGitHistory": true
+  "swebenchPro": {
+    "model": "gpt-5.2-codex",
+    "requestedEffort": "low",
+    "arm": "both",
+    "selection": {
+      "taskIds": null,
+      "count": 20,
+      "seed": 7,
+      "stratifyBy": "repo_language"
+    },
+    "auth": {
+      "mechanism": "chatgpt",
+      "publicIdentity": "operator-supplied-chatgpt-account"
+    },
+    "timeouts": {
+      "sessionMs": 43200000,
+      "verifierMs": 21600000,
+      "evaluatorWatchdogMs": 5400000
+    },
+    "concurrency": {
+      "tasks": 4,
+      "verifier": 8
+    },
+    "docker": {
+      "cpus": 8,
+      "memoryBytes": 25769803776,
+      "keepImages": false
+    },
+    "evaluator": {
+      "repository": "https://github.com/scaleapi/SWE-bench_Pro-os",
+      "revision": "ca10a60a5fcae51e6948ffe1485d4153d421e6c5",
+      "pipIndex": "https://pypi.org/simple"
+    },
+    "sanitizeGitHistory": true
+  },
+  "sweMarathon": {
+    "model": "gpt-5.2-codex",
+    "requestedEffort": "high",
+    "arm": "a",
+    "taskIds": [
+      "zstd-decoder"
+    ],
+    "auth": {
+      "mechanism": "chatgpt",
+      "publicIdentity": "operator-supplied-chatgpt-account"
+    },
+    "workflowWaitMs": 3300000,
+    "timeouts": {
+      "taskMs": 43200000,
+      "verifierMs": 21600000
+    }
+  },
+  "featureBench": {
+    "model": "gpt-5.2-codex",
+    "requestedEffort": "high",
+    "arm": "a",
+    "taskIds": [
+      "operator-selected-featurebench-task"
+    ],
+    "broker": {
+      "publicIdentity": "operator-supplied-broker-identity",
+      "publicVersion": "operator-supplied-broker-version"
+    },
+    "concurrency": {
+      "inference": 4,
+      "evaluation": 4
+    },
+    "timeouts": {
+      "inferenceMs": 43200000,
+      "evaluationMs": 21600000
+    },
+    "resources": {
+      "cpus": 8,
+      "memoryBytes": 25769803776
+    }
+  }
 }

@@ -1,240 +1,154 @@
-/**
- * SWE-bench Pro driver behind `npm run bench -- --suite swebench-pro <command>`.
- * Commands mirror the run lifecycle — fetch (dataset cache), prep (toolchain +
- * eval harness), run (agent sessions), eval (official harness), report, status,
- * clean. `run` freezes its config + instance selection into
- * results/<runId>/run.json so resumes never re-sample.
- */
-import { Command, CommanderError } from 'commander';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+/** Sole public benchmark CLI and terminal-error boundary. */
 import { resolve } from 'node:path';
-import {
-  BENCH_ROOT, armDir, evalDir, loadConfig, runDir, runManifestFile, validateForRun,
-} from './config.js';
-import type { Arm, BenchConfig, BenchInstance, RunManifest } from './types.js';
-import { fetchInstances, loadInstances, selectInstances } from './instances.js';
-import { prepareToolchain, toolchainInfo } from './toolchain.js';
-import { removeOverlays } from './image.js';
-import { runBatch } from './session.js';
-import {
-  collectPredictions, goldPredictions, nullPredictions, prepareHarness, runEval,
-} from './eval.js';
-import { generateReport } from './report.js';
-import { readStatus, writeStatus } from './state.js';
+import { pathToFileURL } from 'node:url';
+import { BENCH_SUITES, SYSTEM_CLOCK, type BenchSuite, type CommandContext } from './shared/contracts.js';
+import { cleanupActiveBenchProcesses, sanitizeDiagnostic } from './shared/process.js';
+import { DEFAULT_BENCH_PATH_ROOTS, validateBenchSuite } from './shared/paths.js';
+import { suiteRegistry, type SuiteRegistry } from './registry.js';
 
-const out = (s: string): void => void process.stdout.write(`${s}\n`);
+export type BenchCliRoute =
+  | { kind: 'root-help' }
+  | { kind: 'suite-help'; suite: BenchSuite }
+  | { kind: 'command-help'; suite: BenchSuite; command: string }
+  | { kind: 'command'; suite: BenchSuite; command: string; argv: string[] };
 
-interface RunFlags {
-  runId: string;
-  model?: string;
-  effort?: string;
-  arms?: string;
-  count?: string;
-  seed?: string;
-  ids?: string;
-  parallel?: string;
-  timeoutSecs?: string;
-  auth?: string;
-  resume?: boolean;
-  redo?: string;
+function suiteNames(): string {
+  return BENCH_SUITES.join('|');
 }
 
-function numFlag(name: string, value: string): number {
-  const n = Number(value);
-  if (!Number.isFinite(n)) throw new Error(`--${name} must be a number, got '${value}'`);
-  return n;
-}
+export const BENCH_USAGE = `Usage:
+  npm run bench -- --suite <${suiteNames()}> <command> [options]
 
-function overridesFromFlags(f: RunFlags): Partial<BenchConfig> {
-  const o: Record<string, unknown> = {};
-  if (f.model !== undefined) o.model = f.model;
-  if (f.effort !== undefined) o.effort = f.effort;
-  if (f.arms !== undefined) o.arms = f.arms;
-  if (f.auth !== undefined) o.auth = { mode: f.auth };
-  const inst: Record<string, unknown> = {};
-  if (f.count !== undefined) inst.count = numFlag('count', f.count);
-  if (f.seed !== undefined) inst.seed = numFlag('seed', f.seed);
-  if (f.ids !== undefined) inst.ids = f.ids.split(',').map((s) => s.trim()).filter(Boolean);
-  if (Object.keys(inst).length) o.instances = inst;
-  if (f.parallel !== undefined) o.parallel = { instances: numFlag('parallel', f.parallel) };
-  if (f.timeoutSecs !== undefined) o.timeouts = { sessionSecs: numFlag('timeout-secs', f.timeoutSecs) };
-  return o as Partial<BenchConfig>;
-}
+Suites:
+  swebench-pro  fetch | prep | run | eval | report | status | clean
+  swe-marathon  prep | run | report
+  featurebench  prep | run | report
 
-/** djb2 over the id, mixed with the seed — stable per-instance arm order. */
-function armOrderFor(seed: number, iid: string): Arm[] {
-  let h = 5381 ^ seed;
-  for (const c of iid) h = ((h * 33) ^ c.charCodeAt(0)) >>> 0;
-  return h % 2 === 0 ? ['a', 'b'] : ['b', 'a'];
-}
+Results:
+  bench/results/<suite>/<runId>/manifest.json`;
 
-function loadOrCreateManifest(cfg: BenchConfig, runId: string, resume: boolean): RunManifest {
-  const file = runManifestFile(runId);
-  if (existsSync(file)) {
-    const m = JSON.parse(readFileSync(file, 'utf8')) as RunManifest;
-    if (!resume) {
-      throw new Error(`run ${runId} already exists — pass --resume to continue it (its config and instance set are frozen)`);
+function selected(argv: readonly string[]): { suite: BenchSuite; rest: string[] } {
+  const first = argv[0];
+  let value: string;
+  let consumed: number;
+  if (first === '--suite') {
+    const candidate = argv[1];
+    if (candidate === undefined || candidate.length === 0 || candidate.startsWith('-')) {
+      throw new Error('--suite requires a value');
     }
-    return m;
+    value = candidate;
+    consumed = 2;
+  } else if (first?.startsWith('--suite=')) {
+    value = first.slice('--suite='.length);
+    if (value.length === 0) throw new Error('--suite requires a value');
+    consumed = 1;
+  } else {
+    throw new Error(`--suite must precede the command; expected ${BENCH_SUITES.join(', ')}`);
   }
-  validateForRun(cfg);
-  const selected = selectInstances(loadInstances(), cfg.instances);
-  const info = toolchainInfo();
-  const manifest: RunManifest = {
-    runId,
-    createdAt: new Date().toISOString(),
-    config: cfg,
-    instanceIds: selected.map((i) => i.instanceId),
-    armOrder: Object.fromEntries(selected.map((i) => [i.instanceId, armOrderFor(cfg.instances.seed, i.instanceId)])),
-    ultracodeSha: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: resolve(BENCH_ROOT, '..'), encoding: 'utf8' }).trim(),
-    codexVersion: info.codexVersion,
-    codexSha256: info.codexSha256,
-  };
-  mkdirSync(runDir(runId), { recursive: true });
-  writeFileSync(file, JSON.stringify(manifest, null, 2));
-  return manifest;
-}
-
-function manifestInstances(m: RunManifest): BenchInstance[] {
-  const byId = new Map(loadInstances().map((i) => [i.instanceId, i]));
-  return m.instanceIds.map((id) => {
-    const inst = byId.get(id);
-    if (!inst) {
-      throw new Error(`instance ${id} from run.json is missing from the dataset cache — re-run \`npm run bench -- --suite swebench-pro fetch\``);
-    }
-    return inst;
-  });
-}
-
-function createSwebenchProProgram(): Command {
-  const program = new Command();
-  program
-    .name('npm run bench -- --suite swebench-pro')
-    .usage('<command> [options]')
-    .description('SWE-bench Pro A/B harness: codex alone vs codex + ultracode')
-    .exitOverride()
-    .configureOutput({ writeErr: () => undefined });
-
-  program.command('fetch').description('cache the SWE-bench Pro dataset (731 rows) from HuggingFace').action(async () => {
-    const n = await fetchInstances();
-    out(`cached ${n} instances`);
-  });
-
-  program.command('prep').description('assemble the container toolchain and the pinned eval harness').action(async () => {
-    const cfg = loadConfig();
-    await prepareToolchain(cfg);
-    out('toolchain ready');
-    await prepareHarness(cfg);
-    out('eval harness ready');
-  });
-
-  program.command('run')
-    .description('run agent sessions for the selected instances')
-    .requiredOption('--run-id <id>')
-    .option('--model <model>').option('--effort <effort>').option('--arms <arms>')
-    .option('--count <n>').option('--seed <n>').option('--ids <ids>')
-    .option('--parallel <n>').option('--timeout-secs <n>').option('--auth <mode>')
-    .option('--resume').option('--redo <ids>')
-    .action(async (f: RunFlags) => {
-      const fresh = loadConfig(overridesFromFlags(f));
-      const manifest = loadOrCreateManifest(fresh, f.runId, f.resume ?? false);
-      const cfg: BenchConfig = { ...manifest.config };
-      if (f.parallel !== undefined) cfg.parallel = { ...cfg.parallel, instances: numFlag('parallel', f.parallel) };
-      const redo = f.redo ? f.redo.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
-      const instances = manifestInstances(manifest);
-      out(`run ${manifest.runId}: ${instances.length} instances, arms=${cfg.arms}, model=${cfg.model}, effort=${cfg.effort}, parallel=${cfg.parallel.instances}`);
-      await runBatch(cfg, manifest, instances, { redo });
-      out('batch complete — next: `npm run bench -- --suite swebench-pro eval --run-id ' + manifest.runId + '`');
-    });
-
-  program.command('eval')
-    .description('score captured patches with the official SWE-bench Pro harness')
-    .requiredOption('--run-id <id>')
-    .option('--gold', 'evaluate the dataset gold patches (pipeline smoke)')
-    .option('--null', 'evaluate a benign no-op patch (flags instances whose tests already pass)')
-    .action(async (f: { runId: string; gold?: boolean; null?: boolean }) => {
-      const manifest = JSON.parse(readFileSync(runManifestFile(f.runId), 'utf8')) as RunManifest;
-      const cfg = manifest.config;
-      const instances = manifestInstances(manifest);
-      mkdirSync(evalDir(f.runId), { recursive: true });
-      if (f.gold || f.null) {
-        const prefix = f.gold ? 'gold' : 'nullcheck';
-        const preds = f.gold ? goldPredictions(instances) : nullPredictions(instances);
-        const results = await runEval(cfg, f.runId, prefix, preds, instances);
-        const ok = Object.values(results).filter(Boolean).length;
-        out(`${prefix}: ${ok}/${instances.length} resolved`);
-        return;
-      }
-      for (const arm of (cfg.arms === 'both' ? ['a', 'b'] as const : [cfg.arms])) {
-        const prefix = arm === 'a' ? 'armA' : 'armB';
-        const preds = collectPredictions(f.runId, arm, instances);
-        out(`${prefix}: evaluating ${preds.length}/${instances.length} non-empty patches`);
-        if (preds.length === 0) continue; // the harness ZeroDivisionErrors on an empty set
-        const results = await runEval(cfg, f.runId, prefix, preds, instances);
-        for (const iid of Object.keys(results)) {
-          const dir = armDir(f.runId, iid, arm);
-          const st = readStatus(dir);
-          if (st.phase === 'patched') writeStatus(dir, { ...st, phase: 'evaled' });
-        }
-        const ok = Object.values(results).filter(Boolean).length;
-        out(`${prefix}: ${ok}/${instances.length} resolved`);
-      }
-      out('next: `npm run bench -- --suite swebench-pro report --run-id ' + f.runId + '`');
-    });
-
-  program.command('report').description('aggregate statuses, metrics, and eval verdicts into report.md/json')
-    .requiredOption('--run-id <id>')
-    .action((f: { runId: string }) => {
-      const { jsonPath, mdPath } = generateReport(f.runId);
-      out(`wrote ${jsonPath}`);
-      out(`wrote ${mdPath}`);
-    });
-
-  program.command('status').description('per instance x arm progress for a run')
-    .requiredOption('--run-id <id>')
-    .action((f: { runId: string }) => {
-      const manifest = JSON.parse(readFileSync(runManifestFile(f.runId), 'utf8')) as RunManifest;
-      for (const iid of manifest.instanceIds) {
-        for (const arm of manifest.armOrder[iid] ?? (['a', 'b'] as Arm[])) {
-          const dir = armDir(f.runId, iid, arm);
-          const st = readStatus(dir);
-          let tokens = '';
-          try {
-            const m = JSON.parse(readFileSync(`${dir}/metrics.json`, 'utf8'));
-            tokens = ` ${Math.round((m.totalUsage?.total ?? 0) / 1000)}k tok`;
-          } catch { /* not collected yet */ }
-          const failure = st.failure ? ` FAIL:${st.failure}` : '';
-          const notes = st.annotations.length ? ` [${st.annotations.join(', ')}]` : '';
-          out(`${iid} ${arm}: ${st.phase}${failure}${tokens}${notes}`);
-        }
-      }
-    });
-
-  program.command('clean').description('remove leftover bench containers (and overlay images with --images)')
-    .option('--images')
-    .action(async (f: { images?: boolean }) => {
-      const ps = execFileSync('docker', ['ps', '-aq', '--filter', 'name=ucbench-'], { encoding: 'utf8' }).trim();
-      if (ps) {
-        execFileSync('docker', ['rm', '-f', ...ps.split('\n')], { stdio: 'ignore' });
-        out(`removed ${ps.split('\n').length} containers`);
-      }
-      if (f.images) out(`removed ${await removeOverlays()} overlay images`);
-      rmSync(resolve(BENCH_ROOT, '.cache/release-stage'), { recursive: true, force: true });
-    });
-
-  return program;
-}
-
-/** Run the SWE-bench Pro command parser without reading or mutating process CLI state. */
-export async function runSwebenchProCli(argv: string[]): Promise<void> {
-  const program = createSwebenchProProgram();
-  try {
-    await program.parseAsync(argv, { from: 'user' });
-  } catch (error) {
-    if (error instanceof CommanderError
-      && (error.code === 'commander.helpDisplayed' || error.code === 'commander.help')
-      && error.exitCode === 0) return;
-    throw error;
+  const rest = argv.slice(consumed);
+  if (rest.some((token) => token === '--suite' || token.startsWith('--suite='))) {
+    throw new Error('--suite may be provided only once and must precede the command');
   }
+  return { suite: validateBenchSuite(value), rest };
+}
+
+/** Parse routing and help grammar without importing any native runner. */
+export function parseBenchCliRoute(argv: readonly string[], registry: SuiteRegistry = suiteRegistry): BenchCliRoute {
+  if (argv.length === 1 && argv[0] === '--help') return { kind: 'root-help' };
+  if (argv.length === 0) throw new Error(`--suite is required; expected ${BENCH_SUITES.join(', ')}`);
+  if (argv[0] === '-h' || argv[0] === 'help') throw new Error("root help is exactly '--help'");
+  const { suite, rest } = selected(argv);
+  if (rest.length === 0) throw new Error(`command is required for ${suite}`);
+  if (rest.length === 1 && rest[0] === '--help') return { kind: 'suite-help', suite };
+  const command = rest[0]!;
+  if (command === '-h' || command === 'help') throw new Error("selected help is exactly '--help'");
+  const adapter = registry.get(suite);
+  const commands = adapter.commands as Record<string, unknown>;
+  if (!Object.hasOwn(commands, command)) {
+    throw new Error(`command '${command}' is not supported for ${suite}; expected ${Object.keys(commands).join(', ')}`);
+  }
+  const commandArgv = rest.slice(1);
+  if (commandArgv.length === 1 && commandArgv[0] === '--help') return { kind: 'command-help', suite, command };
+  if (commandArgv.includes('--help') || commandArgv.includes('-h')) {
+    throw new Error(`help for ${suite} ${command} must be invoked with only '--help' after the command`);
+  }
+  return { kind: 'command', suite, command, argv: commandArgv };
+}
+
+function suiteHelp(suite: BenchSuite, registry: SuiteRegistry): string {
+  const adapter = registry.get(suite);
+  const lines = [
+    `Usage: npm run bench -- --suite ${suite} <command> [options]`,
+    '',
+    `${adapter.displayName}: ${adapter.description}`,
+    '',
+    'Commands:',
+    ...Object.entries(adapter.commands).map(([name, spec]) =>
+      `  ${name.padEnd(10)} ${(spec as { summary: string }).summary}`),
+  ];
+  return `${lines.join('\n')}\n`;
+}
+
+function commandHelp(suite: BenchSuite, command: string, registry: SuiteRegistry): string {
+  const spec = (registry.get(suite).commands as Record<string, {
+    usage: string;
+    summary: string;
+    options: readonly { name: string; valueName?: string; repeatable?: boolean; summary: string }[];
+  }>)[command]!;
+  const lines = [
+    `Usage: npm run bench -- --suite ${suite} ${command}${spec.usage ? ` ${spec.usage}` : ''}`,
+    '',
+    spec.summary,
+    ...(spec.options.length === 0 ? [] : [
+      '',
+      'Options:',
+      ...spec.options.map((option) => {
+        const form = `--${option.name}${option.valueName ? ` <${option.valueName}>` : ''}${option.repeatable ? ' (repeatable)' : ''}`;
+        return `  ${form.padEnd(36)} ${option.summary}`;
+      }),
+    ]),
+  ];
+  return `${lines.join('\n')}\n`;
+}
+
+/** Validate command options before the command lazily imports native code. */
+export async function runBenchCli(
+  argv: readonly string[],
+  registry: SuiteRegistry = suiteRegistry,
+  context: CommandContext = {
+    stdout: process.stdout,
+    stderr: process.stderr,
+    paths: DEFAULT_BENCH_PATH_ROOTS,
+    clock: SYSTEM_CLOCK,
+  },
+): Promise<void> {
+  const route = parseBenchCliRoute(argv, registry);
+  if (route.kind === 'root-help') {
+    context.stdout.write(`${BENCH_USAGE}\n`);
+    return;
+  }
+  if (route.kind === 'suite-help') {
+    context.stdout.write(suiteHelp(route.suite, registry));
+    return;
+  }
+  if (route.kind === 'command-help') {
+    context.stdout.write(commandHelp(route.suite, route.command, registry));
+    return;
+  }
+  const spec = (registry.get(route.suite).commands as Record<string, {
+    parse(argv: readonly string[]): unknown;
+    run(options: unknown, context: CommandContext): Promise<void>;
+  }>)[route.command]!;
+  const options = spec.parse(route.argv);
+  await spec.run(options, context);
+}
+
+const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;
+if (invokedPath === import.meta.url) {
+  runBenchCli(process.argv.slice(2)).catch(async (error: unknown) => {
+    try { await cleanupActiveBenchProcesses(); } catch { /* terminal diagnostic remains singular */ }
+    const message = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
+    process.stderr.write(`bench: ${message.replace(/[\r\n]+/g, ' ').trim() || 'benchmark command failed'}\n`);
+    process.exitCode = 1;
+  });
 }

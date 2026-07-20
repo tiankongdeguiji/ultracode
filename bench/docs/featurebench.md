@@ -1,173 +1,126 @@
-# FeatureBench adapter
+# FeatureBench
 
-`bench/src/featurebench.ts` is a deliberately narrow adapter for a reproducible
-FeatureBench Codex experiment. It is selected through the shared
-`npm run bench` dispatcher, but FeatureBench still owns native preparation,
-inference image selection, execution, patch capture, verification, resume, and
-reporting.
+FeatureBench is a suite-owned adapter around pinned upstream `fb infer` and
+`fb eval`. The official evaluator remains the sole score authority; the common
+benchmark control plane binds its exact native outputs and does not substitute
+another grader.
 
-## Reproducibility contract
+## Pinned inputs and runtime
 
-- FeatureBench source is detached at
-  `445dcbaec0b2e136061b0acb54e753c0a9f1888e` from
-  `LiberCoders/FeatureBench`.
-- The `LiberCoders/FeatureBench` dataset is loaded at revision
-  `e99d6efdfe511ea832c1b5735c536129561ec96a`.
-- The initial policy is the `fast` split, CPU-only containers, one attempt, no
-  adapter retries, 8 CPUs, 24 GiB memory, four inference workers, and a 43,200
-  second task timeout. Planning rejects GPU execution, another split, multiple
-  attempts, retries, and API-key auth rather than silently changing the trial.
-- Task IDs are individual values following `--task-id`; they are never treated
-  as filenames or rewritten as host paths, and they must exist in the pinned
-  dataset.
-- Evaluation is the official upstream `fb eval` command against the pinned
-  dataset. The adapter does not replace FeatureBench grading.
+| Component | Pin |
+| --- | --- |
+| FeatureBench source | `445dcbaec0b2e136061b0acb54e753c0a9f1888e` |
+| `LiberCoders/FeatureBench` dataset | `e99d6efdfe511ea832c1b5735c536129561ec96a` |
+| Split | `fast` |
+| Python | `3.13.5` |
+| Attempts / adapter retries | `1` / `0` |
+| Runtime | Linux x64, CPU only |
 
-`prepareFeatureBench()` clones into a caller-selected cache directory, checks
-out the exact source revision, requires a clean checkout, runs `git apply
---check` against the tracked full-index patch, applies it, and runs the locked
-`uv sync` under exact Python 3.13.5, and pre-pulls the split images. A new clone
-is prepared under a temporary sibling and renamed only after every step passes.
-A checkout with an already-applied exact patch is accepted for idempotence.
-Tracked drift and every unexpected untracked or ignored file fail closed. The
-only generated checkout content allowed by attestation is `.venv/**`; native
-Python preparation, inference, and evaluation children receive
-`PYTHONDONTWRITEBYTECODE=1` so they do not create ignored bytecode elsewhere.
-The virtual environment is rebuilt during preparation and the whole checkout is
-re-attested after that rebuild and before each run.
-Preparation also materializes the pinned task-to-image map under the checkout's
-Git metadata, so pre-manifest run checks only read and hash local state instead
-of invoking a dataset loader that could mutate a cache.
+`prep` checks out the exact source revision, verifies and applies
+`bench/suites/featurebench/codex-chatgpt.patch`, performs a frozen `uv sync`,
+pulls the pinned split, and writes the complete task-to-image map inside Git
+metadata. Every image is resolved to one repository digest and local image ID.
+The prepared source, environment, patch, dataset map, task inventory, images,
+and common toolchain are content-addressed and re-attested before native work.
 
-The tracked patch adds the experiment plumbing FeatureBench lacked:
+The patch preserves upstream inference and evaluation while adding the
+experiment controls: digest-pinned images, CPU and memory limits, CPU-only
+rejection, the credential-broker network, copied Codex telemetry, benchmark
+ownership labels, and the canonical Arm B prompt prefix and toolchain mount.
+Arm A receives the upstream task text verbatim.
 
-- a read-only mount for the prepared Linux-x64 Codex binary; reusable host
-  credentials are never mounted into repository-controlled task containers;
-- immutable per-task image digests and a Docker-internal network whose
-  `ultracode.egress-policy=openai-via-credential-broker` label identifies the
-  sole pre-existing endpoint: a running, immutable, separately labeled OpenAI
-  credential-broker container;
-- Docker CPU and memory limits and an explicit rejection of GPU-requiring tasks;
-- Codex's current `--dangerously-bypass-approvals-and-sandbox` execution flag;
-- a dataset revision passed to both inference and the upstream evaluator;
-- direct copying of `/root/.codex/sessions` from each container in Codex's
-  `post_run_hook` and failure hook, before teardown;
-- for Arm B, the same task preceded by the literal ultracode trigger plus a
-  read-only toolchain mount, Codex MCP registration, and installed ultracode
-  skill. The hook polls every workflow manifest to a terminal state before
-  copying outputs; expiry stops and awaits stragglers and fails the attempt.
-  Arm A receives the upstream task unchanged.
+## Credential and network boundary
 
-## External broker and network contract
+The operator provisions a broker container and dedicated Docker network before
+`run`. The adapter neither creates the broker nor stores its credential.
 
-This repository does **not** contain, launch, configure, or credential an OpenAI
-broker. Before `run`, the operator must provision and keep running an external
-broker container and a dedicated Docker network satisfying all of these checks:
-
+- `FEATUREBENCH_CREDENTIAL_BROKER_URL` is an absolute HTTPS URL without
+  userinfo, query, or fragment. Its hostname is the broker container name.
 - `FEATUREBENCH_RESTRICTED_NETWORK` names a Docker `--internal` network labeled
   `ultracode.egress-policy=openai-via-credential-broker`.
-- Exactly one container is attached to that network at preflight: the broker.
-  Its Docker container name is exactly the hostname in
-  `FEATUREBENCH_CREDENTIAL_BROKER_URL`, and it has the label
-  `ultracode.credential-broker=true`. The broker may also use a separate network
-  for its own upstream egress. During inference, FeatureBench attaches the task
-  containers to this shared network too; concurrent task containers may therefore
-  be mutually reachable even though no other pre-existing service is allowed.
-- The URL is an absolute HTTPS OpenAI-compatible Responses API base URL. It has
-  no userinfo, query, or fragment, its certificate is trusted by every selected
-  task image, and its hostname matches that certificate. The adapter passes no
-  API key or reusable ChatGPT credential to task containers, so the broker must
-  accept requests from the restricted network, inject its own upstream
-  credential, and implement any desired request validation, rate limiting, and
-  credential scoping itself.
-- Docker exposes the broker as a running container backed by an immutable image
-  ID. The run manifest records a SHA-256 attestation over the broker image,
-  resolved command and arguments, mount configuration, attached network names,
-  and labels. It deliberately excludes environment variables and mount contents
-  and persists only the hash, never credential material. Changing any attested
-  runtime configuration prevents an exact-manifest resume.
+- Before each native phase, the network must have exactly one endpoint: the
+  named, running broker container. The broker must have immutable image identity
+  and the configured public identity/version labels.
+- Reusable host credentials and auth files are never mounted or forwarded to
+  repository-controlled task containers. The broker is responsible for its
+  own upstream egress, credential injection, scoping, and request validation.
 
-Provisioning the broker, its trusted TLS certificate, its upstream connectivity,
-and its credential is an operator prerequisite, not a command supplied by this
-repository. An internal Docker network isolates task containers from ordinary
-egress; the broker is the explicit trust boundary and sole pre-existing service
-endpoint, not a per-task network-isolation mechanism.
+Only hashes of the public broker identity, public version, runtime
+configuration, and restricted-network policy enter the manifest. Runtime URL
+and Docker names live only in a private `0600` temporary config that is removed
+after execution. The containing `0700` runtime home has an exact run/arm/nonce
+marker; the next run removes matching hard-crash orphans before writing a new
+runtime config and refuses malformed lookalikes.
 
-Before the broker-only network assertion, preflight removes containers carrying
-the exact `ultracode.external-run=<runOwner>` label. This targeted deletion also
-removes stale network endpoints left by an interrupted run, allowing an exact
-resume to re-establish the one-broker attachment invariant. The same cleanup runs
-on exit; containers with any other owner label are untouched.
+One policy lock below `bench/.cache/.locks/` covers preflight, inference,
+evaluation, and cleanup. This prevents concurrent FeatureBench runs from
+invalidating the broker-only host-wide network assertion. Cleanup discovers
+containers using the complete `ultracode.benchmark.*` ownership tuple,
+reinspects every label including task and purpose, and refuses ambiguous or
+unowned targets.
 
-Callers also provide the prepared checkout, private result root, and pinned Codex
-binary. The native runner receives an allowlisted host environment, so unrelated
-GitHub, npm, cloud, SSH-agent, and similar credentials are not inherited.
-
-## Artifacts
-
-For each invocation, the adapter creates a private temporary directory, writes
-the runtime TOML with mode `0600`, and removes the directory in `finally` after
-inference and evaluation. The result root and timestamped run directory have
-mode `0700`. FeatureBench still records its normal `output.jsonl`, reports,
-per-attempt logs, patches, Codex events, and copied Codex session JSONL under
-that private result tree. Do not commit results, auth files, runtime TOML, source
-clones, or local cache directories.
-
-The intended host flow is:
+## Lifecycle and artifacts
 
 ```bash
 npm run bench -- --suite featurebench prep
-npm run bench -- --suite featurebench run --run-id <fresh-id> \
-  --model <model> --effort <effort> --arm <a|b> \
-  --task-id <instance-id> [--task-id <instance-id> ...]
-npm run bench -- --suite featurebench report --run-id <fresh-id>
+
+FEATUREBENCH_CREDENTIAL_BROKER_URL=https://broker.internal/v1 \
+FEATUREBENCH_RESTRICTED_NETWORK=featurebench-private \
+npm run bench -- --suite featurebench run --run-id feature-a1 \
+  --model <model> --effort <effort> --arm a \
+  --task-id <task> [--task-id <task> ...]
+
+npm run bench -- --suite featurebench report --run-id feature-a1
 ```
 
-The mandatory selector routes these commands to FeatureBench. Routing is the
-only shared layer. The suite manifest remains at
-`bench/results/external/featurebench/<runId>/external-run.json`, separate from
-SWE-bench Pro's `bench/results/<runId>/run.json` and SWE-Marathon's external
-namespace.
+The operator config in `bench/bench.config.json` supplies the same immutable
+model, effort, one-arm task set, public broker identity/version, concurrency,
+timeouts, resources, and optional pricing. CLI run options can select those
+values for a fresh run. `--resume` accepts only the frozen manifest identity;
+`--redo <task-id>` requires resume, invalidates that task and the aggregate
+receipt bindings, runs a new timestamped native inference, and evaluates one
+consolidated complete prediction set.
 
-The CLI requires `--model`, `--effort`, and `--run-id` (used as `runOwner`)
-explicitly; none has a fallback. Set
-`FEATUREBENCH_CREDENTIAL_BROKER_URL` and `FEATUREBENCH_RESTRICTED_NETWORK` before
-`run`, after externally provisioning the contract above. Source,
-dataset-membership, toolchain, network-policy, broker-runtime, and image-digest
-checks pass before the secret-free manifest claims the run ID. The manifest
-records executable, adapter, Node, ultracode, broker-runtime, and image hashes.
-The equivalent lower-level host flow is:
+Every run uses the common suite-qualified layout (with `suite` equal to
+`featurebench`):
 
-```ts
-await prepareFeatureBench({ sourceDir });
-await runFeatureBench({
-  sourceDir,
-  outputDir,
-  codexBin,
-  credentialBrokerUrl,
-  restrictedNetwork,
-  runOwner,
-  arm: 'a',
-  model,
-  effort,
-  taskIds,
-});
+```text
+bench/results/<suite>/<runId>/
+  manifest.json
+  run-state.json
+  verifier-receipt.json
+  report.json
+  report.md
+  native/
+    <YYYY-MM-DD__HH-MM-SS>/
+      run_metadata.json
+      output.jsonl
+      eval_outputs/<task>/attempt-1/report.json
+      report.json
 ```
 
-Arm B additionally requires the toolchain directory built by the existing bench
-toolchain preparation. Repeating `run` with the exact same manifest resumes the
-native FeatureBench directory and skips completed attempts/evaluations; any input
-or provenance difference is rejected. At the lower-level API, `model`, `effort`,
-and `runOwner` are likewise mandatory. `planFeatureBenchRun()`,
-`planFeatureBenchEval()`, `featureBenchRuntimeConfig()`,
-`composeFeatureBenchPrompt()`, and `validateFeatureBenchRun()` are pure seams for
-review and offline tests.
+The upstream timestamp directory is discovered only after `fb infer` creates
+exactly one new native directory, then recorded in host-owned run state. Resume,
+telemetry, verification, and reporting use only state-bound timestamp roots;
+they do not recursively discover lookalike output elsewhere.
 
-## Observed plumbing run
+The verifier receipt binds the timestamped `run_metadata.json`, prediction
+JSONL, each task report, each official completion marker, the exact `fb eval`
+input and invocation record, and the run-level `attempt_1` aggregate. Missing,
+malformed, symlinked, escaped, or later-mutated evidence remains unverified.
 
-An exploratory five-task Arm A run on 2026-07-19 was reported by upstream
-FeatureBench as **4/5 resolved**. A separate polling snapshot watcher observed
-five rollout files and **0 compaction events**. This is historical plumbing
-evidence only: it did not exercise the current direct-copy, pinned-dataset,
-credential-broker, digest, resume, or lifecycle-wait implementation. It is not
-an A/B result, model-quality claim, or statistically meaningful benchmark.
+## Score semantics
+
+FeatureBench has two distinct official quantities:
+
+- A task's common-envelope `score` is its official `pass_rate`; its `resolved`
+  field preserves the separate official boolean.
+- The native run headline is `attempt_1.pass_rate`. `attempt_1.resolved_rate`
+  is reported separately. The mean of bound task pass rates is only a
+  consistency check, and policy-adjusted values have separate names.
+
+The common normalized metrics implementation reads copied Codex rollouts and
+Ultracode workflow artifacts from manifest tasks under state-bound native
+attempt roots. Host/worker roles, billability, tokens, cost, context pressure,
+timings, failures, and annotations therefore use the same schema as the other
+suites.

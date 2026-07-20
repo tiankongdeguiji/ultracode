@@ -20,6 +20,54 @@ The synchronous uncaught-exception monitor signals only worker identities held i
 
 These controls protect signaling decisions made from worker-writable records, but they are **not** a general boundary against arbitrary same-user code. In particular, **`resume` re-executes `script.js`/`config.json` from that worker-writable dir with no review gate** — so a poisoned prior run can influence a later resume (including its `permission`). Treat resuming an untrusted run as running its inputs. Two known replay caveats: a `pipeline()` whose later-stage dispatch order depends on completion timing can lose its cache prefix on resume, and fallback token estimates (no-usage backends) are approximate. Full isolation (control-plane outside the workspace and a separate-process sandbox) is future work.
 
+## Benchmark control plane
+
+The benchmark harness treats suite runners and task containers as native,
+potentially task-influenced producers, not as score authorities by themselves.
+Host-owned schema-v2 manifests, run state, and verifier receipts live outside
+task workspaces with private modes and symlink-safe writes. A report accepts a
+native score only when the exact official-verifier file, SHA-256, scope,
+invocation, role, and record key are bound in the receipt. Repository code can
+still consume compute and modify its task workspace; it cannot turn an agent
+success signal or a lookalike output into an official score.
+
+Native containers carry the complete `ultracode.benchmark.*` ownership label
+tuple. Cleanup filters and reinspects that tuple before deletion; it does not
+claim unlabeled or ambiguously labeled Docker resources. Prepared sources,
+toolchains, evaluator environments, datasets, patches, images, prompt policy,
+and control-plane implementations are pinned or content-addressed and
+re-attested at the suite's launch boundary.
+
+SWE-bench Pro and SWE-Marathon repository-controlled task code shares a
+security domain with the reusable Codex credential needed for that session.
+The harness keeps credential material out of persistent result trees and
+deletes exact nonce-bound runtime homes after their containers are gone, but
+it cannot prevent malicious task code from reading or exfiltrating a live
+credential. Operators must use disposable, narrowly scoped benchmark accounts
+and independently restricted egress.
+
+Native host processes also inherit a high-entropy lifecycle token plus a
+filesystem-backed run scope. The token and direct-child process identity are
+persisted before and immediately after spawn, and interrupted runs perform
+bounded, identity-checked descendant recovery before state is closed. Linux
+can discover marked descendants that escaped the original process group;
+macOS recovery is limited to the recorded candidate leaders. Unverifiable
+descendants fail recovery rather than authorizing a broader signal target.
+
+FeatureBench has a narrower network and credential boundary. Task containers
+receive no reusable host credential and run only on a dedicated internal Docker
+network. The sole pre-existing endpoint must be a separately managed, running,
+immutable-image HTTPS credential broker with the configured public
+identity/version labels. A host-wide policy lock covers cleanup, broker-only
+network preflight, inference, official evaluation, and final cleanup. Persistent
+artifacts contain public identity/version and policy hashes, never the broker
+URL, Docker runtime names, credential material, or credential-file paths. The
+runtime-only broker URL is written under a private run/arm/nonce-marked home;
+normal finalization and the next exact run cleanup remove that home. The
+broker remains trusted to scope credentials, validate requests, and control its
+own upstream egress; compromise of that broker is outside the task-container
+isolation guarantee.
+
 ## Related reading
 
 - `docs/design/minimalist-risk.md` — the historical risk register the shipped mitigations grew from (parts superseded by this document).
