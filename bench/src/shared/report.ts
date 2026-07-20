@@ -24,14 +24,13 @@ import {
   readPrivateFile,
   resolveRegularFileWithinRoot,
   runDir,
-  runStateFile,
   validateRelativeArtifactPath,
   writePrivateFileAtomic,
   writePrivateJsonAtomic,
   verifierReceiptFile,
 } from './paths.js';
 import type { BenchPathRoots, Arm } from './contracts.js';
-import { parseBenchRunState, type BenchRunState } from './run-state.js';
+import { loadBenchRunStateEvidence, type BenchRunState } from './run-state.js';
 import { verifierReceiptSchema, type NativeVerifierResult, type VerifierReceipt } from './verifier.js';
 
 export interface RateAnalysis {
@@ -119,6 +118,7 @@ export interface ReproducibilityEnvelope {
   verifierReceiptSha256: string;
   runStatePath: 'run-state.json';
   runStateSha256: string;
+  runStateLedgerRootSha256: string | null;
   provenance: BenchProvenance;
   suiteConfigSha256: string;
   metricsPolicySha256: string;
@@ -176,6 +176,7 @@ export interface BuildBenchReportOptions<S extends BenchSuite> {
   manifestSha256: string;
   runState: BenchRunState;
   runStateSha256: string;
+  runStateLedgerRootSha256: string | null;
   verifierReceipt: VerifierReceipt;
   verifierReceiptSha256: string;
   metrics: NormalizedMetrics;
@@ -193,6 +194,7 @@ export interface StoredReportEvidence<S extends BenchSuite = BenchSuite> {
   manifestSha256: string;
   runState: BenchRunState;
   runStateSha256: string;
+  runStateLedgerRootSha256: string | null;
   verifierReceipt: VerifierReceipt;
   verifierReceiptSha256: string;
 }
@@ -205,7 +207,6 @@ export function loadStoredReportEvidence<S extends BenchSuite>(
 ): StoredReportEvidence<S> {
   const directory = runDir(roots, suite, runId);
   const manifestPath = manifestFile(roots, suite, runId);
-  const statePath = runStateFile(roots, suite, runId);
   const receiptPath = verifierReceiptFile(roots, suite, runId);
   const parseStored = <T>(path: string, parse: (value: unknown) => T): { value: T; sha256: string } => {
     const bytes = readPrivateFile(directory, path);
@@ -215,8 +216,8 @@ export function loadStoredReportEvidence<S extends BenchSuite>(
   const storedManifest = parseStored(manifestPath, parseBenchRunManifest);
   const manifest = storedManifest.value as Extract<BenchRunManifest, { suite: S }>;
   const manifestSha256 = storedManifest.sha256;
-  const storedState = parseStored(statePath, parseBenchRunState);
-  const runState = storedState.value;
+  const storedState = loadBenchRunStateEvidence(roots, suite, runId, manifestSha256);
+  const runState = storedState.state;
   const storedReceipt = parseStored(receiptPath, (value) => verifierReceiptSchema.parse(value));
   const verifierReceipt = storedReceipt.value;
   if (manifest.suite !== suite || manifest.runId !== runId) {
@@ -243,7 +244,8 @@ export function loadStoredReportEvidence<S extends BenchSuite>(
     manifest,
     manifestSha256,
     runState,
-    runStateSha256: storedState.sha256,
+    runStateSha256: storedState.stateFileSha256,
+    runStateLedgerRootSha256: storedState.ledgerRootSha256,
     verifierReceipt,
     verifierReceiptSha256: storedReceipt.sha256,
   };
@@ -390,6 +392,7 @@ export function buildBenchReport<S extends BenchSuite>(options: BuildBenchReport
       verifierReceiptSha256: options.verifierReceiptSha256,
       runStatePath: 'run-state.json',
       runStateSha256: options.runStateSha256,
+      runStateLedgerRootSha256: options.runStateLedgerRootSha256,
       provenance: manifest.provenance,
       suiteConfigSha256: sha256CanonicalJson(manifest.suiteConfig),
       metricsPolicySha256: manifest.provenance.controlPlane.metricsPolicySha256,
@@ -431,6 +434,7 @@ export function renderBenchReportMarkdown(report: BenchReport): string {
     '',
     `- manifest: \`${report.reproducibility.manifestPath}\` (${report.reproducibility.manifestSha256})`,
     `- run state: \`${report.reproducibility.runStatePath}\` (${report.reproducibility.runStateSha256})`,
+    `- run-state ledger root: ${report.reproducibility.runStateLedgerRootSha256 ?? 'legacy v2 monolith'}`,
     `- verifier receipt: \`${report.reproducibility.verifierReceiptPath}\` (${report.reproducibility.verifierReceiptSha256})`,
     '',
   ];
@@ -451,7 +455,7 @@ export const REPORT_POLICY_SHA256 = sha256CanonicalJson({
   schemaVersion: 2,
   nativeVerifierAuthority: 'receipt-bound-only',
   missingNativeResult: 'unverified-null',
-  provenanceSource: 'manifest-only',
+  provenanceSource: 'manifest-plus-sealed-run-state-ledger-root',
   dispositionPolicy: 'shared-failure-policy-v2',
   analysis: 'suite-discriminated-hook',
 });

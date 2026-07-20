@@ -183,6 +183,12 @@ interface ParsedCumulative {
   reasoningClamped: boolean;
 }
 
+interface ParsedRollout {
+  session: NormalizedSessionMetrics;
+  observedModels: readonly string[];
+  modelEvidenceComplete: boolean;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -261,12 +267,11 @@ function validateScope(scope: MetricsScope): MetricsScope {
   return scope;
 }
 
-/** Parse one exact rollout using the final complete cumulative usage object. */
-export function parseCodexRollout(
+function parseCodexRolloutWithEvidence(
   runDirectory: string,
   artifact: RolloutArtifact,
   policy: MetricsPolicySnapshot,
-): NormalizedSessionMetrics {
+): ParsedRollout {
   const scope = validateScope(artifact.scope);
   const relativePath = validateRelativeArtifactPath(artifact.path);
   const file = resolveRegularFileWithinRoot(runDirectory, relativePath, 'Codex rollout');
@@ -274,6 +279,7 @@ export function parseCodexRollout(
   let contextHighWaterMark = 0;
   let contextWindow: number | null = null;
   let model: string | null = null;
+  const observedModels: string[] = [];
   let effectiveEffort: string | null = null;
   let metadataSessionId: string | null = null;
   let eventCompactions = 0;
@@ -293,11 +299,17 @@ export function parseCodexRollout(
     if (record.type === 'session_meta') {
       const id = payload.session_id ?? payload.id;
       if (typeof id === 'string' && id.length > 0) metadataSessionId = id;
-      if (typeof payload.model === 'string' && payload.model.length > 0) model = payload.model;
+      if (typeof payload.model === 'string' && payload.model.length > 0) {
+        model = payload.model;
+        observedModels.push(model);
+      }
       return;
     }
     if (record.type === 'turn_context') {
-      if (typeof payload.model === 'string' && payload.model.length > 0) model = payload.model;
+      if (typeof payload.model === 'string' && payload.model.length > 0) {
+        model = payload.model;
+        observedModels.push(model);
+      }
       if (typeof payload.effort === 'string' && payload.effort.length > 0) effectiveEffort = payload.effort;
       if (isRecord(payload.collaboration_mode) && isRecord(payload.collaboration_mode.settings)) {
         const nested = payload.collaboration_mode.settings.reasoning_effort;
@@ -353,24 +365,39 @@ export function parseCodexRollout(
   const explicitCompactions = Math.max(eventCompactions, recordCompactions);
   const contextPressureRatio = contextWindow === null ? null : contextHighWaterMark / contextWindow;
   return {
-    scope,
-    sessionId,
-    path: relativePath,
-    role: artifact.roleHint,
-    backend: artifact.backend,
-    billingClass: artifact.billingClass,
-    model,
-    effectiveEffort,
-    usage: cumulative?.usage ?? emptyUsage(policy.cachedInputWeight),
-    explicitCompactions,
-    inferredPromptResets,
-    contextHighWaterMark,
-    contextWindow,
-    contextPressureRatio,
-    underContextPressure: explicitCompactions > 0
-      || (contextPressureRatio !== null && contextPressureRatio >= CONTEXT_PRESSURE_RATIO),
-    annotations,
+    session: {
+      scope,
+      sessionId,
+      path: relativePath,
+      role: artifact.roleHint,
+      backend: artifact.backend,
+      billingClass: artifact.billingClass,
+      model,
+      effectiveEffort,
+      usage: cumulative?.usage ?? emptyUsage(policy.cachedInputWeight),
+      explicitCompactions,
+      inferredPromptResets,
+      contextHighWaterMark,
+      contextWindow,
+      contextPressureRatio,
+      underContextPressure: explicitCompactions > 0
+        || (contextPressureRatio !== null && contextPressureRatio >= CONTEXT_PRESSURE_RATIO),
+      annotations,
+    },
+    observedModels,
+    modelEvidenceComplete: stats.malformedLines === 0
+      && stats.oversizeLines === 0
+      && !stats.unterminatedTail,
   };
+}
+
+/** Parse one exact rollout using the final complete cumulative usage object. */
+export function parseCodexRollout(
+  runDirectory: string,
+  artifact: RolloutArtifact,
+  policy: MetricsPolicySnapshot,
+): NormalizedSessionMetrics {
+  return parseCodexRolloutWithEvidence(runDirectory, artifact, policy).session;
 }
 
 function dedupeWorkflows(workflows: readonly WorkflowArtifact[]): WorkflowArtifact[] {
@@ -600,6 +627,36 @@ function billableCost(usage: TokenUsage, pricing: PricingSnapshot): number {
     + usage.outputTokens / 1_000_000 * pricing.outputPerMTokens;
 }
 
+function priceableBillableUsage(
+  parsedSessions: readonly ParsedRollout[],
+  pricingModel: string,
+  cachedInputWeight: number,
+): { usage: TokenUsage; incomplete: boolean } {
+  let usage = emptyUsage(cachedInputWeight);
+  let incomplete = false;
+  for (const parsed of parsedSessions) {
+    const { session, observedModels, modelEvidenceComplete } = parsed;
+    if (session.billingClass !== 'billable' || session.usage.rawTokenCount === 0) continue;
+    const scope = taskArmScope(session.scope.taskId, session.scope.arm);
+    const distinctModels = new Set(observedModels);
+    if (!modelEvidenceComplete) {
+      incomplete = true;
+    } else if (observedModels.length === 0) {
+      session.annotations.push(annotation('model-unobserved', scope));
+      incomplete = true;
+    } else if (distinctModels.size > 1) {
+      session.annotations.push(annotation('model-multiple', scope));
+      incomplete = true;
+    } else if (observedModels[0] !== pricingModel) {
+      session.annotations.push(annotation('model-mismatch', scope));
+      incomplete = true;
+    } else {
+      usage = addUsage(usage, session.usage);
+    }
+  }
+  return { usage, incomplete };
+}
+
 /** Normalize an adapter-provided exact artifact index into the public contract. */
 export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMetrics {
   const { index } = options;
@@ -620,14 +677,16 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
     paths.add(path);
   }
   const failures = index.failures.map((failure) => failureObservationSchema.parse(failure));
+  const parsedSessions: ParsedRollout[] = [];
   const sessions: NormalizedSessionMetrics[] = [];
   let pricingUsageIncomplete = false;
   for (const artifact of index.rollouts) {
     try {
-      const session = parseCodexRollout(options.runDirectory, artifact, policy);
-      sessions.push(session);
+      const parsed = parseCodexRolloutWithEvidence(options.runDirectory, artifact, policy);
+      parsedSessions.push(parsed);
+      sessions.push(parsed.session);
       if ((artifact.billingClass === 'billable' || artifact.billingClass === 'unknown')
-        && session.annotations.some((entry) => entry.code === 'rollout-usage-missing')) {
+        && parsed.session.annotations.some((entry) => entry.code === 'rollout-usage-missing')) {
         pricingUsageIncomplete = true;
       }
     } catch {
@@ -643,10 +702,15 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
       }));
     }
   }
-  for (const session of sessions) {
-    if (session.model !== null && session.model !== options.requested.model) {
-      session.annotations.push(annotation('model-mismatch', taskArmScope(session.scope.taskId, session.scope.arm)));
-    }
+  for (const invocation of options.runState?.invocations ?? []) {
+    if (invocation.failure === null) continue;
+    failures.push(failureObservationSchema.parse({
+      code: invocation.failure,
+      scope: { kind: 'run' },
+      phase: null,
+      terminal: true,
+      evidence: invocation.failure === 'agent-timeout' ? 'native' : 'harness',
+    }));
   }
   sessions.sort((left, right) => left.path.localeCompare(right.path));
   const scopedSessionIds = new Set<string>();
@@ -663,6 +727,11 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
     byBillingClass[session.billingClass] = addUsage(byBillingClass[session.billingClass], session.usage);
     total = addUsage(total, session.usage);
   }
+  const pricedBillable = priceableBillableUsage(
+    parsedSessions,
+    options.pricing?.model ?? options.requested.model,
+    policy.cachedInputWeight,
+  );
 
   const effortValues: Record<string, number> = {};
   let unknownEffort = 0;
@@ -705,8 +774,8 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
       currency: 'USD',
       verification: pricing === null
         ? 'unpriced'
-        : unknownUsage > 0 || pricingUsageIncomplete ? 'partial' : 'priced',
-      billableCost: pricing === null ? null : billableCost(byBillingClass.billable, pricing),
+        : unknownUsage > 0 || pricingUsageIncomplete || pricedBillable.incomplete ? 'partial' : 'priced',
+      billableCost: pricing === null ? null : billableCost(pricedBillable.usage, pricing),
     },
     context: {
       highWaterMark: sessions.reduce((peak, session) => Math.max(peak, session.contextHighWaterMark), 0),
@@ -778,7 +847,8 @@ export const METRICS_POLICY_SHA256 = sha256CanonicalJson({
   resetMinDropTokens: LARGE_PROMPT_RESET_MIN_DROP_TOKENS,
   resetRetainedFraction: LARGE_PROMPT_RESET_MAX_RETAINED_RATIO,
   workflowDedupeRule: 'run-id',
-  pricing: 'known-billable-subtotal-partial-on-unpriced-or-incomplete-potentially-billable-usage',
+  invocationFailures: 'adapter-and-artifact-failures-then-run-scoped-terminal-invocation-order',
+  pricing: 'positive-billable-subtotal-with-record-integrity-and-uniform-exact-observed-model-evidence',
   timing: 'detached-wait-subset-of-wall-time',
   timingGroups: 'dedupe-task-projections-with-matching-invocation-arm-phase-timestamps-elapsed',
 });

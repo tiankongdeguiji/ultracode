@@ -21,11 +21,11 @@ export interface SwebenchProInstance {
 }
 
 export interface SwebenchProDatasetSnapshot {
-  schemaVersion: 2;
-  kind: 'ultracode-swebench-pro-dataset-snapshot';
-  identity: 'ScaleAI/SWE-bench_Pro';
+  schemaVersion: 1;
+  kind: 'ultracode-swebench-pro-dataset-descriptor';
+  dataset: 'ScaleAI/SWE-bench_Pro';
+  config: 'default';
   split: 'test';
-  source: string;
   rows: Record<string, unknown>[];
 }
 

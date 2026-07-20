@@ -24,8 +24,11 @@ These controls protect signaling decisions made from worker-writable records, bu
 
 The benchmark harness treats suite runners and task containers as native,
 potentially task-influenced producers, not as score authorities by themselves.
-Host-owned schema-v2 manifests, run state, and verifier receipts live outside
-task workspaces with private modes and symlink-safe writes. A report accepts a
+Host-owned schema-v2 manifests and verifier receipts, plus schema-v3 run-state
+ledger heads and segments, live outside task workspaces with private modes and
+symlink-safe writes. Ledger records are bounded and hash chained; replay
+requires contiguous revisions, indexes, and segment ancestry, and reports bind
+the committed chain root. A report accepts a
 native score only when the exact official-verifier file, SHA-256, scope,
 invocation, role, and record key are bound in the receipt. Repository code can
 still consume compute and modify its task workspace; it cannot turn an agent
@@ -45,6 +48,36 @@ deletes exact nonce-bound runtime homes after their containers are gone, but
 it cannot prevent malicious task code from reading or exfiltrating a live
 credential. Operators must use disposable, narrowly scoped benchmark accounts
 and independently restricted egress.
+
+SWE-bench Pro bounds both Docker paths with a frozen, manifest-bound policy.
+Session containers use `no-new-privileges`, a 1,024-process limit, manifest
+CPU/memory limits, `cap-drop ALL`, and only `CHOWN`, `DAC_OVERRIDE`, `SETGID`,
+`SETPCAP`, and `SETUID` for explicit uid-0 immutable setup across base-image
+ownership modes. `SETPCAP` is setup-only and permits `setpriv` to drop the
+bounding set. Codex, detached task processes, and the
+post-task Git-capture helper run as the task uid after the bounding,
+inheritable, and ambient capability sets are cleared. Official evaluator
+containers use the same process, privilege, and resource bounds with no added
+capabilities. The patched evaluator rejects malformed or weakened HostConfig
+policy before container creation. A Docker engine that cannot honor these
+options, or any evaluator task that fails without a verdict, makes the native
+evaluator process fail; partial booleans remain separately attributable and the
+harness does not retry with broader privileges.
+
+Container policy, its evaluator translator, the immutable Git helper, and all
+launch paths are native manifest assets and contribute to session/evaluator
+policy hashes. Offline tests compare exact CLI and Docker SDK projections;
+opt-in tests inspect a live daemon's resulting HostConfig using an explicitly
+operator-supplied local image. This does not make repository code trusted: it
+still controls the task workload, can consume resources within those bounds,
+and shares the live session credential domain described above.
+
+SWE-bench Pro acquisition similarly treats the mutable dataset service as
+untrusted input. A reviewed digest covers dataset, config, split, and complete
+codepoint-sorted rows. Fetch verifies before atomic cache replacement, every
+load re-verifies, and mismatches preserve prior cache bytes. Renewing the pin
+requires two independent captures and reviewer reproduction; the manifest
+records the verified canonical digest rather than cache serialization bytes.
 
 Native host processes also inherit a high-entropy lifecycle token plus a
 filesystem-backed run scope. The token and direct-child process identity are

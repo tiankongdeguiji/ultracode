@@ -140,7 +140,24 @@ export async function runBenchCli(
     run(options: unknown, context: CommandContext): Promise<void>;
   }>)[route.command]!;
   const options = spec.parse(route.argv);
-  await spec.run(options, context);
+  try {
+    await spec.run(options, context);
+  } catch (error) {
+    const cleanup = registry.get(route.suite).cleanup;
+    if (cleanup !== undefined) {
+      try {
+        await cleanup();
+      } catch (cleanupError) {
+        const commandMessage = error instanceof Error ? error.message : String(error);
+        const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        throw new AggregateError(
+          [error, cleanupError],
+          `${commandMessage}; suite runtime cleanup failed: ${cleanupMessage}`,
+        );
+      }
+    }
+    throw error;
+  }
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;

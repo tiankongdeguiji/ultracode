@@ -155,6 +155,43 @@ describe('unified benchmark CLI routing', () => {
     expect(dispatched).toBe(false);
   });
 
+  it('runs a selected suite cleanup hook when command dispatch rejects', async () => {
+    const calls: string[] = [];
+    const adapter = {
+      cleanup: async () => { calls.push('cleanup'); },
+      commands: {
+        run: {
+          parse: () => ({}),
+          run: async () => {
+            calls.push('run');
+            throw new Error('command failed');
+          },
+        },
+      },
+    };
+    const registry = { get: () => adapter } as unknown as SuiteRegistry;
+    await expect(runBenchCli([
+      '--suite', 'featurebench', 'run', '--run-id', 'trial1',
+    ], registry)).rejects.toThrow('command failed');
+    expect(calls).toEqual(['run', 'cleanup']);
+  });
+
+  it('reports both a command failure and a failed suite cleanup retry', async () => {
+    const adapter = {
+      cleanup: async () => { throw new Error('cleanup failed'); },
+      commands: {
+        run: {
+          parse: () => ({}),
+          run: async () => { throw new Error('command failed'); },
+        },
+      },
+    };
+    const registry = { get: () => adapter } as unknown as SuiteRegistry;
+    await expect(runBenchCli([
+      '--suite', 'featurebench', 'run', '--run-id', 'trial1',
+    ], registry)).rejects.toThrow('command failed; suite runtime cleanup failed: cleanup failed');
+  });
+
   it('advertises only the common suite-scoped result layout', () => {
     expect(BENCH_USAGE).toContain('bench/results/<suite>/<runId>/manifest.json');
     expect(BENCH_USAGE).not.toMatch(/external|run\.json/);

@@ -10,25 +10,47 @@ import {
   validateTaskId,
   writePrivateJsonAtomic,
 } from '../../shared/paths.js';
+import { sha256CanonicalJson } from '../../shared/provenance.js';
 import { instancesFile, suiteCacheDir, type SwebenchProConfig } from './config.js';
 import type { SwebenchProDatasetSnapshot, SwebenchProInstance } from './types.js';
 
 export const SWE_BENCH_PRO_DATASET = 'ScaleAI/SWE-bench_Pro';
+export const SWE_BENCH_PRO_CONFIG = 'default';
 export const SWE_BENCH_PRO_SPLIT = 'test';
 const DATASET_SOURCE = 'https://datasets-server.huggingface.co/rows';
 const PAGE_LENGTH = 100;
 const RETRY_DELAYS_MS = [1_000, 4_000, 16_000];
 
 const snapshotSchema = z.strictObject({
-  schemaVersion: z.literal(2),
-  kind: z.literal('ultracode-swebench-pro-dataset-snapshot'),
-  identity: z.literal(SWE_BENCH_PRO_DATASET),
+  schemaVersion: z.literal(1),
+  kind: z.literal('ultracode-swebench-pro-dataset-descriptor'),
+  dataset: z.literal(SWE_BENCH_PRO_DATASET),
+  config: z.literal(SWE_BENCH_PRO_CONFIG),
   split: z.literal(SWE_BENCH_PRO_SPLIT),
-  source: z.literal(DATASET_SOURCE),
   rows: z.array(z.record(z.string(), z.unknown())).min(1),
 });
 
-interface HfRowsPage {
+const datasetPinSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  kind: z.literal('ultracode-swebench-pro-dataset-pin'),
+  dataset: z.literal(SWE_BENCH_PRO_DATASET),
+  config: z.literal(SWE_BENCH_PRO_CONFIG),
+  split: z.literal(SWE_BENCH_PRO_SPLIT),
+  rowCount: z.number().int().positive(),
+  descriptorSha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
+export interface SwebenchProDatasetPin {
+  schemaVersion: 1;
+  kind: 'ultracode-swebench-pro-dataset-pin';
+  dataset: typeof SWE_BENCH_PRO_DATASET;
+  config: typeof SWE_BENCH_PRO_CONFIG;
+  split: typeof SWE_BENCH_PRO_SPLIT;
+  rowCount: number;
+  descriptorSha256: string;
+}
+
+export interface HfRowsPage {
   rows: { row: Record<string, unknown> }[];
   num_rows_total: number;
 }
@@ -80,7 +102,7 @@ export function instanceFromRow(row: Record<string, unknown>): SwebenchProInstan
 async function fetchPage(offset: number): Promise<HfRowsPage> {
   const query = new URLSearchParams({
     dataset: SWE_BENCH_PRO_DATASET,
-    config: 'default',
+    config: SWE_BENCH_PRO_CONFIG,
     split: SWE_BENCH_PRO_SPLIT,
     offset: String(offset),
     length: String(PAGE_LENGTH),
@@ -103,11 +125,87 @@ async function fetchPage(offset: number): Promise<HfRowsPage> {
   throw new Error(`failed to fetch SWE-bench Pro rows at offset ${offset}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
-export async function fetchInstances(roots: BenchPathRoots): Promise<number> {
+function byInstanceId(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): number {
+  const leftId = instanceFromRow(left).instanceId;
+  const rightId = instanceFromRow(right).instanceId;
+  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+}
+
+/** Build the only hashable dataset representation, with codepoint-sorted full rows. */
+export function canonicalDatasetDescriptor(
+  rows: readonly Record<string, unknown>[],
+): SwebenchProDatasetSnapshot {
+  const sorted = rows.map((row) => {
+    instanceFromRow(row);
+    return structuredClone(row);
+  }).sort(byInstanceId);
+  const taskIds = sorted.map((row) => instanceFromRow(row).instanceId);
+  if (new Set(taskIds).size !== taskIds.length) {
+    throw new Error('SWE-bench Pro dataset descriptor contains duplicate task IDs');
+  }
+  return snapshotSchema.parse({
+    schemaVersion: 1,
+    kind: 'ultracode-swebench-pro-dataset-descriptor',
+    dataset: SWE_BENCH_PRO_DATASET,
+    config: SWE_BENCH_PRO_CONFIG,
+    split: SWE_BENCH_PRO_SPLIT,
+    rows: sorted,
+  }) as SwebenchProDatasetSnapshot;
+}
+
+export function loadDatasetPin(roots: BenchPathRoots): SwebenchProDatasetPin {
+  return datasetPinSchema.parse(JSON.parse(readRegularFileWithinRoot(
+    roots.benchRoot,
+    'suites/swebench-pro/dataset-pin.json',
+  ).toString('utf8'))) as SwebenchProDatasetPin;
+}
+
+/** Verify row count and canonical digest against the reviewed repository pin. */
+export function verifiedDatasetDescriptor(
+  roots: BenchPathRoots,
+  value: unknown,
+): SwebenchProDatasetSnapshot {
+  const parsed = snapshotSchema.parse(value) as SwebenchProDatasetSnapshot;
+  const descriptor = canonicalDatasetDescriptor(parsed.rows);
+  const observedIds = parsed.rows.map((row) => instanceFromRow(row).instanceId);
+  const canonicalIds = descriptor.rows.map((row) => instanceFromRow(row).instanceId);
+  if (observedIds.some((taskId, index) => taskId !== canonicalIds[index])) {
+    throw new Error('SWE-bench Pro dataset descriptor rows are not in canonical task-id order');
+  }
+  const pin = loadDatasetPin(roots);
+  const digest = sha256CanonicalJson(descriptor);
+  if (descriptor.rows.length !== pin.rowCount || digest !== pin.descriptorSha256) {
+    throw new Error(
+      `SWE-bench Pro dataset does not match the audited pin: expected ${pin.rowCount} rows at ${pin.descriptorSha256}, got ${descriptor.rows.length} at ${digest}`,
+    );
+  }
+  return descriptor;
+}
+
+export function datasetDescriptorSha256(
+  roots: BenchPathRoots,
+  snapshot: SwebenchProDatasetSnapshot,
+): string {
+  return sha256CanonicalJson(verifiedDatasetDescriptor(roots, snapshot));
+}
+
+export type DatasetPageFetcher = (offset: number) => Promise<HfRowsPage>;
+
+export async function fetchInstances(
+  roots: BenchPathRoots,
+  pageFetcher: DatasetPageFetcher = fetchPage,
+): Promise<number> {
+  const pin = loadDatasetPin(roots);
   const rows: Record<string, unknown>[] = [];
   let total: number | null = null;
   while (total === null || rows.length < total) {
-    const page = await fetchPage(rows.length);
+    const page = await pageFetcher(rows.length);
+    if (page.num_rows_total !== pin.rowCount) {
+      throw new Error(`datasets-server row count does not match the audited pin: expected ${pin.rowCount}, got ${page.num_rows_total}`);
+    }
     if (total !== null && page.num_rows_total !== total) throw new Error('datasets-server total changed during snapshot fetch');
     total = page.num_rows_total;
     if (page.rows.length === 0 && rows.length < total) throw new Error('datasets-server returned an incomplete snapshot');
@@ -118,30 +216,21 @@ export async function fetchInstances(roots: BenchPathRoots): Promise<number> {
     }
   }
   if (rows.length !== total) throw new Error('datasets-server snapshot row count is incomplete');
-  const taskIds = rows.map((row) => instanceFromRow(row).instanceId);
-  if (new Set(taskIds).size !== taskIds.length) throw new Error('datasets-server snapshot contains duplicate task IDs');
+  const snapshot = verifiedDatasetDescriptor(roots, canonicalDatasetDescriptor(rows));
   const directory = ensureRealDirectoryWithin(roots.cacheRoot, suiteCacheDir(roots));
-  const snapshot: SwebenchProDatasetSnapshot = {
-    schemaVersion: 2,
-    kind: 'ultracode-swebench-pro-dataset-snapshot',
-    identity: SWE_BENCH_PRO_DATASET,
-    split: SWE_BENCH_PRO_SPLIT,
-    source: DATASET_SOURCE,
-    rows,
-  };
-  writePrivateJsonAtomic(directory, instancesFile(roots), snapshotSchema.parse(snapshot));
-  return rows.length;
+  writePrivateJsonAtomic(directory, instancesFile(roots), snapshot);
+  return snapshot.rows.length;
 }
 
 export function loadDatasetSnapshot(roots: BenchPathRoots): SwebenchProDatasetSnapshot {
   const file = instancesFile(roots);
   if (!existsSync(file)) {
-    throw new Error(`SWE-bench Pro v2 dataset snapshot is missing; run npm run bench -- --suite swebench-pro fetch`);
+    throw new Error(`SWE-bench Pro audited dataset descriptor is missing; run npm run bench -- --suite swebench-pro fetch`);
   }
-  return snapshotSchema.parse(JSON.parse(readRegularFileWithinRoot(
+  return verifiedDatasetDescriptor(roots, JSON.parse(readRegularFileWithinRoot(
     suiteCacheDir(roots),
     file.slice(suiteCacheDir(roots).length + 1),
-  ).toString('utf8'))) as SwebenchProDatasetSnapshot;
+  ).toString('utf8')));
 }
 
 function mulberry32(seed: number): () => number {

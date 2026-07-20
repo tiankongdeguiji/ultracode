@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { BenchPathRoots } from '../../shared/contracts.js';
 import { runBenchProcess } from '../../shared/process.js';
 import type { DockerImageAttestation, SwebenchProInstance } from './types.js';
+import { ownershipUnsafe, ownershipUnsafeAggregate } from './cleanup.js';
 
 export const BASE_IMAGE_REPOSITORY = 'jefzda/sweap-images';
 const PULL_BACKOFF_MS = [10_000, 30_000, 90_000];
@@ -140,16 +141,35 @@ export async function removeTaskImages(
   attestations: readonly DockerImageAttestation[],
   docker: DockerExecutor = defaultDockerExecutor,
 ): Promise<number> {
-  let removed = 0;
-  const exact = new Map(attestations.map((entry) => [entry.overlayLocalId, entry]));
-  for (const attestation of exact.values()) {
-    await reattestTaskImage(attestation, docker);
-    try {
-      await docker(['image', 'rm', attestation.overlayLocalId]);
+  try {
+    let removed = 0;
+    const exact = new Map(attestations.map((entry) => [entry.overlayLocalId, entry]));
+    const localImageIds = async (): Promise<Set<string>> => {
+      const ids = (await docker(['image', 'ls', '-q', '--no-trunc']))
+        .split('\n').map((entry) => entry.trim()).filter(Boolean);
+      if (ids.some((id) => !/^sha256:[a-f0-9]{64}$/.test(id))) {
+        throw new Error('Docker returned an invalid local image id');
+      }
+      return new Set(ids);
+    };
+    for (const attestation of exact.values()) {
+      await reattestTaskImage(attestation, docker);
+      let removalFailure: unknown;
+      try {
+        await docker(['image', 'rm', attestation.overlayLocalId]);
+      } catch (error) {
+        removalFailure = error;
+      }
+      if ((await localImageIds()).has(attestation.overlayLocalId)) {
+        throw ownershipUnsafeAggregate('overlay image absence was not proven after removal', [
+          removalFailure,
+          new Error(`owned overlay image remains present: ${attestation.overlayLocalId}`),
+        ]);
+      }
       removed += 1;
-    } catch {
-      // An in-use image remains owned and can be retried by an exact run clean.
     }
+    return removed;
+  } catch (error) {
+    throw ownershipUnsafe('unsafe SWE-bench Pro overlay image cleanup', error);
   }
-  return removed;
 }

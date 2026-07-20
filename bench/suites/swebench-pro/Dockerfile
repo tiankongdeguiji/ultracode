@@ -15,3 +15,4 @@ COPY codex-home-b/  /opt/bench/codex-home-b/
 COPY agents-home-b/ /opt/bench/agents-home-b/
 COPY entrypoint.sh  /opt/bench/entrypoint.sh
 COPY sanitize-git.sh /opt/bench/sanitize-git.sh
+COPY capture-git.sh /opt/bench/capture-git.sh

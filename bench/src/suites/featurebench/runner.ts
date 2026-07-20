@@ -287,6 +287,7 @@ function currentControlPlaneHashes(roots: BenchPathRoots): FeatureBenchManifest[
       'src/shared/prompt.ts',
       'src/shared/provenance.ts',
       'src/shared/report.ts',
+      'src/shared/run-state-ledger.ts',
       'src/shared/run-state.ts',
       'src/shared/toolchain.ts',
       'src/shared/verifier.ts',
@@ -313,6 +314,18 @@ function promptPolicySha256(): string {
   });
 }
 
+function featureBenchNativeAssets(roots: BenchPathRoots): FeatureBenchManifest['provenance']['nativeAssets'] {
+  return [
+    'suites/featurebench/.gitattributes',
+    'suites/featurebench/codex-chatgpt.patch',
+    'suites/featurebench/dataset-pin.json',
+    relative(roots.benchRoot, ARM_B_PREFIX_PATH).split(sep).join('/'),
+  ].map((path) => ({
+    path: validateRelativeArtifactPath(path),
+    sha256: sha256File(join(roots.benchRoot, ...path.split('/'))),
+  }));
+}
+
 function buildManifest(
   roots: BenchPathRoots,
   runId: string,
@@ -327,11 +340,7 @@ function buildManifest(
     if (!task) throw new Error(`prepared FeatureBench task is missing: ${taskId}`);
     return task;
   });
-  const assets = [
-    'suites/featurebench/.gitattributes',
-    'suites/featurebench/codex-chatgpt.patch',
-    relative(roots.benchRoot, ARM_B_PREFIX_PATH).split(sep).join('/'),
-  ].map((path) => ({ path: validateRelativeArtifactPath(path), sha256: sha256File(join(roots.benchRoot, ...path.split('/'))) }));
+  const assets = featureBenchNativeAssets(roots);
   return {
     schemaVersion: 2,
     kind: 'ultracode-benchmark-run',
@@ -639,46 +648,52 @@ export async function cleanupFeatureBenchContainers(
   executor: FeatureBenchExecutor = nativeExecute,
 ): Promise<number> {
   validateRunId(runId);
+  taskIds.forEach(validateFeatureBenchTaskId);
+  const taskMembership = new Set(taskIds);
+  if (taskMembership.size !== taskIds.length) {
+    throw new Error('FeatureBench cleanup task membership contains duplicates');
+  }
   const labels = ownershipLabels(runId, arm);
-  const candidates = new Map<string, { taskId: string; purpose: 'prep' | 'session' }>();
-  for (const taskId of taskIds) {
-    for (const purpose of ['prep', 'session'] as const) {
-      const expected = {
-        ...labels,
-        'ultracode.benchmark.task': taskId,
-        'ultracode.benchmark.purpose': purpose,
-      };
-      const filters = Object.entries(expected).flatMap(([name, value]) => ['--filter', `label=${name}=${value}`]);
-      const listed = await executor('docker', ['ps', '--all', '--quiet', ...filters], {
-        env: allowlistedEnvironment(process.env),
-      });
-      for (const id of listed.stdout.split(/\s+/u).filter(Boolean)) {
-        if (!/^[a-f0-9]{12,64}$/.test(id)) throw new Error('Docker returned an invalid owned container id');
-        const prior = candidates.get(id);
-        if (prior !== undefined && (prior.taskId !== taskId || prior.purpose !== purpose)) {
-          throw new Error(`Docker returned ambiguous ownership for FeatureBench container ${id}`);
-        }
-        candidates.set(id, { taskId, purpose });
-      }
+  const filters = Object.entries(labels).flatMap(([name, value]) => ['--filter', `label=${name}=${value}`]);
+  const listed = await executor('docker', ['ps', '--all', '--quiet', ...filters], {
+    env: allowlistedEnvironment(process.env),
+  });
+  const candidates = listed.stdout.split(/\s+/u).filter(Boolean);
+  if (candidates.some((id) => !/^[a-f0-9]{12,64}$/.test(id))) {
+    throw new Error('Docker returned an invalid owned container id');
+  }
+  const orderedCandidates = [...candidates].sort((left, right) => left.length - right.length || left.localeCompare(right));
+  for (let index = 0; index < orderedCandidates.length; index += 1) {
+    const prefix = orderedCandidates[index]!;
+    if (orderedCandidates.some((candidate, candidateIndex) => candidateIndex !== index && candidate.startsWith(prefix))) {
+      throw new Error(`Docker returned duplicate or ambiguous FeatureBench container prefix ${prefix}`);
     }
   }
-  let removed = 0;
-  for (const [id, expected] of candidates) {
-    const inspected = oneRow<DockerContainerInspect>((await executor('docker', ['inspect', id], {
+
+  const verified = new Set<string>();
+  for (const candidate of candidates) {
+    const inspected = oneRow<DockerContainerInspect>((await executor('docker', ['inspect', candidate], {
       env: allowlistedEnvironment(process.env),
     })).stdout, 'owned FeatureBench container');
     const observed = inspected.Config?.Labels !== null && typeof inspected.Config?.Labels === 'object'
       && !Array.isArray(inspected.Config.Labels) ? inspected.Config.Labels as Record<string, unknown> : {};
-    if (typeof inspected.Id !== 'string' || !/^[a-f0-9]{64}$/.test(inspected.Id) || !inspected.Id.startsWith(id)
+    if (typeof inspected.Id !== 'string' || !/^[a-f0-9]{64}$/.test(inspected.Id) || !inspected.Id.startsWith(candidate)
       || Object.entries(labels).some(([name, value]) => observed[name] !== value)
-      || observed['ultracode.benchmark.task'] !== expected.taskId
-      || observed['ultracode.benchmark.purpose'] !== expected.purpose) {
-      throw new Error(`refusing to remove unowned FeatureBench container ${id}`);
+      || typeof observed['ultracode.benchmark.task'] !== 'string'
+      || !taskMembership.has(observed['ultracode.benchmark.task'])
+      || (observed['ultracode.benchmark.purpose'] !== 'prep'
+        && observed['ultracode.benchmark.purpose'] !== 'session')) {
+      throw new Error(`refusing to remove unowned FeatureBench container ${candidate}`);
     }
-    await executor('docker', ['rm', '--force', id], { env: allowlistedEnvironment(process.env), stream: true });
-    removed += 1;
+    if (verified.has(inspected.Id)) {
+      throw new Error(`Docker returned ambiguous ownership for FeatureBench container ${inspected.Id}`);
+    }
+    verified.add(inspected.Id);
   }
-  return removed;
+  for (const id of verified) {
+    await executor('docker', ['rm', '--force', id], { env: allowlistedEnvironment(process.env), stream: true });
+  }
+  return verified.size;
 }
 
 async function attestRuntime(
@@ -727,6 +742,7 @@ function assertProvenance(
     || prepared.datasetMapSha256 !== manifest.suiteConfig.policies.datasetMapSha256
     || runtime.endpointPolicySha256 !== manifest.suiteConfig.restrictedNetworkPolicySha256
     || canonicalJson(control) !== canonicalJson(manifest.provenance.controlPlane)
+    || canonicalJson(featureBenchNativeAssets(roots)) !== canonicalJson(manifest.provenance.nativeAssets)
     || promptPolicySha256() !== manifest.suiteConfig.policies.promptSha256) {
     throw new Error('FeatureBench execution provenance drifted after manifest creation');
   }
@@ -906,6 +922,7 @@ async function loadRunStores(
     const manifest = loadBenchRunManifest(roots, 'featurebench', runId) as FeatureBenchManifest;
     const manifestSha256 = sha256File(manifestFile(roots, 'featurebench', runId));
     const state = new BenchRunStateStore(roots, 'featurebench', runId, manifestSha256, lease);
+    state.migrateLegacyIfNeeded();
     await state.recoverPendingLifecycleProcesses(runDir(roots, 'featurebench', runId));
     if (state.load().invocations.some((invocation) => invocation.endedAt === null)) {
       await cleanupFeatureBenchContainers(

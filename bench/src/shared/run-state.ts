@@ -9,15 +9,22 @@ import { FAILURE_CODES, type BenchPathRoots, type BenchSuite, type FailureCode }
 import type { BenchLockHandle } from './locks.js';
 import { sha256Schema } from './provenance.js';
 import {
-  readPrivateJson,
-  runDir,
   runLeaseFile,
   runStateFile,
   validateRelativeArtifactPath,
   validateRunId,
   validateTaskId,
-  writePrivateJsonAtomic,
 } from './paths.js';
+import {
+  appendRunStateRevision,
+  initializeRunStateLedger,
+  loadRunStateMaterialization,
+  migrateLegacyRunStateLedger,
+  runStateCommitFileSha256,
+  runStateLedgerSegmentsUnchanged,
+  type RunStateLedgerOptions,
+  type RunStateMaterialization,
+} from './run-state-ledger.js';
 
 const commandSchema = z.enum(['fetch', 'prep', 'run', 'eval', 'report', 'status', 'clean']);
 const failureSchema = z.enum(FAILURE_CODES);
@@ -180,9 +187,38 @@ export function parseBenchRunState(value: unknown): BenchRunState {
   return benchRunStateSchema.parse(value);
 }
 
+export interface BenchRunStateEvidence {
+  state: BenchRunState;
+  stateFileSha256: string;
+  ledgerRootSha256: string | null;
+}
+
+/** Read-only materialization used by reports and legacy-v2 inspection. */
+export function loadBenchRunStateEvidence(
+  roots: BenchPathRoots,
+  suite: BenchSuite,
+  runId: string,
+  manifestSha256: string,
+): BenchRunStateEvidence {
+  const materialized = loadRunStateMaterialization(
+    { roots, suite, runId, manifestSha256 },
+    parseBenchRunState,
+  );
+  const state = materialized.state;
+  if (state.suite !== suite || state.runId !== validateRunId(runId) || state.manifestSha256 !== manifestSha256) {
+    throw new Error('run-state identity does not match its immutable manifest');
+  }
+  return {
+    state: structuredClone(state),
+    stateFileSha256: materialized.stateFileSha256,
+    ledgerRootSha256: materialized.ledgerRootSha256,
+  };
+}
+
 /** Serialized in-process mutation plus disk revision checks under the lifecycle lease. */
 export class BenchRunStateStore {
   private queue: Promise<void> = Promise.resolve();
+  private materialized: RunStateMaterialization | null = null;
 
   constructor(
     private readonly roots: BenchPathRoots,
@@ -190,6 +226,7 @@ export class BenchRunStateStore {
     private readonly runId: string,
     private readonly manifestSha256: string,
     private readonly lease: BenchLockHandle,
+    private readonly ledgerOptions: RunStateLedgerOptions = {},
   ) {
     if (lease.path !== runLeaseFile(roots, suite, runId)) {
       throw new Error('run-state store requires the exact run lifecycle lease');
@@ -198,13 +235,9 @@ export class BenchRunStateStore {
 
   load(): BenchRunState {
     this.lease.assertHeld();
-    const directory = runDir(this.roots, this.suite, this.runId);
-    const state = parseBenchRunState(readPrivateJson(
-      directory,
-      runStateFile(this.roots, this.suite, this.runId),
-    ));
+    const state = this.currentMaterialization().state;
     this.assertIdentity(state);
-    return state;
+    return structuredClone(state);
   }
 
   initialize(): BenchRunState {
@@ -212,8 +245,36 @@ export class BenchRunStateStore {
     const path = runStateFile(this.roots, this.suite, this.runId);
     if (existsSync(path)) throw new Error('run state already exists');
     const state = createBenchRunState(this.suite, this.runId, this.manifestSha256);
-    writePrivateJsonAtomic(runDir(this.roots, this.suite, this.runId), path, state);
-    return state;
+    this.materialized = initializeRunStateLedger(this.identity(), state, this.ledgerOptions);
+    return structuredClone(state);
+  }
+
+  /** Explicitly convert a loaded legacy v2 monolith before permitting writes. */
+  migrateLegacy(): BenchRunState {
+    this.lease.assertHeld();
+    const current = this.currentMaterialization();
+    if (current.head !== null) throw new Error('run state already uses the append-only ledger');
+    this.assertIdentity(current.state);
+    this.materialized = migrateLegacyRunStateLedger(
+      this.identity(),
+      current.state,
+      this.ledgerOptions,
+    );
+    return structuredClone(current.state);
+  }
+
+  /** Upgrade legacy v2 storage before any recovery side effects or command write. */
+  migrateLegacyIfNeeded(): boolean {
+    this.lease.assertHeld();
+    const current = this.currentMaterialization();
+    if (current.head !== null) return false;
+    this.assertIdentity(current.state);
+    this.materialized = migrateLegacyRunStateLedger(
+      this.identity(),
+      current.state,
+      this.ledgerOptions,
+    );
+    return true;
   }
 
   async update(
@@ -232,8 +293,7 @@ export class BenchRunStateStore {
         const changed = mutate(current);
         result = parseBenchRunState({ ...changed, revision: current.revision + 1 });
         this.assertIdentity(result);
-        const directory = runDir(this.roots, this.suite, this.runId);
-        writePrivateJsonAtomic(directory, runStateFile(this.roots, this.suite, this.runId), result);
+        this.commit(result);
       } catch (error) {
         failure = error;
       }
@@ -255,11 +315,7 @@ export class BenchRunStateStore {
         const current = this.load();
         result = parseBenchRunState({ ...mutate(current), revision: current.revision + 1 });
         this.assertIdentity(result);
-        writePrivateJsonAtomic(
-          runDir(this.roots, this.suite, this.runId),
-          runStateFile(this.roots, this.suite, this.runId),
-          result,
-        );
+        this.commit(result);
       } catch (error) {
         failure = error;
       }
@@ -277,11 +333,7 @@ export class BenchRunStateStore {
     const current = this.load();
     const result = parseBenchRunState({ ...mutate(current), revision: current.revision + 1 });
     this.assertIdentity(result);
-    writePrivateJsonAtomic(
-      runDir(this.roots, this.suite, this.runId),
-      runStateFile(this.roots, this.suite, this.runId),
-      result,
-    );
+    this.commit(result);
     return result;
   }
 
@@ -451,6 +503,46 @@ export class BenchRunStateStore {
       || state.manifestSha256 !== this.manifestSha256
     ) {
       throw new Error('run-state identity does not match its immutable manifest');
+    }
+  }
+
+  private identity() {
+    return {
+      roots: this.roots,
+      suite: this.suite,
+      runId: this.runId,
+      manifestSha256: this.manifestSha256,
+    };
+  }
+
+  private currentMaterialization(): RunStateMaterialization {
+    if (this.materialized !== null) {
+      const commitSha256 = runStateCommitFileSha256(this.identity(), this.materialized.head !== null);
+      if (commitSha256 !== this.materialized.stateFileSha256
+        || !runStateLedgerSegmentsUnchanged(this.identity(), this.materialized)) {
+        this.materialized = null;
+      }
+    }
+    if (this.materialized === null) {
+      this.materialized = loadRunStateMaterialization(this.identity(), parseBenchRunState);
+      this.assertIdentity(this.materialized.state);
+    }
+    return this.materialized;
+  }
+
+  private commit(next: BenchRunState): void {
+    const current = this.materialized ?? this.currentMaterialization();
+    try {
+      this.materialized = appendRunStateRevision(
+        this.identity(),
+        current,
+        next,
+        parseBenchRunState,
+        this.ledgerOptions,
+      );
+    } catch (error) {
+      this.materialized = null;
+      throw error;
     }
   }
 }

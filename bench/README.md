@@ -44,7 +44,8 @@ Every run uses the same persistent envelope:
 ```text
 bench/results/<suite>/<runId>/
   manifest.json
-  run-state.json
+  run-state.json                 # small atomic ledger head
+  run-state-ledger/              # private append-only JSONL segments
   verifier-receipt.json
   report.json
   report.md
@@ -58,12 +59,40 @@ scope, invocation, role, and native record key are stored in the host-owned
 receipt. Missing or malformed verifier evidence remains unverified; agent
 success and file absence never become a score.
 
+Run state still materializes through the public schema-v2 `BenchRunState`
+contract, but new runs persist it as a schema-v3 head plus bounded,
+hash-chained records. Each state transition appends to the active segment,
+fsyncs it, and then atomically publishes and fsyncs the constant-size head;
+lifecycle token reservation is therefore durable before spawn, and the child
+PID/start identity is durable immediately after spawn. Segments rotate at 8
+MiB and become immutable. Replay streams the complete contiguous chain,
+rejecting gaps, duplicate indexes, hash drift, unsafe files, and malformed
+interior records; only one uncommitted/torn final record is ignored. This keeps
+serialized growth linear and removes the former 64 MiB whole-state limit.
+
+Reports bind both the exact `run-state.json` head bytes and its sealed ledger
+root. Legacy schema-v2 monoliths remain available to read-only consumers. Each
+suite command migrates a legacy run under its lifecycle lease before process
+recovery or any other external side effect; the migration uses one fixed,
+crash-recoverable staging directory so repeated hard failures cannot accumulate
+full-state copies.
+
 Suite preparation publishes immutable content-addressed directories. In
 particular, SWE-bench Pro records a complete transitive, artifact-hashed Python
 lock, rebuilds the evaluator environment under hash enforcement, and binds the
 patched evaluator tree, environment tree, Python executable, and resolved lock
 to the prepared identity. A later `prep` changes only the current pointer used
 by fresh runs; resume loads the exact identity frozen by its manifest.
+
+SWE-bench Pro additionally verifies a reviewed canonical full-row dataset
+digest before publishing or loading its cache. Its session and official
+evaluator containers share one frozen process/capability policy. See
+[SWE-bench Pro provenance and containment](docs/swebench-pro.md) for the
+dataset pin-renewal audit and opt-in Docker parity procedure.
+
+FeatureBench likewise rejects preparation unless the complete task/image map
+matches its reviewed 100-task inventory digest; the source parquet digest and
+inventory digest live in `suites/featurebench/dataset-pin.json`.
 
 ## Typical flows
 
@@ -135,7 +164,13 @@ mock and billable backends, token categories, cost, context pressure,
 compactions, timings, failures, and annotations distinct. With a pricing
 snapshot, billable or unknown-class rollouts with unreadable or missing usage
 produce a partial known subtotal; missing usage from non-billable rollouts does
-not affect price verification. Optional timing groups identify per-task
+not affect price verification. All observed tokens remain in usage totals, but
+cost includes only positive billable sessions whose native model observations
+are present, uniform, exactly equal to the pricing model, and come from a
+rollout with no malformed, oversized, or unterminated record. Missing,
+mismatched, multi-model, or record-integrity evidence makes the known subtotal
+partial; model aliases are never inferred. Valid zero-usage and non-billable
+sessions are neutral to model verification. Optional timing groups identify per-task
 projections of one physical batch process so summed-task, native-runner, and
 verifier time count it once; members must have unique tasks and matching
 physical timing identity.

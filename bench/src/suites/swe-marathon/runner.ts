@@ -158,6 +158,7 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SweMarathonManifest['
       'src/shared/prompt.ts',
       'src/shared/provenance.ts',
       'src/shared/report.ts',
+      'src/shared/run-state-ledger.ts',
       'src/shared/run-state.ts',
       'src/shared/toolchain.ts',
       'src/shared/verifier.ts',
@@ -407,6 +408,7 @@ async function loadRunStores(
     const manifest = loadBenchRunManifest(roots, 'swe-marathon', runId) as SweMarathonManifest;
     const manifestSha256 = sha256File(manifestFile(roots, 'swe-marathon', runId));
     const state = new BenchRunStateStore(roots, 'swe-marathon', runId, manifestSha256, lease);
+    state.migrateLegacyIfNeeded();
     await state.recoverPendingLifecycleProcesses(runDir(roots, 'swe-marathon', runId));
     if (state.load().invocations.some((invocation) => invocation.endedAt === null)) {
       for (const taskId of manifest.experiment.taskIds) {

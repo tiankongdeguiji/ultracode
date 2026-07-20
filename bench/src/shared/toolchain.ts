@@ -22,6 +22,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -258,15 +259,22 @@ async function downloadCached(
   return dest;
 }
 
-async function resolveCodexBin(codexBin: string, cwd: string): Promise<string> {
+/** Resolve an explicit Codex path or discover the login-shell installation. */
+export async function resolveCodexBin(codexBin: string, cwd: string): Promise<string> {
   if (codexBin !== 'auto') return resolve(cwd, codexBin);
+  const marker = `__ULTRACODE_CODEX_PATH_${randomBytes(16).toString('hex')}__`;
   // bash -lc: codex is commonly installed via nvm/npm prefixes that only login
-  // shells put on PATH; readlink -f follows the npm bin symlink to the binary.
-  const out = await toolchainCommand('bash', ['-lc', 'readlink -f "$(command -v codex)"'], cwd);
-  if (!out) {
-    throw new Error('could not resolve a codex binary (`command -v codex` came up empty) — set toolchain.codexBin to an explicit path');
+  // shells put on PATH. The marker ignores profile banners and other stdout.
+  const out = await toolchainCommand(
+    'bash',
+    ['-lc', `codex_path="$(command -v codex)" || codex_path=''; printf '\\n${marker}%s\\n' "$codex_path"`],
+    cwd,
+  );
+  const marked = out.split('\n').filter((line) => line.startsWith(marker));
+  if (marked.length !== 1 || marked[0]!.slice(marker.length).length === 0) {
+    throw new Error('could not resolve a codex binary (`command -v codex` came up empty) — set toolchain.codexBinary to an explicit path');
   }
-  return out;
+  return realpathSync(marked[0]!.slice(marker.length));
 }
 
 function readStableExecutable(path: string): Buffer {
@@ -310,7 +318,7 @@ async function buildReleaseStage(roots: BenchPathRoots): Promise<{ directory: st
 /**
  * Rebuild the toolchain dir from scratch (cached node tarballs are reused):
  * node runtime, codex binary, ultracode release stage, per-arm codex homes,
- * entrypoint.sh, and a manifest.json recording versions + hashes.
+ * Pro session helpers, and a manifest.json recording versions + hashes.
  */
 async function populateSharedToolchain(
   config: ToolchainConfig,
@@ -405,6 +413,12 @@ async function populateSharedToolchain(
   writeFileSync(gitSanitizer, readRegularFileWithinRoot(
     roots.benchRoot,
     'suites/swebench-pro/sanitize-git.sh',
+    1_024 * 1_024,
+  ), { flag: 'wx', mode: 0o755 });
+  const gitCapture = join(dir, 'capture-git.sh');
+  writeFileSync(gitCapture, readRegularFileWithinRoot(
+    roots.benchRoot,
+    'suites/swebench-pro/capture-git.sh',
     1_024 * 1_024,
   ), { flag: 'wx', mode: 0o755 });
 

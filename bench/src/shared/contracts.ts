@@ -68,6 +68,8 @@ export interface SuiteAdapter<S extends BenchSuite> {
   suite: S;
   displayName: string;
   description: string;
+  /** Final in-memory resource retry after a command in this suite rejects. */
+  cleanup?: () => Promise<void>;
   commands: Readonly<{
     [C in CommandBySuite<S>]: SuiteCommandSpec<unknown>;
   }>;

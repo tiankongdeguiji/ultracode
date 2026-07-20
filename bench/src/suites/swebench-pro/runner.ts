@@ -76,7 +76,6 @@ import {
   type VerifierBinding,
 } from '../../shared/verifier.js';
 import {
-  instancesFile,
   loadRuntimeBindings,
   loadSwebenchProOperatorConfig,
   resolveSwebenchProConfig,
@@ -92,6 +91,18 @@ import {
   type DockerExecutor,
 } from './image.js';
 import {
+  containerPolicySha256,
+  loadSwebenchProContainerPolicy,
+  sessionContainerPolicyArgv,
+  type SwebenchProContainerPolicy,
+} from './container-policy.js';
+import {
+  OwnershipUnsafeCleanupError,
+  ownershipUnsafe,
+  ownershipUnsafeAggregate,
+} from './cleanup.js';
+import {
+  datasetDescriptorSha256,
   fetchInstances,
   instanceFromRow,
   loadDatasetSnapshot,
@@ -115,6 +126,7 @@ import {
   goldPredictions,
   nullPredictions,
   runOfficialEvaluator,
+  type EvaluatorRunResult,
 } from './verifier.js';
 import { ARM_B_PREFIX_PATH } from '../../shared/prompt.js';
 
@@ -133,6 +145,9 @@ export const SWEBENCH_PRO_ADAPTER_POLICY_SHA256 = sha256CanonicalJson({
   redo: 'task-arm-exact-receipt-first-invalidation',
   verifier: 'strict-partial-native-booleans',
   credentials: 'runtime-only-outside-results',
+  dataset: 'audited-canonical-descriptor-v1',
+  cleanup: 'typed-command-fatal-after-settlement-retry',
+  containers: 'frozen-session-evaluator-policy',
 });
 
 export interface RunOptions {
@@ -169,6 +184,10 @@ export interface RunIdentityOptions {
 
 export interface CleanOptions extends RunIdentityOptions {
   images: boolean;
+}
+
+export interface SwebenchProRunnerDependencies {
+  sessionDocker?: SessionDockerExecutor;
 }
 
 function output(context: CommandContext, line: string): void {
@@ -223,12 +242,15 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SwebenchProManifest['
       'src/shared/process.ts',
       'src/shared/prompt.ts',
       'src/shared/provenance.ts',
+      'src/shared/run-state-ledger.ts',
       'src/shared/run-state.ts',
       'src/shared/toolchain.ts',
       'src/shared/verifier.ts',
       'src/suites/swebench-pro/adapter.ts',
       'src/suites/swebench-pro/analysis.ts',
+      'src/suites/swebench-pro/cleanup.ts',
       'src/suites/swebench-pro/config.ts',
+      'src/suites/swebench-pro/container-policy.ts',
       'src/suites/swebench-pro/image.ts',
       'src/suites/swebench-pro/instances.ts',
       'src/suites/swebench-pro/prompt.ts',
@@ -247,15 +269,27 @@ function currentPolicies(
   requirementsSha256: string,
   resolvedRequirementsSha256: string,
   ownershipPatchSha256: string,
+  evaluatorPolicyHelperSha256: string,
+  preparedContainerPolicySha256: string,
   adapterPolicySha256 = currentControlPlaneHashes(roots).adapterPolicySha256,
 ): SwebenchProManifest['suiteConfig']['policies'] {
   const entrypoint = join(roots.benchRoot, 'suites', 'swebench-pro', 'entrypoint.sh');
   const gitSanitizer = join(roots.benchRoot, 'suites', 'swebench-pro', 'sanitize-git.sh');
+  const gitCapture = join(roots.benchRoot, 'suites', 'swebench-pro', 'capture-git.sh');
+  const containerPolicyFile = join(roots.benchRoot, 'suites', 'swebench-pro', 'container-policy.json');
+  const policy = loadSwebenchProContainerPolicy(roots);
+  if (sha256File(containerPolicyFile) !== preparedContainerPolicySha256) {
+    throw new Error('prepared evaluator container policy does not match the native policy asset');
+  }
   return {
     sessionSha256: sha256CanonicalJson({
       entrypointSha256: sha256File(entrypoint),
       gitSanitizerSha256: sha256File(gitSanitizer),
-      taskUser: 'host-uid-no-capabilities',
+      gitCaptureSha256: sha256File(gitCapture),
+      containerPolicySha256: containerPolicySha256(policy),
+      setupUser: '0:0',
+      taskUser: 'host-uid-cleared-capability-sets',
+      postTaskGitCapture: 'immutable-helper-as-task-uid',
     }),
     historySha256: sha256CanonicalJson({
       base: 'exact',
@@ -270,16 +304,39 @@ function currentPolicies(
       verifierLabels: 'schema-suite-run-task-arm-purpose-ownership-invocation',
       verifierOwnership: 'post-baseline-exact-repository-contained-mount',
       artifactTree: 'owned-real-single-link',
+      ambiguity: 'requery-exact-identity-retain-until-absent',
+      fatality: 'ownership-unsafe-command-fatal',
     }),
     evaluatorSha256: sha256CanonicalJson({
       requirementsSha256,
       resolvedRequirementsSha256,
       ownershipPatchSha256,
+      evaluatorPolicyHelperSha256,
+      containerPolicySha256: containerPolicySha256(policy),
+      hostConfig: 'frozen-policy-plus-manifest-resources',
       booleans: 'strict',
       partial: 'bind-in-finally',
     }),
     adapterSha256: adapterPolicySha256,
   };
+}
+
+function swebenchProNativeAssets(roots: BenchPathRoots): SwebenchProManifest['provenance']['nativeAssets'] {
+  return [
+    'suites/swebench-pro/Dockerfile',
+    'suites/swebench-pro/entrypoint.sh',
+    'suites/swebench-pro/sanitize-git.sh',
+    'suites/swebench-pro/capture-git.sh',
+    'suites/swebench-pro/container-policy.json',
+    'suites/swebench-pro/dataset-pin.json',
+    'suites/swebench-pro/evaluator-policy.py',
+    'suites/swebench-pro/evaluator-ownership.patch',
+    'suites/swebench-pro/evaluator-requirements.lock',
+    relative(roots.benchRoot, ARM_B_PREFIX_PATH).split(sep).join('/'),
+  ].map((path) => ({
+    path: validateRelativeArtifactPath(path),
+    sha256: sha256File(join(roots.benchRoot, ...path.split('/'))),
+  }));
 }
 
 function armOrder(seed: number, taskId: string, arm: 'a' | 'b' | 'both'): Arm[] {
@@ -324,30 +381,22 @@ function buildManifest(
   instances: readonly SwebenchProInstance[],
   images: ReadonlyMap<string, DockerImageAttestation>,
   prepared: ReturnType<typeof loadPreparedSwebenchProInputs>,
+  datasetSha256: string,
   createdAt: Date,
 ): SwebenchProManifest {
   const taskIds = instances.map((instance) => instance.instanceId);
   const orders = taskIds.map((taskId) => ({ taskId, arms: armOrder(config.selection.seed, taskId, config.arm) }));
-  const datasetSha256 = sha256File(instancesFile(roots));
   const controlPlane = currentControlPlaneHashes(roots);
   const policies = currentPolicies(
     roots,
     prepared.requirementsSha256,
     prepared.resolvedRequirementsSha256,
     prepared.ownershipPatchSha256,
+    prepared.evaluatorPolicyHelperSha256,
+    prepared.containerPolicyFileSha256,
     controlPlane.adapterPolicySha256,
   );
-  const nativeAssets = [
-    'suites/swebench-pro/Dockerfile',
-    'suites/swebench-pro/entrypoint.sh',
-    'suites/swebench-pro/sanitize-git.sh',
-    'suites/swebench-pro/evaluator-ownership.patch',
-    'suites/swebench-pro/evaluator-requirements.lock',
-    relative(roots.benchRoot, ARM_B_PREFIX_PATH).split(sep).join('/'),
-  ].map((path) => ({
-    path: validateRelativeArtifactPath(path),
-    sha256: sha256File(join(roots.benchRoot, ...path.split('/'))),
-  }));
+  const nativeAssets = swebenchProNativeAssets(roots);
   return {
     schemaVersion: 2,
     kind: 'ultracode-benchmark-run',
@@ -369,7 +418,7 @@ function buildManifest(
       suiteSource: prepared.evaluatorSource,
       dataset: {
         identity: SWE_BENCH_PRO_DATASET,
-        revision: `snapshot-sha256:${datasetSha256}`,
+        revision: `canonical-descriptor-v1-sha256:${datasetSha256}`,
         split: SWE_BENCH_PRO_SPLIT,
         snapshotSha256: datasetSha256,
       },
@@ -535,11 +584,14 @@ function assertPreparedProvenance(
     || canonicalJson(prepared.evaluatorSource) !== canonicalJson(manifest.provenance.suiteSource)
     || prepared.evaluatorEnvironmentSha256 !== manifest.provenance.environment.environmentSha256
     || canonicalJson(currentControlPlane) !== canonicalJson(manifest.provenance.controlPlane)
+    || canonicalJson(swebenchProNativeAssets(roots)) !== canonicalJson(manifest.provenance.nativeAssets)
     || canonicalJson(currentPolicies(
       roots,
       prepared.requirementsSha256,
       prepared.resolvedRequirementsSha256,
       prepared.ownershipPatchSha256,
+      prepared.evaluatorPolicyHelperSha256,
+      prepared.containerPolicyFileSha256,
       currentControlPlane.adapterPolicySha256,
     )) !== canonicalJson(manifest.suiteConfig.policies)
     || config.auth.mechanism !== manifest.suiteConfig.auth.mechanism) {
@@ -590,6 +642,7 @@ async function loadRunStores(
     const manifest = loadBenchRunManifest(roots, 'swebench-pro', runId) as SwebenchProManifest;
     const manifestSha256 = sha256File(manifestFile(roots, 'swebench-pro', runId));
     const state = new BenchRunStateStore(roots, 'swebench-pro', runId, manifestSha256, lease);
+    state.migrateLegacyIfNeeded();
     await state.recoverPendingLifecycleProcesses(runDir(roots, 'swebench-pro', runId));
     if (state.load().invocations.some((invocation) => invocation.endedAt === null)) {
       await cleanRunContainers(
@@ -689,6 +742,7 @@ interface ActiveSessionContainer {
   taskId: string;
   arm: Arm;
   lifecycle: ProcessLifecycle;
+  executor: SessionDockerExecutor;
 }
 
 const activeContainers = new Map<string, ActiveSessionContainer>();
@@ -724,54 +778,88 @@ function untrackContainer(name: string): void {
   }
 }
 
-async function docker(argv: readonly string[], lifecycle: ProcessLifecycle = {}): Promise<string> {
+export type SessionDockerExecutor = (
+  argv: readonly string[],
+  lifecycle?: ProcessLifecycle,
+) => Promise<string>;
+
+export const defaultSessionDockerExecutor: SessionDockerExecutor = async (
+  argv,
+  lifecycle = {},
+): Promise<string> => {
   return (await runBenchProcess('docker', argv, {
     cwd: process.cwd(),
     tailBytes: 8 * 1_024 * 1_024,
     ...lifecycle,
   })).stdout;
-}
+};
 
 function containerName(runId: string, taskId: string, arm: Arm): string {
   return `ucbench-${createHash('sha256').update(`${runId}\0${taskId}\0${arm}`, 'utf8').digest('hex').slice(0, 32)}`;
 }
 
-async function stopPersistedSessionContainer(
+export async function stopPersistedSessionContainer(
   name: string,
   runId: string,
   taskId: string,
   arm: Arm,
   lifecycle: ProcessLifecycle = {},
+  executor: SessionDockerExecutor = defaultSessionDockerExecutor,
 ): Promise<void> {
-  const listed = (await docker(['ps', '-aq', '--filter', `name=^/${name}$`], lifecycle))
-    .split('\n').map((entry) => entry.trim()).filter(Boolean);
-  if (listed.length === 0) return;
-  if (listed.length !== 1 || !/^[a-f0-9]{12,64}$/.test(listed[0]!)) {
-    throw new Error(`session container name is not uniquely bound to a valid id: ${name}`);
+  const listExactName = async (): Promise<string[]> => {
+    const listed = (await executor(['ps', '-aq', '--filter', `name=^/${name}$`], lifecycle))
+      .split('\n').map((entry) => entry.trim()).filter(Boolean);
+    if (listed.length > 1 || listed.some((id) => !/^[a-f0-9]{12,64}$/.test(id))) {
+      throw new Error(`session container name is not uniquely bound to a valid id: ${name}`);
+    }
+    return listed;
+  };
+  try {
+    const listed = await listExactName();
+    if (listed.length === 0) return;
+    const parsed = JSON.parse(await executor(['inspect', listed[0]!], lifecycle)) as ContainerInspect[];
+    const inspectedId = parsed.length === 1 ? parsed[0]?.Id : undefined;
+    const labels = parsed[0]?.Config?.Labels ?? {};
+    const runtimeNonce = labels['ultracode.benchmark.runtime'];
+    if (
+      typeof inspectedId !== 'string'
+      || !/^[a-f0-9]{64}$/.test(inspectedId)
+      || !inspectedId.startsWith(listed[0]!)
+      || labels['ultracode.benchmark.schema'] !== '2'
+      || labels['ultracode.benchmark.suite'] !== 'swebench-pro'
+      || labels['ultracode.benchmark.run'] !== runId
+      || labels['ultracode.benchmark.task'] !== taskId
+      || labels['ultracode.benchmark.arm'] !== arm
+      || labels['ultracode.benchmark.purpose'] !== 'session'
+      || labels['ultracode.benchmark.ownership'] !== '1'
+      || typeof runtimeNonce !== 'string'
+      || !/^[a-f0-9]{64}$/.test(runtimeNonce)
+    ) {
+      throw new Error(`refusing to remove unowned container with session name ${name}`);
+    }
+    const runtime = sessionRuntimeDirectory(parsed[0]!, runId, taskId, arm, runtimeNonce);
+    let removalFailure: unknown;
+    try {
+      await executor(['rm', '-f', listed[0]!], lifecycle);
+    } catch (error) {
+      removalFailure = error;
+    }
+    let remaining: string[];
+    try {
+      remaining = await listExactName();
+    } catch (error) {
+      throw ownershipUnsafeAggregate('session removal could not be re-queried exactly', [removalFailure, error]);
+    }
+    if (remaining.length !== 0) {
+      throw ownershipUnsafeAggregate('session container absence was not proven after removal', [
+        removalFailure,
+        new Error(`session container name remains present: ${name}`),
+      ]);
+    }
+    removeSessionRuntime(runtime, runId, taskId, arm, runtimeNonce);
+  } catch (error) {
+    throw ownershipUnsafe(`unsafe SWE-bench Pro session cleanup for ${taskId}/${arm}`, error);
   }
-  const parsed = JSON.parse(await docker(['inspect', listed[0]!], lifecycle)) as ContainerInspect[];
-  const inspectedId = parsed.length === 1 ? parsed[0]?.Id : undefined;
-  const labels = parsed[0]?.Config?.Labels ?? {};
-  const runtimeNonce = labels['ultracode.benchmark.runtime'];
-  if (
-    typeof inspectedId !== 'string'
-    || !/^[a-f0-9]{64}$/.test(inspectedId)
-    || !inspectedId.startsWith(listed[0]!)
-    || labels['ultracode.benchmark.schema'] !== '2'
-    || labels['ultracode.benchmark.suite'] !== 'swebench-pro'
-    || labels['ultracode.benchmark.run'] !== runId
-    || labels['ultracode.benchmark.task'] !== taskId
-    || labels['ultracode.benchmark.arm'] !== arm
-    || labels['ultracode.benchmark.purpose'] !== 'session'
-    || labels['ultracode.benchmark.ownership'] !== '1'
-    || typeof runtimeNonce !== 'string'
-    || !/^[a-f0-9]{64}$/.test(runtimeNonce)
-  ) {
-    throw new Error(`refusing to remove unowned container with session name ${name}`);
-  }
-  const runtime = sessionRuntimeDirectory(parsed[0]!, runId, taskId, arm, runtimeNonce);
-  await docker(['rm', '-f', listed[0]!], lifecycle);
-  rmSync(runtime, { recursive: true });
 }
 
 export async function cleanupActiveSwebenchProContainers(): Promise<number> {
@@ -785,6 +873,7 @@ export async function cleanupActiveSwebenchProContainers(): Promise<number> {
         container.taskId,
         container.arm,
         container.lifecycle,
+        container.executor,
       );
       if (existsSync(container.runtime)) removeSessionRuntime(
         container.runtime,
@@ -798,11 +887,13 @@ export async function cleanupActiveSwebenchProContainers(): Promise<number> {
       failures.push(error);
     }
   }));
-  if (!relayingSignal) {
+  if (!relayingSignal && activeContainers.size === 0) {
     process.off('SIGINT', onSigint);
     process.off('SIGTERM', onSigterm);
   }
-  if (failures.length > 0) throw new AggregateError(failures, 'active SWE-bench Pro container cleanup failed');
+  if (failures.length > 0) {
+    throw ownershipUnsafeAggregate('active SWE-bench Pro container cleanup failed', failures);
+  }
   return entries.length;
 }
 
@@ -811,7 +902,44 @@ interface SessionResult {
   meta: SessionMeta | null;
 }
 
+export interface SessionDockerRunArgvOptions {
+  name: string;
+  runId: string;
+  taskId: string;
+  arm: Arm;
+  runtimeNonce: string;
+  envFile: string;
+  taskDirectory: string;
+  runtimeHome: string;
+  runtimeCodex: string;
+  image: string;
+  docker: SwebenchProConfig['docker'];
+  policy: SwebenchProContainerPolicy;
+}
+
+/** Build the exact session invocation so policy parity is testable without Docker. */
+export function sessionDockerRunArgv(options: SessionDockerRunArgvOptions): string[] {
+  const labels = [
+    ['schema', '2'], ['suite', 'swebench-pro'], ['run', options.runId], ['task', options.taskId],
+    ['arm', options.arm], ['purpose', 'session'], ['ownership', '1'], ['runtime', options.runtimeNonce],
+  ].flatMap(([key, value]) => ['--label', `ultracode.benchmark.${key}=${value}`]);
+  return [
+    'run', '-d', '--name', options.name, ...labels,
+    ...sessionContainerPolicyArgv(options.policy, options.docker),
+    '--user', '0:0',
+    '--env-file', options.envFile,
+    '--mount', `type=bind,src=${options.taskDirectory},dst=/bench`,
+    '--mount', `type=bind,src=${options.runtimeHome},dst=/runtime/home`,
+    '--mount', `type=bind,src=${options.runtimeCodex},dst=/runtime/codex-home`,
+    '--mount', `type=bind,src=${join(options.taskDirectory, 'codex-home', 'sessions')},dst=/runtime/codex-home/sessions`,
+    '--entrypoint', '/bin/bash',
+    options.image,
+    '/opt/bench/entrypoint.sh',
+  ];
+}
+
 async function runSession(
+  roots: BenchPathRoots,
   config: SwebenchProConfig,
   manifest: SwebenchProManifest,
   instance: SwebenchProInstance,
@@ -820,10 +948,19 @@ async function runSession(
   image: DockerImageAttestation,
   runtimeBindings: ReturnType<typeof loadRuntimeBindings>,
   processLifecycle: ProcessLifecycle,
+  executor: SessionDockerExecutor = defaultSessionDockerExecutor,
 ): Promise<SessionResult> {
-  await reattestTaskImage(image);
+  const imageExecutor: DockerExecutor = (argv) => executor(argv, processLifecycle);
+  await reattestTaskImage(image, imageExecutor);
   const name = containerName(manifest.runId, instance.instanceId, arm);
-  await stopPersistedSessionContainer(name, manifest.runId, instance.instanceId, arm, processLifecycle);
+  await stopPersistedSessionContainer(
+    name,
+    manifest.runId,
+    instance.instanceId,
+    arm,
+    processLifecycle,
+    executor,
+  );
   resetArtifactDirectory(runDirFromTask(taskDirectory), taskDirectory);
   for (const directory of [
     'codex-home', 'codex-home/sessions', 'uc', 'logs', 'out',
@@ -867,24 +1004,20 @@ async function runSession(
     rmSync(runtime, { recursive: true, force: true });
     throw error;
   }
-  const labels = [
-    ['schema', '2'], ['suite', 'swebench-pro'], ['run', manifest.runId], ['task', instance.instanceId],
-    ['arm', arm], ['purpose', 'session'], ['ownership', '1'], ['runtime', runtimeNonce],
-  ].flatMap(([key, value]) => ['--label', `ultracode.benchmark.${key}=${value}`]);
-  const args = [
-    'run', '-d', '--name', name, ...labels,
-    '--security-opt', 'no-new-privileges',
-    '--env-file', envFile,
-    '--mount', `type=bind,src=${taskDirectory},dst=/bench`,
-    '--mount', `type=bind,src=${runtimeHome},dst=/runtime/home`,
-    '--mount', `type=bind,src=${runtimeCodex},dst=/runtime/codex-home`,
-    '--mount', `type=bind,src=${join(taskDirectory, 'codex-home', 'sessions')},dst=/runtime/codex-home/sessions`,
-    '--cpus', String(config.docker.cpus),
-    '--memory', String(config.docker.memoryBytes),
-    '--entrypoint', '/bin/bash',
-    image.overlayName,
-    '/opt/bench/entrypoint.sh',
-  ];
+  const args = sessionDockerRunArgv({
+    name,
+    runId: manifest.runId,
+    taskId: instance.instanceId,
+    arm,
+    runtimeNonce,
+    envFile,
+    taskDirectory,
+    runtimeHome,
+    runtimeCodex,
+    image: image.overlayName,
+    docker: config.docker,
+    policy: loadSwebenchProContainerPolicy(roots),
+  });
   const startedAt = Date.now();
   let endedAt = startedAt;
   let backstop = false;
@@ -896,11 +1029,12 @@ async function runSession(
       taskId: instance.instanceId,
       arm,
       lifecycle: processLifecycle,
+      executor,
     });
-    const launchedId = (await docker(args, processLifecycle)).trim();
+    const launchedId = (await executor(args, processLifecycle)).trim();
     if (!/^[a-f0-9]{64}$/.test(launchedId)) throw new Error('Docker returned an invalid session container id');
     unlinkSync(envFile);
-    const waited = docker(['wait', name], processLifecycle);
+    const waited = executor(['wait', name], processLifecycle);
     let timer: NodeJS.Timeout | undefined;
     const stopped = new Promise<'backstop'>((resolvePromise) => {
       timer = setTimeout(resolvePromise, config.timeouts.sessionMs + SESSION_BACKSTOP_EXTRA_MS, 'backstop');
@@ -910,11 +1044,25 @@ async function runSession(
     endedAt = Date.now();
     if (first === 'backstop') {
       backstop = true;
-      await stopPersistedSessionContainer(name, manifest.runId, instance.instanceId, arm, processLifecycle);
+      await stopPersistedSessionContainer(
+        name,
+        manifest.runId,
+        instance.instanceId,
+        arm,
+        processLifecycle,
+        executor,
+      );
       await waited.catch(() => '');
     }
   } finally {
-    await stopPersistedSessionContainer(name, manifest.runId, instance.instanceId, arm, processLifecycle);
+    await stopPersistedSessionContainer(
+      name,
+      manifest.runId,
+      instance.instanceId,
+      arm,
+      processLifecycle,
+      executor,
+    );
     untrackContainer(name);
     if (existsSync(runtime)) removeSessionRuntime(runtime, manifest.runId, instance.instanceId, arm, runtimeNonce);
   }
@@ -1085,6 +1233,29 @@ async function recordCompletedAttempt(
   }
 }
 
+/** Settle every worker, retry active cleanup once, and retain the original fatal aggregate. */
+export async function settleSessionWorkers(
+  workers: readonly Promise<void>[],
+  cleanupRetry: () => Promise<unknown> = cleanupActiveSwebenchProContainers,
+): Promise<void> {
+  const settled = await Promise.allSettled(workers);
+  const rejected = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+  const ownershipFailures: unknown[] = rejected.filter((error) =>
+    error instanceof OwnershipUnsafeCleanupError);
+  if (ownershipFailures.length > 0) {
+    try {
+      await cleanupRetry();
+    } catch (error) {
+      ownershipFailures.push(error);
+    }
+    throw ownershipUnsafeAggregate(
+      'SWE-bench Pro session cleanup was ownership-unsafe after the mandatory active-container retry',
+      ownershipFailures,
+    );
+  }
+  if (rejected.length > 0) throw new AggregateError(rejected, 'SWE-bench Pro session workers failed');
+}
+
 async function executeSessions(
   context: CommandContext,
   config: SwebenchProConfig,
@@ -1093,6 +1264,7 @@ async function executeSessions(
   invocationId: string,
   redo: ReadonlySet<string>,
   resume: boolean,
+  sessionDocker: SessionDockerExecutor = defaultSessionDockerExecutor,
 ): Promise<void> {
   const directory = runDir(context.paths, 'swebench-pro', manifest.runId);
   await cleanRunContainers(
@@ -1103,8 +1275,10 @@ async function executeSessions(
   const images = imageAttestations(manifest);
   const runtimeBindings = loadRuntimeBindings(config);
   let cursor = 0;
+  let ownershipFailure = false;
   const workers = Array.from({ length: config.concurrency.tasks }, async () => {
     for (;;) {
+      if (ownershipFailure) return;
       const execution = manifest.artifacts.executions[cursor++];
       if (!execution) return;
       const taskDirectory = executionDirectory(directory, execution.nativeRoot);
@@ -1116,6 +1290,7 @@ async function executeSessions(
       const image = images.get(execution.taskId)!;
       try {
         const result = await runSession(
+          context.paths,
           config,
           manifest,
           instance,
@@ -1124,10 +1299,15 @@ async function executeSessions(
           image,
           runtimeBindings,
           state.lifecycleHooks(invocationId),
+          sessionDocker,
         );
         await recordCompletedAttempt(state, invocationId, execution, result.status, result.meta);
         output(context, `${execution.taskId} ${execution.arm}: ${result.status.phase}${result.status.failure ? ` (${result.status.failure})` : ''}`);
       } catch (error) {
+        if (error instanceof OwnershipUnsafeCleanupError) {
+          ownershipFailure = true;
+          throw error;
+        }
         const timestamp = context.clock.now().toISOString();
         const failure = sessionFailure(error);
         const status: TaskStatus = {
@@ -1150,7 +1330,7 @@ async function executeSessions(
       }
     }
   });
-  await Promise.all(workers);
+  await settleSessionWorkers(workers);
 }
 
 export async function fetchCommand(options: CacheOptions, context: CommandContext): Promise<void> {
@@ -1179,7 +1359,11 @@ export async function prepCommand(options: CacheOptions, context: CommandContext
   }
 }
 
-export async function runCommand(options: RunOptions, context: CommandContext): Promise<void> {
+export async function runCommand(
+  options: RunOptions,
+  context: CommandContext,
+  dependencies: SwebenchProRunnerDependencies = {},
+): Promise<void> {
   validateRunId(options.runId);
   if (options.redo.length > 0 && !options.resume) throw new Error('--redo requires --resume');
   const operator = loadSwebenchProOperatorConfig(context.paths);
@@ -1213,10 +1397,25 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
         invocationId,
         context.clock.now(),
       );
-      await executeSessions(context, config, stores.manifest, stores.state, invocationId, redo, true);
+      await executeSessions(
+        context,
+        config,
+        stores.manifest,
+        stores.state,
+        invocationId,
+        redo,
+        true,
+        dependencies.sessionDocker,
+      );
       await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
     } catch (error) {
-      if (invocationId !== null) await finishInvocation(stores.state, invocationId, startedMs, context.clock.now(), 'unknown-terminal');
+      if (invocationId !== null) await finishInvocation(
+        stores.state,
+        invocationId,
+        startedMs,
+        context.clock.now(),
+        error instanceof OwnershipUnsafeCleanupError ? 'ownership-unsafe' : 'unknown-terminal',
+      );
       throw error;
     } finally {
       try {
@@ -1250,6 +1449,7 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
     inputLocks = await acquirePreparedInputLocks(context.paths, options.recoverStaleLock);
     const prepared = loadCurrentPreparedSwebenchProInputs(context.paths, config);
     const snapshot = loadDatasetSnapshot(context.paths);
+    const datasetSha256 = datasetDescriptorSha256(context.paths, snapshot);
     const selected = selectInstances(snapshot, config.selection);
     const images = new Map<string, DockerImageAttestation>();
     for (const instance of selected) {
@@ -1259,16 +1459,40 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
         toolchainPayloadSha256: prepared.toolchain.provenance.payloadSha256,
       }));
     }
-    const manifest = buildManifest(context.paths, options.runId, config, selected, images, prepared, context.clock.now());
+    const manifest = buildManifest(
+      context.paths,
+      options.runId,
+      config,
+      selected,
+      images,
+      prepared,
+      datasetSha256,
+      context.clock.now(),
+    );
     initialized = await initializeRun(context.paths, manifest, options.recoverStaleLock, claim);
     claim.release();
     const startedMs = performance.now();
     const invocationId = await beginInvocation(initialized.state, 'run', context.clock.now());
     try {
-      await executeSessions(context, config, manifest, initialized.state, invocationId, new Set(), false);
+      await executeSessions(
+        context,
+        config,
+        manifest,
+        initialized.state,
+        invocationId,
+        new Set(),
+        false,
+        dependencies.sessionDocker,
+      );
       await finishInvocation(initialized.state, invocationId, startedMs, context.clock.now());
     } catch (error) {
-      await finishInvocation(initialized.state, invocationId, startedMs, context.clock.now(), 'unknown-terminal');
+      await finishInvocation(
+        initialized.state,
+        invocationId,
+        startedMs,
+        context.clock.now(),
+        error instanceof OwnershipUnsafeCleanupError ? 'ownership-unsafe' : 'unknown-terminal',
+      );
       throw error;
     }
   } finally {
@@ -1296,6 +1520,121 @@ function verifierBindings(
     path: validateRelativeArtifactPath(path),
     nativeRecordKey,
   });
+}
+
+/** Build exact receipt bindings for one evaluator mode without mutating the receipt store. */
+export function evaluatorReceiptBindings(options: {
+  runDirectory: string;
+  invocationId: string;
+  prefix: string;
+  arm: Arm | null;
+  result: EvaluatorRunResult;
+}): VerifierBinding[] {
+  const scope = options.arm === null
+    ? { kind: 'suite-check' as const, name: options.prefix }
+    : null;
+  const additions: VerifierBinding[] = [
+    verifierBindings(
+      options.runDirectory,
+      options.invocationId,
+      scope ?? { kind: 'suite-check', name: `${options.prefix}-inputs` },
+      'raw-samples',
+      options.result.rawSamplesRelativePath,
+      null,
+    ),
+    verifierBindings(
+      options.runDirectory,
+      options.invocationId,
+      scope ?? { kind: 'suite-check', name: `${options.prefix}-inputs` },
+      'predictions',
+      options.result.predictionsRelativePath,
+      null,
+    ),
+    verifierBindings(
+      options.runDirectory,
+      options.invocationId,
+      scope ?? { kind: 'suite-check', name: `${options.prefix}-invocation` },
+      'verifier-invocation',
+      options.result.invocationRelativePath,
+      null,
+    ),
+    verifierBindings(
+      options.runDirectory,
+      options.invocationId,
+      scope ?? { kind: 'suite-check', name: `${options.prefix}-policy` },
+      'native-config',
+      options.result.policyRelativePath,
+      null,
+    ),
+  ];
+  if (options.result.resultRelativePath === null) return additions;
+  if (options.arm === null) {
+    additions.push(verifierBindings(
+      options.runDirectory,
+      options.invocationId,
+      scope!,
+      'native-result',
+      options.result.resultRelativePath,
+      options.prefix,
+    ));
+  } else {
+    for (const [taskId] of Object.entries(options.result.verdicts)) {
+      additions.push(verifierBindings(
+        options.runDirectory,
+        options.invocationId,
+        { kind: 'task-arm', taskId, arm: options.arm },
+        'native-result',
+        options.result.resultRelativePath,
+        taskId,
+      ));
+    }
+  }
+  return additions;
+}
+
+export interface EvaluatorTaskAttribution {
+  phase: 'evaluated';
+  attempt: BenchRunState['attempts'][number];
+}
+
+/** Attribute one batch evaluator result only to a task that was actually submitted. */
+export function evaluatorTaskAttribution(options: {
+  result: EvaluatorRunResult;
+  execution: SwebenchProManifest['artifacts']['executions'][number];
+  submitted: ReadonlySet<string>;
+  invocationId: string;
+  attemptId: string;
+  ordinal: number;
+}): EvaluatorTaskAttribution | null {
+  if (!options.submitted.has(options.execution.taskId)) return null;
+  const nativePresent = Object.hasOwn(options.result.verdicts, options.execution.taskId);
+  const failure = nativePresent ? null
+    : options.result.processFailure
+      ?? (options.result.malformedTaskIds.includes(options.execution.taskId)
+        ? 'verifier-output-malformed'
+        : 'unattributed-verifier-absence');
+  return {
+    phase: 'evaluated',
+    attempt: {
+      attemptId: options.attemptId,
+      invocationId: options.invocationId,
+      taskId: options.execution.taskId,
+      arm: options.execution.arm,
+      ordinal: options.ordinal,
+      phase: 'verifier',
+      startedAt: options.result.startedAt,
+      endedAt: options.result.endedAt,
+      elapsedMs: options.result.elapsedMs,
+      nativePath: options.result.resultRelativePath === null
+        ? null
+        : validateRelativeArtifactPath(options.result.resultRelativePath),
+      exitCode: failure === null ? 0 : 1,
+      signal: null,
+      status: failure === null ? 'succeeded' : 'failed',
+      failures: failure === null ? [] : [failure],
+      annotations: [],
+    },
+  };
 }
 
 export async function evalCommand(options: EvalOptions, context: CommandContext): Promise<void> {
@@ -1336,31 +1675,19 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
         prefix: mode.prefix,
         predictions: mode.predictions,
         instances,
+        containerPolicy: loadSwebenchProContainerPolicy(context.paths),
         processLifecycle: {
           workerScope: runDirectory,
           ...stores.state.lifecycleHooks(invocationId),
         },
       });
-      const scope = mode.arm === null
-        ? { kind: 'suite-check' as const, name: mode.prefix }
-        : null;
-      const additions: VerifierBinding[] = [
-        verifierBindings(runDirectory, invocationId, scope ?? { kind: 'suite-check', name: `${mode.prefix}-inputs` }, 'raw-samples', result.rawSamplesRelativePath, null),
-        verifierBindings(runDirectory, invocationId, scope ?? { kind: 'suite-check', name: `${mode.prefix}-inputs` }, 'predictions', result.predictionsRelativePath, null),
-        verifierBindings(runDirectory, invocationId, scope ?? { kind: 'suite-check', name: `${mode.prefix}-invocation` }, 'verifier-invocation', result.invocationRelativePath, null),
-        verifierBindings(runDirectory, invocationId, scope ?? { kind: 'suite-check', name: `${mode.prefix}-policy` }, 'native-config', result.policyRelativePath, null),
-      ];
-      if (result.resultRelativePath !== null) {
-        if (mode.arm === null) {
-          additions.push(verifierBindings(runDirectory, invocationId, scope!, 'native-result', result.resultRelativePath, mode.prefix));
-        } else {
-          for (const [taskId] of Object.entries(result.verdicts)) {
-            additions.push(verifierBindings(runDirectory, invocationId, {
-              kind: 'task-arm', taskId, arm: mode.arm,
-            }, 'native-result', result.resultRelativePath, taskId));
-          }
-        }
-      }
+      const additions = evaluatorReceiptBindings({
+        runDirectory,
+        invocationId,
+        prefix: mode.prefix,
+        arm: mode.arm,
+        result,
+      });
       const receipt = stores.receipt.load();
       await stores.receipt.update(receipt.revision, (bindings) => [
         ...bindings.filter((binding) => {
@@ -1373,25 +1700,24 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
       if (mode.arm !== null) {
         const submitted = new Set(mode.predictions.map((prediction) => prediction.instance_id));
         for (const execution of stores.manifest.artifacts.executions.filter((entry) => entry.arm === mode.arm)) {
-          if (!submitted.has(execution.taskId)) continue;
+          const currentState = stores.state.load();
+          const attribution = evaluatorTaskAttribution({
+            result,
+            execution,
+            submitted,
+            invocationId,
+            attemptId: randomUUID(),
+            ordinal: currentState.attempts.filter((entry) =>
+              entry.taskId === execution.taskId && entry.arm === execution.arm).length + 1,
+          });
+          if (attribution === null) continue;
           const statusDirectory = executionDirectory(runDirectory, execution.nativeRoot);
           if (!existsSync(statusDirectory)) continue;
           const status = readTaskStatus(statusDirectory);
-          writeTaskStatus(statusDirectory, { ...status, phase: 'evaluated' });
-          const nativePresent = Object.hasOwn(result.verdicts, execution.taskId);
-          const failure = nativePresent ? null
-            : result.processFailure ?? (result.malformedTaskIds.includes(execution.taskId) ? 'verifier-output-malformed' : 'unattributed-verifier-absence');
+          writeTaskStatus(statusDirectory, { ...status, phase: attribution.phase });
           await stores.state.updateCurrent((state) => ({
             ...state,
-            attempts: [...state.attempts, {
-              attemptId: randomUUID(), invocationId: invocationId!, taskId: execution.taskId, arm: execution.arm,
-              ordinal: state.attempts.filter((entry) => entry.taskId === execution.taskId && entry.arm === execution.arm).length + 1,
-              phase: 'verifier', startedAt: result.startedAt, endedAt: result.endedAt,
-              elapsedMs: result.elapsedMs,
-              nativePath: result.resultRelativePath === null ? null : validateRelativeArtifactPath(result.resultRelativePath),
-              exitCode: failure === null ? 0 : 1, signal: null, status: failure === null ? 'succeeded' : 'failed',
-              failures: failure === null ? [] : [failure], annotations: [],
-            }],
+            attempts: [...state.attempts, attribution.attempt],
           }));
         }
       }
@@ -1399,7 +1725,13 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
     }
     await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
   } catch (error) {
-    if (invocationId !== null) await finishInvocation(stores.state, invocationId, startedMs, context.clock.now(), 'verifier-process-failed');
+    if (invocationId !== null) await finishInvocation(
+      stores.state,
+      invocationId,
+      startedMs,
+      context.clock.now(),
+      error instanceof OwnershipUnsafeCleanupError ? 'ownership-unsafe' : 'verifier-process-failed',
+    );
     throw error;
   } finally {
     try {
@@ -1699,59 +2031,99 @@ async function cleanRunContainers(
   invocationIds: ReadonlySet<string>,
   executor: DockerExecutor = defaultDockerExecutor,
 ): Promise<number> {
-  const runId = manifest.runId;
-  const ids = (await executor(['ps', '-aq', '--filter', `label=ultracode.benchmark.run=${runId}`]))
-    .split('\n').map((entry) => entry.trim()).filter(Boolean);
-  if (ids.some((id) => !/^[a-f0-9]{12,64}$/.test(id))) throw new Error('Docker returned an invalid run-owned container id');
-  const parsed = ids.length === 0 ? [] : JSON.parse(await executor(['inspect', ...ids])) as ContainerInspect[];
-  if (parsed.length !== ids.length || parsed.some((record) => typeof record.Id !== 'string'
-    || !/^[a-f0-9]{64}$/.test(record.Id)
-    || ids.filter((id) => record.Id!.startsWith(id)).length !== 1)) {
-    throw new Error('Docker inspection did not exactly bind the requested run-owned container ids');
+  try {
+    const runId = manifest.runId;
+    const listRunIds = async (): Promise<string[]> => {
+      const ids = (await executor(['ps', '-aq', '--no-trunc', '--filter', `label=ultracode.benchmark.run=${runId}`]))
+        .split('\n').map((entry) => entry.trim()).filter(Boolean);
+      if (ids.some((id) => !/^[a-f0-9]{64}$/.test(id))) {
+        throw new Error('Docker returned an invalid run-owned container id');
+      }
+      return ids;
+    };
+    const ids = await listRunIds();
+    const parsed = ids.length === 0 ? [] : JSON.parse(await executor(['inspect', ...ids])) as ContainerInspect[];
+    if (parsed.length !== ids.length || parsed.some((record) => typeof record.Id !== 'string'
+      || !/^[a-f0-9]{64}$/.test(record.Id)
+      || ids.filter((id) => record.Id === id).length !== 1)) {
+      throw new Error('Docker inspection did not exactly bind the requested run-owned container ids');
+    }
+    const owned = ownedRunContainerIds(parsed, runId, new Set(manifest.experiment.taskIds), invocationIds);
+    if (owned.length !== parsed.length) {
+      throw new Error('run-labelled Docker resources do not have complete manifest ownership');
+    }
+    for (const id of owned) {
+      const record = parsed.find((candidate) => candidate.Id === id)!;
+      const labels = record.Config?.Labels ?? {};
+      const runtime = labels['ultracode.benchmark.purpose'] === 'session'
+        ? sessionRuntimeDirectory(
+            record,
+            runId,
+            labels['ultracode.benchmark.task']!,
+            labels['ultracode.benchmark.arm'] as Arm,
+            labels['ultracode.benchmark.runtime']!,
+          )
+        : null;
+      let removalFailure: unknown;
+      try {
+        await executor(['rm', '-f', id]);
+      } catch (error) {
+        removalFailure = error;
+      }
+      const remaining = await listRunIds();
+      if (remaining.includes(id)) {
+        throw ownershipUnsafeAggregate('run-owned container absence was not proven after removal', [
+          removalFailure,
+          new Error(`run-owned container remains present: ${id}`),
+        ]);
+      }
+      if (runtime !== null) removeSessionRuntime(
+        runtime,
+        runId,
+        labels['ultracode.benchmark.task']!,
+        labels['ultracode.benchmark.arm'] as Arm,
+        labels['ultracode.benchmark.runtime']!,
+      );
+    }
+    const remaining = await listRunIds();
+    if (remaining.length > 0) {
+      throw new Error(`run-owned containers remain after cleanup: ${remaining.join(', ')}`);
+    }
+    cleanupProRuntimeHomes(manifest);
+    return owned.length;
+  } catch (error) {
+    throw ownershipUnsafe('unsafe SWE-bench Pro run-owned cleanup', error);
   }
-  const owned = ownedRunContainerIds(parsed, runId, new Set(manifest.experiment.taskIds), invocationIds);
-  if (owned.length !== parsed.length) {
-    throw new Error('run-labelled Docker resources do not have complete manifest ownership');
-  }
-  for (const id of owned) {
-    const record = parsed.find((candidate) => candidate.Id === id)!;
-    const labels = record.Config?.Labels ?? {};
-    const runtime = labels['ultracode.benchmark.purpose'] === 'session'
-      ? sessionRuntimeDirectory(
-          record,
-          runId,
-          labels['ultracode.benchmark.task']!,
-          labels['ultracode.benchmark.arm'] as Arm,
-          labels['ultracode.benchmark.runtime']!,
-        )
-      : null;
-    await executor(['rm', '-f', id]);
-    if (runtime !== null) removeSessionRuntime(
-      runtime,
-      runId,
-      labels['ultracode.benchmark.task']!,
-      labels['ultracode.benchmark.arm'] as Arm,
-      labels['ultracode.benchmark.runtime']!,
-    );
-  }
-  cleanupProRuntimeHomes(manifest);
-  return owned.length;
 }
 
 export async function cleanCommand(options: CleanOptions, context: CommandContext): Promise<void> {
   const stores = await loadRunStores(context.paths, options.runId, options.recoverStaleLock ?? false);
   const startedMs = performance.now();
+  let invocationId: string | null = null;
   try {
-    const invocationId = await beginInvocation(stores.state, 'clean', context.clock.now());
+    invocationId = await beginInvocation(stores.state, 'clean', context.clock.now());
     const containers = await cleanRunContainers(
       stores.manifest,
       new Set(stores.state.load().invocations.map((invocation) => invocation.invocationId)),
     );
-    const images = options.images ? await removeTaskImages([...imageAttestations(stores.manifest).values()]) : 0;
+    const attestations = [...imageAttestations(stores.manifest).values()];
+    const images = options.images ? await removeTaskImages(attestations) : 0;
+    if (options.images && images !== new Set(attestations.map((entry) => entry.overlayLocalId)).size) {
+      throw ownershipUnsafe('not every exact run-owned overlay image was removed');
+    }
     rmSync(reportJsonFile(context.paths, 'swebench-pro', options.runId), { force: true });
     rmSync(reportMarkdownFile(context.paths, 'swebench-pro', options.runId), { force: true });
     await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
     output(context, `removed ${containers} owned containers${options.images ? ` and ${images} owned overlay images` : ''}`);
+  } catch (error) {
+    if (invocationId !== null) await finishInvocation(
+      stores.state,
+      invocationId,
+      startedMs,
+      context.clock.now(),
+      error instanceof OwnershipUnsafeCleanupError ? 'ownership-unsafe' : 'unknown-terminal',
+    );
+    throw error;
   } finally {
     stores.lease.release();
   }
@@ -1759,9 +2131,21 @@ export async function cleanCommand(options: CleanOptions, context: CommandContex
 
 /** Root fatal/signal cleanup covers native processes and daemon-owned sessions. */
 export async function cleanupSwebenchProRuntime(): Promise<void> {
-  await cleanupActiveBenchProcesses();
-  await cleanupActiveSwebenchProEvaluators();
-  await cleanupActiveSwebenchProContainers();
+  const failures: unknown[] = [];
+  try {
+    await cleanupActiveBenchProcesses();
+  } catch (error) {
+    failures.push(error);
+  }
+  const settled = await Promise.allSettled([
+    cleanupActiveSwebenchProEvaluators(),
+    cleanupActiveSwebenchProContainers(),
+  ]);
+  failures.push(...settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []));
+  if (failures.some((error) => error instanceof OwnershipUnsafeCleanupError)) {
+    throw ownershipUnsafeAggregate('SWE-bench Pro runtime cleanup failed ownership checks', failures);
+  }
+  if (failures.length > 0) throw new AggregateError(failures, 'SWE-bench Pro runtime cleanup failed');
 }
 
 export const defaultCommandContext = (paths: BenchPathRoots): CommandContext => ({

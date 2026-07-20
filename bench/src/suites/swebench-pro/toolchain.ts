@@ -14,6 +14,7 @@ import type { RuntimeBindings, ToolchainConfig } from '../../shared/config.js';
 import {
   ensureRealDirectoryWithin,
   readPrivateJson,
+  readRegularFileWithinRoot,
   writePrivateFileAtomic,
   writePrivateJsonAtomic,
 } from '../../shared/paths.js';
@@ -57,6 +58,8 @@ const preparedIdentitySchema = z.strictObject({
   requirementsSha256: sha256Schema,
   resolvedRequirementsSha256: sha256Schema,
   ownershipPatchSha256: sha256Schema,
+  evaluatorPolicyHelperSha256: sha256Schema,
+  containerPolicyFileSha256: sha256Schema,
   toolchainPayloadSha256: sha256Schema,
 });
 
@@ -78,6 +81,8 @@ export interface PreparedSwebenchPro {
   requirementsSha256: string;
   resolvedRequirementsSha256: string;
   ownershipPatchSha256: string;
+  evaluatorPolicyHelperSha256: string;
+  containerPolicyFileSha256: string;
   preparedInputSha256: string;
 }
 
@@ -185,6 +190,8 @@ export function loadPreparedSwebenchProInputs(
   const evaluatorEnvironmentDirectory = join(resolved, 'environment');
   const requirements = join(roots.benchRoot, 'suites', 'swebench-pro', 'evaluator-requirements.lock');
   const ownershipPatch = join(roots.benchRoot, 'suites', 'swebench-pro', 'evaluator-ownership.patch');
+  const evaluatorPolicyHelper = join(roots.benchRoot, 'suites', 'swebench-pro', 'evaluator-policy.py');
+  const containerPolicy = join(roots.benchRoot, 'suites', 'swebench-pro', 'container-policy.json');
   const environment = evaluatorEnvironmentIdentity(evaluatorEnvironmentDirectory);
   if (sourceTreeSha256(evaluatorDirectory) !== manifest.evaluatorTreeSha256
     || environment.treeSha256 !== manifest.evaluatorEnvironmentTreeSha256
@@ -192,7 +199,10 @@ export function loadPreparedSwebenchProInputs(
     || environment.identitySha256 !== manifest.evaluatorEnvironmentSha256
     || sha256File(join(resolved, RESOLVED_REQUIREMENTS)) !== manifest.resolvedRequirementsSha256
     || sha256File(requirements) !== manifest.requirementsSha256
-    || sha256File(ownershipPatch) !== manifest.ownershipPatchSha256) {
+    || sha256File(ownershipPatch) !== manifest.ownershipPatchSha256
+    || sha256File(evaluatorPolicyHelper) !== manifest.evaluatorPolicyHelperSha256
+    || sha256File(join(evaluatorDirectory, 'ultracode_evaluator_policy.py')) !== manifest.evaluatorPolicyHelperSha256
+    || sha256File(containerPolicy) !== manifest.containerPolicyFileSha256) {
     throw new Error('prepared SWE-bench Pro evaluator provenance drifted');
   }
   return {
@@ -211,6 +221,8 @@ export function loadPreparedSwebenchProInputs(
     requirementsSha256: manifest.requirementsSha256,
     resolvedRequirementsSha256: manifest.resolvedRequirementsSha256,
     ownershipPatchSha256: manifest.ownershipPatchSha256,
+    evaluatorPolicyHelperSha256: manifest.evaluatorPolicyHelperSha256,
+    containerPolicyFileSha256: manifest.containerPolicyFileSha256,
     preparedInputSha256: manifest.payloadSha256,
   };
 }
@@ -264,8 +276,15 @@ export async function prepareSwebenchProInputs(
     if (patchedFiles.length !== 1 || patchedFiles[0] !== 'swe_bench_pro_eval.py') {
       throw new Error('official evaluator ownership patch changed an unexpected file set');
     }
+    const evaluatorPolicyHelper = join(roots.benchRoot, 'suites', 'swebench-pro', 'evaluator-policy.py');
+    writePrivateFileAtomic(
+      evaluatorDirectory,
+      join(evaluatorDirectory, 'ultracode_evaluator_policy.py'),
+      readRegularFileWithinRoot(roots.benchRoot, 'suites/swebench-pro/evaluator-policy.py'),
+    );
 
     const requirements = join(roots.benchRoot, 'suites', 'swebench-pro', 'evaluator-requirements.lock');
+    const containerPolicy = join(roots.benchRoot, 'suites', 'swebench-pro', 'container-policy.json');
     await command('python3', ['-m', 'venv', resolverDirectory], roots.cacheRoot, runtime);
     const resolverReport = await command(join(resolverDirectory, 'bin', 'pip'), [
       'install', '--quiet', '--disable-pip-version-check', '--index-url', config.evaluator.pipIndex,
@@ -297,6 +316,8 @@ export async function prepareSwebenchProInputs(
       requirementsSha256: sha256File(requirements),
       resolvedRequirementsSha256: sha256File(resolvedRequirementsPath),
       ownershipPatchSha256: sha256File(ownershipPatch),
+      evaluatorPolicyHelperSha256: sha256File(evaluatorPolicyHelper),
+      containerPolicyFileSha256: sha256File(containerPolicy),
       toolchainPayloadSha256: toolchain.provenance.payloadSha256,
     };
     writePrivateJsonAtomic(stage, join(stage, PREPARED_IDENTITY), manifestWithoutPayload);

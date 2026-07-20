@@ -15,8 +15,15 @@ import {
   cleanupActiveBenchProcesses,
   runBenchProcess,
   type BenchProcessOptions,
+  type BenchProcessResult,
 } from '../../shared/process.js';
 import type { SwebenchProConfig } from './config.js';
+import {
+  containerPolicySha256,
+  evaluatorContainerPolicy,
+  type SwebenchProContainerPolicy,
+} from './container-policy.js';
+import { ownershipUnsafe, ownershipUnsafeAggregate } from './cleanup.js';
 import { BASE_IMAGE_REPOSITORY } from './image.js';
 import { readTaskStatus } from './state.js';
 import type { EvalPrediction, SwebenchProInstance } from './types.js';
@@ -192,10 +199,18 @@ export function existingEvaluatorContainerIds(
 
 export type EvaluatorDocker = (argv: readonly string[]) => Promise<string>;
 
+export type EvaluatorProcessExecutor = (
+  command: string,
+  argv: readonly string[],
+  options: BenchProcessOptions,
+) => Promise<BenchProcessResult>;
+
 const defaultDocker: EvaluatorDocker = async (argv) => (await runBenchProcess('docker', argv, {
   cwd: process.cwd(),
   tailBytes: 64 * 1_024 * 1_024,
 })).stdout;
+
+const defaultProcessExecutor: EvaluatorProcessExecutor = runBenchProcess;
 
 async function containerIds(docker: EvaluatorDocker): Promise<Set<string>> {
   const output = await docker(['ps', '-aq', '--no-trunc']);
@@ -231,19 +246,43 @@ async function cleanupOwned(
   invocationStartedMs: number,
   maximumAgeMs: number | null,
 ): Promise<void> {
-  const records = await inspectContainers(docker);
-  for (const id of ownedEvaluatorContainerIds(records, {
-    outputDirectory,
-    baselineIds,
-    runId,
-    armLabel,
-    invocationId,
-    taskIds,
-    invocationStartedMs,
-    nowMs: Date.now(),
-    maximumAgeMs,
-  })) {
-    await docker(['rm', '-f', id]);
+  try {
+    const ownershipOptions = {
+      outputDirectory,
+      baselineIds,
+      runId,
+      armLabel,
+      invocationId,
+      taskIds,
+      invocationStartedMs,
+      nowMs: Date.now(),
+      maximumAgeMs,
+    };
+    const records = await inspectContainers(docker);
+    for (const id of ownedEvaluatorContainerIds(records, ownershipOptions)) {
+      let removalFailure: unknown;
+      try {
+        await docker(['rm', '-f', id]);
+      } catch (error) {
+        removalFailure = error;
+      }
+      const remaining = await inspectContainers(docker);
+      if (remaining.some((record) => record.Id === id)) {
+        throw ownershipUnsafeAggregate('evaluator container absence was not proven after removal', [
+          removalFailure,
+          new Error(`evaluator container remains present: ${id}`),
+        ]);
+      }
+    }
+    const remainingOwned = ownedEvaluatorContainerIds(
+      await inspectContainers(docker),
+      { ...ownershipOptions, nowMs: Date.now() },
+    );
+    if (remainingOwned.length > 0) {
+      throw new Error(`owned evaluator containers remain after cleanup: ${remainingOwned.join(', ')}`);
+    }
+  } catch (error) {
+    throw ownershipUnsafe('unsafe SWE-bench Pro evaluator cleanup', error);
   }
 }
 
@@ -251,9 +290,28 @@ async function cleanupPreviousOutput(
   docker: EvaluatorDocker,
   options: Parameters<typeof existingEvaluatorContainerIds>[1],
 ): Promise<void> {
-  const records = await inspectContainers(docker);
-  for (const id of existingEvaluatorContainerIds(records, options)) {
-    await docker(['rm', '-f', id]);
+  try {
+    const records = await inspectContainers(docker);
+    for (const id of existingEvaluatorContainerIds(records, options)) {
+      let removalFailure: unknown;
+      try {
+        await docker(['rm', '-f', id]);
+      } catch (error) {
+        removalFailure = error;
+      }
+      if ((await inspectContainers(docker)).some((record) => record.Id === id)) {
+        throw ownershipUnsafeAggregate('previous evaluator container absence was not proven', [
+          removalFailure,
+          new Error(`previous evaluator container remains present: ${id}`),
+        ]);
+      }
+    }
+    const remainingOwned = existingEvaluatorContainerIds(await inspectContainers(docker), options);
+    if (remainingOwned.length > 0) {
+      throw new Error(`previous evaluator containers remain after cleanup: ${remainingOwned.join(', ')}`);
+    }
+  } catch (error) {
+    throw ownershipUnsafe('unsafe previous SWE-bench Pro evaluator cleanup', error);
   }
 }
 
@@ -305,7 +363,7 @@ function untrackEvaluator(entry: ActiveEvaluator): void {
 /** Retry exact evaluator-container cleanup during root fatal handling. */
 export async function cleanupActiveSwebenchProEvaluators(): Promise<number> {
   const active = [...ACTIVE_EVALUATORS];
-  let failure: unknown;
+  const failures: unknown[] = [];
   for (const entry of active) {
     try {
       await cleanupOwned(
@@ -321,10 +379,12 @@ export async function cleanupActiveSwebenchProEvaluators(): Promise<number> {
       );
       untrackEvaluator(entry);
     } catch (error) {
-      failure ??= error;
+      failures.push(error);
     }
   }
-  if (failure !== undefined) throw failure;
+  if (failures.length > 0) {
+    throw ownershipUnsafeAggregate('active SWE-bench Pro evaluator cleanup failed', failures);
+  }
   return active.length;
 }
 
@@ -351,14 +411,62 @@ export interface RunEvaluatorOptions {
   prefix: string;
   predictions: readonly EvalPrediction[];
   instances: readonly SwebenchProInstance[];
+  containerPolicy: SwebenchProContainerPolicy;
   docker?: EvaluatorDocker;
+  processExecutor?: EvaluatorProcessExecutor;
   processLifecycle?: Pick<BenchProcessOptions,
     'workerScope' | 'onLifecycleToken' | 'onLifecycleStarted' | 'onLifecycleRecovered'>;
+}
+
+export interface EvaluatorProcessArgvOptions {
+  rawSamples: string;
+  predictions: string;
+  outputDirectory: string;
+  policy: string;
+  workers: number;
+  runId: string;
+  armLabel: Arm | 'gold' | 'nullcheck';
+  invocationId: string;
+}
+
+/** Build the exact pinned evaluator invocation without launching a process. */
+export function evaluatorProcessArgv(options: EvaluatorProcessArgvOptions): string[] {
+  return [
+    'swe_bench_pro_eval.py',
+    '--use_local_docker',
+    '--num_workers', String(options.workers),
+    '--raw_sample_path', options.rawSamples,
+    '--patch_path', options.predictions,
+    '--output_dir', options.outputDirectory,
+    '--scripts_dir', 'run_scripts',
+    '--dockerhub_username', DOCKERHUB_USERNAME,
+    '--benchmark_run_id', options.runId,
+    '--benchmark_arm', options.armLabel,
+    '--benchmark_invocation_id', options.invocationId,
+    '--benchmark_policy_path', options.policy,
+  ];
+}
+
+/** Exact policy artifact consumed by the patched official evaluator. */
+export function evaluatorPolicyDocument(
+  config: SwebenchProConfig,
+  policy: SwebenchProContainerPolicy,
+): Record<string, unknown> {
+  return {
+    schemaVersion: 2,
+    evaluatorRepository: config.evaluator.repository,
+    evaluatorRevision: config.evaluator.revision,
+    strictBooleanVerdicts: true,
+    emptyPredictions: 'unverified-no-native-output',
+    containerPolicySha256: containerPolicySha256(policy),
+    containerPolicy: evaluatorContainerPolicy(policy, config.docker),
+  };
 }
 
 /** Parse partial output in finally, keeping process failure separate from verdicts. */
 export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promise<EvaluatorRunResult> {
   const docker = options.docker ?? defaultDocker;
+  const processExecutor = options.processExecutor ?? defaultProcessExecutor;
   const verifierRoot = ensurePrivateDirectoryWithin(
     options.runDirectory,
     join(options.runDirectory, 'native', 'verifier', options.prefix),
@@ -378,13 +486,11 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
   const policy = join(verifierRoot, 'evaluator-policy.json');
   generateRawSamples(options.instances, rawSamples);
   replaceArtifactFile(predictions, `${JSON.stringify(options.predictions, null, 2)}\n`);
-  replaceArtifactFile(policy, `${JSON.stringify({
-    schemaVersion: 2,
-    evaluatorRepository: options.config.evaluator.repository,
-    evaluatorRevision: options.config.evaluator.revision,
-    strictBooleanVerdicts: true,
-    emptyPredictions: 'unverified-no-native-output',
-  }, null, 2)}\n`);
+  replaceArtifactFile(policy, `${JSON.stringify(
+    evaluatorPolicyDocument(options.config, options.containerPolicy),
+    null,
+    2,
+  )}\n`);
   const relativePath = (path: string): string => relative(options.runDirectory, path).split(sep).join('/');
   const initialTime = new Date().toISOString();
   const baseResult = {
@@ -414,19 +520,16 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
   const startedAt = Date.now();
   let processFailure: FailureCode | null = null;
   let exitCode = 0;
-  const args = [
-    'swe_bench_pro_eval.py',
-    '--use_local_docker',
-    '--num_workers', String(options.config.concurrency.verifier),
-    '--raw_sample_path', rawSamples,
-    '--patch_path', predictions,
-    '--output_dir', outputDirectory,
-    '--scripts_dir', 'run_scripts',
-    '--dockerhub_username', DOCKERHUB_USERNAME,
-    '--benchmark_run_id', options.runId,
-    '--benchmark_arm', options.armLabel,
-    '--benchmark_invocation_id', options.invocationId,
-  ];
+  const args = evaluatorProcessArgv({
+    rawSamples,
+    predictions,
+    outputDirectory,
+    policy,
+    workers: options.config.concurrency.verifier,
+    runId: options.runId,
+    armLabel: options.armLabel,
+    invocationId: options.invocationId,
+  });
   const activeEvaluator: ActiveEvaluator = {
     docker,
     outputDirectory,
@@ -439,6 +542,7 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
   };
   trackEvaluator(activeEvaluator);
   let watchdogCleanup: Promise<void> | null = null;
+  let retainedCleanupFailure: unknown;
   const watchdog = setInterval(() => {
     if (watchdogCleanup !== null) return;
     watchdogCleanup = cleanupOwned(
@@ -455,7 +559,7 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
       .finally(() => { watchdogCleanup = null; });
   }, Math.min(60_000, options.config.timeouts.evaluatorWatchdogMs));
   try {
-    await runBenchProcess(options.evaluatorPythonBinary, args, {
+    await processExecutor(options.evaluatorPythonBinary, args, {
       cwd: options.evaluatorDirectory,
       stream: true,
       timeoutMs: options.config.timeouts.verifierMs,
@@ -485,8 +589,8 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
         null,
       );
       untrackEvaluator(activeEvaluator);
-    } catch {
-      processFailure ??= 'verifier-process-failed';
+    } catch (error) {
+      retainedCleanupFailure = error;
     }
     replaceArtifactFile(invocation, `${JSON.stringify({
       schemaVersion: 2,
@@ -498,6 +602,8 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
       baselineContainerIds: [...baselineIds].sort(),
     }, null, 2)}\n`);
   }
+
+  if (retainedCleanupFailure !== undefined) throw retainedCleanupFailure;
 
   const resultFile = join(outputDirectory, 'eval_results.json');
   const endedAt = Date.now();

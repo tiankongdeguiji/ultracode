@@ -182,8 +182,12 @@ export const swebenchProAdapter: SuiteAdapter<'swebench-pro'> = {
   suite: 'swebench-pro',
   displayName: 'SWE-bench Pro',
   description: 'Docker sessions and the pinned official SWE-bench Pro evaluator',
+  async cleanup() {
+    const runner = await import('./runner.js');
+    await runner.cleanupSwebenchProRuntime();
+  },
   commands: {
-    fetch: cacheSpec('freeze the complete official dataset snapshot', 'fetchCommand'),
+    fetch: cacheSpec('verify and freeze the audited canonical dataset descriptor', 'fetchCommand'),
     prep: cacheSpec('prepare immutable toolchain and evaluator inputs', 'prepCommand'),
     run: runSpec,
     eval: evalSpec,

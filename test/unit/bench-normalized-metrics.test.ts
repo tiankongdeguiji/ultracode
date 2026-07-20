@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { failureObservationSchema } from '../../bench/src/shared/failure.js';
 import type { MetricsPolicySnapshot } from '../../bench/src/shared/manifest.js';
 import {
   emptyMetricsArtifactIndex,
@@ -13,7 +14,11 @@ import {
   type RolloutArtifact,
   type TimingObservation,
 } from '../../bench/src/shared/metrics.js';
-import { parseBenchRunState, type AttemptRecord } from '../../bench/src/shared/run-state.js';
+import {
+  parseBenchRunState,
+  type AttemptRecord,
+  type InvocationRecord,
+} from '../../bench/src/shared/run-state.js';
 
 const HOST_ID = '11111111-1111-4111-8111-111111111111';
 const WORKER_ID = '22222222-2222-4222-8222-222222222222';
@@ -115,6 +120,25 @@ function completedAttempt(
   };
 }
 
+function completedInvocation(
+  invocationId: string,
+  over: Partial<InvocationRecord> = {},
+): InvocationRecord {
+  return {
+    invocationId,
+    command: 'run',
+    startedAt: '2026-07-20T00:00:00.000Z',
+    endedAt: '2026-07-20T00:00:01.000Z',
+    activeElapsedMs: 1_000,
+    exitCode: 0,
+    signal: null,
+    lifecycleProcesses: [],
+    failure: null,
+    nativeInvocation: 'native',
+    ...over,
+  };
+}
+
 function timing(
   sourceKey: string,
   taskId: string,
@@ -158,6 +182,7 @@ describe('Codex cumulative rollout normalization', () => {
         rawTokenCount: 1_320,
       },
     });
+    expect(session).not.toHaveProperty('observedModels');
   });
 
   it('replaces with the final complete cumulative object and never double-counts reasoning', () => {
@@ -271,9 +296,54 @@ describe('normalized aggregation invariants', () => {
     });
   });
 
+  it('prices only positive billable sessions with uniform exact observed model evidence', () => {
+    const runDirectory = root();
+    const observed = (
+      name: string,
+      models: string[],
+      inputTokens: number,
+    ): string => put(runDirectory, `native/${name}.jsonl`, jsonl(
+      ...models.map((model, index) => index === 0
+        ? { type: 'session_meta', payload: { model } }
+        : { type: 'turn_context', payload: { model } }),
+      tokenCount({ input_tokens: inputTokens, cached_input_tokens: inputTokens === 1_000 ? 400 : 0,
+        output_tokens: inputTokens / 10 }),
+    ));
+    const matched = observed('matched', ['gpt-test', 'gpt-test'], 1_000);
+    const mismatched = observed('mismatched', ['gpt-other'], 2_000);
+    const unobserved = observed('unobserved', [], 3_000);
+    const requestedThenOther = observed('requested-then-other', ['gpt-test', 'gpt-other'], 4_000);
+    const otherThenRequested = observed('other-then-requested', ['gpt-other', 'gpt-test'], 5_000);
+    const metrics = normalizeMetrics({
+      runDirectory,
+      index: {
+        ...emptyMetricsArtifactIndex(),
+        rollouts: [matched, mismatched, unobserved, requestedThenOther, otherThenRequested]
+          .map((path) => artifact(path)),
+      },
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing,
+    });
+    const annotations = (path: string) => metrics.sessions.items.find((session) => session.path === path)!
+      .annotations.map(({ code }) => code);
+
+    expect(metrics.tokens.total.rawTokenCount).toBe(16_500);
+    expect(metrics.tokens.byBillingClass.billable.rawTokenCount).toBe(16_500);
+    expect(metrics.pricing).toEqual({ currency: 'USD', verification: 'partial', billableCost: 0.74 });
+    expect(annotations(matched)).toEqual([]);
+    expect(annotations(mismatched)).toContain('model-mismatch');
+    expect(annotations(unobserved)).toContain('model-unobserved');
+    expect(annotations(requestedThenOther)).toContain('model-multiple');
+    expect(annotations(otherThenRequested)).toContain('model-multiple');
+    expect(metrics.sessions.items.find((session) => session.path === requestedThenOther)?.model).toBe('gpt-other');
+    expect(metrics.sessions.items.find((session) => session.path === otherThenRequested)?.model).toBe('gpt-test');
+  });
+
   it('keeps the known subtotal but makes pricing partial for missing billable usage', () => {
     const runDirectory = root();
     const known = put(runDirectory, 'native/rollout-known.jsonl', jsonl(
+      { type: 'turn_context', payload: { model: 'gpt-test' } },
       tokenCount({ input_tokens: 1_000, cached_input_tokens: 400, output_tokens: 100 }),
     ));
     const missing = put(runDirectory, 'native/rollout-missing.jsonl', jsonl(
@@ -303,9 +373,29 @@ describe('normalized aggregation invariants', () => {
     }).pricing).toEqual({ currency: 'USD', verification: 'unpriced', billableCost: null });
   });
 
+  it('excludes positive usage when malformed records make model evidence incomplete', () => {
+    const runDirectory = root();
+    const corrupt = put(runDirectory, 'native/rollout-corrupt.jsonl', jsonl(
+      { type: 'turn_context', payload: { model: 'gpt-test' } },
+      '{not-json',
+      tokenCount({ input_tokens: 1_000, cached_input_tokens: 400, output_tokens: 100 }),
+    ));
+    const metrics = normalizeMetrics({
+      runDirectory,
+      index: { ...emptyMetricsArtifactIndex(), rollouts: [artifact(corrupt)] },
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing,
+    });
+    expect(metrics.tokens.byBillingClass.billable.rawTokenCount).toBe(1_100);
+    expect(metrics.pricing).toEqual({ currency: 'USD', verification: 'partial', billableCost: 0 });
+    expect(metrics.sessions.items[0]?.annotations.map(({ code }) => code)).toContain('rollout-malformed-json');
+  });
+
   it('keeps pricing partial when potentially billable indexed usage cannot be established', () => {
     const runDirectory = root();
     const known = put(runDirectory, 'native/rollout-known.jsonl', jsonl(
+      { type: 'turn_context', payload: { model: 'gpt-test' } },
       tokenCount({ input_tokens: 1_000, cached_input_tokens: 400, output_tokens: 100 }),
     ));
     const unknownMissing = put(runDirectory, 'native/rollout-unknown.jsonl', jsonl(
@@ -343,13 +433,16 @@ describe('normalized aggregation invariants', () => {
     });
   });
 
-  it('prices valid all-zero usage and ignores missing usage from non-billable rollouts', () => {
+  it('keeps valid zero usage and non-billable sessions neutral for model-verified pricing', () => {
     const runDirectory = root();
     const zero = put(runDirectory, 'native/rollout-zero.jsonl', jsonl(
       tokenCount({ input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 }),
     ));
     const missingNonBillable = put(runDirectory, 'native/rollout-missing-nonbillable.jsonl', jsonl(
       { type: 'turn_context', payload: { effort: 'high', model: 'gpt-test' } },
+    ));
+    const positiveNonBillable = put(runDirectory, 'native/rollout-positive-nonbillable.jsonl', jsonl(
+      tokenCount({ input_tokens: 2_000, cached_input_tokens: 0, output_tokens: 200 }),
     ));
     const metrics = normalizeMetrics({
       runDirectory,
@@ -362,6 +455,11 @@ describe('normalized aggregation invariants', () => {
             backend: 'local',
             billingClass: 'non-billable',
           }),
+          artifact(positiveNonBillable, {
+            scope: { taskId: 'task-three', arm: 'b' },
+            backend: 'local',
+            billingClass: 'non-billable',
+          }),
         ],
       },
       requested: { model: 'gpt-test', effort: 'high' },
@@ -369,10 +467,16 @@ describe('normalized aggregation invariants', () => {
       pricing,
     });
     expect(metrics.pricing).toEqual({ currency: 'USD', verification: 'priced', billableCost: 0 });
+    expect(metrics.tokens.total.rawTokenCount).toBe(2_200);
+    expect(metrics.tokens.byBillingClass['non-billable'].rawTokenCount).toBe(2_200);
     expect(metrics.sessions.items.find((session) => session.path === zero)?.annotations
       .map(({ code }) => code)).not.toContain('rollout-usage-missing');
+    expect(metrics.sessions.items.find((session) => session.path === zero)?.annotations
+      .map(({ code }) => code)).not.toContain('model-unobserved');
     expect(metrics.sessions.items.find((session) => session.path === missingNonBillable)?.annotations
       .map(({ code }) => code)).toContain('rollout-usage-missing');
+    expect(metrics.sessions.items.find((session) => session.path === positiveNonBillable)?.annotations
+      .map(({ code }) => code)).not.toContain('model-unobserved');
   });
 
   it('rejects duplicate paths and same-scope session ids, but permits ids across scopes', () => {
@@ -429,6 +533,51 @@ describe('normalized aggregation invariants', () => {
     });
     expect(metrics.sessions.total).toBe(0);
     expect(metrics.failures.map(({ code }) => code)).toEqual(['artifact-unsafe']);
+  });
+
+  it('projects failed invocations after adapter and artifact failures while ignoring successful ones', () => {
+    const state = parseBenchRunState({
+      schemaVersion: 2,
+      kind: 'ultracode-benchmark-run-state',
+      suite: 'swebench-pro',
+      runId: 'run-one',
+      manifestSha256: HASH,
+      revision: 0,
+      invocations: [
+        completedInvocation(HOST_ID),
+        completedInvocation(WORKER_ID, { failure: 'unknown-terminal', exitCode: 1 }),
+        completedInvocation(SECOND_INVOCATION_ID, { failure: 'agent-timeout', exitCode: 1 }),
+      ],
+      attempts: [],
+    });
+    const metrics = normalizeMetrics({
+      runDirectory: root(),
+      index: {
+        ...emptyMetricsArtifactIndex(),
+        rollouts: [artifact('native/missing.jsonl')],
+        failures: [failureObservationSchema.parse({
+          code: 'driver-watchdog',
+          scope: { kind: 'run' },
+          phase: null,
+          terminal: true,
+          evidence: 'harness',
+        })],
+      },
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing: null,
+      runState: state,
+    });
+
+    expect(metrics.failures).toEqual([
+      { code: 'driver-watchdog', scope: { kind: 'run' }, phase: null, terminal: true, evidence: 'harness' },
+      {
+        code: 'artifact-unsafe', scope: { kind: 'task-arm', taskId: 'task-one', arm: 'b' },
+        phase: 'report', terminal: false, evidence: 'harness',
+      },
+      { code: 'unknown-terminal', scope: { kind: 'run' }, phase: null, terminal: true, evidence: 'harness' },
+      { code: 'agent-timeout', scope: { kind: 'run' }, phase: null, terminal: true, evidence: 'native' },
+    ]);
   });
 
   it('rejects adapter task/arm scopes that are absent from the immutable manifest', () => {

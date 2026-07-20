@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 const temporaryRoots: string[] = [];
 const sanitizer = join(process.cwd(), 'bench/suites/swebench-pro/sanitize-git.sh');
 const entrypoint = join(process.cwd(), 'bench/suites/swebench-pro/entrypoint.sh');
+const capture = join(process.cwd(), 'bench/suites/swebench-pro/capture-git.sh');
 
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -187,5 +188,39 @@ describe('SWE-bench Pro Git sanitizer', () => {
     expect(source).toContain('if ! git status --porcelain > "$BENCH/out/pre-status.txt" 2>&1; then');
     expect(source).toContain('if ! TRACKED_DIRTY=$(git status --porcelain --untracked-files=no');
     expect(source).toContain('if ! git status --porcelain -z 2>/dev/null | "$NODE" -e');
+  });
+
+  it('captures an evaluator-faithful patch in the immutable task-uid helper', () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-bench-pro-capture-'));
+    temporaryRoots.push(root);
+    const repository = join(root, 'repository');
+    const bench = join(root, 'bench');
+    const preDirty = join(root, 'predirty.z');
+    initializeRepository(repository);
+    mkdirSync(join(bench, 'out'), { recursive: true });
+    mkdirSync(join(bench, 'logs'));
+    writeFileSync(join(repository, 'tracked.txt'), 'base\n');
+    git(repository, ['add', 'tracked.txt']);
+    git(repository, ['commit', '--quiet', '-m', 'base']);
+    const base = git(repository, ['rev-parse', 'HEAD']);
+    writeFileSync(join(repository, 'tracked.txt'), 'changed\n');
+    writeFileSync(join(repository, 'pre-existing.txt'), 'image runtime file\n');
+    writeFileSync(preDirty, ':(literal)pre-existing.txt\0');
+
+    const result = spawnSync('bash', [capture, repository, base, bench, process.execPath, preDirty], {
+      encoding: 'utf8',
+      env: cleanGitEnvironment(),
+    });
+    expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
+      status: 0,
+      stdout: '',
+      stderr: '',
+    });
+    const patch = readFileSync(join(bench, 'out/patch.diff'), 'utf8');
+    expect(patch).toContain('+changed');
+    expect(patch).not.toContain('pre-existing.txt');
+    expect(readFileSync(join(bench, 'out/apply-check'), 'utf8')).toBe('ok\n');
+    expect(readFileSync(join(bench, 'out/binary-stripped'), 'utf8')).toBe('0');
+    expect(git(repository, ['status', '--porcelain'])).toBe('?? pre-existing.txt');
   });
 });

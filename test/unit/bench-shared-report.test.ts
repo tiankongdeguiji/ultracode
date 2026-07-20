@@ -207,6 +207,7 @@ function build(over: Record<string, unknown> = {}) {
     manifestSha256: HASH,
     runState: state() as never,
     runStateSha256: OTHER_HASH,
+    runStateLedgerRootSha256: HASH,
     verifierReceipt: receipt() as never,
     verifierReceiptSha256: OTHER_HASH,
     metrics: metrics(),
@@ -276,6 +277,7 @@ describe('common report evidence envelope', () => {
       nativeVerifier: { verification: 'unverified', score: null, resolved: null, artifact: null },
     });
     expect(report.reproducibility.provenance).toEqual(manifest().provenance);
+    expect(report.reproducibility.runStateLedgerRootSha256).toBe(HASH);
     expect(report.analysis.policyAdjusted.paired).toMatchObject({ paired: 1, aOnly: 1, bOnly: 0 });
     expect(report.analysis.native.paired.paired).toBe(0);
     expect(renderBenchReportMarkdown(report)).toContain(`native/a/verdict.json | ${OTHER_HASH}`);
@@ -303,6 +305,35 @@ describe('common report evidence envelope', () => {
     const inputs = taskInputs();
     inputs[1]!.nativeVerifier = { verification: 'unverified', score: 0, resolved: false, artifact: null };
     expect(() => build({ taskResults: inputs })).toThrow(/must be null/);
+  });
+
+  it('preserves source ordering while deduplicating normalized invocation failures report-wide', () => {
+    const invocationFailure = failureObservationSchema.parse({
+      code: 'unknown-terminal',
+      scope: { kind: 'run' },
+      phase: null,
+      terminal: true,
+      evidence: 'harness',
+    });
+    const additionalFailure = failureObservationSchema.parse({
+      code: 'driver-watchdog',
+      scope: { kind: 'run' },
+      phase: null,
+      terminal: true,
+      evidence: 'harness',
+    });
+    const observedMetrics = metrics();
+    observedMetrics.failures = [invocationFailure];
+    const report = build({
+      metrics: observedMetrics,
+      failures: [invocationFailure, additionalFailure],
+    });
+
+    expect(report.failures).toEqual([
+      invocationFailure,
+      additionalFailure,
+      failure('empty-patch'),
+    ]);
   });
 });
 

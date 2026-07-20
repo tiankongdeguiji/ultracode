@@ -4,8 +4,8 @@
  * are bounded after direct-child exit, and fatal cleanup shares one registry.
  */
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { Readable } from 'node:stream';
-import { spawnAgentProcess, TailBuffer, type SpawnedAgent } from '../../../src/exec/spawn.js';
+import { Writable, type Readable } from 'node:stream';
+import { spawnAgentProcess, type SpawnedAgent } from '../../../src/exec/spawn.js';
 import { readProcessIdentity } from '../../../src/exec/procinfo.js';
 
 const BASE_CHILD_ENV = [
@@ -99,13 +99,158 @@ export class BenchProcessError extends Error {
   }
 }
 
-function appendStreamEnd(stream: Readable | null): Promise<void> {
-  if (stream === null || stream.readableEnded || stream.destroyed) return Promise.resolve();
-  return new Promise((resolvePromise) => {
-    const done = (): void => resolvePromise();
-    stream.once('end', done);
-    stream.once('close', done);
+interface StreamEndWait {
+  promise: Promise<void>;
+  cleanup(): void;
+}
+
+class ByteTailBuffer {
+  private bytes = Buffer.alloc(0);
+
+  constructor(private readonly maximumBytes: number) {}
+
+  push(chunk: Buffer): void {
+    if (this.maximumBytes === 0) {
+      this.bytes = Buffer.alloc(0);
+    } else if (chunk.length >= this.maximumBytes) {
+      this.bytes = Buffer.from(chunk.subarray(chunk.length - this.maximumBytes));
+    } else {
+      const combined = Buffer.concat([this.bytes, chunk]);
+      this.bytes = combined.length <= this.maximumBytes
+        ? combined
+        : Buffer.from(combined.subarray(combined.length - this.maximumBytes));
+    }
+  }
+
+  get text(): string {
+    return this.bytes.toString('utf8');
+  }
+}
+
+class CallerTargetAdapter extends Writable {
+  readonly completion: Promise<void>;
+  private targetListenerAttached = true;
+
+  constructor(private readonly target: Writable) {
+    super();
+    this.target.on('error', this.onTargetError);
+    this.completion = new Promise<void>((resolvePromise, rejectPromise) => {
+      const cleanup = (): void => {
+        this.removeListener('finish', onFinish);
+        this.removeListener('error', onError);
+      };
+      const onFinish = (): void => {
+        cleanup();
+        resolvePromise();
+      };
+      const onError = (error: Error): void => {
+        cleanup();
+        rejectPromise(error);
+      };
+      this.once('finish', onFinish);
+      this.once('error', onError);
+    });
+    void this.completion.catch(() => {});
+  }
+
+  override _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    try {
+      this.target.write(chunk, callback);
+    } catch (error) {
+      callback(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  override _final(callback: (error?: Error | null) => void): void {
+    this.detachTargetListener();
+    callback();
+  }
+
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+    this.detachTargetListener();
+    callback(error);
+  }
+
+  detach(): void {
+    this.detachTargetListener();
+    if (!this.destroyed) this.destroy();
+  }
+
+  private readonly onTargetError = (error: Error): void => {
+    this.destroy(error);
+  };
+
+  private detachTargetListener(): void {
+    if (!this.targetListenerAttached) return;
+    this.target.removeListener('error', this.onTargetError);
+    this.targetListenerAttached = false;
+  }
+}
+
+function waitForStreamEnd(stream: Readable | null): StreamEndWait {
+  if (stream === null || stream.readableEnded || stream.destroyed) {
+    return { promise: Promise.resolve(), cleanup: () => {} };
+  }
+  let resolveWait!: () => void;
+  const cleanup = (): void => {
+    stream.removeListener('end', done);
+    stream.removeListener('close', done);
+  };
+  const done = (): void => {
+    cleanup();
+    resolveWait();
+  };
+  const promise = new Promise<void>((resolvePromise) => {
+    resolveWait = resolvePromise;
   });
+  stream.once('end', done);
+  stream.once('close', done);
+  return { promise, cleanup };
+}
+
+async function waitForOutputDrain(
+  stdout: Readable | null,
+  stderr: Readable | null,
+  forwarders: readonly CallerTargetAdapter[],
+  drainMs: number,
+): Promise<boolean> {
+  const stdoutEnd = waitForStreamEnd(stdout);
+  const stderrEnd = waitForStreamEnd(stderr);
+  let drainTimeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      Promise.all([
+        stdoutEnd.promise,
+        stderrEnd.promise,
+        ...forwarders.map((forwarder) => forwarder.completion),
+      ]).then(() => true),
+      new Promise<boolean>((resolvePromise) => {
+        drainTimeout = setTimeout(() => resolvePromise(false), drainMs);
+      }),
+    ]);
+  } finally {
+    if (drainTimeout !== undefined) clearTimeout(drainTimeout);
+    stdoutEnd.cleanup();
+    stderrEnd.cleanup();
+  }
+}
+
+function detachChildReadable(
+  source: Readable | null,
+  forwarder: CallerTargetAdapter | null,
+  handler: (chunk: Buffer) => void,
+): void {
+  if (source === null) {
+    forwarder?.detach();
+    return;
+  }
+  try {
+    if (forwarder !== null) source.unpipe(forwarder);
+  } finally {
+    source.removeListener('data', handler);
+    forwarder?.detach();
+    if (!source.readableEnded && !source.destroyed) source.destroy();
+  }
 }
 
 /** Run one native command and fully retire its owned process group. */
@@ -160,48 +305,77 @@ export async function runBenchProcess(
     if (remaining === 0) ACTIVE_BENCH_PROCESSES.delete(spawned);
     throw error;
   }
-  const stdout = new TailBuffer(tailBytes);
-  const stderr = new TailBuffer(tailBytes);
+  const stdout = new ByteTailBuffer(tailBytes);
+  const stderr = new ByteTailBuffer(tailBytes);
   const stdoutTarget = options.stdout ?? process.stdout;
   const stderrTarget = options.stderr ?? process.stderr;
-  spawned.child.stdout?.on('data', (chunk: Buffer) => {
-    stdout.push(chunk.toString('utf8'));
-    if (options.stream) stdoutTarget.write(chunk);
-  });
-  spawned.child.stderr?.on('data', (chunk: Buffer) => {
-    stderr.push(chunk.toString('utf8'));
-    if (options.stream) stderrTarget.write(chunk);
-  });
+  const childStdout = spawned.child.stdout;
+  const childStderr = spawned.child.stderr;
+  const onStdoutData = (chunk: Buffer): void => {
+    stdout.push(chunk);
+  };
+  const onStderrData = (chunk: Buffer): void => {
+    stderr.push(chunk);
+  };
+  const stdoutForwarder = options.stream && childStdout !== null
+    ? new CallerTargetAdapter(stdoutTarget as Writable)
+    : null;
+  const stderrForwarder = options.stream && childStderr !== null
+    ? new CallerTargetAdapter(stderrTarget as Writable)
+    : null;
 
   let timeout: NodeJS.Timeout | undefined;
   let timeoutEscalation: NodeJS.Timeout | undefined;
   let timedOut = false;
-  if (options.timeoutMs !== undefined && options.timeoutMs !== null) {
-    timeout = setTimeout(() => {
-      timedOut = true;
-      spawned.killTree('SIGTERM');
-      timeoutEscalation = setTimeout(() => spawned.killTree('SIGKILL'), terminationGraceMs);
-    }, options.timeoutMs);
-  }
-
   let cleanupRemaining: number | null = null;
   let cleanupRecorded = false;
+  let outputDrainFailure: Error | null = null;
   const recordCompleteCleanup = (): void => {
     if (cleanupRecorded) return;
     options.onLifecycleRecovered?.(spawned.workerToken, 'complete');
     cleanupRecorded = true;
   };
   try {
+    childStdout?.on('data', onStdoutData);
+    childStderr?.on('data', onStderrData);
+    if (stdoutForwarder !== null) childStdout?.pipe(stdoutForwarder);
+    if (stderrForwarder !== null) childStderr?.pipe(stderrForwarder);
+    if (options.timeoutMs !== undefined && options.timeoutMs !== null) {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        spawned.killTree('SIGTERM');
+        timeoutEscalation = setTimeout(() => spawned.killTree('SIGKILL'), terminationGraceMs);
+      }, options.timeoutMs);
+    }
     const termination = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, reject) => {
-      spawned.child.once('error', reject);
-      spawned.child.once('exit', (code, signal) => resolvePromise({ code, signal }));
+      const cleanup = (): void => {
+        spawned.child.removeListener('error', onError);
+        spawned.child.removeListener('exit', onExit);
+      };
+      const onError = (error: Error): void => {
+        cleanup();
+        reject(error);
+      };
+      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+        cleanup();
+        resolvePromise({ code, signal });
+      };
+      spawned.child.once('error', onError);
+      spawned.child.once('exit', onExit);
     });
     if (timeout !== undefined) clearTimeout(timeout);
     if (timeoutEscalation !== undefined) clearTimeout(timeoutEscalation);
-    await Promise.race([
-      Promise.all([appendStreamEnd(spawned.child.stdout), appendStreamEnd(spawned.child.stderr)]),
-      sleep(drainMs),
-    ]);
+    try {
+      const drained = await waitForOutputDrain(
+        childStdout,
+        childStderr,
+        [stdoutForwarder, stderrForwarder].filter((value): value is CallerTargetAdapter => value !== null),
+        drainMs,
+      );
+      if (!drained && !timedOut) outputDrainFailure = new Error(`output did not drain within ${drainMs}ms`);
+    } catch (error) {
+      outputDrainFailure = error instanceof Error ? error : new Error(String(error));
+    }
     cleanupRemaining = await spawned.cleanupEscaped(
       terminationGraceMs,
     );
@@ -217,6 +391,12 @@ export async function runBenchProcess(
     if (cleanupRemaining !== 0) {
       throw new BenchProcessError(
         `${command} descendant cleanup failed`,
+        { ...output, exitCode: termination.code },
+      );
+    }
+    if (outputDrainFailure !== null) {
+      throw new BenchProcessError(
+        `${command} output forwarding failed: ${sanitizeDiagnostic(outputDrainFailure.message)}`,
         { ...output, exitCode: termination.code },
       );
     }
@@ -246,6 +426,11 @@ export async function runBenchProcess(
       if (cleanupRemaining === 0) recordCompleteCleanup();
     }
     if (cleanupRemaining === 0) ACTIVE_BENCH_PROCESSES.delete(spawned);
+    try {
+      detachChildReadable(childStdout, stdoutForwarder, onStdoutData);
+    } finally {
+      detachChildReadable(childStderr, stderrForwarder, onStderrData);
+    }
   }
 }
 

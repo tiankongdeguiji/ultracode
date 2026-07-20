@@ -259,34 +259,12 @@ if [ -n "$GIT_AUDIT_DIR" ]; then
   cleanup_git_audit
 fi
 
-# --- patch capture: diff agent work against the base, keeping pre-dirty runtime
-# --- paths and bench droppings out; binary hunks stripped to
-# --- mirror the official harness (it strips them before git apply) ---
-git add -A >/dev/null 2>&1
-if [ -s /tmp/predirty.z ]; then
-  xargs -0 git reset -q -- < /tmp/predirty.z >/dev/null 2>&1
-fi
-git -c core.quotePath=false diff --no-color --no-ext-diff --cached "$BASE_SHA" -- . \
-  ':(exclude).ultracode' ':(exclude).agents' ':(exclude).codex' ':(exclude)*.workflow.js' \
-  > "$BENCH/out/patch.full.diff" 2>>"$BENCH/logs/entry.log"
-"$NODE" -e '
-  const fs = require("fs");
-  const full = fs.readFileSync("/bench/out/patch.full.diff", "utf8");
-  const sections = full.length ? full.split(/^(?=diff --git )/m) : [];
-  let stripped = 0;
-  const kept = sections.filter((s) => {
-    if (/^Binary files .* differ$/m.test(s) || /^GIT binary patch$/m.test(s)) { stripped++; return false; }
-    return true;
-  });
-  fs.writeFileSync("/bench/out/patch.diff", kept.join(""));
-  fs.writeFileSync("/bench/out/binary-stripped", String(stripped));
-' 2>>"$BENCH/logs/entry.log" || cp "$BENCH/out/patch.full.diff" "$BENCH/out/patch.diff"
-if [ -s "$BENCH/out/patch.diff" ]; then
-  git reset --hard "$BASE_SHA" >/dev/null 2>&1  # junk from the snapshot drops out: eval-faithful base tree
-  if git apply --check --whitespace=nowarn "$BENCH/out/patch.diff" 2>>"$BENCH/logs/entry.log"; then
-    echo ok > "$BENCH/out/apply-check"
-  else
-    echo fail > "$BENCH/out/apply-check"
-  fi
+# Patch capture is immutable harness code but operates on task-controlled Git
+# state, so it runs as the task uid with every capability set cleared.
+if ! setpriv --reuid "$TASK_UID" --regid "$TASK_GID" --clear-groups \
+  --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \
+  /opt/bench/capture-git.sh "$REPO_DIR" "$BASE_SHA" "$BENCH" "$NODE" /tmp/predirty.z; then
+  log "post-session Git capture failed"
+  META_FAILURE="harness-setup-failed"
 fi
 finish

@@ -1,4 +1,5 @@
 /** Offline FeatureBench pins, trust boundary, native commands, and evidence. */
+import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
   cpSync,
@@ -30,6 +31,7 @@ import {
 } from '../../bench/src/suites/featurebench/config.js';
 import { validateFeatureBenchHost } from '../../bench/src/suites/featurebench/host.js';
 import {
+  FEATUREBENCH_DATASET_MEMBERSHIP_SCRIPT,
   parseFeatureBenchDatasetMap,
   type PreparedFeatureBenchInputs,
 } from '../../bench/src/suites/featurebench/prepare.js';
@@ -52,15 +54,58 @@ import { indexFeatureBenchMetrics } from '../../bench/src/suites/featurebench/te
 import { indexFeatureBenchEvidence } from '../../bench/src/suites/featurebench/verifier.js';
 
 const FIXTURE = resolve('test/fixtures/bench/featurebench');
+const INVENTORY_FIXTURE = resolve(
+  'test/fixtures/bench/featurebench-inventory-e99d6efdfe511ea832c1b5735c536129561ec96a.json',
+);
 const TIMESTAMP = '2026-07-19__13-00-41';
 const TASK_IDS = ['task-alpha', 'task-beta', 'task-gamma', 'task-delta', 'task-epsilon'];
 const HASH = 'a'.repeat(64);
 const temporaryRoots: string[] = [];
 
+interface PinnedInventoryFixture {
+  dataset: string;
+  revision: string;
+  split: string;
+  expectedTaskCount: number;
+  sourceParquetSha256: string;
+  tasks: Record<string, string>;
+}
+
 function temporary(): string {
   const root = mkdtempSync(join(tmpdir(), 'uc-featurebench-test-'));
   temporaryRoots.push(root);
   return root;
+}
+
+function pinnedInventory(): PinnedInventoryFixture {
+  return JSON.parse(readFileSync(INVENTORY_FIXTURE, 'utf8')) as PinnedInventoryFixture;
+}
+
+function projectFeatureBenchRows(rows: readonly unknown[]) {
+  const stubDirectory = temporary();
+  writeFileSync(join(stubDirectory, 'datasets.py'), `import json
+import os
+
+def load_dataset(dataset, *, split, revision):
+    expected = json.loads(os.environ["FEATUREBENCH_STUB_EXPECTED"])
+    if {"dataset": dataset, "split": split, "revision": revision} != expected:
+        raise AssertionError("projection did not use the pinned load_dataset arguments")
+    return json.loads(os.environ["FEATUREBENCH_STUB_ROWS"])
+`);
+  return spawnSync('python3', ['-c', FEATUREBENCH_DATASET_MEMBERSHIP_SCRIPT], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      FEATUREBENCH_STUB_EXPECTED: JSON.stringify({
+        dataset: FEATUREBENCH_DATASET,
+        revision: FEATUREBENCH_DATASET_REVISION,
+        split: FEATUREBENCH_SPLIT,
+      }),
+      FEATUREBENCH_STUB_ROWS: JSON.stringify(rows),
+      PYTHONPATH: stubDirectory,
+      PYTHONDONTWRITEBYTECODE: '1',
+    },
+  });
 }
 
 function nativeFixture(): string {
@@ -134,23 +179,80 @@ function consolidatedPredictions(runDirectory: string, path: string): Map<string
 }
 
 describe('FeatureBench immutable inputs and host policy', () => {
-  it('freezes upstream source, dataset, split, Python, and complete membership', () => {
+  it('freezes upstream source, dataset, split, Python, and pinned inventory', () => {
+    const inventory = pinnedInventory();
     expect(FEATUREBENCH_SOURCE_REVISION).toBe('445dcbaec0b2e136061b0acb54e753c0a9f1888e');
     expect(FEATUREBENCH_DATASET_REVISION).toBe('e99d6efdfe511ea832c1b5735c536129561ec96a');
     expect(FEATUREBENCH_SPLIT).toBe('fast');
     expect(FEATUREBENCH_PYTHON_VERSION).toBe('3.13.5');
+    expect({
+      dataset: inventory.dataset,
+      revision: inventory.revision,
+      split: inventory.split,
+    }).toEqual({
+      dataset: FEATUREBENCH_DATASET,
+      revision: FEATUREBENCH_DATASET_REVISION,
+      split: FEATUREBENCH_SPLIT,
+    });
+    const taskIds = Object.keys(inventory.tasks);
+    expect(inventory.expectedTaskCount).toBe(100);
+    expect(inventory.sourceParquetSha256).toBe('e8a704f83d673e1cc78086eefb76bd56461ead8a65ca06fd6972f7363be8a775');
+    expect(taskIds).toHaveLength(inventory.expectedTaskCount);
+    expect(new Set(taskIds).size).toBe(inventory.expectedTaskCount);
+    expect(Object.entries(inventory.tasks).every(([taskId, image]) => taskId.length > 0 && image.length > 0)).toBe(true);
     expect(parseFeatureBenchDatasetMap({
       dataset: FEATUREBENCH_DATASET,
       revision: FEATUREBENCH_DATASET_REVISION,
       split: FEATUREBENCH_SPLIT,
-      tasks: { 'task-alpha': 'example.test/image:tag' },
-    }).tasks).toEqual({ 'task-alpha': 'example.test/image:tag' });
+      tasks: inventory.tasks,
+    }).tasks).toEqual(inventory.tasks);
+    expect(() => parseFeatureBenchDatasetMap({
+      dataset: FEATUREBENCH_DATASET,
+      revision: FEATUREBENCH_DATASET_REVISION,
+      split: FEATUREBENCH_SPLIT,
+      tasks: { invented: 'invented/image' },
+    })).toThrow(/audited inventory pin/);
     expect(() => parseFeatureBenchDatasetMap({
       dataset: FEATUREBENCH_DATASET,
       revision: 'floating',
       split: FEATUREBENCH_SPLIT,
       tasks: { 'task-alpha': 'example.test/image:tag' },
     })).toThrow(/pinned dataset/);
+  });
+
+  it('projects the exact pinned-shape source inventory from top-level image_name values', () => {
+    const inventory = pinnedInventory();
+    const rows = Object.entries(inventory.tasks).map(([instanceId, imageName]) => ({
+      instance_id: instanceId,
+      image_name: imageName,
+      repo_settings: JSON.stringify({ image_name: 'wrong/nested-image', docker_image: 'wrong/fallback-image' }),
+    }));
+    const projected = projectFeatureBenchRows(rows);
+    expect(projected.status, projected.stderr).toBe(0);
+    expect(JSON.parse(projected.stdout)).toEqual({
+      dataset: inventory.dataset,
+      revision: inventory.revision,
+      split: inventory.split,
+      tasks: inventory.tasks,
+    });
+  });
+
+  it('rejects non-string, empty, and duplicate projection identities before emitting an inventory', () => {
+    const failures = [
+      [{ instance_id: '', image_name: 'example.test/image:tag' }],
+      [{ instance_id: 7, image_name: 'example.test/image:tag' }],
+      [{ instance_id: 'task-alpha', image_name: '' }],
+      [{ instance_id: 'task-alpha', image_name: 7 }],
+      [
+        { instance_id: 'task-alpha', image_name: 'example.test/image:one' },
+        { instance_id: 'task-alpha', image_name: 'example.test/image:two' },
+      ],
+    ];
+    for (const rows of failures) {
+      const projected = projectFeatureBenchRows(rows);
+      expect(projected.status).not.toBe(0);
+      expect(projected.stdout).toBe('');
+    }
   });
 
   it('requires Linux x64 and runtime-only HTTPS endpoint names', () => {
@@ -265,36 +367,158 @@ describe('FeatureBench credential-broker trust boundary', () => {
     })).toThrow(/public identity, version/);
   });
 
-  it('discovers and removes only containers with the complete ownership tuple', async () => {
+  it('uses one common-label discovery for 100 tasks and validates every container before removal', async () => {
+    const taskIds = Array.from({ length: 100 }, (_, index) => `task-${index}`);
+    const candidates = ['a', 'b', 'c'].map((character) => character.repeat(12));
+    const fullIds = ['a', 'b', 'c'].map((character) => character.repeat(64));
     const commands: string[][] = [];
     const executor = async (command: string, argv: readonly string[]) => {
       commands.push([command, ...argv]);
-      if (argv[0] === 'ps') {
-        const session = argv.includes('label=ultracode.benchmark.purpose=session');
-        return { stdout: session ? `${'c'.repeat(12)}\n` : '', stderr: '' };
+      if (argv[0] === 'ps') return { stdout: `${candidates.join('\n')}\n`, stderr: '' };
+      if (argv[0] === 'inspect') {
+        const index = candidates.indexOf(argv[1]!);
+        return { stdout: JSON.stringify([{
+          Id: fullIds[index],
+          Config: { Labels: {
+            'ultracode.benchmark.schema': '2',
+            'ultracode.benchmark.suite': 'featurebench',
+            'ultracode.benchmark.run': 'run-one',
+            'ultracode.benchmark.arm': 'b',
+            'ultracode.benchmark.ownership': '1',
+            'ultracode.benchmark.task': taskIds[index * 40],
+            'ultracode.benchmark.purpose': index === 1 ? 'prep' : 'session',
+          } },
+        }]), stderr: '' };
       }
-      if (argv[0] === 'inspect') return { stdout: JSON.stringify([{
-        Id: 'c'.repeat(64),
-        Config: { Labels: {
-          'ultracode.benchmark.schema': '2',
-          'ultracode.benchmark.suite': 'featurebench',
-          'ultracode.benchmark.run': 'run-one',
-          'ultracode.benchmark.arm': 'b',
-          'ultracode.benchmark.ownership': '1',
-          'ultracode.benchmark.task': 'task-alpha',
-          'ultracode.benchmark.purpose': 'session',
-        } },
-      }]), stderr: '' };
       return { stdout: '', stderr: '' };
     };
-    await expect(cleanupFeatureBenchContainers('run-one', 'b', ['task-alpha'], executor)).resolves.toBe(1);
-    expect(commands.at(-1)).toEqual(['docker', 'rm', '--force', 'c'.repeat(12)]);
-    expect(commands[0]!.join(' ')).toContain('label=ultracode.benchmark.ownership=1');
-    const discoveries = commands.filter((argv) => argv[1] === 'ps').map((argv) => argv.join(' '));
-    expect(discoveries).toHaveLength(2);
-    expect(discoveries.every((argv) => argv.includes('label=ultracode.benchmark.task=task-alpha'))).toBe(true);
-    expect(discoveries.some((argv) => argv.includes('label=ultracode.benchmark.purpose=prep'))).toBe(true);
-    expect(discoveries.some((argv) => argv.includes('label=ultracode.benchmark.purpose=session'))).toBe(true);
+    await expect(cleanupFeatureBenchContainers('run-one', 'b', taskIds, executor)).resolves.toBe(3);
+    const discoveries = commands.filter((argv) => argv[1] === 'ps');
+    expect(discoveries).toEqual([[
+      'docker', 'ps', '--all', '--quiet',
+      '--filter', 'label=ultracode.benchmark.schema=2',
+      '--filter', 'label=ultracode.benchmark.suite=featurebench',
+      '--filter', 'label=ultracode.benchmark.run=run-one',
+      '--filter', 'label=ultracode.benchmark.arm=b',
+      '--filter', 'label=ultracode.benchmark.ownership=1',
+    ]]);
+    const firstRemoval = commands.findIndex((argv) => argv[1] === 'rm');
+    expect(commands.slice(1, firstRemoval).every((argv) => argv[1] === 'inspect')).toBe(true);
+    expect(commands.slice(firstRemoval)).toEqual(fullIds.map((id) => ['docker', 'rm', '--force', id]));
+    expect(commands.slice(firstRemoval).every((argv) => argv.at(-1)?.length === 64)).toBe(true);
+  });
+
+  it('makes unsafe membership, labels, ids, and prefixes fail without partial removals', async () => {
+    const prefix = 'a'.repeat(12);
+    const fullId = 'a'.repeat(64);
+    const labels = {
+      'ultracode.benchmark.schema': '2',
+      'ultracode.benchmark.suite': 'featurebench',
+      'ultracode.benchmark.run': 'run-one',
+      'ultracode.benchmark.arm': 'b',
+      'ultracode.benchmark.ownership': '1',
+      'ultracode.benchmark.task': 'task-alpha',
+      'ultracode.benchmark.purpose': 'session',
+    };
+    const cases = [
+      {
+        name: 'task membership',
+        listed: prefix,
+        inspection: { Id: fullId, Config: { Labels: { ...labels, 'ultracode.benchmark.task': 'foreign-task' } } },
+      },
+      {
+        name: 'purpose membership',
+        listed: prefix,
+        inspection: { Id: fullId, Config: { Labels: { ...labels, 'ultracode.benchmark.purpose': 'foreign' } } },
+      },
+      {
+        name: 'common ownership labels',
+        listed: prefix,
+        inspection: {
+          Id: fullId,
+          Config: { Labels: { ...labels, 'ultracode.benchmark.ownership': '0' } },
+        },
+      },
+      {
+        name: 'discovered ids',
+        listed: 'not-an-id',
+        inspection: null,
+      },
+      {
+        name: 'inspected ids',
+        listed: prefix,
+        inspection: { Id: 'a'.repeat(63), Config: { Labels: labels } },
+      },
+      {
+        name: 'duplicate prefixes',
+        listed: `${prefix}\n${prefix}`,
+        inspection: null,
+      },
+      {
+        name: 'ambiguous prefixes',
+        listed: `${prefix}\n${'a'.repeat(13)}`,
+        inspection: null,
+      },
+    ];
+    for (const scenario of cases) {
+      const commands: string[][] = [];
+      const executor = async (command: string, argv: readonly string[]) => {
+        commands.push([command, ...argv]);
+        if (argv[0] === 'ps') return { stdout: `${scenario.listed}\n`, stderr: '' };
+        if (argv[0] === 'inspect' && scenario.inspection !== null) {
+          return { stdout: JSON.stringify([scenario.inspection]), stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      };
+      await expect(
+        cleanupFeatureBenchContainers('run-one', 'b', ['task-alpha'], executor),
+        scenario.name,
+      ).rejects.toThrow();
+      expect(commands.filter((argv) => argv[1] === 'rm'), scenario.name).toHaveLength(0);
+    }
+  });
+
+  it('does not remove an earlier verified container when a later inspection is unsafe', async () => {
+    const candidates = ['a', 'b'].map((character) => character.repeat(12));
+    const commands: string[][] = [];
+    const executor = async (command: string, argv: readonly string[]) => {
+      commands.push([command, ...argv]);
+      if (argv[0] === 'ps') return { stdout: `${candidates.join('\n')}\n`, stderr: '' };
+      if (argv[0] === 'inspect') {
+        const character = argv[1]![0]!;
+        return { stdout: JSON.stringify([{
+          Id: character.repeat(64),
+          Config: { Labels: {
+            'ultracode.benchmark.schema': '2',
+            'ultracode.benchmark.suite': 'featurebench',
+            'ultracode.benchmark.run': 'run-one',
+            'ultracode.benchmark.arm': 'b',
+            'ultracode.benchmark.ownership': character === 'a' ? '1' : '0',
+            'ultracode.benchmark.task': 'task-alpha',
+            'ultracode.benchmark.purpose': 'session',
+          } },
+        }]), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    };
+    await expect(cleanupFeatureBenchContainers('run-one', 'b', ['task-alpha'], executor)).rejects.toThrow();
+    expect(commands.filter((argv) => argv[1] === 'inspect')).toHaveLength(2);
+    expect(commands.filter((argv) => argv[1] === 'rm')).toHaveLength(0);
+  });
+
+  it('rejects duplicate cleanup task membership before discovery or removal', async () => {
+    const commands: string[][] = [];
+    const executor = async (command: string, argv: readonly string[]) => {
+      commands.push([command, ...argv]);
+      return { stdout: '', stderr: '' };
+    };
+    await expect(cleanupFeatureBenchContainers(
+      'run-one',
+      'b',
+      ['task-alpha', 'task-alpha'],
+      executor,
+    )).rejects.toThrow(/membership contains duplicates/);
+    expect(commands).toHaveLength(0);
   });
 });
 

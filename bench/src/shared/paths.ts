@@ -187,6 +187,9 @@ export const manifestFile = (roots: BenchPathRoots, suite: BenchSuite, runId: Ru
 export const runStateFile = (roots: BenchPathRoots, suite: BenchSuite, runId: RunId | string): string =>
   join(runDir(roots, suite, runId), 'run-state.json');
 
+export const runStateLedgerDir = (roots: BenchPathRoots, suite: BenchSuite, runId: RunId | string): string =>
+  join(runDir(roots, suite, runId), 'run-state-ledger');
+
 export const verifierReceiptFile = (roots: BenchPathRoots, suite: BenchSuite, runId: RunId | string): string =>
   join(runDir(roots, suite, runId), 'verifier-receipt.json');
 
@@ -385,7 +388,8 @@ function assertRealAncestorChain(root: string, path: string, description: string
   return target;
 }
 
-function fsyncDirectory(path: string): void {
+/** Durably publish directory-entry changes where the host filesystem supports it. */
+export function fsyncDirectory(path: string): void {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | NOFOLLOW);

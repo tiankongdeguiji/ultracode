@@ -7,6 +7,7 @@ import { swebenchProAdapter } from '../../bench/src/suites/swebench-pro/adapter.
 import { resolveSwebenchProConfig, type SwebenchProConfig } from '../../bench/src/suites/swebench-pro/config.js';
 import { repositoryDigest } from '../../bench/src/suites/swebench-pro/image.js';
 import { instanceFromRow, selectInstances } from '../../bench/src/suites/swebench-pro/instances.js';
+import type { SwebenchProContainerPolicy } from '../../bench/src/suites/swebench-pro/container-policy.js';
 import { classifyOutcome } from '../../bench/src/suites/swebench-pro/state.js';
 import {
   hasCompleteProVerifierReceipt,
@@ -62,6 +63,25 @@ const config: SwebenchProConfig = {
     pipIndex: 'https://pypi.org/simple',
   },
   sanitizeGitHistory: true,
+};
+
+const containerPolicy: SwebenchProContainerPolicy = {
+  schemaVersion: 1,
+  kind: 'ultracode-swebench-pro-container-policy',
+  session: {
+    pidsLimit: 1_024,
+    securityOpt: ['no-new-privileges'],
+    capDrop: ['ALL'],
+    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'],
+    resources: 'manifest-docker',
+  },
+  evaluator: {
+    pidsLimit: 1_024,
+    securityOpt: ['no-new-privileges'],
+    capDrop: ['ALL'],
+    capAdd: [],
+    resources: 'manifest-docker',
+  },
 };
 
 describe('SWE-bench Pro adapter parsing', () => {
@@ -129,11 +149,11 @@ describe('complete row freezing and strict native evidence', () => {
     expect(instance.row).not.toBe(source);
     expect(instance.row.future_dataset_column).toEqual({ preserved: true });
     const selected = selectInstances({
-      schemaVersion: 2,
-      kind: 'ultracode-swebench-pro-dataset-snapshot',
-      identity: 'ScaleAI/SWE-bench_Pro',
+      schemaVersion: 1,
+      kind: 'ultracode-swebench-pro-dataset-descriptor',
+      dataset: 'ScaleAI/SWE-bench_Pro',
+      config: 'default',
       split: 'test',
-      source: 'https://datasets-server.huggingface.co/rows',
       rows: [row('task-b'), row('task-a')],
     }, { taskIds: ['task-a'], count: 1, seed: 0, stratifyBy: 'repo' });
     expect(selected.map((entry) => entry.instanceId)).toEqual(['task-a']);
@@ -247,6 +267,7 @@ describe('evaluator ownership and empty predictions', () => {
       prefix: 'armA',
       predictions: [],
       instances: [instanceFromRow(row('task-a'))],
+      containerPolicy,
       docker: async () => { throw new Error('docker must not be called'); },
     });
     expect(result.resultRelativePath).toBeNull();

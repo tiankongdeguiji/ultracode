@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "kind": "ultracode-swebench-pro-dataset-pin",
+  "dataset": "ScaleAI/SWE-bench_Pro",
+  "config": "default",
+  "split": "test",
+  "rowCount": 731,
+  "descriptorSha256": "067bd23ae664ba2113b70d24803e04bb95242ff7c15a7c92642c482544fce0d2"
+}
