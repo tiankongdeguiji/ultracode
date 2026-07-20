@@ -72,7 +72,6 @@ export const sweMarathonConfigSchema = z.strictObject({
   workflowWaitMs: z.number().int().positive(),
   timeouts: z.strictObject({
     taskMs: z.number().int().min(60_000),
-    verifierMs: z.number().int().positive(),
   }),
   pricing: z.record(z.string(), pricingEntrySchema).optional(),
 });
@@ -95,7 +94,7 @@ export const DEFAULT_SWE_MARATHON_CONFIG: SweMarathonConfig = {
   taskIds: [],
   auth: { mechanism: 'chatgpt', publicIdentity: 'operator-supplied-chatgpt-account' },
   workflowWaitMs: 3_300_000,
-  timeouts: { taskMs: 43_200_000, verifierMs: 21_600_000 },
+  timeouts: { taskMs: 43_200_000 },
 };
 
 export function validateMarathonTaskId(taskId: string): string {

@@ -53,8 +53,7 @@
     },
     "workflowWaitMs": 3300000,
     "timeouts": {
-      "taskMs": 43200000,
-      "verifierMs": 21600000
+      "taskMs": 43200000
     }
   },
   "featureBench": {

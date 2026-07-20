@@ -229,7 +229,7 @@ function buildManifest(
     experiment: { model: config.model, requestedEffort: config.requestedEffort, arm: config.arm, taskIds: [...config.taskIds] },
     limits: {
       hostTaskTimeoutMs: config.timeouts.taskMs,
-      hostVerifierTimeoutMs: config.timeouts.verifierMs,
+      hostVerifierTimeoutMs: null,
       taskConcurrency: 1,
       verifierConcurrency: 1,
     },
@@ -319,7 +319,6 @@ function resumeConfig(operator: SweMarathonConfig, manifest: SweMarathonManifest
     auth: { ...operator.auth, mechanism: manifest.suiteConfig.auth.mechanism },
     timeouts: {
       taskMs: manifest.limits.hostTaskTimeoutMs!,
-      verifierMs: manifest.limits.hostVerifierTimeoutMs!,
     },
     pricing: manifest.pricing === null ? undefined : {
       [manifest.pricing.model]: {
@@ -648,6 +647,23 @@ function executionIdentity(manifest: SweMarathonManifest, taskId: string): Harbo
   };
 }
 
+/** Keep refreshed native evidence attached to the invocation that produced the latest session attempt. */
+export function harborEvidenceInvocationId(
+  state: Pick<BenchRunState, 'attempts'>,
+  taskId: string,
+  arm: Arm,
+  fallbackInvocationId: string,
+): string {
+  return state.attempts.filter((attempt) =>
+    attempt.taskId === taskId && attempt.arm === arm && attempt.phase === 'session').at(-1)?.invocationId
+    ?? fallbackInvocationId;
+}
+
+/** Redo resets an artifact tree and must start a new native job even though the empty directory exists. */
+export function shouldResumeHarborJob(jobDirectoryExists: boolean, redo: boolean): boolean {
+  return jobDirectoryExists && !redo;
+}
+
 async function updateReceipt(
   receipt: VerifierReceiptStore,
   identity: HarborExecutionIdentity,
@@ -693,6 +709,20 @@ async function recordAttempt(
   }));
 }
 
+/** Reconcile Harbor terminal evidence without relabeling the outer process watchdog. */
+export function marathonTaskFailure(
+  processFailure: FailureCode | null,
+  evidence: Pick<ReturnType<typeof indexHarborEvidence>, 'nativeResult' | 'terminalFailure'>,
+): FailureCode | null {
+  if (evidence.terminalFailure !== null && (processFailure === null || processFailure === 'native-runner-failed')) {
+    return evidence.terminalFailure;
+  }
+  if (processFailure === null && evidence.nativeResult.verification === 'unverified') {
+    return 'verifier-output-missing';
+  }
+  return processFailure;
+}
+
 async function runTask(
   context: CommandContext,
   config: SweMarathonConfig,
@@ -703,6 +733,7 @@ async function runTask(
   invocationId: string,
   taskId: string,
   resume: boolean,
+  redo: boolean,
 ): Promise<void> {
   await attestMarathonTask(common, taskId);
   const directory = runDir(context.paths, 'swe-marathon', manifest.runId);
@@ -711,13 +742,20 @@ async function runTask(
   const jobDirectory = join(directory, ...identity.jobRelativeRoot.split('/'));
   const exists = existsSync(jobDirectory);
   if (exists && !resume) throw new Error(`unexpected native Harbor job for fresh task ${taskId}`);
-  const plan = planHarborRun(context.paths, directory, manifest, common, taskId, exists);
-  if (exists) validateHarborResume(directory, identity);
-  if (exists) {
-    const existingEvidence = indexHarborEvidence(directory, identity, invocationId);
-    if (existingEvidence.nativeResult.verification === 'verified') {
+  const resumeNativeJob = shouldResumeHarborJob(exists, redo);
+  const plan = planHarborRun(context.paths, directory, manifest, common, taskId, resumeNativeJob);
+  if (resumeNativeJob) validateHarborResume(directory, identity);
+  if (resumeNativeJob) {
+    const evidenceInvocationId = harborEvidenceInvocationId(
+      state.load(),
+      identity.taskId,
+      identity.arm,
+      invocationId,
+    );
+    const existingEvidence = indexHarborEvidence(directory, identity, evidenceInvocationId);
+    if (existingEvidence.nativeResult.verification === 'verified' || existingEvidence.terminalFailure !== null) {
       await updateReceipt(receipt, identity, existingEvidence.bindings);
-      output(context, `${taskId} ${identity.arm}: already verified`);
+      output(context, `${taskId} ${identity.arm}: already ${existingEvidence.terminalFailure ?? 'verified'}`);
       return;
     }
   }
@@ -767,11 +805,11 @@ async function runTask(
       untrackExecution(activeKey);
     }
     const evidence = indexHarborEvidence(directory, identity, invocationId);
-    await updateReceipt(receipt, identity, evidence.bindings);
-    if (failure === null && evidence.nativeResult.verification === 'unverified') failure = 'verifier-output-missing';
+    failure = marathonTaskFailure(failure, evidence);
     const endedAt = context.clock.now();
     await recordAttempt(state, invocationId, identity, startedAt, endedAt,
       Math.max(0, performance.now() - startedMs), failure, identity.jobRelativeRoot);
+    await updateReceipt(receipt, identity, evidence.bindings);
     output(context, `${taskId} ${identity.arm}: ${evidence.nativeResult.verification}${failure ? ` (${failure})` : ''}`);
   }
 }
@@ -869,7 +907,18 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
         context.clock.now(),
       );
       for (const taskId of stores.manifest.experiment.taskIds) {
-        await runTask(context, config, stores.manifest, common, stores.state, stores.receipt, invocationId, taskId, true);
+        await runTask(
+          context,
+          config,
+          stores.manifest,
+          common,
+          stores.state,
+          stores.receipt,
+          invocationId,
+          taskId,
+          true,
+          targets.has(taskId),
+        );
       }
       await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
     } catch (error) {
@@ -908,7 +957,7 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
     const invocationId = await beginInvocation(stores.state, 'run', context.clock.now());
     try {
       for (const taskId of manifest.experiment.taskIds) {
-        await runTask(context, config, manifest, common, stores.state, stores.receipt, invocationId, taskId, false);
+        await runTask(context, config, manifest, common, stores.state, stores.receipt, invocationId, taskId, false, false);
       }
       await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
     } catch (error) {
@@ -921,24 +970,37 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
   }
 }
 
-function receiptBoundNativeResult(
+function receiptBoundHarborEvidence(
   directory: string,
   manifest: SweMarathonManifest,
   taskId: string,
   bindings: readonly VerifierBinding[],
-): NativeVerifierResult {
+): { nativeResult: NativeVerifierResult; terminalFailure: 'verifier-timeout' | null } {
   const identity = executionIdentity(manifest, taskId);
-  const indexed = indexHarborEvidence(directory, identity, randomUUID()).nativeResult;
-  if (indexed.verification === 'unverified' || indexed.artifact === null) return UNVERIFIED_NATIVE_RESULT;
-  const bound = bindings.some((binding) => binding.scope.kind === 'task-arm'
-    && binding.scope.taskId === taskId && binding.scope.arm === identity.arm
-    && binding.role === 'native-result' && binding.path === indexed.artifact!.path
-    && binding.sha256 === indexed.artifact!.sha256
-    && binding.nativeRecordKey === indexed.artifact!.nativeRecordKey);
-  return bound ? indexed : UNVERIFIED_NATIVE_RESULT;
+  const indexed = indexHarborEvidence(directory, identity, randomUUID());
+  const isBound = (candidate: Pick<VerifierBinding, 'role' | 'path' | 'sha256' | 'nativeRecordKey'>): boolean =>
+    bindings.some((binding) => binding.scope.kind === 'task-arm'
+      && binding.scope.taskId === taskId && binding.scope.arm === identity.arm
+      && binding.role === candidate.role && binding.path === candidate.path
+      && binding.sha256 === candidate.sha256 && binding.nativeRecordKey === candidate.nativeRecordKey);
+  const nativeResult = indexed.nativeResult.verification === 'verified'
+    && indexed.nativeResult.artifact !== null
+    && isBound({ role: 'native-result', ...indexed.nativeResult.artifact })
+    ? indexed.nativeResult
+    : UNVERIFIED_NATIVE_RESULT;
+  const terminalBinding = indexed.terminalFailure === null
+    ? undefined
+    : indexed.bindings.find((binding) => binding.role === 'native-result'
+      && binding.nativeRecordKey?.endsWith('/exception_info.exception_type'));
+  return {
+    nativeResult,
+    terminalFailure: terminalBinding !== undefined && isBound(terminalBinding)
+      ? indexed.terminalFailure
+      : null,
+  };
 }
 
-/** Require the exact Harbor job, trial, and reward evidence set for one task. */
+/** Require the exact Harbor job, trial, and terminal result evidence set for one task. */
 export function hasCompleteHarborReceipt(
   bindings: readonly VerifierBinding[],
   invocationId: string,
@@ -954,7 +1016,7 @@ export function hasCompleteHarborReceipt(
     && scoped.some((binding) => binding.role === 'native-result');
 }
 
-function taskInputs(
+export function marathonTaskInputs(
   manifest: SweMarathonManifest,
   state: BenchRunState,
   bindings: readonly VerifierBinding[],
@@ -963,18 +1025,24 @@ function taskInputs(
   return manifest.artifacts.executions.map((execution) => {
     const attempts = state.attempts.filter((attempt) => attempt.taskId === execution.taskId && attempt.arm === execution.arm);
     const latest = attempts.at(-1);
+    const evidence = receiptBoundHarborEvidence(directory, manifest, execution.taskId, bindings);
     const failures = new Set<FailureCode>(latest?.failures ?? []);
     if (latest !== undefined && latest.status !== 'running'
       && !hasCompleteHarborReceipt(bindings, latest.invocationId, execution.taskId, execution.arm)) {
       failures.add('receipt-incomplete');
     }
-    if (latest !== undefined && latest.status !== 'running'
-      && receiptBoundNativeResult(directory, manifest, execution.taskId, bindings).verification === 'unverified'
+    if (evidence.terminalFailure !== null) {
+      failures.delete('native-runner-failed');
+      failures.delete('verifier-output-missing');
+      failures.delete('unattributed-verifier-absence');
+      failures.add(evidence.terminalFailure);
+    }
+    if (latest !== undefined && latest.status !== 'running' && evidence.nativeResult.verification === 'unverified'
       && failures.size === 0) failures.add('unattributed-verifier-absence');
     return {
       taskId: execution.taskId,
       arm: execution.arm,
-      nativeVerifier: receiptBoundNativeResult(directory, manifest, execution.taskId, bindings),
+      nativeVerifier: evidence.nativeResult,
       failures: [...failures].map((code) => failureObservationSchema.parse({
         code,
         scope: taskArmScope(execution.taskId, execution.arm),
@@ -1021,7 +1089,7 @@ export async function reportCommand(options: ReportOptions, context: CommandCont
       return buildBenchReport({
         ...evidence,
         metrics,
-        taskResults: taskInputs(evidence.manifest, evidence.runState, evidence.verifierReceipt.bindings, directory),
+        taskResults: marathonTaskInputs(evidence.manifest, evidence.runState, evidence.verifierReceipt.bindings, directory),
         currentPolicyHashes: currentControlPlaneHashes(context.paths),
         analysisHook: sweMarathonAnalysisHook,
         generatedAt: context.clock.now(),

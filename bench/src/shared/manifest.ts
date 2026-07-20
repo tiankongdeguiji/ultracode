@@ -321,6 +321,9 @@ function refineManifest(manifest: RawManifest, context: z.RefinementCtx): void {
       addIssue(context, ['suiteConfig', 'policies', 'adapterSha256'], 'adapter policy hash must equal provenance');
     }
   } else if (manifest.suite === 'swe-marathon') {
+    if (manifest.limits.hostVerifierTimeoutMs !== null) {
+      addIssue(context, ['limits', 'hostVerifierTimeoutMs'], 'SWE-Marathon uses only native verifier deadlines');
+    }
     if (manifest.suiteConfig.policies.adapterSha256 !== manifest.provenance.controlPlane.adapterPolicySha256) {
       addIssue(context, ['suiteConfig', 'policies', 'adapterSha256'], 'adapter policy hash must equal provenance');
     }
@@ -421,4 +424,5 @@ export const MANIFEST_POLICY_SHA256 = sha256CanonicalJson({
   resumeProjection: 'all-except-created-at',
   credentials: 'forbidden',
   artifacts: 'suite-task-arm-exact',
+  marathonVerifierTimeout: 'native-only-host-null',
 });

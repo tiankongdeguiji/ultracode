@@ -73,13 +73,24 @@ npm run bench -- --suite featurebench run --run-id feature-a1 \
 npm run bench -- --suite featurebench report --run-id feature-a1
 ```
 
-The operator config in `bench/bench.config.json` supplies the same immutable
-model, effort, one-arm task set, public broker identity/version, concurrency,
-timeouts, resources, and optional pricing. CLI run options can select those
-values for a fresh run. `--resume` accepts only the frozen manifest identity;
-`--redo <task-id>` requires resume, invalidates that task and the aggregate
-receipt bindings, runs a new timestamped native inference, and evaluates one
-consolidated complete prediction set.
+The operator config in `bench/bench.config.json` supplies the complete run
+configuration. On a fresh run, the only configuration values that the CLI can
+override are `--model`, `--effort`, `--arm`, and repeatable `--task-id`. Public
+broker identity/version, inference and evaluation concurrency, timeouts, CPU
+and memory resources, and optional model pricing are config-only; the CLI has
+no flags for them.
+
+The fresh run resolves config plus those four optional overrides, validates the
+result, and freezes it in the immutable manifest. Concurrency, timeouts, and
+resources are frozen directly; broker identity/version and pricing are frozen
+as public hashes or a pricing snapshot. Resume reconstructs the effective run
+configuration from that manifest and rejects conflicting CLI overrides. The
+operator's current public broker identity/version must still match the frozen
+hashes, while runtime broker URL and network names are resolved anew from the
+environment and re-attested on every launch. `--redo <task-id>` requires
+`--resume`, invalidates that task and the aggregate receipt bindings, runs a new
+timestamped native inference, and evaluates a complete prediction set
+consolidated from every state-bound inference root in append order.
 
 Every run uses the common suite-qualified layout (with `suite` equal to
 `featurebench`):

@@ -166,9 +166,11 @@ function proManifest(): Record<string, unknown> {
 }
 
 function marathonManifest(): Record<string, unknown> {
+  const base = common();
   return {
-    ...common(),
+    ...base,
     suite: 'swe-marathon',
+    limits: { ...(base.limits as object), hostVerifierTimeoutMs: null },
     artifacts: {
       nativeRoot: 'native',
       runState: 'run-state.json',
@@ -228,7 +230,9 @@ function featureManifest(): Record<string, unknown> {
 describe('strict v2 manifest validation', () => {
   it('accepts all three suite discriminants with one common envelope', () => {
     expect(parseBenchRunManifest(proManifest()).suite).toBe('swebench-pro');
-    expect(parseBenchRunManifest(marathonManifest()).suite).toBe('swe-marathon');
+    const marathon = parseBenchRunManifest(marathonManifest());
+    expect(marathon.suite).toBe('swe-marathon');
+    expect(marathon.limits.hostVerifierTimeoutMs).toBeNull();
     expect(parseBenchRunManifest(featureManifest()).suite).toBe('featurebench');
   });
 
@@ -240,6 +244,9 @@ describe('strict v2 manifest validation', () => {
     const both = structuredClone(marathonManifest());
     (both.experiment as Record<string, unknown>).arm = 'both';
     expect(() => parseBenchRunManifest(both)).toThrow(/requires one arm/);
+    const verifierTimeout = structuredClone(marathonManifest());
+    (verifierTimeout.limits as Record<string, unknown>).hostVerifierTimeoutMs = 21_600_000;
+    expect(() => parseBenchRunManifest(verifierTimeout)).toThrow(/native verifier deadlines/);
     const drift = structuredClone(proManifest());
     const config = drift.suiteConfig as { instances: Array<{ rowSha256: string }> };
     config.instances[0]!.rowSha256 = 'c'.repeat(64);

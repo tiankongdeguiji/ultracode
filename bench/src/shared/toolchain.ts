@@ -401,6 +401,12 @@ async function populateSharedToolchain(
     'suites/swebench-pro/entrypoint.sh',
     1_024 * 1_024,
   ), { flag: 'wx', mode: 0o755 });
+  const gitSanitizer = join(dir, 'sanitize-git.sh');
+  writeFileSync(gitSanitizer, readRegularFileWithinRoot(
+    roots.benchRoot,
+    'suites/swebench-pro/sanitize-git.sh',
+    1_024 * 1_024,
+  ), { flag: 'wx', mode: 0o755 });
 
   const ultracodeRevision = await toolchainCommand('git', ['rev-parse', 'HEAD'], resolve(roots.benchRoot, '..'));
   const payloadSha256 = sha256Tree(dir);

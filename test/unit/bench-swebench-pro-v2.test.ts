@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { swebenchProAdapter } from '../../bench/src/suites/swebench-pro/adapter.js';
+import { resolveSwebenchProConfig, type SwebenchProConfig } from '../../bench/src/suites/swebench-pro/config.js';
 import { repositoryDigest } from '../../bench/src/suites/swebench-pro/image.js';
 import { instanceFromRow, selectInstances } from '../../bench/src/suites/swebench-pro/instances.js';
 import { classifyOutcome } from '../../bench/src/suites/swebench-pro/state.js';
@@ -19,7 +20,6 @@ import {
   runOfficialEvaluator,
 } from '../../bench/src/suites/swebench-pro/verifier.js';
 import { createBenchPathRoots } from '../../bench/src/shared/paths.js';
-import type { SwebenchProConfig } from '../../bench/src/suites/swebench-pro/config.js';
 
 const temporaryRoots: string[] = [];
 
@@ -96,6 +96,14 @@ describe('SWE-bench Pro adapter parsing', () => {
       [{ kind: 'task-arm', taskId: 'one', arm: 'b' }, 'native-result'],
       [{ kind: 'task-arm', taskId: 'two', arm: 'a' }, 'predictions'],
     ]);
+  });
+
+  it('rejects disabling the mandatory Git history sanitizer', () => {
+    expect(() => resolveSwebenchProConfig({
+      schemaVersion: 2,
+      toolchain: { nodeVersion: '22.0.0', nodeDistribution: 'nodejs', codexBinary: '/bin/false' },
+      swebenchPro: config,
+    }, { sanitizeGitHistory: false } as never)).toThrow();
   });
 
   it('does not treat a partial Pro verifier receipt as complete', () => {

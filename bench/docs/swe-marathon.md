@@ -38,7 +38,10 @@ Redo invalidates that task's receipt bindings before resetting its job tree.
 
 Before execution, common prepared inputs are re-attested once. Each task TOML
 and Docker image identity is then re-attested immediately before that task is
-launched, making the work linear in the number of tasks.
+launched, making the work linear in the number of tasks. Native agent and
+verifier deadlines come from those attested task TOMLs and Harbor. The configured
+`timeouts.taskMs` is only the outer Harbor process watchdog; an expiry is recorded
+as `driver-watchdog`, not as a native verifier timeout.
 
 ## Arms and evidence
 
@@ -51,8 +54,10 @@ metrics code is the sole public token aggregator.
 
 Reporting indexes only the manifest-declared job and its single direct-child
 trial. It validates task, job, trial, arm, model, effort, one-attempt/no-retry
-policy, and a finite reward in `[0,1]`. Nested lookalikes are ignored. A task is
-resolved only when the native reward is exactly `1`.
+policy, and a finite reward in `[0,1]`. Identity-valid trial results whose exact
+`exception_info.exception_type` is `VerifierTimeoutError` are bound as terminal
+verifier-timeout evidence without synthesizing a reward. Nested lookalikes are
+ignored. A task is resolved only when the native reward is exactly `1`.
 
 The four CUA tasks without authoritative verifier results are not runnable:
 `excel-clone`, `mastodon-clone`, `s3-clone`, and `slack-clone`. The

@@ -26,6 +26,7 @@ export interface HarborExecutionIdentity {
 export interface IndexedHarborEvidence {
   bindings: VerifierBinding[];
   nativeResult: NativeVerifierResult;
+  terminalFailure: 'verifier-timeout' | null;
   trialName: string | null;
 }
 
@@ -123,13 +124,27 @@ function validateTrialConfig(
   validateHarborJobConfig({ ...config, n_attempts: 1, max_retries: 0 }, identity);
 }
 
-function rewardFrom(result: Record<string, unknown>, trialName: string, taskId: string): number {
+function validateTrialResultIdentity(
+  result: Record<string, unknown>,
+  trialName: string,
+  taskId: string,
+): void {
+  if (result.task_name !== taskId || result.trial_name !== trialName) {
+    throw new Error('Harbor trial result identity is invalid');
+  }
+}
+
+function hasVerifierTimeout(result: Record<string, unknown>): boolean {
+  if (result.exception_info === null || result.exception_info === undefined) return false;
+  return object(result.exception_info, 'trial exception_info').exception_type === 'VerifierTimeoutError';
+}
+
+function rewardFrom(result: Record<string, unknown>): number {
   const verifierResult = object(result.verifier_result, 'trial verifier_result');
   const rewards = object(verifierResult.rewards, 'trial verifier rewards');
   const reward = rewards.reward;
-  if (result.task_name !== taskId || result.trial_name !== trialName
-    || typeof reward !== 'number' || !Number.isFinite(reward) || reward < 0 || reward > 1) {
-    throw new Error('Harbor trial result identity or bounded reward is invalid');
+  if (typeof reward !== 'number' || !Number.isFinite(reward) || reward < 0 || reward > 1) {
+    throw new Error('Harbor trial bounded reward is invalid');
   }
   return reward;
 }
@@ -142,6 +157,7 @@ export function indexHarborEvidence(
 ): IndexedHarborEvidence {
   const bindings: VerifierBinding[] = [];
   let nativeResult = UNVERIFIED_NATIVE_RESULT;
+  let terminalFailure: IndexedHarborEvidence['terminalFailure'] = null;
   let trialName: string | null = null;
   const jobConfigPath = `${identity.jobRelativeRoot}/config.json`;
   try {
@@ -155,11 +171,13 @@ export function indexHarborEvidence(
       nativeRecordKey: 'job-config',
     }, jobConfig.sha256));
   } catch {
-    return { bindings, nativeResult, trialName };
+    return { bindings, nativeResult, terminalFailure, trialName };
   }
 
   const jobResultPath = `${identity.jobRelativeRoot}/result.json`;
-  if (!existsSync(join(runDirectory, ...jobResultPath.split('/')))) return { bindings, nativeResult, trialName };
+  if (!existsSync(join(runDirectory, ...jobResultPath.split('/')))) {
+    return { bindings, nativeResult, terminalFailure, trialName };
+  }
   try {
     const jobResult = json(runDirectory, jobResultPath, 'job result');
     bindings.push(createVerifierBinding(runDirectory, {
@@ -170,7 +188,7 @@ export function indexHarborEvidence(
       nativeRecordKey: 'job-result',
     }, jobResult.sha256));
   } catch {
-    return { bindings, nativeResult, trialName };
+    return { bindings, nativeResult, terminalFailure, trialName };
   }
 
   try {
@@ -186,7 +204,19 @@ export function indexHarborEvidence(
       nativeRecordKey: `trial-config:${trial.name}`,
     }, trialConfig.sha256));
     const result = json(runDirectory, trial.result, 'trial result');
-    const reward = rewardFrom(result.value, trial.name, identity.taskId);
+    validateTrialResultIdentity(result.value, trial.name, identity.taskId);
+    if (hasVerifierTimeout(result.value)) {
+      bindings.push(createVerifierBinding(runDirectory, {
+        invocationId,
+        scope: { kind: 'task-arm', taskId: identity.taskId, arm: identity.arm },
+        role: 'native-result',
+        path: validateRelativeArtifactPath(trial.result),
+        nativeRecordKey: `${identity.taskId}/${trial.name}/exception_info.exception_type`,
+      }, result.sha256));
+      terminalFailure = 'verifier-timeout';
+      return { bindings, nativeResult, terminalFailure, trialName };
+    }
+    const reward = rewardFrom(result.value);
     const binding = createVerifierBinding(runDirectory, {
       invocationId,
       scope: { kind: 'task-arm', taskId: identity.taskId, arm: identity.arm },
@@ -202,7 +232,7 @@ export function indexHarborEvidence(
       artifact: { path: binding.path, sha256: binding.sha256, nativeRecordKey: binding.nativeRecordKey },
     };
   } catch { /* incomplete or malformed native evidence remains unverified */ }
-  return { bindings, nativeResult, trialName };
+  return { bindings, nativeResult, terminalFailure, trialName };
 }
 
 /** Validate an immutable native resume before invoking Harbor. */

@@ -11,11 +11,16 @@ import {
   parseCodexRollout,
   type MetricsArtifactIndex,
   type RolloutArtifact,
+  type TimingObservation,
 } from '../../bench/src/shared/metrics.js';
+import { parseBenchRunState, type AttemptRecord } from '../../bench/src/shared/run-state.js';
 
 const HOST_ID = '11111111-1111-4111-8111-111111111111';
 const WORKER_ID = '22222222-2222-4222-8222-222222222222';
 const HASH = 'a'.repeat(64);
+const SECOND_INVOCATION_ID = '33333333-3333-4333-8333-333333333333';
+const THIRD_ATTEMPT_ID = '44444444-4444-4444-8444-444444444444';
+const FOURTH_ATTEMPT_ID = '55555555-5555-4555-8555-555555555555';
 const policy: MetricsPolicySnapshot = {
   parserContractVersion: 2,
   cachedInputWeight: 0.1,
@@ -24,6 +29,14 @@ const policy: MetricsPolicySnapshot = {
   resetRetainedFraction: 0.5,
   workflowDedupeRule: 'run-id',
   implementationSha256: HASH,
+};
+
+const pricing = {
+  currency: 'USD' as const,
+  model: 'gpt-test',
+  uncachedInputPerMTokens: 1_000,
+  cachedInputPerMTokens: 100,
+  outputPerMTokens: 1_000,
 };
 
 const tokenCount = (
@@ -71,6 +84,56 @@ function normalize(runDirectory: string, index: MetricsArtifactIndex) {
     policy,
     pricing: null,
   });
+}
+
+function completedAttempt(
+  attemptId: string,
+  taskId: string,
+  phase: AttemptRecord['phase'],
+  startedAt: string,
+  endedAt: string,
+  elapsedMs: number,
+  over: Partial<AttemptRecord> = {},
+): AttemptRecord {
+  return {
+    attemptId,
+    invocationId: HOST_ID,
+    taskId,
+    arm: 'b',
+    ordinal: 1,
+    phase,
+    startedAt,
+    endedAt,
+    elapsedMs,
+    nativePath: null,
+    exitCode: 0,
+    signal: null,
+    status: 'succeeded',
+    failures: [],
+    annotations: [],
+    ...over,
+  };
+}
+
+function timing(
+  sourceKey: string,
+  taskId: string,
+  phase: TimingObservation['phase'],
+  startedAt: string,
+  endedAt: string,
+  elapsedMs: number,
+  over: Partial<TimingObservation> = {},
+): TimingObservation {
+  return {
+    sourceKey,
+    invocationId: HOST_ID,
+    scope: { taskId, arm: 'b' },
+    phase,
+    startedAt,
+    endedAt,
+    elapsedMs,
+    ...over,
+  };
 }
 
 describe('Codex cumulative rollout normalization', () => {
@@ -194,13 +257,7 @@ describe('normalized aggregation invariants', () => {
       },
       requested: { model: 'gpt-test', effort: 'high' },
       policy,
-      pricing: {
-        currency: 'USD',
-        model: 'gpt-test',
-        uncachedInputPerMTokens: 1_000,
-        cachedInputPerMTokens: 100,
-        outputPerMTokens: 1_000,
-      },
+      pricing,
     });
     expect(metrics.sessions).toMatchObject({ total: 2, host: 1, worker: 1, unknown: 0 });
     expect(metrics.tokens.total.rawTokenCount).toBe(3_300);
@@ -212,6 +269,110 @@ describe('normalized aggregation invariants', () => {
       values: { high: 2 },
       matchesRequested: true,
     });
+  });
+
+  it('keeps the known subtotal but makes pricing partial for missing billable usage', () => {
+    const runDirectory = root();
+    const known = put(runDirectory, 'native/rollout-known.jsonl', jsonl(
+      tokenCount({ input_tokens: 1_000, cached_input_tokens: 400, output_tokens: 100 }),
+    ));
+    const missing = put(runDirectory, 'native/rollout-missing.jsonl', jsonl(
+      { type: 'turn_context', payload: { effort: 'high', model: 'gpt-test' } },
+    ));
+    const index = {
+      ...emptyMetricsArtifactIndex(),
+      rollouts: [artifact(known), artifact(missing, { scope: { taskId: 'task-two', arm: 'b' } })],
+    };
+    const metrics = normalizeMetrics({
+      runDirectory,
+      index,
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing,
+    });
+    expect(metrics.pricing).toEqual({ currency: 'USD', verification: 'partial', billableCost: 0.74 });
+    expect(metrics.sessions.items.find((session) => session.path === missing)?.annotations
+      .map(({ code }) => code)).toContain('rollout-usage-missing');
+
+    expect(normalizeMetrics({
+      runDirectory,
+      index,
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing: null,
+    }).pricing).toEqual({ currency: 'USD', verification: 'unpriced', billableCost: null });
+  });
+
+  it('keeps pricing partial when potentially billable indexed usage cannot be established', () => {
+    const runDirectory = root();
+    const known = put(runDirectory, 'native/rollout-known.jsonl', jsonl(
+      tokenCount({ input_tokens: 1_000, cached_input_tokens: 400, output_tokens: 100 }),
+    ));
+    const unknownMissing = put(runDirectory, 'native/rollout-unknown.jsonl', jsonl(
+      { type: 'turn_context', payload: { effort: 'high', model: 'gpt-test' } },
+    ));
+    const metrics = (rollouts: RolloutArtifact[]) => normalizeMetrics({
+      runDirectory,
+      index: { ...emptyMetricsArtifactIndex(), rollouts },
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing,
+    });
+
+    const unreadableBillable = metrics([
+      artifact(known),
+      artifact('native/rollout-absent.jsonl', { scope: { taskId: 'task-two', arm: 'b' } }),
+    ]);
+    expect(unreadableBillable.sessions.total).toBe(1);
+    expect(unreadableBillable.failures.map(({ code }) => code)).toEqual(['artifact-unsafe']);
+    expect(unreadableBillable.pricing).toEqual({
+      currency: 'USD', verification: 'partial', billableCost: 0.74,
+    });
+
+    const missingUnknown = metrics([
+      artifact(known),
+      artifact(unknownMissing, {
+        scope: { taskId: 'task-two', arm: 'b' },
+        backend: null,
+        billingClass: 'unknown',
+      }),
+    ]);
+    expect(missingUnknown.tokens.byBillingClass.unknown.rawTokenCount).toBe(0);
+    expect(missingUnknown.pricing).toEqual({
+      currency: 'USD', verification: 'partial', billableCost: 0.74,
+    });
+  });
+
+  it('prices valid all-zero usage and ignores missing usage from non-billable rollouts', () => {
+    const runDirectory = root();
+    const zero = put(runDirectory, 'native/rollout-zero.jsonl', jsonl(
+      tokenCount({ input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 }),
+    ));
+    const missingNonBillable = put(runDirectory, 'native/rollout-missing-nonbillable.jsonl', jsonl(
+      { type: 'turn_context', payload: { effort: 'high', model: 'gpt-test' } },
+    ));
+    const metrics = normalizeMetrics({
+      runDirectory,
+      index: {
+        ...emptyMetricsArtifactIndex(),
+        rollouts: [
+          artifact(zero),
+          artifact(missingNonBillable, {
+            scope: { taskId: 'task-two', arm: 'b' },
+            backend: 'local',
+            billingClass: 'non-billable',
+          }),
+        ],
+      },
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing,
+    });
+    expect(metrics.pricing).toEqual({ currency: 'USD', verification: 'priced', billableCost: 0 });
+    expect(metrics.sessions.items.find((session) => session.path === zero)?.annotations
+      .map(({ code }) => code)).not.toContain('rollout-usage-missing');
+    expect(metrics.sessions.items.find((session) => session.path === missingNonBillable)?.annotations
+      .map(({ code }) => code)).toContain('rollout-usage-missing');
   });
 
   it('rejects duplicate paths and same-scope session ids, but permits ids across scopes', () => {
@@ -361,5 +522,170 @@ describe('normalized aggregation invariants', () => {
       nativeRunnerMs: 100_000,
       detachedWorkflowWaitMs: 40_000,
     });
+  });
+
+  it('counts grouped attempt projections once and permits per-task status differences', () => {
+    const state = parseBenchRunState({
+      schemaVersion: 2,
+      kind: 'ultracode-benchmark-run-state',
+      suite: 'featurebench',
+      runId: 'run-one',
+      manifestSha256: HASH,
+      revision: 0,
+      invocations: [{
+        invocationId: HOST_ID,
+        command: 'run',
+        startedAt: '2026-07-20T00:00:00.000Z',
+        endedAt: '2026-07-20T00:00:00.130Z',
+        activeElapsedMs: 130,
+        exitCode: 0,
+        signal: null,
+        lifecycleProcesses: [],
+        failure: null,
+        nativeInvocation: null,
+      }],
+      attempts: [
+        completedAttempt(WORKER_ID, 'task-one', 'inference',
+          '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.100Z', 100,
+          { timingGroupId: 'inference-batch' }),
+        completedAttempt(SECOND_INVOCATION_ID, 'task-two', 'inference',
+          '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.100Z', 100,
+          { timingGroupId: 'inference-batch', status: 'failed', exitCode: 1 }),
+        completedAttempt(THIRD_ATTEMPT_ID, 'task-one', 'verifier',
+          '2026-07-20T00:00:00.100Z', '2026-07-20T00:00:00.130Z', 30,
+          { timingGroupId: 'verifier-batch', status: 'failed', exitCode: 1 }),
+        completedAttempt(FOURTH_ATTEMPT_ID, 'task-two', 'verifier',
+          '2026-07-20T00:00:00.100Z', '2026-07-20T00:00:00.130Z', 30,
+          { timingGroupId: 'verifier-batch' }),
+      ],
+    });
+    const metrics = normalizeMetrics({
+      runDirectory: root(),
+      index: emptyMetricsArtifactIndex(),
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing: null,
+      runState: state,
+    });
+    expect(metrics.timing).toMatchObject({
+      criticalPathMs: 130,
+      summedTaskMs: 130,
+      nativeRunnerMs: 100,
+      verifierMs: 30,
+    });
+  });
+
+  it('counts grouped timing observations once and preserves ungrouped task sums', () => {
+    const grouped = [
+      timing('inference-one', 'task-one', 'inference',
+        '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.100Z', 100,
+        { timingGroupId: 'inference-batch' }),
+      timing('inference-two', 'task-two', 'inference',
+        '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.100Z', 100,
+        { timingGroupId: 'inference-batch' }),
+      timing('verifier-one', 'task-one', 'verifier',
+        '2026-07-20T00:00:00.100Z', '2026-07-20T00:00:00.130Z', 30,
+        { timingGroupId: 'verifier-batch' }),
+      timing('verifier-two', 'task-two', 'verifier',
+        '2026-07-20T00:00:00.100Z', '2026-07-20T00:00:00.130Z', 30,
+        { timingGroupId: 'verifier-batch' }),
+    ];
+    const normalized = (timings: TimingObservation[]) => normalizeMetrics({
+      runDirectory: root(),
+      index: { ...emptyMetricsArtifactIndex(), timings },
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing: null,
+    }).timing;
+    expect(normalized(grouped)).toMatchObject({
+      summedTaskMs: 130,
+      nativeRunnerMs: 100,
+      verifierMs: 30,
+    });
+    expect(normalized(grouped.map(({ timingGroupId: _timingGroupId, ...entry }) => entry))).toMatchObject({
+      summedTaskMs: 260,
+      nativeRunnerMs: 200,
+      verifierMs: 60,
+    });
+  });
+
+  it.each([
+    ['invocation', { invocationId: SECOND_INVOCATION_ID }],
+    ['arm', { scope: { taskId: 'task-two', arm: 'a' as const } }],
+    ['phase', { phase: 'verifier' as const }],
+    ['start timestamp', { startedAt: '2026-07-20T00:00:00.001Z' }],
+    ['end timestamp', { endedAt: '2026-07-20T00:00:00.101Z' }],
+    ['elapsed time', { elapsedMs: 101 }],
+  ])('rejects timing-group members that disagree on %s', (_description, conflict) => {
+    const first = timing('one', 'task-one', 'inference',
+      '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.100Z', 100,
+      { timingGroupId: 'batch-one' });
+    const second = timing('two', 'task-two', 'inference',
+      '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.100Z', 100,
+      { timingGroupId: 'batch-one', ...conflict });
+    expect(() => normalize(root(), {
+      ...emptyMetricsArtifactIndex(),
+      timings: [first, second],
+    })).toThrow(/conflicting timing group/);
+  });
+
+  it('rejects repeated and unscoped tasks in timing groups', () => {
+    const first = timing('one', 'task-one', 'inference',
+      '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.100Z', 100,
+      { timingGroupId: 'batch-one' });
+    expect(() => normalize(root(), {
+      ...emptyMetricsArtifactIndex(),
+      timings: [first, { ...first, sourceKey: 'two' }],
+    })).toThrow(/repeats task/);
+    expect(() => normalize(root(), {
+      ...emptyMetricsArtifactIndex(),
+      timings: [{ ...first, scope: null }],
+    })).toThrow(/task-scoped/);
+  });
+
+  it('keeps schema-v2 attempts without timing groups compatible and validates grouped attempts', () => {
+    const invocation = {
+      invocationId: HOST_ID,
+      command: 'run',
+      startedAt: '2026-07-20T00:00:00.000Z',
+      endedAt: '2026-07-20T00:00:00.100Z',
+      activeElapsedMs: 100,
+      exitCode: 0,
+      signal: null,
+      lifecycleProcesses: [],
+      failure: null,
+      nativeInvocation: null,
+    } as const;
+    const first = completedAttempt(WORKER_ID, 'task-one', 'inference',
+      '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.100Z', 100);
+    const value = {
+      schemaVersion: 2,
+      kind: 'ultracode-benchmark-run-state',
+      suite: 'featurebench',
+      runId: 'run-one',
+      manifestSha256: HASH,
+      revision: 0,
+      invocations: [invocation],
+      attempts: [first],
+    } as const;
+    expect(parseBenchRunState(value).attempts[0]?.timingGroupId).toBeUndefined();
+
+    const grouped = {
+      ...value,
+      attempts: [
+        { ...first, timingGroupId: 'batch-one' },
+        completedAttempt(SECOND_INVOCATION_ID, 'task-two', 'inference',
+          first.startedAt, first.endedAt!, first.elapsedMs!, { timingGroupId: 'batch-one' }),
+      ],
+    };
+    expect(parseBenchRunState(grouped).attempts).toHaveLength(2);
+    expect(() => parseBenchRunState({
+      ...grouped,
+      attempts: [grouped.attempts[0], { ...grouped.attempts[1], elapsedMs: 101 }],
+    })).toThrow(/same physical process/);
+    expect(() => parseBenchRunState({
+      ...grouped,
+      attempts: [grouped.attempts[0], { ...grouped.attempts[1], taskId: 'task-one' }],
+    })).toThrow(/must not repeat a task/);
   });
 });

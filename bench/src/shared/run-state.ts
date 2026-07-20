@@ -45,6 +45,7 @@ export const invocationRecordSchema = z.strictObject({
 export const attemptRecordSchema = z.strictObject({
   attemptId: z.string().uuid(),
   invocationId: z.string().uuid(),
+  timingGroupId: z.string().min(1).max(256).optional(),
   taskId: z.string().transform(validateTaskId),
   arm: z.enum(['a', 'b']),
   ordinal: z.number().int().positive(),
@@ -92,6 +93,15 @@ export const benchRunStateSchema = rawRunStateSchema.superRefine((state, context
     }
   }
   const attempts = new Set<string>();
+  const timingGroups = new Map<string, {
+    invocationId: string;
+    arm: 'a' | 'b';
+    phase: typeof state.attempts[number]['phase'];
+    startedAt: string;
+    endedAt: string | null;
+    elapsedMs: number | null;
+    taskIds: Set<string>;
+  }>();
   for (let index = 0; index < state.attempts.length; index += 1) {
     const attempt = state.attempts[index]!;
     if (attempts.has(attempt.attemptId)) {
@@ -104,6 +114,43 @@ export const benchRunStateSchema = rawRunStateSchema.superRefine((state, context
     const running = attempt.status === 'running';
     if (running !== (attempt.endedAt === null && attempt.elapsedMs === null)) {
       context.addIssue({ code: 'custom', path: ['attempts', index], message: 'attempt timing does not match status' });
+    }
+    if (attempt.timingGroupId !== undefined) {
+      const previous = timingGroups.get(attempt.timingGroupId);
+      if (previous === undefined) {
+        timingGroups.set(attempt.timingGroupId, {
+          invocationId: attempt.invocationId,
+          arm: attempt.arm,
+          phase: attempt.phase,
+          startedAt: attempt.startedAt,
+          endedAt: attempt.endedAt,
+          elapsedMs: attempt.elapsedMs,
+          taskIds: new Set([attempt.taskId]),
+        });
+      } else {
+        if (
+          previous.invocationId !== attempt.invocationId
+          || previous.arm !== attempt.arm
+          || previous.phase !== attempt.phase
+          || previous.startedAt !== attempt.startedAt
+          || previous.endedAt !== attempt.endedAt
+          || previous.elapsedMs !== attempt.elapsedMs
+        ) {
+          context.addIssue({
+            code: 'custom',
+            path: ['attempts', index, 'timingGroupId'],
+            message: 'timing group members must describe the same physical process',
+          });
+        }
+        if (previous.taskIds.has(attempt.taskId)) {
+          context.addIssue({
+            code: 'custom',
+            path: ['attempts', index, 'timingGroupId'],
+            message: 'timing group must not repeat a task',
+          });
+        }
+        previous.taskIds.add(attempt.taskId);
+      }
     }
   }
 });

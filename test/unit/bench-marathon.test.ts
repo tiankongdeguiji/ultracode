@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { BenchPathRoots } from '../../bench/src/shared/contracts.js';
 import { artifactKey } from '../../bench/src/shared/paths.js';
 import type { SweMarathonManifest } from '../../bench/src/shared/manifest.js';
+import { sha256File } from '../../bench/src/shared/provenance.js';
 import { sweMarathonAdapter } from '../../bench/src/suites/swe-marathon/adapter.js';
 import {
   assertMarathonRuntimeBinding,
@@ -29,11 +30,13 @@ import {
   SWE_MARATHON_PYTHON_VERSION,
   SWE_MARATHON_REPOSITORY,
   SWE_MARATHON_SOURCE_REVISION,
+  sweMarathonConfigSchema,
   validateMarathonTaskId,
 } from '../../bench/src/suites/swe-marathon/config.js';
 import {
   planMarathonPreparation,
   taskImageReference,
+  validateHarborCodexApiKeyContract,
   type PreparedMarathonInputs,
 } from '../../bench/src/suites/swe-marathon/prepare.js';
 import {
@@ -41,8 +44,12 @@ import {
   type MarathonCommonAttestation,
 } from '../../bench/src/suites/swe-marathon/provenance.js';
 import {
+  harborEvidenceInvocationId,
   hasCompleteHarborReceipt,
+  marathonTaskInputs,
+  marathonTaskFailure,
   planHarborRun,
+  shouldResumeHarborJob,
   sweMarathonAnalysisHook,
 } from '../../bench/src/suites/swe-marathon/runner.js';
 import { indexSweMarathonMetrics } from '../../bench/src/suites/swe-marathon/telemetry.js';
@@ -106,6 +113,36 @@ describe('SWE-Marathon configuration and preparation', () => {
       'rust-java-lsp',
     ]);
   });
+
+  it('rejects the unsupported Marathon verifier timeout option', () => {
+    const config = {
+      model: 'gpt-test', requestedEffort: 'high', arm: 'a', taskIds: ['zstd-decoder'],
+      auth: { mechanism: 'api-key', publicIdentity: 'test' }, workflowWaitMs: 1_000,
+      timeouts: { taskMs: 60_000 },
+    };
+    expect(sweMarathonConfigSchema.parse(config).timeouts).toEqual({ taskMs: 60_000 });
+    expect(() => sweMarathonConfigSchema.parse({
+      ...config,
+      timeouts: { ...config.timeouts, verifierMs: 1_000 },
+    })).toThrow();
+  });
+
+  it('guards Harbor API-key auth creation before the Arm-B registration hook', () => {
+    const authSetup = [
+      'Codex auth: using OPENAI_API_KEY',
+      'env["OPENAI_API_KEY"]',
+      '"$CODEX_HOME/auth.json"',
+      'mcp_command = self._build_register_mcp_servers_command()',
+      'command=setup_command',
+    ].join('\n');
+    expect(() => validateHarborCodexApiKeyContract(authSetup)).not.toThrow();
+    expect(() => validateHarborCodexApiKeyContract(authSetup.replace(
+      'mcp_command = self._build_register_mcp_servers_command()\ncommand=setup_command',
+      'command=setup_command\nmcp_command = self._build_register_mcp_servers_command()',
+    ))).toThrow(/before MCP registration/);
+    expect(readFileSync(resolve('bench/suites/swe-marathon/arm_b_codex.py'), 'utf8'))
+      .toContain('cp -L "$CODEX_HOME/auth.json"');
+  });
 });
 
 describe('SWE-Marathon command and provenance boundaries', () => {
@@ -159,7 +196,7 @@ describe('SWE-Marathon command and provenance boundaries', () => {
     const config = {
       model: 'gpt-test', requestedEffort: 'high', arm: 'a' as const, taskIds: ['zstd-decoder'],
       auth: { mechanism: 'chatgpt' as const, publicIdentity: 'test' }, workflowWaitMs: 1_000,
-      timeouts: { taskMs: 60_000, verifierMs: 1_000 },
+      timeouts: { taskMs: 60_000 },
     };
     const source = { PATH: '/usr/bin', CODEX_AUTH_JSON_PATH: auth };
     expect(() => assertMarathonRuntimeBinding(config, source)).not.toThrow();
@@ -273,6 +310,127 @@ describe('native Harbor evidence', () => {
       '5a9db8e2-7768-4f7e-8dad-cabfa11a48f8',
       identity.taskId,
       identity.arm,
+    )).toBe(false);
+  });
+
+  it('recovers an attempt-ahead receipt write under the producing invocation', () => {
+    const fixture = nativeFixture();
+    const producingInvocation = '11111111-1111-4111-8111-111111111111';
+    const noOpInvocation = '22222222-2222-4222-8222-222222222222';
+    const state = { attempts: [{
+      taskId: fixture.identity.taskId,
+      arm: fixture.identity.arm,
+      phase: 'session',
+      invocationId: producingInvocation,
+    }] };
+    const bindingInvocation = harborEvidenceInvocationId(
+      state as never,
+      fixture.identity.taskId,
+      fixture.identity.arm,
+      noOpInvocation,
+    );
+    const recovered = indexHarborEvidence(fixture.root, fixture.identity, bindingInvocation);
+    expect(bindingInvocation).toBe(producingInvocation);
+    expect(new Set(recovered.bindings.map((binding) => binding.invocationId)))
+      .toEqual(new Set([producingInvocation]));
+    expect(hasCompleteHarborReceipt(
+      recovered.bindings,
+      producingInvocation,
+      fixture.identity.taskId,
+      fixture.identity.arm,
+    )).toBe(true);
+    expect(hasCompleteHarborReceipt(
+      recovered.bindings,
+      noOpInvocation,
+      fixture.identity.taskId,
+      fixture.identity.arm,
+    )).toBe(false);
+    expect(harborEvidenceInvocationId(
+      { attempts: [] },
+      fixture.identity.taskId,
+      fixture.identity.arm,
+      noOpInvocation,
+    )).toBe(noOpInvocation);
+    expect(shouldResumeHarborJob(true, false)).toBe(true);
+    expect(shouldResumeHarborJob(true, true)).toBe(false);
+    const redoEvidence = indexHarborEvidence(fixture.root, fixture.identity, noOpInvocation);
+    expect(new Set(redoEvidence.bindings.map((binding) => binding.invocationId)))
+      .toEqual(new Set([noOpInvocation]));
+
+    const source = readFileSync(resolve('bench/src/suites/swe-marathon/runner.ts'), 'utf8');
+    const outcomeAt = source.indexOf('const evidence = indexHarborEvidence(directory, identity, invocationId);');
+    const outcomeBlock = source.slice(outcomeAt, source.indexOf('output(context,', outcomeAt));
+    expect(outcomeAt).toBeGreaterThan(0);
+    expect(outcomeBlock.indexOf('await recordAttempt(state,')).toBeGreaterThan(0);
+    expect(outcomeBlock.indexOf('await updateReceipt(receipt, identity, evidence.bindings);'))
+      .toBeGreaterThan(outcomeBlock.indexOf('await recordAttempt(state,'));
+  });
+
+  it('binds exact identity-valid VerifierTimeoutError evidence without a reward', () => {
+    const fixture = nativeFixture();
+    const invocationId = '11111111-1111-4111-8111-111111111111';
+    const resultPath = join(fixture.trial, 'result.json');
+    put(resultPath, `${JSON.stringify({
+      task_name: fixture.identity.taskId,
+      trial_name: 'trial-1',
+      verifier_result: null,
+      exception_info: { exception_type: 'VerifierTimeoutError', exception_message: 'native deadline' },
+    })}\n`);
+    const indexed = indexHarborEvidence(fixture.root, fixture.identity, invocationId);
+    expect(indexed.nativeResult).toEqual({ verification: 'unverified', score: null, resolved: null, artifact: null });
+    expect(indexed.terminalFailure).toBe('verifier-timeout');
+    expect(indexed.bindings.at(-1)).toMatchObject({
+      role: 'native-result',
+      sha256: sha256File(resultPath),
+      nativeRecordKey: 'zstd-decoder/trial-1/exception_info.exception_type',
+    });
+    expect(hasCompleteHarborReceipt(
+      indexed.bindings,
+      invocationId,
+      fixture.identity.taskId,
+      fixture.identity.arm,
+    )).toBe(true);
+    const task = marathonTaskInputs(fixture.manifest, { attempts: [{
+      taskId: fixture.identity.taskId,
+      arm: fixture.identity.arm,
+      phase: 'session',
+      invocationId,
+      status: 'failed',
+      failures: ['native-runner-failed', 'verifier-output-missing'],
+    }] } as never, indexed.bindings, fixture.root)[0]!;
+    expect(task.nativeVerifier).toEqual({ verification: 'unverified', score: null, resolved: null, artifact: null });
+    expect(task.failures.map((failure) => failure.code)).toEqual(['verifier-timeout']);
+    expect(marathonTaskFailure('driver-watchdog', indexed)).toBe('driver-watchdog');
+    expect(marathonTaskFailure('native-runner-failed', indexed)).toBe('verifier-timeout');
+  });
+
+  it('keeps wrong-identity timeouts and generic missing rewards unverified and incomplete', () => {
+    const fixture = nativeFixture();
+    const invocationId = '11111111-1111-4111-8111-111111111111';
+    const resultPath = join(fixture.trial, 'result.json');
+    put(resultPath, `${JSON.stringify({
+      task_name: 'wasm-simd',
+      trial_name: 'trial-1',
+      exception_info: { exception_type: 'VerifierTimeoutError' },
+    })}\n`);
+    const wrongIdentity = indexHarborEvidence(fixture.root, fixture.identity, invocationId);
+    expect(wrongIdentity.terminalFailure).toBeNull();
+    expect(wrongIdentity.bindings.some((binding) => binding.role === 'native-result')).toBe(false);
+
+    put(resultPath, `${JSON.stringify({
+      task_name: fixture.identity.taskId,
+      trial_name: 'trial-1',
+      verifier_result: { rewards: {} },
+      exception_info: null,
+    })}\n`);
+    const missingReward = indexHarborEvidence(fixture.root, fixture.identity, invocationId);
+    expect(missingReward.terminalFailure).toBeNull();
+    expect(marathonTaskFailure(null, missingReward)).toBe('verifier-output-missing');
+    expect(hasCompleteHarborReceipt(
+      missingReward.bindings,
+      invocationId,
+      fixture.identity.taskId,
+      fixture.identity.arm,
     )).toBe(false);
   });
 

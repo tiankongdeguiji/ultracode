@@ -250,9 +250,21 @@ function currentPolicies(
   adapterPolicySha256 = currentControlPlaneHashes(roots).adapterPolicySha256,
 ): SwebenchProManifest['suiteConfig']['policies'] {
   const entrypoint = join(roots.benchRoot, 'suites', 'swebench-pro', 'entrypoint.sh');
+  const gitSanitizer = join(roots.benchRoot, 'suites', 'swebench-pro', 'sanitize-git.sh');
   return {
-    sessionSha256: sha256CanonicalJson({ entrypointSha256: sha256File(entrypoint), taskUser: 'host-uid-no-capabilities' }),
-    historySha256: sha256CanonicalJson({ base: 'exact', trackedDirty: 'reject', preDirty: 'untracked-excluded' }),
+    sessionSha256: sha256CanonicalJson({
+      entrypointSha256: sha256File(entrypoint),
+      gitSanitizerSha256: sha256File(gitSanitizer),
+      taskUser: 'host-uid-no-capabilities',
+    }),
+    historySha256: sha256CanonicalJson({
+      base: 'exact',
+      trackedDirty: 'reject',
+      preDirty: 'untracked-excluded',
+      objectDatabase: 'fresh-base-reachable-closure-only',
+      refs: 'base-branch-and-head-only',
+      audit: 'root-private-until-post-session-safe-summary',
+    }),
     cleanupSha256: sha256CanonicalJson({
       sessionLabels: 'schema-suite-run-task-arm-purpose-ownership-runtime',
       verifierLabels: 'schema-suite-run-task-arm-purpose-ownership-invocation',
@@ -328,6 +340,7 @@ function buildManifest(
   const nativeAssets = [
     'suites/swebench-pro/Dockerfile',
     'suites/swebench-pro/entrypoint.sh',
+    'suites/swebench-pro/sanitize-git.sh',
     'suites/swebench-pro/evaluator-ownership.patch',
     'suites/swebench-pro/evaluator-requirements.lock',
     relative(roots.benchRoot, ARM_B_PREFIX_PATH).split(sep).join('/'),
@@ -843,7 +856,7 @@ async function runSession(
       `BENCH_EFFORT=${config.requestedEffort}`,
       `BENCH_BASE_COMMIT=${instance.baseCommit}`,
       `BENCH_CHOWN=${typeof process.getuid === 'function' ? process.getuid() : 0}:${typeof process.getgid === 'function' ? process.getgid() : 0}`,
-      `BENCH_SANITIZE=${config.sanitizeGitHistory ? 1 : 0}`,
+      'BENCH_SANITIZE=1',
       'CODEX_HOME=/runtime/codex-home',
       'ULTRACODE_HOME=/bench/uc',
       'HOME=/runtime/home',

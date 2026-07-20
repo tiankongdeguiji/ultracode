@@ -63,6 +63,8 @@ export type TimingPhase = 'prep' | 'inference' | 'session' | 'verifier' | 'detac
 export interface TimingObservation {
   sourceKey: string;
   invocationId: string;
+  /** Non-empty shared identity for per-task projections of one physical batch process. */
+  timingGroupId?: string;
   scope: MetricsScope | null;
   phase: TimingPhase;
   startedAt: string;
@@ -391,8 +393,11 @@ function dedupeWorkflows(workflows: readonly WorkflowArtifact[]): WorkflowArtifa
 
 interface Interval {
   invocationId: string;
+  timingGroupId: string | null;
   scope: MetricsScope | null;
   phase: TimingPhase;
+  startedAt: string;
+  endedAt: string;
   start: number;
   end: number;
   elapsedMs: number;
@@ -404,10 +409,51 @@ function parseTimestamp(value: string, description: string): number {
   return parsed;
 }
 
+function validateTimingGroups(intervals: readonly Interval[]): void {
+  const groups = new Map<string, {
+    interval: Interval;
+    taskIds: Set<string>;
+  }>();
+  for (const interval of intervals) {
+    if (interval.timingGroupId === null) continue;
+    if (interval.scope === null) {
+      throw new Error(`timing group '${interval.timingGroupId}' must contain only task-scoped records`);
+    }
+    const previous = groups.get(interval.timingGroupId);
+    if (previous === undefined) {
+      groups.set(interval.timingGroupId, {
+        interval,
+        taskIds: new Set([interval.scope.taskId]),
+      });
+      continue;
+    }
+    const expected = previous.interval;
+    if (
+      expected.invocationId !== interval.invocationId
+      || expected.scope?.arm !== interval.scope.arm
+      || expected.phase !== interval.phase
+      || expected.startedAt !== interval.startedAt
+      || expected.endedAt !== interval.endedAt
+      || expected.elapsedMs !== interval.elapsedMs
+    ) {
+      throw new Error(`conflicting timing group '${interval.timingGroupId}'`);
+    }
+    if (previous.taskIds.has(interval.scope.taskId)) {
+      throw new Error(`timing group '${interval.timingGroupId}' repeats task '${interval.scope.taskId}'`);
+    }
+    previous.taskIds.add(interval.scope.taskId);
+  }
+}
+
 function observationIntervals(observations: readonly TimingObservation[]): Interval[] {
   const bySource = new Map<string, TimingObservation>();
   for (const observation of observations) {
-    if (!observation.sourceKey || !observation.invocationId) throw new Error('timing identity must be non-empty');
+    const timingGroupId = observation.timingGroupId;
+    if (!observation.sourceKey || !observation.invocationId
+      || timingGroupId !== undefined
+        && (typeof timingGroupId !== 'string' || timingGroupId.length === 0 || timingGroupId.length > 256)) {
+      throw new Error('timing identity must be non-empty');
+    }
     if (observation.scope !== null) validateScope(observation.scope);
     if (!Number.isFinite(observation.elapsedMs) || observation.elapsedMs < 0) {
       throw new Error(`invalid elapsed time for '${observation.sourceKey}'`);
@@ -418,19 +464,24 @@ function observationIntervals(observations: readonly TimingObservation[]): Inter
     }
     bySource.set(observation.sourceKey, observation);
   }
-  return [...bySource.values()].map((observation) => {
+  const intervals = [...bySource.values()].map((observation) => {
     const start = parseTimestamp(observation.startedAt, 'timing start');
     const end = parseTimestamp(observation.endedAt, 'timing end');
     if (end < start) throw new Error(`timing end precedes start for '${observation.sourceKey}'`);
     return {
       invocationId: observation.invocationId,
+      timingGroupId: observation.timingGroupId ?? null,
       scope: observation.scope,
       phase: observation.phase,
+      startedAt: observation.startedAt,
+      endedAt: observation.endedAt,
       start,
       end,
       elapsedMs: observation.elapsedMs,
     };
   });
+  validateTimingGroups(intervals);
+  return intervals;
 }
 
 function intervalUnionMs(intervals: readonly Pick<Interval, 'start' | 'end'>[]): number {
@@ -463,14 +514,18 @@ function timingMetrics(state: BenchRunState | null, observations: readonly Timin
       const end = parseTimestamp(attempt.endedAt, 'attempt end');
       stateIntervals.push({
         invocationId: attempt.invocationId,
+        timingGroupId: attempt.timingGroupId ?? null,
         scope: { taskId: attempt.taskId, arm: attempt.arm },
         phase: attempt.phase,
+        startedAt: attempt.startedAt,
+        endedAt: attempt.endedAt,
         start,
         end,
         elapsedMs: attempt.elapsedMs,
       });
     }
   }
+  validateTimingGroups(stateIntervals);
   const stateKeys = new Set(stateIntervals.map((interval) =>
     `${interval.invocationId}\0${interval.scope?.taskId ?? ''}\0${interval.scope?.arm ?? ''}\0${interval.phase}`));
   const intervals = [
@@ -479,6 +534,7 @@ function timingMetrics(state: BenchRunState | null, observations: readonly Timin
       `${interval.invocationId}\0${interval.scope?.taskId ?? ''}\0${interval.scope?.arm ?? ''}\0${interval.phase}`,
     )),
   ];
+  validateTimingGroups(intervals);
   const byInvocation = new Map<string, Interval[]>();
   for (const interval of intervals) {
     const values = byInvocation.get(interval.invocationId) ?? [];
@@ -502,13 +558,24 @@ function timingMetrics(state: BenchRunState | null, observations: readonly Timin
   const last = spanIntervals.reduce<number | null>((value, interval) =>
     value === null ? interval.end : Math.max(value, interval.end), null);
   const taskIntervals = intervals.filter((interval) => interval.scope !== null);
-  const elapsedFor = (phases: readonly TimingPhase[]): number => taskIntervals
-    .filter((interval) => phases.includes(interval.phase))
-    .reduce((sum, interval) => sum + interval.elapsedMs, 0);
+  const elapsedFor = (phases: readonly TimingPhase[], groupAware: boolean): number => {
+    const timingGroups = new Set<string>();
+    return taskIntervals
+      .filter((interval) => phases.includes(interval.phase))
+      .reduce((sum, interval) => {
+        if (groupAware && interval.timingGroupId !== null) {
+          if (timingGroups.has(interval.timingGroupId)) return sum;
+          timingGroups.add(interval.timingGroupId);
+        }
+        return sum + interval.elapsedMs;
+      }, 0);
+  };
   const taskAttemptPhases: readonly TimingPhase[] = ['inference', 'session', 'verifier', 'detached-wait'];
   const taskAttemptIntervals = new Map<string, Interval[]>();
   for (const interval of taskIntervals.filter((entry) => taskAttemptPhases.includes(entry.phase))) {
-    const key = `${interval.invocationId}\0${interval.scope!.taskId}\0${interval.scope!.arm}`;
+    const key = interval.timingGroupId === null
+      ? `task\0${interval.invocationId}\0${interval.scope!.taskId}\0${interval.scope!.arm}`
+      : `group\0${interval.timingGroupId}`;
     const values = taskAttemptIntervals.get(key) ?? [];
     values.push(interval);
     taskAttemptIntervals.set(key, values);
@@ -521,9 +588,9 @@ function timingMetrics(state: BenchRunState | null, observations: readonly Timin
       (sum, values) => sum + intervalUnionMs(values),
       0,
     ),
-    nativeRunnerMs: elapsedFor(['inference', 'session']),
-    verifierMs: elapsedFor(['verifier']),
-    detachedWorkflowWaitMs: elapsedFor(['detached-wait']),
+    nativeRunnerMs: elapsedFor(['inference', 'session'], true),
+    verifierMs: elapsedFor(['verifier'], true),
+    detachedWorkflowWaitMs: elapsedFor(['detached-wait'], false),
   };
 }
 
@@ -554,10 +621,19 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
   }
   const failures = index.failures.map((failure) => failureObservationSchema.parse(failure));
   const sessions: NormalizedSessionMetrics[] = [];
+  let pricingUsageIncomplete = false;
   for (const artifact of index.rollouts) {
     try {
-      sessions.push(parseCodexRollout(options.runDirectory, artifact, policy));
+      const session = parseCodexRollout(options.runDirectory, artifact, policy);
+      sessions.push(session);
+      if ((artifact.billingClass === 'billable' || artifact.billingClass === 'unknown')
+        && session.annotations.some((entry) => entry.code === 'rollout-usage-missing')) {
+        pricingUsageIncomplete = true;
+      }
     } catch {
+      if (artifact.billingClass === 'billable' || artifact.billingClass === 'unknown') {
+        pricingUsageIncomplete = true;
+      }
       failures.push(failureObservationSchema.parse({
         code: 'artifact-unsafe',
         scope: taskArmScope(artifact.scope.taskId, artifact.scope.arm),
@@ -627,7 +703,9 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
     tokens: { total, byBillingClass },
     pricing: {
       currency: 'USD',
-      verification: pricing === null ? 'unpriced' : unknownUsage > 0 ? 'partial' : 'priced',
+      verification: pricing === null
+        ? 'unpriced'
+        : unknownUsage > 0 || pricingUsageIncomplete ? 'partial' : 'priced',
       billableCost: pricing === null ? null : billableCost(byBillingClass.billable, pricing),
     },
     context: {
@@ -700,7 +778,9 @@ export const METRICS_POLICY_SHA256 = sha256CanonicalJson({
   resetMinDropTokens: LARGE_PROMPT_RESET_MIN_DROP_TOKENS,
   resetRetainedFraction: LARGE_PROMPT_RESET_MAX_RETAINED_RATIO,
   workflowDedupeRule: 'run-id',
+  pricing: 'known-billable-subtotal-partial-on-unpriced-or-incomplete-potentially-billable-usage',
   timing: 'detached-wait-subset-of-wall-time',
+  timingGroups: 'dedupe-task-projections-with-matching-invocation-arm-phase-timestamps-elapsed',
 });
 
 export const DEFAULT_METRICS_POLICY: MetricsPolicySnapshot = {

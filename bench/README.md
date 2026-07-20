@@ -132,7 +132,13 @@ closing an interrupted invocation.
 One normalized metrics implementation reads native rollouts and workflow
 artifacts declared by each suite adapter. It keeps host and worker sessions,
 mock and billable backends, token categories, cost, context pressure,
-compactions, timings, failures, and annotations distinct.
+compactions, timings, failures, and annotations distinct. With a pricing
+snapshot, billable or unknown-class rollouts with unreadable or missing usage
+produce a partial known subtotal; missing usage from non-billable rollouts does
+not affect price verification. Optional timing groups identify per-task
+projections of one physical batch process so summed-task, native-runner, and
+verifier time count it once; members must have unique tasks and matching
+physical timing identity.
 
 Reports keep official/native analysis separate from policy-adjusted analysis:
 

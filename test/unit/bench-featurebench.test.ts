@@ -16,7 +16,8 @@ import { acquireBenchLock } from '../../bench/src/shared/locks.js';
 import type { FeatureBenchManifest } from '../../bench/src/shared/manifest.js';
 import { createBenchPathRoots, writePrivateJsonAtomic } from '../../bench/src/shared/paths.js';
 import type { TaskResult } from '../../bench/src/shared/report.js';
-import type { BenchRunState } from '../../bench/src/shared/run-state.js';
+import type { BenchRunState, BenchRunStateStore } from '../../bench/src/shared/run-state.js';
+import { featureBenchAdapter } from '../../bench/src/suites/featurebench/adapter.js';
 import {
   FEATUREBENCH_DATASET,
   FEATUREBENCH_DATASET_REVISION,
@@ -36,12 +37,16 @@ import {
   archiveFeatureBenchEvaluation,
   cleanupFeatureBenchContainers,
   cleanupFeatureBenchRuntimeHomes,
+  consolidateFeatureBenchPredictions,
+  createFeatureBenchEvidenceResolver,
   featureBenchAnalysisHook,
   featureBenchPolicyLockFile,
   hasCompleteFeatureBenchReceipt,
   inspectFeatureBenchTrustBoundary,
   planFeatureBenchEval,
+  planFeatureBenchResume,
   planFeatureBenchRun,
+  recordFeatureBenchBatchAttempts,
 } from '../../bench/src/suites/featurebench/runner.js';
 import { indexFeatureBenchMetrics } from '../../bench/src/suites/featurebench/telemetry.js';
 import { indexFeatureBenchEvidence } from '../../bench/src/suites/featurebench/verifier.js';
@@ -107,6 +112,25 @@ function prepared(): PreparedFeatureBenchInputs {
     fbBinary: '/prepared/.venv/bin/fb',
     sourceDirectory: '/prepared/source',
   } as PreparedFeatureBenchInputs;
+}
+
+function predictionRoot(
+  runDirectory: string,
+  timestamp: string,
+  predictions: Readonly<Record<string, unknown>>,
+): string {
+  const root = `native/${timestamp}`;
+  const directory = join(runDirectory, ...root.split('/'));
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, 'output.jsonl'), `${Object.entries(predictions).map(([taskId, prediction]) =>
+    JSON.stringify({ instance_id: taskId, prediction })).join('\n')}\n`);
+  return root;
+}
+
+function consolidatedPredictions(runDirectory: string, path: string): Map<string, unknown> {
+  return new Map(readFileSync(join(runDirectory, ...path.split('/')), 'utf8').trim().split(/\r?\n/u)
+    .map((line) => JSON.parse(line) as { instance_id: string; prediction: unknown })
+    .map((prediction) => [prediction.instance_id, prediction.prediction]));
 }
 
 describe('FeatureBench immutable inputs and host policy', () => {
@@ -299,6 +323,155 @@ describe('pinned native fb commands', () => {
       '--n-concurrent', '3', '--task-id', ...TASK_IDS,
     ]);
   });
+
+  it('keeps native resume on the original complete inference root', () => {
+    expect(planFeatureBenchResume(
+      prepared(),
+      manifest(),
+      '/run/native/2026-07-19__13-00-41',
+      '/private/config.toml',
+    ).argv).toEqual([
+      'infer', '--resume', '/run/native/2026-07-19__13-00-41',
+      '--config-path', '/private/config.toml', '--n-concurrent', '4', '--timeout', '60',
+    ]);
+  });
+});
+
+describe('FeatureBench resume and redo assembly', () => {
+  it('keeps redo predictions on a subsequent ordinary resume', () => {
+    const runDirectory = temporary();
+    const original = predictionRoot(runDirectory, '2026-07-19__13-00-41', {
+      'task-alpha': 'original-alpha',
+      'task-beta': 'original-beta',
+    });
+    const redo = predictionRoot(runDirectory, '2026-07-19__13-00-42', {
+      'task-alpha': 'redo-alpha',
+    });
+    const state = {
+      attempts: [
+        { phase: 'inference', nativePath: original },
+        { phase: 'inference', nativePath: redo },
+        { phase: 'inference', nativePath: original },
+      ],
+    } as BenchRunState;
+
+    const path = consolidateFeatureBenchPredictions(
+      runDirectory,
+      state,
+      original,
+      ['task-alpha', 'task-beta'],
+    );
+    expect(consolidatedPredictions(runDirectory, path)).toEqual(new Map([
+      ['task-alpha', 'redo-alpha'],
+      ['task-beta', 'original-beta'],
+    ]));
+  });
+
+  it('uses the newest persisted prediction across multiple redo roots', () => {
+    const runDirectory = temporary();
+    const original = predictionRoot(runDirectory, '2026-07-19__13-00-41', {
+      'task-alpha': 'original-alpha',
+      'task-beta': 'original-beta',
+      'task-gamma': 'original-gamma',
+    });
+    const firstRedo = predictionRoot(runDirectory, '2026-07-19__13-00-42', {
+      'task-alpha': 'first-redo-alpha',
+    });
+    const secondRedo = predictionRoot(runDirectory, '2026-07-19__13-00-43', {
+      'task-beta': 'second-redo-beta',
+    });
+    const latestRedo = predictionRoot(runDirectory, '2026-07-19__13-00-44', {
+      'task-alpha': 'latest-redo-alpha',
+    });
+    const state = {
+      attempts: [original, firstRedo, secondRedo, latestRedo].map((nativePath) => ({
+        phase: 'inference',
+        nativePath,
+      })),
+    } as BenchRunState;
+
+    const path = consolidateFeatureBenchPredictions(
+      runDirectory,
+      state,
+      latestRedo,
+      ['task-alpha', 'task-beta', 'task-gamma'],
+    );
+    expect(consolidatedPredictions(runDirectory, path)).toEqual(new Map([
+      ['task-alpha', 'latest-redo-alpha'],
+      ['task-beta', 'second-redo-beta'],
+      ['task-gamma', 'original-gamma'],
+    ]));
+  });
+
+  it('shares one timing group per redo and resume batch process', async () => {
+    let state = { attempts: [] } as unknown as BenchRunState;
+    const store = {
+      async updateCurrent(update: (current: BenchRunState) => BenchRunState) {
+        state = update(state);
+        return state;
+      },
+    } as unknown as BenchRunStateStore;
+    const started = new Date('2026-07-20T00:00:00.000Z');
+    const ended = new Date('2026-07-20T00:00:01.000Z');
+    const redoInvocation = '00000000-0000-4000-8000-000000000010';
+    const resumeInvocation = '00000000-0000-4000-8000-000000000011';
+    await recordFeatureBenchBatchAttempts(
+      store, redoInvocation, ['task-alpha', 'task-beta'], 'b', 'inference',
+      started, ended, 1_000, 'native/2026-07-19__13-00-42', null,
+    );
+    await recordFeatureBenchBatchAttempts(
+      store, redoInvocation, TASK_IDS, 'b', 'verifier',
+      started, ended, 1_000, 'native/2026-07-19__13-00-42', null,
+    );
+    await recordFeatureBenchBatchAttempts(
+      store, resumeInvocation, TASK_IDS, 'b', 'inference',
+      started, ended, 1_000, 'native/2026-07-19__13-00-41', null,
+    );
+    await recordFeatureBenchBatchAttempts(
+      store, resumeInvocation, TASK_IDS, 'b', 'verifier',
+      started, ended, 1_000, 'native/2026-07-19__13-00-41', null,
+    );
+
+    const batches = [
+      state.attempts.filter((attempt) => attempt.invocationId === redoInvocation && attempt.phase === 'inference'),
+      state.attempts.filter((attempt) => attempt.invocationId === redoInvocation && attempt.phase === 'verifier'),
+      state.attempts.filter((attempt) => attempt.invocationId === resumeInvocation && attempt.phase === 'inference'),
+      state.attempts.filter((attempt) => attempt.invocationId === resumeInvocation && attempt.phase === 'verifier'),
+    ];
+    expect(batches.map((batch) => new Set(batch.map((attempt) => attempt.timingGroupId)).size))
+      .toEqual([1, 1, 1, 1]);
+    expect(new Set(batches.map((batch) => batch[0]!.timingGroupId)).size).toBe(4);
+  });
+});
+
+describe('FeatureBench CLI configuration boundary', () => {
+  it('declares only the four fresh-run configuration overrides', () => {
+    expect(featureBenchAdapter.commands.run.options.map(({ name }) => name)).toEqual([
+      'run-id', 'model', 'effort', 'arm', 'task-id', 'resume', 'redo', 'recover-stale-lock',
+    ]);
+    expect(featureBenchAdapter.commands.run.parse([
+      '--run-id', 'feature-one', '--model', 'gpt-test', '--effort', 'high', '--arm', 'b',
+      '--task-id', 'task-alpha', '--task-id', 'task-beta',
+    ])).toMatchObject({
+      model: 'gpt-test', requestedEffort: 'high', arm: 'b', taskIds: ['task-alpha', 'task-beta'],
+    });
+  });
+
+  it.each([
+    'broker-public-identity',
+    'broker-public-version',
+    'inference-concurrency',
+    'evaluation-concurrency',
+    'inference-timeout-ms',
+    'evaluation-timeout-ms',
+    'cpus',
+    'memory-bytes',
+    'pricing',
+  ])('rejects config-only --%s', (name) => {
+    expect(() => featureBenchAdapter.commands.run.parse([
+      '--run-id', 'feature-one', `--${name}`, 'value',
+    ])).toThrow(`unknown option '--${name}'`);
+  });
 });
 
 describe('FeatureBench official verifier evidence', () => {
@@ -352,6 +525,62 @@ describe('FeatureBench official verifier evidence', () => {
     expect([...evidence.taskResults.values()].every((result) => result.verification === 'verified')).toBe(true);
     expect(evidence.aggregate).toBeNull();
     expect(evidence.bindings.some((binding) => binding.role === 'aggregate-report')).toBe(false);
+  });
+
+  it('indexes each unique root once per assembly and preserves receipt-bound fallback', () => {
+    const runDirectory = nativeFixture();
+    const latestTimestamp = '2026-07-19__13-00-42';
+    cpSync(
+      join(runDirectory, 'native', TIMESTAMP),
+      join(runDirectory, 'native', latestTimestamp),
+      { recursive: true },
+    );
+    const older = indexFeatureBenchEvidence(
+      runDirectory, `native/${TIMESTAMP}`, TASK_IDS, 'b', '00000000-0000-4000-8000-000000000020',
+    );
+    const latest = indexFeatureBenchEvidence(
+      runDirectory, `native/${latestTimestamp}`, TASK_IDS, 'b', '00000000-0000-4000-8000-000000000021',
+    );
+    const latestWithoutAlpha = latest.bindings.filter((binding) =>
+      binding.scope.kind !== 'task-arm' || binding.scope.taskId !== 'task-alpha');
+    const state = {
+      attempts: [
+        ...TASK_IDS.map((taskId) => ({
+          taskId, phase: 'verifier', nativePath: `native/${TIMESTAMP}`,
+        })),
+        ...TASK_IDS.map((taskId) => ({
+          taskId, phase: 'verifier', nativePath: `native/${latestTimestamp}`,
+        })),
+      ],
+    } as BenchRunState;
+    const indexedRoots: string[] = [];
+    const indexer: typeof indexFeatureBenchEvidence = (...args) => {
+      indexedRoots.push(args[1]);
+      return indexFeatureBenchEvidence(...args);
+    };
+
+    const resolver = createFeatureBenchEvidenceResolver(
+      runDirectory,
+      manifest(),
+      state,
+      [...older.bindings, ...latestWithoutAlpha],
+      indexer,
+    );
+    expect(indexedRoots).toEqual([`native/${latestTimestamp}`, `native/${TIMESTAMP}`]);
+    expect(TASK_IDS.map((taskId) => resolver.taskResults.get(taskId)?.verification))
+      .toEqual(TASK_IDS.map(() => 'verified'));
+    expect(resolver.taskResults.get('task-alpha')?.artifact?.path).toContain(TIMESTAMP);
+    expect(resolver.taskResults.get('task-beta')?.artifact?.path).toContain(latestTimestamp);
+    expect(resolver.aggregate?.artifact.path).toContain(TIMESTAMP);
+
+    createFeatureBenchEvidenceResolver(
+      runDirectory,
+      manifest(),
+      state,
+      [...older.bindings, ...latestWithoutAlpha],
+      indexer,
+    );
+    expect(indexedRoots).toHaveLength(4);
   });
 
   it('rejects unbound or non-timestamp native roots', () => {

@@ -52,7 +52,7 @@ export const swebenchProConfigSchema = z.strictObject({
     revision: z.string().regex(/^[a-f0-9]{40}$/),
     pipIndex: publicLocatorSchema,
   }),
-  sanitizeGitHistory: z.boolean(),
+  sanitizeGitHistory: z.literal(true),
   pricing: z.record(z.string(), pricingEntrySchema).optional(),
 });
 

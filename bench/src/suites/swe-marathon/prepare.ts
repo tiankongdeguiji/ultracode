@@ -107,6 +107,25 @@ export function planMarathonPreparation(roots: BenchPathRoots): MarathonPrepPlan
   };
 }
 
+/** Guard known statement order in the exact pinned Harbor source used by Arm B. */
+export function validateHarborCodexApiKeyContract(source: string): void {
+  const markers = [
+    'Codex auth: using OPENAI_API_KEY',
+    'env["OPENAI_API_KEY"]',
+    '"$CODEX_HOME/auth.json"',
+    'mcp_command = self._build_register_mcp_servers_command()',
+    'command=setup_command',
+  ];
+  let offset = 0;
+  for (const marker of markers) {
+    const index = source.indexOf(marker, offset);
+    if (index === -1) {
+      throw new Error('pinned Harbor Codex API-key auth no longer creates CODEX_HOME/auth.json before MCP registration');
+    }
+    offset = index + marker.length;
+  }
+}
+
 /** Parse the immutable image reference from the pinned task TOML. */
 export function taskImageReference(taskToml: string): string {
   let section = '';
@@ -305,6 +324,10 @@ export async function prepareMarathonInputs(
     const sitePackages = await command(pythonBinary, [
       '-c', 'import pathlib, harbor; print(pathlib.Path(harbor.__file__).resolve().parent.parent)',
     ], roots.benchRoot);
+    validateHarborCodexApiKeyContract(readFileSync(
+      join(sitePackages, 'harbor', 'agents', 'installed', 'codex.py'),
+      'utf8',
+    ));
     await command('patch', ['--batch', '--forward', '-p1', '-d', sitePackages, '-i', plan.ownershipPatch], roots.benchRoot);
     normalizeEnvironmentEntrypoints(environmentDirectory);
     if (!readFileSync(harborBinary, 'utf8').startsWith('#!/usr/bin/env python3')) {

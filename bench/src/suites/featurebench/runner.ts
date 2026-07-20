@@ -993,7 +993,8 @@ function predictionTaskId(value: unknown): string | null {
     : null;
 }
 
-function consolidatePredictions(
+/** Assemble one complete verifier input from state-bound inference roots in append order. */
+export function consolidateFeatureBenchPredictions(
   directory: string,
   state: BenchRunState,
   currentRoot: string,
@@ -1025,7 +1026,8 @@ function consolidatePredictions(
   return path;
 }
 
-async function recordAttempts(
+/** Project one physical FeatureBench batch process onto its task-scoped attempts. */
+export async function recordFeatureBenchBatchAttempts(
   state: BenchRunStateStore,
   invocationId: string,
   taskIds: readonly string[],
@@ -1037,11 +1039,13 @@ async function recordAttempts(
   nativePath: string | null,
   failure: FailureCode | null,
 ): Promise<void> {
+  const timingGroupId = randomUUID();
   await state.updateCurrent((current) => ({
     ...current,
     attempts: [...current.attempts, ...taskIds.map((taskId) => ({
       attemptId: randomUUID(),
       invocationId,
+      timingGroupId,
       taskId,
       arm,
       ordinal: current.attempts.filter((attempt) => attempt.taskId === taskId && attempt.arm === arm && attempt.phase === phase).length + 1,
@@ -1298,7 +1302,7 @@ async function executeNativeRunWithHome(
     catch { inferenceFailure = 'artifact-unsafe'; }
   }
   const inferenceEnded = context.clock.now();
-  await recordAttempts(
+  await recordFeatureBenchBatchAttempts(
     stores.state,
     invocationId,
     inferTasks,
@@ -1317,9 +1321,12 @@ async function executeNativeRunWithHome(
   try {
     if (nativeRoot === null) throw new Error('FeatureBench inference produced no timestamped native directory');
     if (inferenceFailure === 'artifact-unsafe') throw new Error('FeatureBench inference artifact tree is unsafe');
-    const predictions = redo.size > 0
-      ? consolidatePredictions(directory, stores.state.load(), nativeRoot, manifest.experiment.taskIds)
-      : `${nativeRoot}/output.jsonl`;
+    const predictions = consolidateFeatureBenchPredictions(
+      directory,
+      stores.state.load(),
+      nativeRoot,
+      manifest.experiment.taskIds,
+    );
     const evalPlan = planFeatureBenchEval(prepared, manifest, join(directory, ...predictions.split('/')), configPath);
     await updateReceipt(stores.receipt, [
       createVerifierBinding(directory, {
@@ -1374,7 +1381,7 @@ async function executeNativeRunWithHome(
     try { await cleanupFeatureBenchContainers(manifest.runId, manifest.experiment.arm as Arm, manifest.experiment.taskIds, executor); }
     catch { verifierFailure = 'ownership-unsafe'; }
     const verifierEnded = context.clock.now();
-    await recordAttempts(
+    await recordFeatureBenchBatchAttempts(
       stores.state,
       invocationId,
       manifest.experiment.taskIds,
@@ -1557,66 +1564,90 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
   }
 }
 
-function boundNativeResult(
-  directory: string,
-  manifest: FeatureBenchManifest,
-  state: BenchRunState,
-  bindings: readonly VerifierBinding[],
-  taskId: string,
-): NativeVerifierResult {
-  const roots = [...state.attempts].reverse()
-    .filter((attempt) => attempt.phase === 'verifier' && attempt.nativePath !== null)
-    .map((attempt) => attempt.nativePath!);
-  for (const root of [...new Set(roots)]) {
-    const result = indexFeatureBenchEvidence(
-      directory,
-      root,
-      manifest.experiment.taskIds,
-      manifest.experiment.arm as Arm,
-      randomUUID(),
-    ).taskResults.get(taskId) ?? UNVERIFIED_NATIVE_RESULT;
-    if (result.verification === 'unverified' || result.artifact === null) continue;
-    if (bindings.some((binding) => binding.scope.kind === 'task-arm'
-      && binding.scope.taskId === taskId && binding.scope.arm === manifest.experiment.arm
-      && binding.role === 'task-report' && binding.path === result.artifact!.path
-      && binding.sha256 === result.artifact!.sha256
-      && binding.nativeRecordKey === result.artifact!.nativeRecordKey)) return result;
-  }
-  return UNVERIFIED_NATIVE_RESULT;
+type FeatureBenchEvidenceIndexer = typeof indexFeatureBenchEvidence;
+
+export interface FeatureBenchEvidenceResolver {
+  taskResults: ReadonlyMap<string, NativeVerifierResult>;
+  aggregate: FeatureBenchAggregate | null;
 }
 
-function boundAggregate(
+function artifactIdentity(artifact: { path: string; sha256: string; nativeRecordKey: string }): string {
+  return `${artifact.path}\0${artifact.sha256}\0${artifact.nativeRecordKey}`;
+}
+
+/** Index each latest-first verifier root once for one report assembly. */
+export function createFeatureBenchEvidenceResolver(
   directory: string,
   manifest: FeatureBenchManifest,
   state: BenchRunState,
   bindings: readonly VerifierBinding[],
-): FeatureBenchAggregate | null {
+  indexEvidence: FeatureBenchEvidenceIndexer = indexFeatureBenchEvidence,
+): FeatureBenchEvidenceResolver {
   const roots = [...state.attempts].reverse()
     .filter((attempt) => attempt.phase === 'verifier' && attempt.nativePath !== null)
     .map((attempt) => attempt.nativePath!);
-  for (const root of [...new Set(roots)]) {
-    const evidence = indexFeatureBenchEvidence(
-      directory,
-      root,
-      manifest.experiment.taskIds,
-      manifest.experiment.arm as Arm,
-      randomUUID(),
-    );
-    const aggregate = evidence.aggregate;
-    const tasksBound = manifest.experiment.taskIds.every((taskId) => {
-      const result = evidence.taskResults.get(taskId) ?? UNVERIFIED_NATIVE_RESULT;
-      return result.verification === 'verified' && result.artifact !== null
-        && bindings.some((binding) => binding.scope.kind === 'task-arm'
-          && binding.scope.taskId === taskId && binding.scope.arm === manifest.experiment.arm
-          && binding.role === 'task-report' && binding.path === result.artifact!.path
-          && binding.sha256 === result.artifact!.sha256
-          && binding.nativeRecordKey === result.artifact!.nativeRecordKey);
+  const indexed = [...new Set(roots)].map((root) => indexEvidence(
+    directory,
+    root,
+    manifest.experiment.taskIds,
+    manifest.experiment.arm as Arm,
+    randomUUID(),
+  ));
+  const taskBindings = new Map<string, Set<string>>();
+  const aggregateBindings = new Set<string>();
+  for (const binding of bindings) {
+    if (binding.nativeRecordKey === null) continue;
+    const identity = artifactIdentity({
+      path: binding.path,
+      sha256: binding.sha256,
+      nativeRecordKey: binding.nativeRecordKey,
     });
-    if (aggregate !== null && bindings.some((binding) => binding.role === 'aggregate-report'
-      && binding.path === aggregate.artifact.path && binding.sha256 === aggregate.artifact.sha256
-      && binding.nativeRecordKey === aggregate.artifact.nativeRecordKey) && tasksBound) return aggregate;
+    if (binding.role === 'task-report' && binding.scope.kind === 'task-arm'
+      && binding.scope.arm === manifest.experiment.arm) {
+      const values = taskBindings.get(binding.scope.taskId) ?? new Set<string>();
+      values.add(identity);
+      taskBindings.set(binding.scope.taskId, values);
+    } else if (binding.role === 'aggregate-report') {
+      aggregateBindings.add(identity);
+    }
   }
-  return null;
+  const isTaskBound = (taskId: string, result: NativeVerifierResult): boolean => {
+    const artifact = result.artifact;
+    return result.verification === 'verified' && artifact !== null && artifact.nativeRecordKey !== null
+      && taskBindings.get(taskId)?.has(artifactIdentity({
+        path: artifact.path,
+        sha256: artifact.sha256,
+        nativeRecordKey: artifact.nativeRecordKey,
+      })) === true;
+  };
+  const taskResults = new Map<string, NativeVerifierResult>();
+  for (const taskId of manifest.experiment.taskIds) {
+    let resolved = UNVERIFIED_NATIVE_RESULT;
+    for (const evidence of indexed) {
+      const result = evidence.taskResults.get(taskId) ?? UNVERIFIED_NATIVE_RESULT;
+      if (!isTaskBound(taskId, result)) continue;
+      resolved = result;
+      break;
+    }
+    taskResults.set(taskId, resolved);
+  }
+  let aggregate: FeatureBenchAggregate | null = null;
+  for (const evidence of indexed) {
+    const candidate = evidence.aggregate;
+    if (candidate === null || !aggregateBindings.has(artifactIdentity(candidate.artifact))) continue;
+    if (!manifest.experiment.taskIds.every((taskId) =>
+      isTaskBound(taskId, evidence.taskResults.get(taskId) ?? UNVERIFIED_NATIVE_RESULT))) continue;
+    aggregate = candidate;
+    break;
+  }
+  return { taskResults, aggregate };
+}
+
+function boundNativeResult(
+  resolver: FeatureBenchEvidenceResolver,
+  taskId: string,
+): NativeVerifierResult {
+  return resolver.taskResults.get(taskId) ?? UNVERIFIED_NATIVE_RESULT;
 }
 
 /** Require the full upstream inference/evaluation evidence set for one invocation. */
@@ -1640,13 +1671,13 @@ function taskInputs(
   manifest: FeatureBenchManifest,
   state: BenchRunState,
   bindings: readonly VerifierBinding[],
-  directory: string,
+  resolver: FeatureBenchEvidenceResolver,
 ): TaskReportInput[] {
   return manifest.artifacts.executions.map((execution) => {
     const attempts = state.attempts.filter((attempt) => attempt.taskId === execution.taskId && attempt.arm === execution.arm);
     const latestInference = attempts.filter((attempt) => attempt.phase === 'inference').at(-1);
     const latestVerifier = attempts.filter((attempt) => attempt.phase === 'verifier').at(-1);
-    const nativeVerifier = boundNativeResult(directory, manifest, state, bindings, execution.taskId);
+    const nativeVerifier = boundNativeResult(resolver, execution.taskId);
     const latestAttempts = [latestInference, latestVerifier].filter((attempt) => attempt !== undefined);
     const failures = new Set<FailureCode>(latestAttempts.flatMap((attempt) => attempt.failures));
     if (latestVerifier !== undefined && latestVerifier.status !== 'running'
@@ -1732,14 +1763,19 @@ export async function reportCommand(options: ReportOptions, context: CommandCont
         indexFeatureBenchMetrics(evidence.manifest, directory, evidence.runState),
         evidence.runState,
       );
-      const aggregate = boundAggregate(directory, evidence.manifest, evidence.runState, evidence.verifierReceipt.bindings);
+      const resolver = createFeatureBenchEvidenceResolver(
+        directory,
+        evidence.manifest,
+        evidence.runState,
+        evidence.verifierReceipt.bindings,
+      );
       return buildBenchReport({
         ...evidence,
         metrics,
-        taskResults: taskInputs(evidence.manifest, evidence.runState, evidence.verifierReceipt.bindings, directory),
+        taskResults: taskInputs(evidence.manifest, evidence.runState, evidence.verifierReceipt.bindings, resolver),
         currentPolicyHashes: currentControlPlaneHashes(context.paths),
         analysisHook: featureBenchAnalysisHook,
-        nativeAnalysisInput: aggregate,
+        nativeAnalysisInput: resolver.aggregate,
         generatedAt: context.clock.now(),
       });
     };

@@ -53,3 +53,4 @@ bench/suites/swebench-pro/Dockerfile
 bench/suites/swebench-pro/entrypoint.sh
 bench/suites/swebench-pro/evaluator-ownership.patch
 bench/suites/swebench-pro/evaluator-requirements.lock
+bench/suites/swebench-pro/sanitize-git.sh
