@@ -8,6 +8,7 @@ import {
   BENCH_USAGE,
   parseBenchCliRoute,
   runBenchCli,
+  runBenchExecutable,
 } from '../../bench/src/cli.js';
 import type { SuiteRegistry } from '../../bench/src/registry.js';
 import type { CommandContext } from '../../bench/src/shared/contracts.js';
@@ -211,6 +212,127 @@ describe('benchmark executable structure', () => {
       'bench',
       'bench:check',
     ]);
+  });
+
+  it('keeps SIGINT and SIGTERM ownership at the executable boundary', () => {
+    const signalOwners = sourceFiles(join(REPO_ROOT, 'bench/src')).filter((path) => {
+      const source = readFileSync(path, 'utf8');
+      return source.includes("process.on('SIGINT'") || source.includes("process.on('SIGTERM'");
+    });
+    expect(signalOwners).toEqual([join(REPO_ROOT, 'bench/src/cli.ts')]);
+  });
+});
+
+describe('benchmark signal cleanup bounds', () => {
+  it('quiesces active Docker clients before and after two suite cleanup sweeps', async () => {
+    const events: string[] = [];
+    let releaseCommand!: () => void;
+    const command = new Promise<void>((resolvePromise) => { releaseCommand = resolvePromise; });
+    const adapter = {
+      cleanup: async () => { events.push('suite'); },
+      commands: {
+        run: {
+          parse: () => ({}),
+          run: async () => {
+            setTimeout(() => process.emit('SIGTERM'), 0);
+            await command;
+          },
+        },
+      },
+    };
+    await runBenchExecutable(
+      ['--suite', 'featurebench', 'run'],
+      { get: () => adapter } as unknown as SuiteRegistry,
+      {
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+        paths: { benchRoot: '/bench', cacheRoot: '/bench/.cache', resultsRoot: '/bench/results' },
+        clock: { now: () => new Date(0), monotonicMs: () => 0 },
+      } as unknown as CommandContext,
+      {
+        cleanupActiveProcesses: async () => { events.push('active'); },
+        signalCleanupTimeoutMs: 1_000,
+        resendSignal: () => { events.push('resend'); releaseCommand(); },
+      },
+    );
+    expect(events).toEqual(['active', 'suite', 'active', 'suite', 'resend']);
+  });
+
+  it('re-delivers the first signal after the cleanup deadline when a suite hook never settles', async () => {
+    const resent: NodeJS.Signals[] = [];
+    let releaseCommand!: () => void;
+    const command = new Promise<void>((resolvePromise) => { releaseCommand = resolvePromise; });
+    const adapter = {
+      cleanup: async () => await new Promise(() => {}),
+      commands: {
+        run: {
+          parse: () => ({}),
+          run: async () => {
+            setTimeout(() => process.emit('SIGTERM'), 0);
+            await command;
+          },
+        },
+      },
+    };
+    await runBenchExecutable(
+      ['--suite', 'featurebench', 'run'],
+      { get: () => adapter } as unknown as SuiteRegistry,
+      {
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+        paths: { benchRoot: '/bench', cacheRoot: '/bench/.cache', resultsRoot: '/bench/results' },
+        clock: { now: () => new Date(0), monotonicMs: () => 0 },
+      } as unknown as CommandContext,
+      {
+        cleanupActiveProcesses: async () => {},
+        signalCleanupTimeoutMs: 20,
+        resendSignal: (signal) => {
+          resent.push(signal);
+          releaseCommand();
+        },
+      },
+    );
+    expect(resent).toEqual(['SIGTERM']);
+  });
+
+  it('makes a repeated signal immediately force re-delivery during cleanup', async () => {
+    const resent: NodeJS.Signals[] = [];
+    let releaseCommand!: () => void;
+    const command = new Promise<void>((resolvePromise) => { releaseCommand = resolvePromise; });
+    const adapter = {
+      cleanup: async () => await new Promise(() => {}),
+      commands: {
+        run: {
+          parse: () => ({}),
+          run: async () => {
+            setTimeout(() => {
+              process.emit('SIGTERM');
+              setTimeout(() => process.emit('SIGINT'), 0);
+            }, 0);
+            await command;
+          },
+        },
+      },
+    };
+    await runBenchExecutable(
+      ['--suite', 'featurebench', 'run'],
+      { get: () => adapter } as unknown as SuiteRegistry,
+      {
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+        paths: { benchRoot: '/bench', cacheRoot: '/bench/.cache', resultsRoot: '/bench/results' },
+        clock: { now: () => new Date(0), monotonicMs: () => 0 },
+      } as unknown as CommandContext,
+      {
+        cleanupActiveProcesses: async () => {},
+        signalCleanupTimeoutMs: 60_000,
+        resendSignal: (signal) => {
+          resent.push(signal);
+          releaseCommand();
+        },
+      },
+    );
+    expect(resent).toEqual(['SIGINT']);
   });
 });
 

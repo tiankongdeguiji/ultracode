@@ -16,6 +16,8 @@ the exact Harbor config and result bytes but never recomputes a reward.
 It prepares the shared Codex/Node/Ultracode toolchain, checks out the exact
 source revision, performs the frozen `uv` sync, applies the tracked Harbor
 ownership-label patch, and pulls every runnable digest-pinned task image.
+It requires `uv` and GNU `patch` (including `--batch` and `--forward`) and preflights both before
+network access, cache staging, or Python environment construction.
 
 Runs use the common suite-qualified namespace (with `suite` equal to
 `swe-marathon`):
@@ -68,9 +70,9 @@ The four CUA tasks without authoritative verifier results are not runnable:
 
 Choose the configured authentication mechanism on every run:
 
-- `chatgpt`: set `CODEX_AUTH_JSON_PATH` to a current-user-owned regular file
-  with mode `0600`.
-- `api-key`: set `OPENAI_API_KEY`.
+- `chatgpt`: set `CODEX_AUTH_JSON_PATH` to a current-user-owned, singly-linked
+  regular file no larger than 4 MiB with mode `0600`.
+- `api-key`: set `OPENAI_API_KEY` (not SWE-bench Pro's `CODEX_API_KEY`).
 
 Credentials are copied or forwarded only into an ephemeral `0700` runtime home
 and never enter argv, manifests, reports, or the persistent run directory.

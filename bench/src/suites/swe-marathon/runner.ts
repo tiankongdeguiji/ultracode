@@ -66,7 +66,11 @@ import {
   validateMarathonTaskId,
   type SweMarathonConfig,
 } from './config.js';
-import { prepareMarathonInputs, type MarathonTaskInput } from './prepare.js';
+import {
+  preflightMarathonPreparation,
+  prepareMarathonInputs,
+  type MarathonTaskInput,
+} from './prepare.js';
 import {
   attestMarathonCommon,
   attestMarathonTask,
@@ -78,6 +82,7 @@ import { indexHarborEvidence, validateHarborResume, type HarborExecutionIdentity
 const TOOLCHAIN_CACHE_LOCK = '.locks/toolchain.lock';
 const SUITE_CACHE_LOCK = '.locks/swe-marathon.lock';
 const BRIDGE_CLASS = 'arm_b_codex:ArmBCodex';
+const CLEANUP_DOCKER_TIMEOUT_MS = 30_000;
 
 interface PrepOptions { recoverStaleLock: boolean }
 interface RunOptions {
@@ -148,6 +153,7 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SweMarathonManifest['
     failurePolicySha256: sourcePolicyHash(roots, FAILURE_POLICY_SHA256, ['src/shared/failure.ts']),
     reportPolicySha256: sourcePolicyHash(roots, REPORT_POLICY_SHA256, ['src/shared/report.ts']),
     adapterPolicySha256: sourcePolicyHash(roots, SWE_MARATHON_ADAPTER_POLICY_SHA256, [
+      'src/cli.ts',
       'src/shared/config.ts',
       'src/shared/contracts.ts',
       'src/shared/locks.ts',
@@ -162,6 +168,8 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SweMarathonManifest['
       'src/shared/run-state.ts',
       'src/shared/toolchain.ts',
       'src/shared/verifier.ts',
+      '../src/exec/procinfo.ts',
+      '../src/exec/spawn.ts',
       'src/suites/swe-marathon/adapter.ts',
       'src/suites/swe-marathon/auth.ts',
       'src/suites/swe-marathon/config.ts',
@@ -551,42 +559,50 @@ interface ActiveMarathonExecution {
   taskId: string;
   arm: Arm;
   cleanupRuntime(): void;
+  cleanupPromise?: Promise<void>;
 }
 
 const activeExecutions = new Map<string, ActiveMarathonExecution>();
-let relayingSignal = false;
-
-const relaySignal = (signal: NodeJS.Signals): void => {
-  if (relayingSignal) return;
-  relayingSignal = true;
-  const active = [...activeExecutions.values()];
-  void Promise.all(active.map(async (execution) => {
-    try { await cleanupMarathonContainers(execution.runId, execution.taskId, execution.arm); } catch { /* exact cleanup retries on resume */ }
-    execution.cleanupRuntime();
-  })).finally(() => {
-    process.off('SIGINT', onSigint);
-    process.off('SIGTERM', onSigterm);
-    process.kill(process.pid, signal);
-  });
-};
-
-const onSigint = (): void => relaySignal('SIGINT');
-const onSigterm = (): void => relaySignal('SIGTERM');
 
 function trackExecution(key: string, execution: ActiveMarathonExecution): void {
-  if (activeExecutions.size === 0) {
-    process.on('SIGINT', onSigint);
-    process.on('SIGTERM', onSigterm);
-  }
+  if (activeExecutions.has(key)) throw new Error(`SWE-Marathon execution is already tracked: ${key}`);
   activeExecutions.set(key, execution);
 }
 
-function untrackExecution(key: string): void {
-  activeExecutions.delete(key);
-  if (activeExecutions.size === 0 && !relayingSignal) {
-    process.off('SIGINT', onSigint);
-    process.off('SIGTERM', onSigterm);
+async function cleanupTrackedExecution(key: string): Promise<void> {
+  const execution = activeExecutions.get(key);
+  if (execution === undefined) return;
+  execution.cleanupPromise ??= (async () => {
+    const failures: unknown[] = [];
+    try {
+      await cleanupMarathonContainers(execution.runId, execution.taskId, execution.arm);
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      execution.cleanupRuntime();
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) throw new AggregateError(failures, 'SWE-Marathon active execution cleanup failed');
+    activeExecutions.delete(key);
+  })();
+  const cleanup = execution.cleanupPromise;
+  try {
+    await cleanup;
+  } finally {
+    if (activeExecutions.get(key) === execution && execution.cleanupPromise === cleanup) {
+      execution.cleanupPromise = undefined;
+    }
   }
+}
+
+/** Settle every tracked Harbor container set and exact credential runtime. */
+export async function cleanupSweMarathonRuntime(): Promise<void> {
+  const keys = [...activeExecutions.keys()];
+  const settled = await Promise.allSettled(keys.map(cleanupTrackedExecution));
+  const failures = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+  if (failures.length > 0) throw new AggregateError(failures, 'SWE-Marathon runtime cleanup failed');
 }
 
 /** Remove only containers bearing the complete exact ownership label tuple. */
@@ -603,14 +619,22 @@ export async function cleanupMarathonContainers(runId: string, taskId: string, a
   const filters = Object.entries(expected).flatMap(([name, value]) => [
     '--filter', `label=${name.replace(/^ULTRACODE_BENCHMARK_/, 'ultracode.benchmark.').toLowerCase().replaceAll('_', '-')}=${value}`,
   ]);
-  const listed = await runBenchProcess('docker', ['ps', '-aq', ...filters], { cwd: process.cwd(), tailBytes: 8 * 1_024 * 1_024 });
+  const listed = await runBenchProcess('docker', ['ps', '-aq', ...filters], {
+    cwd: process.cwd(),
+    tailBytes: 8 * 1_024 * 1_024,
+    timeoutMs: CLEANUP_DOCKER_TIMEOUT_MS,
+  });
   const ids = listed.stdout.split('\n').map((value) => value.trim()).filter(Boolean);
   if (ids.some((id) => !/^[a-f0-9]{12,64}$/.test(id))) {
     throw new Error('Docker returned an invalid Harbor container id');
   }
   let removed = 0;
   for (const id of ids) {
-    const inspected = await runBenchProcess('docker', ['inspect', id], { cwd: process.cwd(), tailBytes: 8 * 1_024 * 1_024 });
+    const inspected = await runBenchProcess('docker', ['inspect', id], {
+      cwd: process.cwd(),
+      tailBytes: 8 * 1_024 * 1_024,
+      timeoutMs: CLEANUP_DOCKER_TIMEOUT_MS,
+    });
     const rows = JSON.parse(inspected.stdout) as ContainerInspect[];
     const inspectedId = rows.length === 1 ? rows[0]?.Id : undefined;
     const labels = rows.length === 1 ? rows[0]?.Config?.Labels ?? {} : {};
@@ -631,7 +655,11 @@ export async function cleanupMarathonContainers(runId: string, taskId: string, a
     })) throw new Error(`refusing to remove unowned Harbor container ${id}`);
     const runtimeNonce = labels['ultracode.benchmark.runtime'] ?? '';
     if (!/^[a-f0-9]{64}$/.test(runtimeNonce)) throw new Error(`Harbor container ${id} has no valid runtime owner`);
-    await runBenchProcess('docker', ['rm', '-f', id], { cwd: process.cwd(), tailBytes: 8 * 1_024 * 1_024 });
+    await runBenchProcess('docker', ['rm', '-f', id], {
+      cwd: process.cwd(),
+      tailBytes: 8 * 1_024 * 1_024,
+      timeoutMs: CLEANUP_DOCKER_TIMEOUT_MS,
+    });
     removed += 1;
   }
   cleanupMarathonRuntimeHomes(runId, taskId, arm);
@@ -800,11 +828,11 @@ async function runTask(
         ? 'auth-failed'
         : 'native-runner-failed';
   } finally {
-    try { await cleanupMarathonContainers(manifest.runId, taskId, identity.arm); }
-    catch { failure = 'ownership-unsafe'; }
-    finally {
-      runtime.cleanup();
-      untrackExecution(activeKey);
+    let cleanupFailure: unknown;
+    try { await cleanupTrackedExecution(activeKey); }
+    catch (error) {
+      failure = 'ownership-unsafe';
+      cleanupFailure = error;
     }
     const evidence = indexHarborEvidence(directory, identity, invocationId);
     failure = marathonTaskFailure(failure, evidence);
@@ -813,6 +841,7 @@ async function runTask(
       Math.max(0, performance.now() - startedMs), failure, identity.jobRelativeRoot);
     await updateReceipt(receipt, identity, evidence.bindings);
     output(context, `${taskId} ${identity.arm}: ${evidence.nativeResult.verification}${failure ? ` (${failure})` : ''}`);
+    if (cleanupFailure !== undefined) throw cleanupFailure;
   }
 }
 
@@ -869,7 +898,12 @@ async function invalidateRedo(
   }
 }
 
-export async function prepCommand(options: PrepOptions, context: CommandContext): Promise<void> {
+export async function prepCommand(
+  options: PrepOptions,
+  context: CommandContext,
+  preflight = preflightMarathonPreparation,
+): Promise<void> {
+  await preflight(context.paths.benchRoot);
   const locks = await acquireInputLocks(context.paths, options.recoverStaleLock);
   try {
     const operator = loadSweMarathonOperatorConfig(context.paths);

@@ -12,20 +12,19 @@ import {
 } from '../../shared/paths.js';
 import {
   BenchProcessError,
-  cleanupActiveBenchProcesses,
   runBenchProcess,
   type BenchProcessOptions,
   type BenchProcessResult,
 } from '../../shared/process.js';
+import { sha256CanonicalJson } from '../../shared/provenance.js';
 import type { SwebenchProConfig } from './config.js';
 import {
   containerPolicySha256,
   evaluatorContainerPolicy,
   type SwebenchProContainerPolicy,
 } from './container-policy.js';
-import { ownershipUnsafe, ownershipUnsafeAggregate } from './cleanup.js';
-import { BASE_IMAGE_REPOSITORY } from './image.js';
-import { readTaskStatus } from './state.js';
+import { ArtifactUnsafeError, ownershipUnsafe, ownershipUnsafeAggregate } from './cleanup.js';
+import { readPatchArtifact } from './state.js';
 import type { EvalPrediction, SwebenchProInstance } from './types.js';
 
 const DOCKERHUB_USERNAME = 'jefzda';
@@ -76,20 +75,22 @@ export function collectPredictions(
     if (!instance) throw new Error(`manifest has no frozen row for ${execution.taskId}`);
     const taskDirectory = join(runDirectory, ...execution.nativeRoot.split('/'));
     if (!existsSync(taskDirectory)) continue;
-    assertArtifactTree(taskDirectory);
-    const status = readTaskStatus(taskDirectory);
-    if (status.failure === 'patch-too-large') continue;
-    let patch: string;
     try {
-      patch = readRegularFileWithinRoot(taskDirectory, 'out/patch.diff', 10_000_001).toString('utf8');
-    } catch {
-      continue;
+      assertArtifactTree(taskDirectory);
+    } catch (error) {
+      throw new ArtifactUnsafeError(`artifact-unsafe patch tree for ${execution.taskId}/${arm}`, error);
     }
-    if (patch.trim()) predictions.push({
-      instance_id: instance.instanceId,
-      patch,
-      prefix: arm === 'a' ? 'armA' : 'armB',
-    });
+    const patch = readPatchArtifact(taskDirectory);
+    if (patch.kind === 'unsafe') {
+      throw new ArtifactUnsafeError(`artifact-unsafe patch for ${execution.taskId}/${arm}`, patch.failure);
+    }
+    if (patch.kind === 'patch') {
+      predictions.push({
+        instance_id: instance.instanceId,
+        patch: patch.patch,
+        prefix: arm === 'a' ? 'armA' : 'armB',
+      });
+    }
   }
   return predictions;
 }
@@ -112,16 +113,32 @@ export const nullPredictions = (instances: readonly SwebenchProInstance[]): Eval
 
 export interface EvaluatorContainerInspect {
   Id?: string;
+  Image?: string;
   Config?: { Image?: string; Labels?: Record<string, string> };
   State?: { StartedAt?: string };
-  Mounts?: Array<{ Type?: string; Source?: string }>;
+  Mounts?: Array<{ Type?: string; Source?: string; Destination?: string }>;
 }
 
-function exactRepository(image: string): string {
-  const withoutDigest = image.split('@')[0]!;
-  const slash = withoutDigest.lastIndexOf('/');
-  const colon = withoutDigest.lastIndexOf(':');
-  return colon > slash ? withoutDigest.slice(0, colon) : withoutDigest;
+export interface EvaluatorImageIdentity {
+  reference: string;
+  localId: string;
+}
+
+function exactEvaluatorRuntime(
+  record: EvaluatorContainerInspect,
+  outputDirectory: string,
+  taskId: string,
+  identities: ReadonlyMap<string, EvaluatorImageIdentity>,
+): boolean {
+  const expected = identities.get(taskId);
+  if (expected === undefined || record.Config?.Image !== expected.reference || record.Image !== expected.localId) {
+    return false;
+  }
+  const binds = (record.Mounts ?? []).filter((mount) => mount.Type === 'bind');
+  return binds.length === 1
+    && binds[0]?.Destination === '/workspace'
+    && typeof binds[0].Source === 'string'
+    && resolve(binds[0].Source) === resolve(outputDirectory, taskId, 'workspace');
 }
 
 /** Own only post-baseline evaluator containers with an exact contained mount. */
@@ -134,17 +151,16 @@ export function ownedEvaluatorContainerIds(
     armLabel: string;
     invocationId: string;
     taskIds: ReadonlySet<string>;
+    imageIdentities: ReadonlyMap<string, EvaluatorImageIdentity>;
     invocationStartedMs: number;
     nowMs: number;
     maximumAgeMs: number | null;
   },
 ): string[] {
-  const root = resolve(options.outputDirectory);
   return records.flatMap((record) => {
     if (!record.Id || !/^[a-f0-9]{64}$/.test(record.Id) || options.baselineIds.has(record.Id)) return [];
-    const image = record.Config?.Image;
-    if (!image || exactRepository(image) !== BASE_IMAGE_REPOSITORY) return [];
     const labels = record.Config?.Labels ?? {};
+    const taskId = labels['ultracode.benchmark.task'] ?? '';
     if (labels['ultracode.benchmark.schema'] !== '2'
       || labels['ultracode.benchmark.suite'] !== 'swebench-pro'
       || labels['ultracode.benchmark.run'] !== options.runId
@@ -152,16 +168,12 @@ export function ownedEvaluatorContainerIds(
       || labels['ultracode.benchmark.invocation'] !== options.invocationId
       || labels['ultracode.benchmark.purpose'] !== 'verifier'
       || labels['ultracode.benchmark.ownership'] !== '1'
-      || !options.taskIds.has(labels['ultracode.benchmark.task'] ?? '')) return [];
+      || !options.taskIds.has(taskId)
+      || !exactEvaluatorRuntime(record, options.outputDirectory, taskId, options.imageIdentities)) return [];
     const startedAt = Date.parse(record.State?.StartedAt ?? '');
     if (!Number.isFinite(startedAt) || startedAt < options.invocationStartedMs) return [];
     if (options.maximumAgeMs !== null && options.nowMs - startedAt <= options.maximumAgeMs) return [];
-    const mountOwned = record.Mounts?.some((mount) => {
-      if (mount.Type !== 'bind' || typeof mount.Source !== 'string') return false;
-      const fromRoot = relative(root, resolve(mount.Source));
-      return fromRoot === '' || (fromRoot !== '..' && !fromRoot.startsWith(`..${sep}`));
-    }) ?? false;
-    return mountOwned ? [record.Id] : [];
+    return [record.Id];
   });
 }
 
@@ -173,31 +185,36 @@ export function existingEvaluatorContainerIds(
     runId: string;
     armLabel: string;
     taskIds: ReadonlySet<string>;
+    imageIdentities: ReadonlyMap<string, EvaluatorImageIdentity>;
+    invocationIds?: ReadonlySet<string>;
+    invocationStartedMs?: ReadonlyMap<string, number>;
   },
 ): string[] {
-  const root = resolve(options.outputDirectory);
   return records.flatMap((record) => {
-    const image = record.Config?.Image;
-    if (!record.Id || !/^[a-f0-9]{64}$/.test(record.Id)
-      || !image || exactRepository(image) !== BASE_IMAGE_REPOSITORY) return [];
+    if (!record.Id || !/^[a-f0-9]{64}$/.test(record.Id)) return [];
     const labels = record.Config?.Labels ?? {};
+    const taskId = labels['ultracode.benchmark.task'] ?? '';
+    const invocationId = labels['ultracode.benchmark.invocation'] ?? '';
     if (labels['ultracode.benchmark.schema'] !== '2'
       || labels['ultracode.benchmark.suite'] !== 'swebench-pro'
       || labels['ultracode.benchmark.run'] !== options.runId
       || labels['ultracode.benchmark.arm'] !== options.armLabel
       || labels['ultracode.benchmark.purpose'] !== 'verifier'
       || labels['ultracode.benchmark.ownership'] !== '1'
-      || !options.taskIds.has(labels['ultracode.benchmark.task'] ?? '')) return [];
-    const ownsMount = record.Mounts?.some((mount) => {
-      if (mount.Type !== 'bind' || typeof mount.Source !== 'string') return false;
-      const fromRoot = relative(root, resolve(mount.Source));
-      return fromRoot === '' || (fromRoot !== '..' && !fromRoot.startsWith(`..${sep}`));
-    }) ?? false;
-    return ownsMount ? [record.Id] : [];
+      || !options.taskIds.has(taskId)
+      || (options.invocationIds !== undefined && !options.invocationIds.has(invocationId))
+      || !exactEvaluatorRuntime(record, options.outputDirectory, taskId, options.imageIdentities)) return [];
+    if (options.invocationStartedMs !== undefined) {
+      const invocationStarted = options.invocationStartedMs.get(invocationId);
+      const containerStarted = Date.parse(record.State?.StartedAt ?? '');
+      if (invocationStarted === undefined || !Number.isFinite(containerStarted)
+        || containerStarted < invocationStarted) return [];
+    }
+    return [record.Id];
   });
 }
 
-export type EvaluatorDocker = (argv: readonly string[]) => Promise<string>;
+export type EvaluatorDocker = (argv: readonly string[], timeoutMs?: number) => Promise<string>;
 
 export type EvaluatorProcessExecutor = (
   command: string,
@@ -205,15 +222,18 @@ export type EvaluatorProcessExecutor = (
   options: BenchProcessOptions,
 ) => Promise<BenchProcessResult>;
 
-const defaultDocker: EvaluatorDocker = async (argv) => (await runBenchProcess('docker', argv, {
+const EVALUATOR_DOCKER_TIMEOUT_MS = 30_000;
+
+const defaultDocker: EvaluatorDocker = async (argv, timeoutMs = EVALUATOR_DOCKER_TIMEOUT_MS) => (await runBenchProcess('docker', argv, {
   cwd: process.cwd(),
   tailBytes: 64 * 1_024 * 1_024,
+  timeoutMs,
 })).stdout;
 
 const defaultProcessExecutor: EvaluatorProcessExecutor = runBenchProcess;
 
 async function containerIds(docker: EvaluatorDocker): Promise<Set<string>> {
-  const output = await docker(['ps', '-aq', '--no-trunc']);
+  const output = await docker(['ps', '-aq', '--no-trunc'], EVALUATOR_DOCKER_TIMEOUT_MS);
   const ids = output.split('\n').map((entry) => entry.trim()).filter(Boolean);
   if (ids.some((id) => !/^[a-f0-9]{64}$/.test(id))) {
     throw new Error('Docker returned an invalid evaluator container id');
@@ -224,7 +244,7 @@ async function containerIds(docker: EvaluatorDocker): Promise<Set<string>> {
 async function inspectContainers(docker: EvaluatorDocker): Promise<EvaluatorContainerInspect[]> {
   const ids = [...await containerIds(docker)];
   if (ids.length === 0) return [];
-  const parsed = JSON.parse(await docker(['inspect', ...ids])) as unknown;
+  const parsed = JSON.parse(await docker(['inspect', ...ids], EVALUATOR_DOCKER_TIMEOUT_MS)) as unknown;
   if (!Array.isArray(parsed) || parsed.length !== ids.length
     || parsed.some((record) => record === null || typeof record !== 'object'
       || typeof (record as EvaluatorContainerInspect).Id !== 'string'
@@ -243,6 +263,7 @@ async function cleanupOwned(
   armLabel: string,
   invocationId: string,
   taskIds: ReadonlySet<string>,
+  imageIdentities: ReadonlyMap<string, EvaluatorImageIdentity>,
   invocationStartedMs: number,
   maximumAgeMs: number | null,
 ): Promise<void> {
@@ -254,6 +275,7 @@ async function cleanupOwned(
       armLabel,
       invocationId,
       taskIds,
+      imageIdentities,
       invocationStartedMs,
       nowMs: Date.now(),
       maximumAgeMs,
@@ -262,7 +284,7 @@ async function cleanupOwned(
     for (const id of ownedEvaluatorContainerIds(records, ownershipOptions)) {
       let removalFailure: unknown;
       try {
-        await docker(['rm', '-f', id]);
+        await docker(['rm', '-f', id], EVALUATOR_DOCKER_TIMEOUT_MS);
       } catch (error) {
         removalFailure = error;
       }
@@ -295,7 +317,7 @@ async function cleanupPreviousOutput(
     for (const id of existingEvaluatorContainerIds(records, options)) {
       let removalFailure: unknown;
       try {
-        await docker(['rm', '-f', id]);
+        await docker(['rm', '-f', id], EVALUATOR_DOCKER_TIMEOUT_MS);
       } catch (error) {
         removalFailure = error;
       }
@@ -323,65 +345,46 @@ interface ActiveEvaluator {
   armLabel: string;
   invocationId: string;
   taskIds: ReadonlySet<string>;
+  imageIdentities: ReadonlyMap<string, EvaluatorImageIdentity>;
   invocationStartedMs: number;
+  cleanupPromise?: Promise<void>;
 }
 
 const ACTIVE_EVALUATORS = new Set<ActiveEvaluator>();
-let relayingSignal = false;
-
-const relaySignal = (signal: NodeJS.Signals): void => {
-  if (relayingSignal) return;
-  relayingSignal = true;
-  void cleanupActiveBenchProcesses()
-    .then(async () => cleanupActiveSwebenchProEvaluators())
-    .finally(() => {
-      process.off('SIGINT', onSigint);
-      process.off('SIGTERM', onSigterm);
-      process.kill(process.pid, signal);
-    });
-};
-
-const onSigint = (): void => relaySignal('SIGINT');
-const onSigterm = (): void => relaySignal('SIGTERM');
 
 function trackEvaluator(entry: ActiveEvaluator): void {
-  if (ACTIVE_EVALUATORS.size === 0) {
-    process.on('SIGINT', onSigint);
-    process.on('SIGTERM', onSigterm);
-  }
   ACTIVE_EVALUATORS.add(entry);
 }
 
-function untrackEvaluator(entry: ActiveEvaluator): void {
-  ACTIVE_EVALUATORS.delete(entry);
-  if (ACTIVE_EVALUATORS.size === 0 && !relayingSignal) {
-    process.off('SIGINT', onSigint);
-    process.off('SIGTERM', onSigterm);
+async function cleanupTrackedEvaluator(entry: ActiveEvaluator): Promise<void> {
+  if (!ACTIVE_EVALUATORS.has(entry)) return;
+  entry.cleanupPromise ??= cleanupOwned(
+    entry.docker,
+    entry.outputDirectory,
+    entry.baselineIds,
+    entry.runId,
+    entry.armLabel,
+    entry.invocationId,
+    entry.taskIds,
+    entry.imageIdentities,
+    entry.invocationStartedMs,
+    null,
+  ).then(() => {
+    ACTIVE_EVALUATORS.delete(entry);
+  });
+  const cleanup = entry.cleanupPromise;
+  try {
+    await cleanup;
+  } finally {
+    if (ACTIVE_EVALUATORS.has(entry) && entry.cleanupPromise === cleanup) entry.cleanupPromise = undefined;
   }
 }
 
 /** Retry exact evaluator-container cleanup during root fatal handling. */
 export async function cleanupActiveSwebenchProEvaluators(): Promise<number> {
   const active = [...ACTIVE_EVALUATORS];
-  const failures: unknown[] = [];
-  for (const entry of active) {
-    try {
-      await cleanupOwned(
-        entry.docker,
-        entry.outputDirectory,
-        entry.baselineIds,
-        entry.runId,
-        entry.armLabel,
-        entry.invocationId,
-        entry.taskIds,
-        entry.invocationStartedMs,
-        null,
-      );
-      untrackEvaluator(entry);
-    } catch (error) {
-      failures.push(error);
-    }
-  }
+  const settled = await Promise.allSettled(active.map(cleanupTrackedEvaluator));
+  const failures = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
   if (failures.length > 0) {
     throw ownershipUnsafeAggregate('active SWE-bench Pro evaluator cleanup failed', failures);
   }
@@ -412,10 +415,12 @@ export interface RunEvaluatorOptions {
   predictions: readonly EvalPrediction[];
   instances: readonly SwebenchProInstance[];
   containerPolicy: SwebenchProContainerPolicy;
+  imageIdentities: ReadonlyMap<string, EvaluatorImageIdentity>;
+  invocationStartedMs: ReadonlyMap<string, number>;
   docker?: EvaluatorDocker;
   processExecutor?: EvaluatorProcessExecutor;
   processLifecycle?: Pick<BenchProcessOptions,
-    'workerScope' | 'onLifecycleToken' | 'onLifecycleStarted' | 'onLifecycleRecovered'>;
+    'workerScope' | 'onLifecycleToken' | 'onLifecycleStarted' | 'onLifecycleCandidates' | 'onLifecycleRecovered'>;
 }
 
 export interface EvaluatorProcessArgvOptions {
@@ -423,6 +428,7 @@ export interface EvaluatorProcessArgvOptions {
   predictions: string;
   outputDirectory: string;
   policy: string;
+  policySha256: string;
   workers: number;
   runId: string;
   armLabel: Arm | 'gold' | 'nullcheck';
@@ -444,16 +450,29 @@ export function evaluatorProcessArgv(options: EvaluatorProcessArgvOptions): stri
     '--benchmark_arm', options.armLabel,
     '--benchmark_invocation_id', options.invocationId,
     '--benchmark_policy_path', options.policy,
+    '--benchmark_policy_sha256', options.policySha256,
   ];
+}
+
+export interface EvaluatorPolicyDocument {
+  schemaVersion: 2;
+  kind: 'ultracode-swebench-pro-evaluator-policy';
+  evaluatorRepository: string;
+  evaluatorRevision: string;
+  strictBooleanVerdicts: true;
+  emptyPredictions: 'unverified-no-native-output';
+  containerPolicySha256: string;
+  containerPolicy: ReturnType<typeof evaluatorContainerPolicy>;
 }
 
 /** Exact policy artifact consumed by the patched official evaluator. */
 export function evaluatorPolicyDocument(
   config: SwebenchProConfig,
   policy: SwebenchProContainerPolicy,
-): Record<string, unknown> {
+): EvaluatorPolicyDocument {
   return {
     schemaVersion: 2,
+    kind: 'ultracode-swebench-pro-evaluator-policy',
     evaluatorRepository: config.evaluator.repository,
     evaluatorRevision: config.evaluator.revision,
     strictBooleanVerdicts: true,
@@ -461,6 +480,11 @@ export function evaluatorPolicyDocument(
     containerPolicySha256: containerPolicySha256(policy),
     containerPolicy: evaluatorContainerPolicy(policy, config.docker),
   };
+}
+
+/** Trusted host binding for the complete generated evaluator policy. */
+export function evaluatorPolicyDocumentSha256(document: EvaluatorPolicyDocument): string {
+  return sha256CanonicalJson(document);
 }
 
 /** Parse partial output in finally, keeping process failure separate from verdicts. */
@@ -478,19 +502,20 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
     runId: options.runId,
     armLabel: options.armLabel,
     taskIds,
+    imageIdentities: options.imageIdentities,
+    invocationIds: new Set(options.invocationStartedMs.keys()),
+    invocationStartedMs: options.invocationStartedMs,
   });
   const outputDirectory = resetArtifactDirectory(verifierRoot, outputPath);
   const rawSamples = join(verifierRoot, 'raw-samples.jsonl');
   const predictions = join(verifierRoot, 'predictions.json');
   const invocation = join(verifierRoot, 'invocation.json');
   const policy = join(verifierRoot, 'evaluator-policy.json');
+  const policyDocument = evaluatorPolicyDocument(options.config, options.containerPolicy);
+  const policySha256 = evaluatorPolicyDocumentSha256(policyDocument);
   generateRawSamples(options.instances, rawSamples);
   replaceArtifactFile(predictions, `${JSON.stringify(options.predictions, null, 2)}\n`);
-  replaceArtifactFile(policy, `${JSON.stringify(
-    evaluatorPolicyDocument(options.config, options.containerPolicy),
-    null,
-    2,
-  )}\n`);
+  replaceArtifactFile(policy, `${JSON.stringify(policyDocument, null, 2)}\n`);
   const relativePath = (path: string): string => relative(options.runDirectory, path).split(sep).join('/');
   const initialTime = new Date().toISOString();
   const baseResult = {
@@ -525,6 +550,7 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
     predictions,
     outputDirectory,
     policy,
+    policySha256,
     workers: options.config.concurrency.verifier,
     runId: options.runId,
     armLabel: options.armLabel,
@@ -538,6 +564,7 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
     armLabel: options.armLabel,
     invocationId: options.invocationId,
     taskIds,
+    imageIdentities: options.imageIdentities,
     invocationStartedMs: startedAt,
   };
   trackEvaluator(activeEvaluator);
@@ -553,6 +580,7 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
       options.armLabel,
       options.invocationId,
       taskIds,
+      options.imageIdentities,
       startedAt,
       options.config.timeouts.evaluatorWatchdogMs,
     ).catch(() => { /* The mandatory final cleanup retries and records failure. */ })
@@ -577,18 +605,7 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
     clearInterval(watchdog);
     await watchdogCleanup;
     try {
-      await cleanupOwned(
-        docker,
-        outputDirectory,
-        baselineIds,
-        options.runId,
-        options.armLabel,
-        options.invocationId,
-        taskIds,
-        startedAt,
-        null,
-      );
-      untrackEvaluator(activeEvaluator);
+      await cleanupTrackedEvaluator(activeEvaluator);
     } catch (error) {
       retainedCleanupFailure = error;
     }

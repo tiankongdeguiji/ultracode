@@ -113,5 +113,9 @@ export const sweMarathonAdapter: SuiteAdapter<'swe-marathon'> = {
   suite: 'swe-marathon',
   displayName: 'SWE-Marathon',
   description: 'Pinned Harbor jobs and their official native verifiers',
+  async cleanup() {
+    const runner = await import('./runner.js');
+    await runner.cleanupSweMarathonRuntime();
+  },
   commands: { prep: prepSpec, run: runSpec, report: reportSpec },
 };

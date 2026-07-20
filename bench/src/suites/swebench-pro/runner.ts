@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { Arm, BenchPathRoots, CommandContext, FailureCode } from '../../shared/contracts.js';
 import { assertPrivateRuntimeFile } from '../../shared/config.js';
 import { SYSTEM_CLOCK } from '../../shared/contracts.js';
@@ -55,7 +55,6 @@ import {
   writePrivateJsonAtomic,
 } from '../../shared/paths.js';
 import {
-  cleanupActiveBenchProcesses,
   runBenchProcess,
   type BenchProcessOptions,
 } from '../../shared/process.js';
@@ -94,9 +93,11 @@ import {
   containerPolicySha256,
   loadSwebenchProContainerPolicy,
   sessionContainerPolicyArgv,
+  sessionTaskIdentity,
   type SwebenchProContainerPolicy,
 } from './container-policy.js';
 import {
+  ArtifactUnsafeError,
   OwnershipUnsafeCleanupError,
   ownershipUnsafe,
   ownershipUnsafeAggregate,
@@ -112,7 +113,14 @@ import {
 } from './instances.js';
 import { composePrompt } from './prompt.js';
 import { swebenchProAnalysisHook } from './analysis.js';
-import { classifyOutcome, parseSessionMeta, readTaskStatus, validatePatch, writeTaskStatus } from './state.js';
+import {
+  classifyPatchArtifact,
+  classifyOutcome,
+  parseSessionMeta,
+  readPatchArtifact,
+  readTaskStatus,
+  writeTaskStatus,
+} from './state.js';
 import { indexSwebenchProMetrics } from './telemetry.js';
 import {
   loadCurrentPreparedSwebenchProInputs,
@@ -123,15 +131,18 @@ import type { DockerImageAttestation, SessionMeta, SwebenchProInstance, TaskStat
 import {
   cleanupActiveSwebenchProEvaluators,
   collectPredictions,
+  existingEvaluatorContainerIds,
   goldPredictions,
   nullPredictions,
   runOfficialEvaluator,
   type EvaluatorRunResult,
+  type EvaluatorImageIdentity,
 } from './verifier.js';
 import { ARM_B_PREFIX_PATH } from '../../shared/prompt.js';
 
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const SESSION_BACKSTOP_EXTRA_MS = 15 * 60_000;
+const SESSION_CLEANUP_RESERVE_MS = 2 * 60_000;
 const TERMINAL_PHASES = new Set(['session-done', 'patched', 'evaluated']);
 const TOOLCHAIN_CACHE_LOCK = '.locks/toolchain.lock';
 const SUITE_CACHE_LOCK = '.locks/swebench-pro.lock';
@@ -147,7 +158,7 @@ export const SWEBENCH_PRO_ADAPTER_POLICY_SHA256 = sha256CanonicalJson({
   credentials: 'runtime-only-outside-results',
   dataset: 'audited-canonical-descriptor-v1',
   cleanup: 'typed-command-fatal-after-settlement-retry',
-  containers: 'frozen-session-evaluator-policy',
+  containers: 'host-distinct-task-identity-stopped-reclamation-exact-evaluator-ownership',
 });
 
 export interface RunOptions {
@@ -234,6 +245,7 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SwebenchProManifest['
     failurePolicySha256: sourcePolicyHash(roots, FAILURE_POLICY_SHA256, ['src/shared/failure.ts']),
     reportPolicySha256: sourcePolicyHash(roots, REPORT_POLICY_SHA256, ['src/shared/report.ts']),
     adapterPolicySha256: sourcePolicyHash(roots, SWEBENCH_PRO_ADAPTER_POLICY_SHA256, [
+      'src/cli.ts',
       'src/shared/config.ts',
       'src/shared/contracts.ts',
       'src/shared/locks.ts',
@@ -246,6 +258,8 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SwebenchProManifest['
       'src/shared/run-state.ts',
       'src/shared/toolchain.ts',
       'src/shared/verifier.ts',
+      '../src/exec/procinfo.ts',
+      '../src/exec/spawn.ts',
       'src/suites/swebench-pro/adapter.ts',
       'src/suites/swebench-pro/analysis.ts',
       'src/suites/swebench-pro/cleanup.ts',
@@ -288,7 +302,7 @@ function currentPolicies(
       gitCaptureSha256: sha256File(gitCapture),
       containerPolicySha256: containerPolicySha256(policy),
       setupUser: '0:0',
-      taskUser: 'host-uid-cleared-capability-sets',
+      taskUser: 'dynamic-host-distinct-nonzero-cleared-capability-sets',
       postTaskGitCapture: 'immutable-helper-as-task-uid',
     }),
     historySha256: sha256CanonicalJson({
@@ -302,8 +316,8 @@ function currentPolicies(
     cleanupSha256: sha256CanonicalJson({
       sessionLabels: 'schema-suite-run-task-arm-purpose-ownership-runtime',
       verifierLabels: 'schema-suite-run-task-arm-purpose-ownership-invocation',
-      verifierOwnership: 'post-baseline-exact-repository-contained-mount',
-      artifactTree: 'owned-real-single-link',
+      verifierOwnership: 'post-baseline-exact-local-image-workspace-mount-invocation-start',
+      artifactTree: 'stopped-reclaimed-owned-real-single-link',
       ambiguity: 'requery-exact-identity-retain-until-absent',
       fatality: 'ownership-unsafe-command-fatal',
     }),
@@ -646,8 +660,12 @@ async function loadRunStores(
     await state.recoverPendingLifecycleProcesses(runDir(roots, 'swebench-pro', runId));
     if (state.load().invocations.some((invocation) => invocation.endedAt === null)) {
       await cleanRunContainers(
+        roots,
         manifest,
-        new Set(state.load().invocations.map((invocation) => invocation.invocationId)),
+        new Map(state.load().invocations.map((invocation) => [
+          invocation.invocationId,
+          Date.parse(invocation.startedAt),
+        ])),
       );
       await state.closeInterruptedInvocations();
     }
@@ -733,7 +751,7 @@ function credentialBytes(path: string): Buffer {
 }
 
 type ProcessLifecycle = Pick<BenchProcessOptions,
-  'workerScope' | 'onLifecycleToken' | 'onLifecycleStarted' | 'onLifecycleRecovered'>;
+  'workerScope' | 'onLifecycleToken' | 'onLifecycleStarted' | 'onLifecycleCandidates' | 'onLifecycleRecovered'>;
 
 interface ActiveSessionContainer {
   runtime: string;
@@ -741,58 +759,84 @@ interface ActiveSessionContainer {
   runId: string;
   taskId: string;
   arm: Arm;
+  taskDirectory: string;
+  artifactOwner: SessionArtifactOwner;
+  image: DockerImageAttestation;
+  attemptDeadline: number;
   lifecycle: ProcessLifecycle;
   executor: SessionDockerExecutor;
+  cleanupPromise?: Promise<void>;
 }
 
 const activeContainers = new Map<string, ActiveSessionContainer>();
-let relayingSignal = false;
-
-const relaySignal = (signal: NodeJS.Signals): void => {
-  if (relayingSignal) return;
-  relayingSignal = true;
-  void cleanupActiveSwebenchProContainers().finally(() => {
-    process.off('SIGINT', onSigint);
-    process.off('SIGTERM', onSigterm);
-    process.kill(process.pid, signal);
-  });
-};
-
-const onSigint = (): void => relaySignal('SIGINT');
-const onSigterm = (): void => relaySignal('SIGTERM');
 
 function trackContainer(name: string, container: ActiveSessionContainer): void {
   if (activeContainers.has(name)) throw new Error(`session container is already tracked: ${name}`);
-  if (activeContainers.size === 0) {
-    process.on('SIGINT', onSigint);
-    process.on('SIGTERM', onSigterm);
-  }
   activeContainers.set(name, container);
-}
-
-function untrackContainer(name: string): void {
-  activeContainers.delete(name);
-  if (activeContainers.size === 0 && !relayingSignal) {
-    process.off('SIGINT', onSigint);
-    process.off('SIGTERM', onSigterm);
-  }
 }
 
 export type SessionDockerExecutor = (
   argv: readonly string[],
   lifecycle?: ProcessLifecycle,
+  timeoutMs?: number,
 ) => Promise<string>;
 
 export const defaultSessionDockerExecutor: SessionDockerExecutor = async (
   argv,
   lifecycle = {},
+  timeoutMs,
 ): Promise<string> => {
   return (await runBenchProcess('docker', argv, {
     cwd: process.cwd(),
     tailBytes: 8 * 1_024 * 1_024,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     ...lifecycle,
   })).stdout;
 };
+
+export interface SessionArtifactOwner {
+  uid: number;
+  gid: number;
+}
+
+function hostArtifactOwner(): SessionArtifactOwner {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : 0;
+  if (!Number.isSafeInteger(uid) || uid < 0 || !Number.isSafeInteger(gid) || gid < 0) {
+    throw new Error('host artifact owner is invalid');
+  }
+  return { uid, gid };
+}
+
+/** Return a positive per-operation timeout from one monotonic attempt deadline. */
+export function remainingSessionOperationTimeout(
+  deadline: number,
+  reserveMs = 0,
+  now = performance.now(),
+): number {
+  if (!Number.isFinite(deadline) || !Number.isFinite(reserveMs) || reserveMs < 0) {
+    throw new Error('session Docker deadline is invalid');
+  }
+  const remaining = Math.ceil(deadline - now - reserveMs);
+  if (remaining <= 0) throw new Error('session Docker deadline is exhausted');
+  return remaining;
+}
+
+/** Race Docker wait against the driver backstop without retaining a timer on either settlement path. */
+export async function waitForSessionExit(
+  waited: Promise<unknown>,
+  timeoutMs: number,
+): Promise<'exited' | 'backstop'> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const stopped = new Promise<'backstop'>((resolvePromise) => {
+      timer = setTimeout(resolvePromise, timeoutMs, 'backstop');
+    });
+    return await Promise.race([waited.then(() => 'exited' as const), stopped]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 function containerName(runId: string, taskId: string, arm: Arm): string {
   return `ucbench-${createHash('sha256').update(`${runId}\0${taskId}\0${arm}`, 'utf8').digest('hex').slice(0, 32)}`;
@@ -805,9 +849,24 @@ export async function stopPersistedSessionContainer(
   arm: Arm,
   lifecycle: ProcessLifecycle = {},
   executor: SessionDockerExecutor = defaultSessionDockerExecutor,
+  options: {
+    attemptDeadline?: number;
+    taskDirectory?: string;
+    artifactOwner?: SessionArtifactOwner;
+    image?: DockerImageAttestation;
+    runtimeDirectory?: string;
+  } = {},
 ): Promise<void> {
+  const cleanupDeadline = Math.min(
+    options.attemptDeadline ?? Number.POSITIVE_INFINITY,
+    performance.now() + SESSION_CLEANUP_RESERVE_MS,
+  );
+  const artifactOwner = options.artifactOwner ?? hostArtifactOwner();
+  const taskIdentity = sessionTaskIdentity(artifactOwner);
+  const image = options.image;
+  const timeout = (): number => remainingSessionOperationTimeout(cleanupDeadline);
   const listExactName = async (): Promise<string[]> => {
-    const listed = (await executor(['ps', '-aq', '--filter', `name=^/${name}$`], lifecycle))
+    const listed = (await executor(['ps', '-aq', '--filter', `name=^/${name}$`], lifecycle, timeout()))
       .split('\n').map((entry) => entry.trim()).filter(Boolean);
     if (listed.length > 1 || listed.some((id) => !/^[a-f0-9]{12,64}$/.test(id))) {
       throw new Error(`session container name is not uniquely bound to a valid id: ${name}`);
@@ -816,8 +875,42 @@ export async function stopPersistedSessionContainer(
   };
   try {
     const listed = await listExactName();
-    if (listed.length === 0) return;
-    const parsed = JSON.parse(await executor(['inspect', listed[0]!], lifecycle)) as ContainerInspect[];
+    if (listed.length === 0) {
+      if (options.taskDirectory !== undefined && existsSync(options.taskDirectory)) {
+        if (image === undefined) throw new Error('session recovery has no exact overlay image identity');
+        const runtime = options.runtimeDirectory === undefined
+          ? findSessionRuntimeDirectory(runId, taskId, arm)
+          : trustedSessionRuntimeDirectory(options.runtimeDirectory, runId, taskId, arm);
+        await reclaimSessionOwnership(
+          options.taskDirectory,
+          runtime,
+          artifactOwner,
+          image,
+          lifecycle,
+          executor,
+          timeout,
+        );
+        reclaimAndAssertArtifactTree(options.taskDirectory);
+        if (runtime !== undefined) {
+          const marker = readPrivateJson(runtime, join(runtime, SESSION_RUNTIME_MARKER)) as {
+            runtimeNonce: string;
+          };
+          assertSessionRuntimeDirectory(
+            runtime,
+            join(runtime, 'codex-home'),
+            runId,
+            taskId,
+            arm,
+            marker.runtimeNonce,
+          );
+          removeSessionRuntime(runtime, runId, taskId, arm, marker.runtimeNonce);
+        }
+      }
+      return;
+    }
+    const parsed = JSON.parse(
+      await executor(['inspect', listed[0]!], lifecycle, timeout()),
+    ) as ContainerInspect[];
     const inspectedId = parsed.length === 1 ? parsed[0]?.Id : undefined;
     const labels = parsed[0]?.Config?.Labels ?? {};
     const runtimeNonce = labels['ultracode.benchmark.runtime'];
@@ -832,15 +925,56 @@ export async function stopPersistedSessionContainer(
       || labels['ultracode.benchmark.arm'] !== arm
       || labels['ultracode.benchmark.purpose'] !== 'session'
       || labels['ultracode.benchmark.ownership'] !== '1'
+      || labels['ultracode.benchmark.task-uid'] !== String(taskIdentity.uid)
+      || labels['ultracode.benchmark.task-gid'] !== String(taskIdentity.gid)
+      || labels['ultracode.benchmark.artifact-uid'] !== String(artifactOwner.uid)
+      || labels['ultracode.benchmark.artifact-gid'] !== String(artifactOwner.gid)
+      || image === undefined
+      || parsed[0]?.Config?.Image !== image.overlayName
+      || parsed[0]?.Image !== image.overlayLocalId
       || typeof runtimeNonce !== 'string'
       || !/^[a-f0-9]{64}$/.test(runtimeNonce)
     ) {
       throw new Error(`refusing to remove unowned container with session name ${name}`);
     }
-    const runtime = sessionRuntimeDirectory(parsed[0]!, runId, taskId, arm, runtimeNonce);
+    const taskDirectory = sessionTaskDirectory(parsed[0]!, options.taskDirectory);
+    const runtime = trustedSessionRuntimeDirectory(
+      sessionRuntimePaths(parsed[0]!).runtime,
+      runId,
+      taskId,
+      arm,
+      runtimeNonce,
+    );
+    if (parsed[0]!.State?.Running === true) {
+      let stopFailure: unknown;
+      try {
+        await executor(['stop', '--time', '10', inspectedId], lifecycle, timeout());
+      } catch (error) {
+        stopFailure = error;
+      }
+      const stopped = JSON.parse(
+        await executor(['inspect', inspectedId], lifecycle, timeout()),
+      ) as ContainerInspect[];
+      if (stopped.length !== 1 || stopped[0]?.Id !== inspectedId || stopped[0]?.State?.Running !== false) {
+        throw ownershipUnsafeAggregate('owned session container could not be proven stopped', [stopFailure]);
+      }
+    } else if (parsed[0]!.State?.Running !== false) {
+      throw new Error('owned session container running state is not proven');
+    }
+    await reclaimSessionOwnership(
+      taskDirectory,
+      runtime,
+      artifactOwner,
+      image,
+      lifecycle,
+      executor,
+      timeout,
+    );
+    reclaimAndAssertArtifactTree(taskDirectory);
+    sessionRuntimeDirectory(parsed[0]!, runId, taskId, arm, runtimeNonce);
     let removalFailure: unknown;
     try {
-      await executor(['rm', '-f', listed[0]!], lifecycle);
+      await executor(['rm', '-f', listed[0]!], lifecycle, timeout());
     } catch (error) {
       removalFailure = error;
     }
@@ -862,35 +996,48 @@ export async function stopPersistedSessionContainer(
   }
 }
 
+async function cleanupTrackedContainer(name: string): Promise<void> {
+  const container = activeContainers.get(name);
+  if (container === undefined) return;
+  container.cleanupPromise ??= (async () => {
+    await stopPersistedSessionContainer(
+      name,
+      container.runId,
+      container.taskId,
+      container.arm,
+      container.lifecycle,
+      container.executor,
+      {
+        attemptDeadline: container.attemptDeadline,
+        taskDirectory: container.taskDirectory,
+        artifactOwner: container.artifactOwner,
+        image: container.image,
+        runtimeDirectory: container.runtime,
+      },
+    );
+    if (existsSync(container.runtime)) removeSessionRuntime(
+      container.runtime,
+      container.runId,
+      container.taskId,
+      container.arm,
+      container.runtimeNonce,
+    );
+    activeContainers.delete(name);
+  })();
+  const cleanup = container.cleanupPromise;
+  try {
+    await cleanup;
+  } finally {
+    if (activeContainers.get(name) === container && container.cleanupPromise === cleanup) {
+      container.cleanupPromise = undefined;
+    }
+  }
+}
+
 export async function cleanupActiveSwebenchProContainers(): Promise<number> {
   const entries = [...activeContainers.entries()];
-  const failures: unknown[] = [];
-  await Promise.all(entries.map(async ([name, container]) => {
-    try {
-      await stopPersistedSessionContainer(
-        name,
-        container.runId,
-        container.taskId,
-        container.arm,
-        container.lifecycle,
-        container.executor,
-      );
-      if (existsSync(container.runtime)) removeSessionRuntime(
-        container.runtime,
-        container.runId,
-        container.taskId,
-        container.arm,
-        container.runtimeNonce,
-      );
-      untrackContainer(name);
-    } catch (error) {
-      failures.push(error);
-    }
-  }));
-  if (!relayingSignal && activeContainers.size === 0) {
-    process.off('SIGINT', onSigint);
-    process.off('SIGTERM', onSigterm);
-  }
+  const settled = await Promise.allSettled(entries.map(([name]) => cleanupTrackedContainer(name)));
+  const failures = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
   if (failures.length > 0) {
     throw ownershipUnsafeAggregate('active SWE-bench Pro container cleanup failed', failures);
   }
@@ -912,6 +1059,7 @@ export interface SessionDockerRunArgvOptions {
   taskDirectory: string;
   runtimeHome: string;
   runtimeCodex: string;
+  artifactOwner: SessionArtifactOwner;
   image: string;
   docker: SwebenchProConfig['docker'];
   policy: SwebenchProContainerPolicy;
@@ -919,9 +1067,12 @@ export interface SessionDockerRunArgvOptions {
 
 /** Build the exact session invocation so policy parity is testable without Docker. */
 export function sessionDockerRunArgv(options: SessionDockerRunArgvOptions): string[] {
+  const taskIdentity = sessionTaskIdentity(options.artifactOwner);
   const labels = [
     ['schema', '2'], ['suite', 'swebench-pro'], ['run', options.runId], ['task', options.taskId],
     ['arm', options.arm], ['purpose', 'session'], ['ownership', '1'], ['runtime', options.runtimeNonce],
+    ['task-uid', String(taskIdentity.uid)], ['task-gid', String(taskIdentity.gid)],
+    ['artifact-uid', String(options.artifactOwner.uid)], ['artifact-gid', String(options.artifactOwner.gid)],
   ].flatMap(([key, value]) => ['--label', `ultracode.benchmark.${key}=${value}`]);
   return [
     'run', '-d', '--name', options.name, ...labels,
@@ -950,7 +1101,16 @@ async function runSession(
   processLifecycle: ProcessLifecycle,
   executor: SessionDockerExecutor = defaultSessionDockerExecutor,
 ): Promise<SessionResult> {
-  const imageExecutor: DockerExecutor = (argv) => executor(argv, processLifecycle);
+  const startedAt = Date.now();
+  const attemptDeadline = performance.now()
+    + config.timeouts.sessionMs + SESSION_BACKSTOP_EXTRA_MS + SESSION_CLEANUP_RESERVE_MS;
+  const artifactOwner = hostArtifactOwner();
+  const taskIdentity = sessionTaskIdentity(artifactOwner);
+  const activeTimeout = (): number => remainingSessionOperationTimeout(
+    attemptDeadline,
+    SESSION_CLEANUP_RESERVE_MS,
+  );
+  const imageExecutor: DockerExecutor = (argv) => executor(argv, processLifecycle, activeTimeout());
   await reattestTaskImage(image, imageExecutor);
   const name = containerName(manifest.runId, instance.instanceId, arm);
   await stopPersistedSessionContainer(
@@ -960,6 +1120,12 @@ async function runSession(
     arm,
     processLifecycle,
     executor,
+    {
+      attemptDeadline: attemptDeadline - SESSION_CLEANUP_RESERVE_MS,
+      taskDirectory,
+      artifactOwner,
+      image,
+    },
   );
   resetArtifactDirectory(runDirFromTask(taskDirectory), taskDirectory);
   for (const directory of [
@@ -992,7 +1158,10 @@ async function runSession(
       `BENCH_MODEL=${config.model}`,
       `BENCH_EFFORT=${config.requestedEffort}`,
       `BENCH_BASE_COMMIT=${instance.baseCommit}`,
-      `BENCH_CHOWN=${typeof process.getuid === 'function' ? process.getuid() : 0}:${typeof process.getgid === 'function' ? process.getgid() : 0}`,
+      `BENCH_TASK_UID=${taskIdentity.uid}`,
+      `BENCH_TASK_GID=${taskIdentity.gid}`,
+      `BENCH_ARTIFACT_OWNER=${artifactOwner.uid}:${artifactOwner.gid}`,
+      'BENCH_REPO_DIR=/app',
       'BENCH_SANITIZE=1',
       'CODEX_HOME=/runtime/codex-home',
       'ULTRACODE_HOME=/bench/uc',
@@ -1014,11 +1183,11 @@ async function runSession(
     taskDirectory,
     runtimeHome,
     runtimeCodex,
+    artifactOwner,
     image: image.overlayName,
     docker: config.docker,
     policy: loadSwebenchProContainerPolicy(roots),
   });
-  const startedAt = Date.now();
   let endedAt = startedAt;
   let backstop = false;
   try {
@@ -1028,43 +1197,30 @@ async function runSession(
       runId: manifest.runId,
       taskId: instance.instanceId,
       arm,
+      taskDirectory,
+      artifactOwner,
+      image,
+      attemptDeadline,
       lifecycle: processLifecycle,
       executor,
     });
-    const launchedId = (await executor(args, processLifecycle)).trim();
+    const launchedId = (await executor(args, processLifecycle, activeTimeout())).trim();
     if (!/^[a-f0-9]{64}$/.test(launchedId)) throw new Error('Docker returned an invalid session container id');
     unlinkSync(envFile);
-    const waited = executor(['wait', name], processLifecycle);
-    let timer: NodeJS.Timeout | undefined;
-    const stopped = new Promise<'backstop'>((resolvePromise) => {
-      timer = setTimeout(resolvePromise, config.timeouts.sessionMs + SESSION_BACKSTOP_EXTRA_MS, 'backstop');
-    });
-    const first = await Promise.race([waited.then(() => 'exited' as const), stopped]);
-    if (timer) clearTimeout(timer);
+    const waited = executor(
+      ['wait', name],
+      processLifecycle,
+      remainingSessionOperationTimeout(attemptDeadline),
+    );
+    const first = await waitForSessionExit(waited, activeTimeout());
     endedAt = Date.now();
     if (first === 'backstop') {
       backstop = true;
-      await stopPersistedSessionContainer(
-        name,
-        manifest.runId,
-        instance.instanceId,
-        arm,
-        processLifecycle,
-        executor,
-      );
+      await cleanupTrackedContainer(name);
       await waited.catch(() => '');
     }
   } finally {
-    await stopPersistedSessionContainer(
-      name,
-      manifest.runId,
-      instance.instanceId,
-      arm,
-      processLifecycle,
-      executor,
-    );
-    untrackContainer(name);
-    if (existsSync(runtime)) removeSessionRuntime(runtime, manifest.runId, instance.instanceId, arm, runtimeNonce);
+    await cleanupTrackedContainer(name);
   }
   reclaimAndAssertArtifactTree(taskDirectory);
   let meta: SessionMeta | null = null;
@@ -1073,19 +1229,19 @@ async function runSession(
   } catch {
     meta = null;
   }
-  let patch = '';
-  try { patch = readRegularFileWithinRoot(taskDirectory, 'out/patch.diff', 10_000_001).toString('utf8'); } catch { /* absent */ }
+  const patch = readPatchArtifact(taskDirectory);
+  const patchEvidence = classifyPatchArtifact(patch);
   const outcome = backstop
-    ? { failure: 'driver-watchdog' as const, annotations: ['backstop-kill'] }
-    : classifyOutcome(meta, validatePatch(patch));
+    ? classifyOutcome(null, patchEvidence.validation)
+    : classifyOutcome(meta, patchEvidence.validation);
   const status: TaskStatus = {
     schemaVersion: 2,
-    phase: patch.trim() ? 'patched' : 'session-done',
+    phase: patchEvidence.phase,
     failure: outcome.failure,
     startedAt: new Date(startedAt).toISOString(),
     endedAt: new Date(endedAt).toISOString(),
     wallClockMs: endedAt - startedAt,
-    patchBytes: Buffer.byteLength(patch, 'utf8'),
+    ...(patchEvidence.patchBytes === undefined ? {} : { patchBytes: patchEvidence.patchBytes }),
     applyCheck: meta?.applyCheck ?? null,
     annotations: [...new Set(outcome.annotations)],
     ...(meta === null ? {} : { codexExit: meta.codexExit }),
@@ -1102,6 +1258,7 @@ function runDirFromTask(taskDirectory: string): string {
 }
 
 function sessionFailure(error: unknown): FailureCode {
+  if (error instanceof ArtifactUnsafeError) return 'artifact-unsafe';
   const message = error instanceof Error ? error.message : String(error);
   if (/auth file|credential|CODEX_(?:AUTH|API)/i.test(message)) return 'auth-failed';
   if (/image identity drifted/i.test(message)) return 'image-identity-drift';
@@ -1268,8 +1425,12 @@ async function executeSessions(
 ): Promise<void> {
   const directory = runDir(context.paths, 'swebench-pro', manifest.runId);
   await cleanRunContainers(
+    context.paths,
     manifest,
-    new Set(state.load().invocations.map((invocation) => invocation.invocationId)),
+    new Map(state.load().invocations.map((invocation) => [
+      invocation.invocationId,
+      Date.parse(invocation.startedAt),
+    ])),
   );
   const byId = new Map(manifestInstances(manifest).map((instance) => [instance.instanceId, instance]));
   const images = imageAttestations(manifest);
@@ -1655,8 +1816,19 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
     );
     assertPreparedProvenance(stores.manifest, config, prepared, context.paths);
     const instances = manifestInstances(stores.manifest);
+    const evaluatorImages = new Map(stores.manifest.provenance.tasks.map((task) => {
+      if (task.image === null) throw new Error(`task ${task.taskId} has no evaluator image identity`);
+      return [task.taskId, {
+        reference: task.image.requested,
+        localId: task.image.base.localId,
+      }] as const;
+    }));
     const runDirectory = runDir(context.paths, 'swebench-pro', stores.manifest.runId);
     invocationId = await beginInvocation(stores.state, 'eval', context.clock.now());
+    const evaluatorInvocationStarts = new Map(stores.state.load().invocations.map((invocation) => [
+      invocation.invocationId,
+      Date.parse(invocation.startedAt),
+    ]));
     const modes: Array<{ prefix: string; arm: Arm | null; predictions: ReturnType<typeof goldPredictions> }> = options.gold
       ? [{ prefix: 'gold', arm: null, predictions: goldPredictions(instances) }]
       : options.nullCheck
@@ -1676,6 +1848,8 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
         predictions: mode.predictions,
         instances,
         containerPolicy: loadSwebenchProContainerPolicy(context.paths),
+        imageIdentities: evaluatorImages,
+        invocationStartedMs: evaluatorInvocationStarts,
         processLifecycle: {
           workerScope: runDirectory,
           ...stores.state.lifecycleHooks(invocationId),
@@ -1730,7 +1904,11 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
       invocationId,
       startedMs,
       context.clock.now(),
-      error instanceof OwnershipUnsafeCleanupError ? 'ownership-unsafe' : 'verifier-process-failed',
+      error instanceof OwnershipUnsafeCleanupError
+        ? 'ownership-unsafe'
+        : error instanceof ArtifactUnsafeError
+          ? 'artifact-unsafe'
+          : 'verifier-process-failed',
     );
     throw error;
   } finally {
@@ -1889,8 +2067,58 @@ export async function statusCommand(options: RunIdentityOptions, context: Comman
 
 interface ContainerInspect {
   Id?: string;
-  Config?: { Labels?: Record<string, string> };
+  Image?: string;
+  Config?: { Image?: string; Labels?: Record<string, string> };
+  State?: { Running?: boolean; StartedAt?: string };
   Mounts?: Array<{ Type?: string; Source?: string; Destination?: string }>;
+}
+
+function uniqueSessionBindMount(record: ContainerInspect, destination: string): string {
+  const mounts = (record.Mounts ?? []).filter((mount) => mount.Type === 'bind'
+    && mount.Destination === destination && typeof mount.Source === 'string');
+  if (mounts.length !== 1) throw new Error(`owned session container has no unique ${destination} bind mount`);
+  return mounts[0]!.Source!;
+}
+
+function sessionTaskDirectory(record: ContainerInspect, expected: string | undefined): string {
+  if (expected === undefined) throw new Error('owned session cleanup has no trusted task directory');
+  const observed = uniqueSessionBindMount(record, '/bench');
+  const sessions = uniqueSessionBindMount(record, '/runtime/codex-home/sessions');
+  const writableDestinations = new Set([
+    '/bench',
+    '/runtime/home',
+    '/runtime/codex-home',
+    '/runtime/codex-home/sessions',
+  ]);
+  const writableMounts = (record.Mounts ?? []).filter((mount) =>
+    typeof mount.Destination === 'string'
+    && ['/bench', '/runtime/home', '/runtime/codex-home'].some((root) =>
+      mount.Destination === root || mount.Destination!.startsWith(`${root}/`)));
+  if (writableMounts.length !== writableDestinations.size
+    || writableMounts.some((mount) => mount.Type !== 'bind'
+      || !writableDestinations.has(mount.Destination!))
+    || resolve(observed) !== resolve(expected)
+    || resolve(sessions) !== resolve(expected, 'codex-home', 'sessions')) {
+    throw new Error('owned session task mount does not match the trusted task directory');
+  }
+  return expected;
+}
+
+function sessionRuntimePaths(record: ContainerInspect): {
+  runtime: string;
+  runtimeHome: string;
+  runtimeCodex: string;
+} {
+  const runtimeHome = uniqueSessionBindMount(record, '/runtime/home');
+  const runtimeCodex = uniqueSessionBindMount(record, '/runtime/codex-home');
+  const runtime = dirname(runtimeCodex);
+  const relativeRuntime = relative(tmpdir(), runtime);
+  if (!/^uc-bench-pro-runtime-[A-Za-z0-9]+$/.test(relativeRuntime) || relativeRuntime.includes(sep)
+    || resolve(runtimeHome) !== resolve(runtime, 'home')
+    || resolve(runtimeCodex) !== resolve(runtime, 'codex-home')) {
+    throw new Error('owned session credential mounts are outside the exact temporary namespace');
+  }
+  return { runtime, runtimeHome, runtimeCodex };
 }
 
 function sessionRuntimeDirectory(
@@ -1900,12 +2128,112 @@ function sessionRuntimeDirectory(
   arm: Arm,
   runtimeNonce: string,
 ): string {
-  const mounts = (record.Mounts ?? []).filter((mount) => mount.Type === 'bind'
-    && mount.Destination === '/runtime/codex-home' && typeof mount.Source === 'string');
-  if (mounts.length !== 1) throw new Error('owned session container has no unique credential runtime mount');
-  const runtimeCodex = mounts[0]!.Source!;
-  const runtime = dirname(runtimeCodex);
-  return assertSessionRuntimeDirectory(runtime, runtimeCodex, runId, taskId, arm, runtimeNonce);
+  const { runtime, runtimeHome, runtimeCodex } = sessionRuntimePaths(record);
+  const validated = assertSessionRuntimeDirectory(runtime, runtimeCodex, runId, taskId, arm, runtimeNonce);
+  const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+  const homeInfo = lstatSync(runtimeHome);
+  if (homeInfo.isSymbolicLink() || !homeInfo.isDirectory() || (homeInfo.mode & 0o777) !== 0o700
+    || (uid !== undefined && homeInfo.uid !== uid)) {
+    throw new Error('owned session home mount is unsafe');
+  }
+  return validated;
+}
+
+function trustedSessionRuntimeDirectory(
+  runtime: string,
+  runId: string,
+  taskId: string,
+  arm: Arm,
+  expectedNonce?: string,
+): string {
+  const relativeRuntime = relative(tmpdir(), runtime);
+  if (!/^uc-bench-pro-runtime-[A-Za-z0-9]+$/.test(relativeRuntime) || relativeRuntime.includes(sep)) {
+    throw new Error('owned session credential runtime is outside the exact temporary namespace');
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+  const runtimeInfo = lstatSync(runtime);
+  if (runtimeInfo.isSymbolicLink() || !runtimeInfo.isDirectory() || (runtimeInfo.mode & 0o777) !== 0o700
+    || (uid !== undefined && runtimeInfo.uid !== uid)) {
+    throw new Error('owned session runtime is unsafe');
+  }
+  for (const path of [join(runtime, 'home'), join(runtime, 'codex-home')]) {
+    const info = lstatSync(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error('owned session writable runtime mount is unsafe');
+    }
+  }
+  const marker = readPrivateJson(runtime, join(runtime, SESSION_RUNTIME_MARKER));
+  const observedNonce = marker !== null && typeof marker === 'object' && !Array.isArray(marker)
+    && typeof (marker as Record<string, unknown>).runtimeNonce === 'string'
+    ? (marker as Record<string, string>).runtimeNonce ?? ''
+    : '';
+  if (!/^[a-f0-9]{64}$/.test(observedNonce) || (expectedNonce !== undefined && observedNonce !== expectedNonce)
+    || canonicalJson(marker) !== canonicalJson({
+      schemaVersion: 2,
+      kind: 'ultracode-swebench-pro-session-runtime',
+      runId,
+      taskId,
+      arm,
+      runtimeNonce: observedNonce,
+    })) {
+    throw new Error('owned session credential runtime marker does not match its container');
+  }
+  return runtime;
+}
+
+function findSessionRuntimeDirectory(runId: string, taskId: string, arm: Arm): string | undefined {
+  const matches: string[] = [];
+  for (const entry of readdirSync(tmpdir(), { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^uc-bench-pro-runtime-[A-Za-z0-9]+$/.test(entry.name)) continue;
+    const runtime = join(tmpdir(), entry.name);
+    let marker: unknown;
+    try {
+      marker = readPrivateJson(runtime, join(runtime, SESSION_RUNTIME_MARKER));
+    } catch {
+      continue;
+    }
+    if (marker === null || typeof marker !== 'object' || Array.isArray(marker)) continue;
+    const value = marker as Record<string, unknown>;
+    if (value.runId !== runId || value.taskId !== taskId || value.arm !== arm) continue;
+    matches.push(trustedSessionRuntimeDirectory(runtime, runId, taskId, arm));
+  }
+  if (matches.length > 1) throw new Error('owned session has ambiguous credential runtime directories');
+  return matches[0];
+}
+
+async function reclaimSessionOwnership(
+  taskDirectory: string,
+  runtime: string | undefined,
+  artifactOwner: SessionArtifactOwner,
+  image: DockerImageAttestation,
+  lifecycle: ProcessLifecycle,
+  executor: SessionDockerExecutor,
+  timeout: () => number,
+): Promise<void> {
+  const taskInfo = lstatSync(taskDirectory);
+  if (taskInfo.isSymbolicLink() || !taskInfo.isDirectory()) {
+    throw new Error('owned session task directory is unsafe before reclamation');
+  }
+  const mounts = ['--mount', `type=bind,src=${taskDirectory},dst=/bench`];
+  const targets = ['/bench'];
+  if (runtime !== undefined) {
+    mounts.push(
+      '--mount', `type=bind,src=${join(runtime, 'home')},dst=/runtime/home`,
+      '--mount', `type=bind,src=${join(runtime, 'codex-home')},dst=/runtime/codex-home`,
+    );
+    targets.push('/runtime/home', '/runtime/codex-home');
+  }
+  const owner = `${artifactOwner.uid}:${artifactOwner.gid}`;
+  await executor([
+    'run', '--rm', '--network', 'none', '--pids-limit', '64',
+    '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
+    '--cap-add', 'CHOWN', '--cap-add', 'DAC_OVERRIDE', '--cap-add', 'FOWNER', '--user', '0:0',
+    ...mounts,
+    '--entrypoint', '/bin/bash',
+    image.overlayLocalId,
+    '-c', '/bin/chown -R -- "$1" "${@:2}" && /bin/chmod 0700 "${@:2}"',
+    'ultracode-reclaim', owner, ...targets,
+  ], lifecycle, timeout());
 }
 
 function assertSessionRuntimeDirectory(
@@ -1916,29 +2244,14 @@ function assertSessionRuntimeDirectory(
   arm: Arm,
   runtimeNonce: string,
 ): string {
-  const relativeRuntime = relative(tmpdir(), runtime);
-  if (!/^uc-bench-pro-runtime-[A-Za-z0-9]+$/.test(relativeRuntime) || relativeRuntime.includes(sep)) {
-    throw new Error('owned session credential runtime is outside the exact temporary namespace');
-  }
+  trustedSessionRuntimeDirectory(runtime, runId, taskId, arm, runtimeNonce);
   const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
-  for (const [path, description] of [[runtime, 'runtime'], [runtimeCodex, 'credential mount']] as const) {
+  for (const [path, description] of [[runtimeCodex, 'credential mount']] as const) {
     const info = lstatSync(path);
     if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o777) !== 0o700
       || (uid !== undefined && info.uid !== uid)) {
       throw new Error(`owned session ${description} is unsafe`);
     }
-  }
-  const marker = readPrivateJson(runtime, join(runtime, SESSION_RUNTIME_MARKER));
-  const expected = {
-    schemaVersion: 2,
-    kind: 'ultracode-swebench-pro-session-runtime',
-    runId,
-    taskId,
-    arm,
-    runtimeNonce,
-  };
-  if (canonicalJson(marker) !== canonicalJson(expected)) {
-    throw new Error('owned session credential runtime marker does not match its container');
   }
   return runtime;
 }
@@ -2003,6 +2316,11 @@ export function ownedRunContainerIds(
   runId: string,
   taskIds: ReadonlySet<string>,
   invocationIds: ReadonlySet<string>,
+  verifierEvidence?: {
+    runDirectory: string;
+    imageIdentities: ReadonlyMap<string, EvaluatorImageIdentity>;
+    invocationStartedMs: ReadonlyMap<string, number>;
+  },
 ): string[] {
   return records.flatMap((record) => {
     const labels = record.Config?.Labels ?? {};
@@ -2010,9 +2328,24 @@ export function ownedRunContainerIds(
     const arm = labels['ultracode.benchmark.arm'];
     const exactPurpose = purpose === 'session'
       ? (arm === 'a' || arm === 'b') && /^[a-f0-9]{64}$/.test(labels['ultracode.benchmark.runtime'] ?? '')
-      : purpose === 'verifier'
+      : purpose === 'verifier' && verifierEvidence !== undefined
         && ['a', 'b', 'gold', 'nullcheck'].includes(arm ?? '')
-        && invocationIds.has(labels['ultracode.benchmark.invocation'] ?? '');
+        && invocationIds.has(labels['ultracode.benchmark.invocation'] ?? '')
+        && existingEvaluatorContainerIds([record], {
+          outputDirectory: join(
+            verifierEvidence.runDirectory,
+            'native',
+            'verifier',
+            arm === 'a' ? 'armA' : arm === 'b' ? 'armB' : arm!,
+            'output',
+          ),
+          runId,
+          armLabel: arm!,
+          taskIds,
+          imageIdentities: verifierEvidence.imageIdentities,
+          invocationIds,
+          invocationStartedMs: verifierEvidence.invocationStartedMs,
+        }).length === 1;
     return record.Id
       && /^[a-f0-9]{64}$/.test(record.Id)
       && labels['ultracode.benchmark.schema'] === '2'
@@ -2027,14 +2360,20 @@ export function ownedRunContainerIds(
 }
 
 async function cleanRunContainers(
+  roots: BenchPathRoots,
   manifest: SwebenchProManifest,
-  invocationIds: ReadonlySet<string>,
+  invocationStartedMs: ReadonlyMap<string, number>,
   executor: DockerExecutor = defaultDockerExecutor,
 ): Promise<number> {
   try {
     const runId = manifest.runId;
+    const cleanupDeadline = performance.now() + SESSION_CLEANUP_RESERVE_MS;
+    const timeout = (): number => remainingSessionOperationTimeout(cleanupDeadline);
     const listRunIds = async (): Promise<string[]> => {
-      const ids = (await executor(['ps', '-aq', '--no-trunc', '--filter', `label=ultracode.benchmark.run=${runId}`]))
+      const ids = (await executor(
+        ['ps', '-aq', '--no-trunc', '--filter', `label=ultracode.benchmark.run=${runId}`],
+        timeout(),
+      ))
         .split('\n').map((entry) => entry.trim()).filter(Boolean);
       if (ids.some((id) => !/^[a-f0-9]{64}$/.test(id))) {
         throw new Error('Docker returned an invalid run-owned container id');
@@ -2042,31 +2381,68 @@ async function cleanRunContainers(
       return ids;
     };
     const ids = await listRunIds();
-    const parsed = ids.length === 0 ? [] : JSON.parse(await executor(['inspect', ...ids])) as ContainerInspect[];
+    const parsed = ids.length === 0
+      ? []
+      : JSON.parse(await executor(['inspect', ...ids], timeout())) as ContainerInspect[];
     if (parsed.length !== ids.length || parsed.some((record) => typeof record.Id !== 'string'
       || !/^[a-f0-9]{64}$/.test(record.Id)
       || ids.filter((id) => record.Id === id).length !== 1)) {
       throw new Error('Docker inspection did not exactly bind the requested run-owned container ids');
     }
-    const owned = ownedRunContainerIds(parsed, runId, new Set(manifest.experiment.taskIds), invocationIds);
+    const invocationIds = new Set(invocationStartedMs.keys());
+    const verifierImageIdentities = new Map(manifest.provenance.tasks.map((task) => {
+      if (task.image === null) throw new Error(`task ${task.taskId} has no evaluator image identity`);
+      return [task.taskId, {
+        reference: task.image.requested,
+        localId: task.image.base.localId,
+      }] as const;
+    }));
+    const owned = ownedRunContainerIds(
+      parsed,
+      runId,
+      new Set(manifest.experiment.taskIds),
+      invocationIds,
+      {
+        runDirectory: runDir(roots, 'swebench-pro', runId),
+        imageIdentities: verifierImageIdentities,
+        invocationStartedMs,
+      },
+    );
     if (owned.length !== parsed.length) {
       throw new Error('run-labelled Docker resources do not have complete manifest ownership');
     }
+    const taskDirectories = new Map(manifest.artifacts.executions.map((execution) => [
+      `${execution.taskId}\0${execution.arm}`,
+      executionDirectory(runDir(roots, 'swebench-pro', runId), execution.nativeRoot),
+    ]));
+    const taskImages = imageAttestations(manifest);
+    const artifactOwner = hostArtifactOwner();
     for (const id of owned) {
       const record = parsed.find((candidate) => candidate.Id === id)!;
       const labels = record.Config?.Labels ?? {};
-      const runtime = labels['ultracode.benchmark.purpose'] === 'session'
-        ? sessionRuntimeDirectory(
-            record,
-            runId,
-            labels['ultracode.benchmark.task']!,
-            labels['ultracode.benchmark.arm'] as Arm,
-            labels['ultracode.benchmark.runtime']!,
-          )
-        : null;
+      if (labels['ultracode.benchmark.purpose'] === 'session') {
+        const taskId = labels['ultracode.benchmark.task']!;
+        const arm = labels['ultracode.benchmark.arm'] as Arm;
+        const taskDirectory = taskDirectories.get(`${taskId}\0${arm}`);
+        const image = taskImages.get(taskId);
+        if (taskDirectory === undefined) throw new Error('owned session has no manifest task directory');
+        if (image === undefined) throw new Error('owned session has no manifest image identity');
+        const sessionExecutor: SessionDockerExecutor = (argv, _lifecycle, timeoutMs) =>
+          executor(argv, timeoutMs);
+        await stopPersistedSessionContainer(
+          containerName(runId, taskId, arm),
+          runId,
+          taskId,
+          arm,
+          {},
+          sessionExecutor,
+          { attemptDeadline: cleanupDeadline, taskDirectory, artifactOwner, image },
+        );
+        continue;
+      }
       let removalFailure: unknown;
       try {
-        await executor(['rm', '-f', id]);
+        await executor(['rm', '-f', id], timeout());
       } catch (error) {
         removalFailure = error;
       }
@@ -2077,13 +2453,6 @@ async function cleanRunContainers(
           new Error(`run-owned container remains present: ${id}`),
         ]);
       }
-      if (runtime !== null) removeSessionRuntime(
-        runtime,
-        runId,
-        labels['ultracode.benchmark.task']!,
-        labels['ultracode.benchmark.arm'] as Arm,
-        labels['ultracode.benchmark.runtime']!,
-      );
     }
     const remaining = await listRunIds();
     if (remaining.length > 0) {
@@ -2103,8 +2472,12 @@ export async function cleanCommand(options: CleanOptions, context: CommandContex
   try {
     invocationId = await beginInvocation(stores.state, 'clean', context.clock.now());
     const containers = await cleanRunContainers(
+      context.paths,
       stores.manifest,
-      new Set(stores.state.load().invocations.map((invocation) => invocation.invocationId)),
+      new Map(stores.state.load().invocations.map((invocation) => [
+        invocation.invocationId,
+        Date.parse(invocation.startedAt),
+      ])),
     );
     const attestations = [...imageAttestations(stores.manifest).values()];
     const images = options.images ? await removeTaskImages(attestations) : 0;
@@ -2129,19 +2502,13 @@ export async function cleanCommand(options: CleanOptions, context: CommandContex
   }
 }
 
-/** Root fatal/signal cleanup covers native processes and daemon-owned sessions. */
+/** Suite cleanup covers every tracked daemon-owned session and evaluator. */
 export async function cleanupSwebenchProRuntime(): Promise<void> {
-  const failures: unknown[] = [];
-  try {
-    await cleanupActiveBenchProcesses();
-  } catch (error) {
-    failures.push(error);
-  }
   const settled = await Promise.allSettled([
     cleanupActiveSwebenchProEvaluators(),
     cleanupActiveSwebenchProContainers(),
   ]);
-  failures.push(...settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []));
+  const failures = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
   if (failures.some((error) => error instanceof OwnershipUnsafeCleanupError)) {
     throw ownershipUnsafeAggregate('SWE-bench Pro runtime cleanup failed ownership checks', failures);
   }

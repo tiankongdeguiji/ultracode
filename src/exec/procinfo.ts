@@ -16,8 +16,19 @@ export const WORKER_SCOPE_ENV = 'ULTRACODE_WORKER_SCOPE';
 const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
 const WORKER_SCOPE_RE = /^[a-f0-9]{64}$/;
 const DARWIN_PS_BATCH_SIZE = 128;
-const MAX_DARWIN_PS_QUERIES = 64;
+const MAX_DARWIN_PS_QUERIES = 66;
+/** Maximum durable macOS identities accepted for one worker lifecycle. */
+export const MAX_DARWIN_CANDIDATE_PROCESSES = 4_096;
 const MAX_PROCESS_ID = 2_147_483_647;
+
+export interface ProcessInspectionOptions {
+  /** Explicit platform seam for deterministic process-supervision tests. */
+  platform?: NodeJS.Platform;
+  /** Headerless `/bin/ps` execution seam; arguments exclude the executable. */
+  executePs?: (argv: readonly string[]) => string;
+  /** POSIX signal seam, including signal 0 probes. */
+  signalProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
+}
 
 export interface ProcStat {
   /** Process-group id (field 5). A detached worker is its own group leader, so pgrp === pid. */
@@ -59,44 +70,123 @@ export function readProcStat(pid: number): ProcStat | undefined {
   return { pgrp, starttime };
 }
 
-/** Read process-group identities on supported hosts in one bounded operation.
- *  Linux uses procfs; macOS batches `ps` under a fixed locale. */
-export function readProcessIdentities(pids: Iterable<number>): Map<number, ProcStat> {
+/** One bounded identity read plus whether absence claims are authoritative. */
+export interface ProcessIdentitySnapshot {
+  identities: Map<number, ProcStat>;
+  complete: boolean;
+}
+
+function inspectionPlatform(options: ProcessInspectionOptions): NodeJS.Platform {
+  return options.platform ?? process.platform;
+}
+
+function executeDarwinPs(argv: readonly string[], options: ProcessInspectionOptions): string {
+  if (options.executePs !== undefined) return options.executePs(argv);
+  return execFileSync('/bin/ps', [...argv], {
+    encoding: 'utf8',
+    env: { ...process.env, LC_ALL: 'C' },
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 1_000,
+    maxBuffer: 256 * 1_024,
+  });
+}
+
+interface DarwinPsFailure {
+  status?: unknown;
+  stdout?: unknown;
+}
+
+function isDarwinNoSelection(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const failure = error as DarwinPsFailure;
+  const stdout = typeof failure.stdout === 'string'
+    ? failure.stdout
+    : Buffer.isBuffer(failure.stdout)
+      ? failure.stdout.toString('utf8')
+      : '';
+  return failure.status === 1 && stdout.trim() === '';
+}
+
+function parseDarwinIdentities(raw: string): ProcessIdentitySnapshot {
+  const identities = new Map<number, ProcStat>();
+  let complete = true;
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue;
+    const match = line.match(
+      /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s*$/,
+    );
+    if (!match) {
+      complete = false;
+      continue;
+    }
+    const [, pidText = '', pgrpText = '', started = ''] = match;
+    const pid = Number(pidText);
+    const pgrp = Number(pgrpText);
+    if (!isSafeProcessId(pid) || !isSafeProcessGroupId(pgrp) || identities.has(pid)) {
+      complete = false;
+      continue;
+    }
+    identities.set(pid, {
+      pgrp,
+      starttime: `darwin:${started.trim().replace(/\s+/g, '_')}`,
+    });
+  }
+  return { identities, complete };
+}
+
+/** Read process identities while preserving whether macOS `ps` was authoritative. */
+export function readProcessIdentitySnapshot(
+  pids: Iterable<number>,
+  options: ProcessInspectionOptions = {},
+): ProcessIdentitySnapshot {
   const requested = [...new Set(pids)].filter(isSafeProcessId);
   const found = new Map<number, ProcStat>();
-  if (process.platform === 'linux') {
+  const platform = inspectionPlatform(options);
+  if (platform === 'linux') {
     for (const pid of requested) {
       const stat = readProcStat(pid);
       if (stat) found.set(pid, stat);
     }
-    return found;
+    return { identities: found, complete: true };
   }
-  if (process.platform !== 'darwin' || requested.length === 0) return found;
-  let raw: string;
-  try {
-    raw = execFileSync('/bin/ps', ['-o', 'pid=', '-o', 'pgid=', '-o', 'lstart=', '-p', requested.join(',')], {
-      encoding: 'utf8',
-      env: { ...process.env, LC_ALL: 'C' },
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 1_000,
-      maxBuffer: 256 * 1_024,
-    }).trim();
-  } catch {
-    return found;
+  if (platform !== 'darwin' || requested.length === 0) {
+    return { identities: found, complete: platform === 'darwin' };
   }
-  for (const line of raw.split('\n')) {
-    const [pidText, pgrpText, ...started] = line.trim().split(/\s+/);
-    const pid = Number(pidText);
-    const pgrp = Number(pgrpText);
-    if (!isSafeProcessId(pid) || !isSafeProcessGroupId(pgrp) || started.length === 0) continue;
-    found.set(pid, { pgrp, starttime: `darwin:${started.join('_')}` });
+  let complete = true;
+  for (let offset = 0; offset < requested.length; offset += DARWIN_PS_BATCH_SIZE) {
+    const batch = requested.slice(offset, offset + DARWIN_PS_BATCH_SIZE);
+    const accepted = new Set(batch);
+    try {
+      const parsed = parseDarwinIdentities(executeDarwinPs(
+        ['-o', 'pid=', '-o', 'pgid=', '-o', 'lstart=', '-p', batch.join(',')],
+        options,
+      ));
+      complete &&= parsed.complete;
+      for (const [pid, identity] of parsed.identities) {
+        if (accepted.has(pid)) found.set(pid, identity);
+        else complete = false;
+      }
+    } catch (error) {
+      if (!isDarwinNoSelection(error)) complete = false;
+    }
   }
-  return found;
+  return { identities: found, complete };
+}
+
+/** Read process-group identities on supported hosts in one bounded operation. */
+export function readProcessIdentities(
+  pids: Iterable<number>,
+  options: ProcessInspectionOptions = {},
+): Map<number, ProcStat> {
+  return readProcessIdentitySnapshot(pids, options).identities;
 }
 
 /** Read one process-group identity. */
-export function readProcessIdentity(pid: number): ProcStat | undefined {
-  return readProcessIdentities([pid]).get(pid);
+export function readProcessIdentity(
+  pid: number,
+  options: ProcessInspectionOptions = {},
+): ProcStat | undefined {
+  return readProcessIdentities([pid], options).get(pid);
 }
 
 /** Worker tokens cross a worker-writable boundary when persisted in the run
@@ -122,112 +212,208 @@ export interface TrackedWorkerProcess extends TrackedProcess {
   token: string;
 }
 
-/** Find marked processes for a bounded token set. Linux can scan procfs for
- *  escaped descendants; macOS only verifies a supplied candidate PID set. */
-export function findWorkerProcessesForTokens(
+export interface WorkerProcessDiscovery {
+  processes: TrackedWorkerProcess[];
+  /** False means an empty/partial result cannot prove process absence. */
+  complete: boolean;
+}
+
+interface DarwinProcess extends TrackedProcess {
+  command: string;
+}
+
+interface DarwinProcessParse {
+  processes: Map<number, DarwinProcess>;
+  complete: boolean;
+}
+
+function parseDarwinProcesses(raw: string): DarwinProcessParse {
+  const processes = new Map<number, DarwinProcess>();
+  let complete = true;
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue;
+    const match = line.match(
+      /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})(?:\s+(.*))?$/,
+    );
+    if (!match) {
+      complete = false;
+      continue;
+    }
+    const [, pidText = '', pgrpText = '', started = '', command = ''] = match;
+    const pid = Number(pidText);
+    const pgrp = Number(pgrpText);
+    if (!isSafeProcessId(pid) || !isSafeProcessGroupId(pgrp) || processes.has(pid)) {
+      complete = false;
+      continue;
+    }
+    processes.set(pid, {
+      pid,
+      pgrp,
+      starttime: `darwin:${started.trim().replace(/\s+/g, '_')}`,
+      command,
+    });
+  }
+  return { processes, complete };
+}
+
+function isPsOverflow(error: unknown): boolean {
+  return error instanceof Error && /maxBuffer|ENOBUFS/u.test(error.message);
+}
+
+function darwinProcessQuery(
+  batch: readonly number[] | undefined,
+  includeEnvironment: boolean,
+  options: ProcessInspectionOptions,
+): DarwinProcessParse & { overflow: boolean } {
+  try {
+    const raw = executeDarwinPs([
+      '-ww',
+      ...(batch === undefined ? ['-ax'] : []),
+      ...(includeEnvironment ? ['-E'] : []),
+      '-o',
+      'pid=',
+      '-o',
+      'pgid=',
+      '-o',
+      'lstart=',
+      '-o',
+      'command=',
+      ...(batch === undefined ? [] : ['-p', batch.join(',')]),
+    ], options);
+    return { ...parseDarwinProcesses(raw), overflow: false };
+  } catch (error) {
+    if (batch !== undefined && isDarwinNoSelection(error)) {
+      return { processes: new Map(), complete: true, overflow: false };
+    }
+    return { processes: new Map(), complete: false, overflow: isPsOverflow(error) };
+  }
+}
+
+function darwinProcessIds(options: ProcessInspectionOptions): {
+  pids: number[];
+  complete: boolean;
+} {
+  try {
+    const seen = new Set<number>();
+    for (const line of executeDarwinPs(['-ax', '-o', 'pid='], options).split('\n')) {
+      if (line.trim() === '') continue;
+      const pid = Number(line.trim());
+      if (!/^\d+$/u.test(line.trim()) || !isSafeProcessId(pid) || seen.has(pid)) {
+        return { pids: [], complete: false };
+      }
+      if (pid !== process.pid) seen.add(pid);
+      if (seen.size > MAX_DARWIN_CANDIDATE_PROCESSES) {
+        return { pids: [], complete: false };
+      }
+    }
+    return { pids: [...seen], complete: true };
+  } catch {
+    return { pids: [], complete: false };
+  }
+}
+
+/** Discover marked processes and report whether the bounded snapshot was complete. */
+export function discoverWorkerProcessesForTokens(
   tokens: Iterable<string>,
   scope?: string,
   candidatePids?: Iterable<number>,
-): TrackedWorkerProcess[] {
+  options: ProcessInspectionOptions = {},
+): WorkerProcessDiscovery {
   const accepted = new Set([...tokens].filter(isWorkerToken));
-  if (accepted.size === 0) return [];
+  if (accepted.size === 0) return { processes: [], complete: true };
   const candidates =
     candidatePids === undefined
       ? undefined
       : [...new Set(candidatePids)].filter((pid) => isSafeProcessId(pid) && pid !== process.pid);
   const scopeValue = scope === undefined ? undefined : workerScopeValue(scope);
+  const platform = inspectionPlatform(options);
 
-  if (process.platform === 'darwin') {
-    // macOS has no procfs. Recovery only inspects the bounded candidate leader
-    // set from persisted records; it never performs a host-wide token sweep.
-    if (scopeValue === undefined || candidates === undefined || candidates.length === 0) return [];
-    type DarwinProcess = TrackedProcess & { command: string };
-    const parseProcesses = (raw: string): Map<number, DarwinProcess> => {
-      const processes = new Map<number, DarwinProcess>();
-      for (const line of raw.split('\n')) {
-        const match = line.match(
-          /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/,
-        );
-        if (!match) continue;
-        const [, pidText = '', pgrpText = '', started = '', command = ''] = match;
-        const pid = Number(pidText);
-        const pgrp = Number(pgrpText);
-        if (!isSafeProcessId(pid) || !isSafeProcessGroupId(pgrp)) continue;
-        processes.set(pid, {
-          pid,
-          pgrp,
-          starttime: `darwin:${started.trim().replace(/\s+/g, '_')}`,
-          command,
-        });
-      }
-      return processes;
-    };
+  if (platform === 'darwin') {
+    if (scopeValue === undefined) return { processes: [], complete: false };
+    if (candidates !== undefined && candidates.length === 0) return { processes: [], complete: true };
     const found: TrackedWorkerProcess[] = [];
-    const batches: number[][] = [];
-    for (let offset = 0; offset < candidates.length; offset += DARWIN_PS_BATCH_SIZE) {
-      batches.push(candidates.slice(offset, offset + DARWIN_PS_BATCH_SIZE));
+    const batches: Array<number[] | undefined> = [];
+    if (candidates === undefined) {
+      batches.push(undefined);
+    } else {
+      for (let offset = 0; offset < candidates.length; offset += DARWIN_PS_BATCH_SIZE) {
+        batches.push(candidates.slice(offset, offset + DARWIN_PS_BATCH_SIZE));
+      }
     }
     let queries = 0;
-    while (batches.length > 0 && queries + 2 <= MAX_DARWIN_PS_QUERIES) {
+    let complete = true;
+    while (batches.length > 0) {
+      if (queries + 2 > MAX_DARWIN_PS_QUERIES) {
+        complete = false;
+        break;
+      }
       const batch = batches.shift()!;
-      const query = (includeEnvironment: boolean): { processes?: Map<number, DarwinProcess>; overflow: boolean } => {
-        queries++;
-        try {
-          const raw = execFileSync(
-            '/bin/ps',
-            [
-              '-ww',
-              ...(includeEnvironment ? ['-E'] : []),
-              '-o',
-              'pid=',
-              '-o',
-              'pgid=',
-              '-o',
-              'lstart=',
-              '-o',
-              'command=',
-              '-p',
-              batch.join(','),
-            ],
-            {
-              encoding: 'utf8',
-              env: { ...process.env, LC_ALL: 'C' },
-              stdio: ['ignore', 'pipe', 'ignore'],
-              timeout: 1_000,
-              maxBuffer: 256 * 1_024,
-            },
-          ).trim();
-          return { processes: parseProcesses(raw), overflow: false };
-        } catch (err) {
-          return { overflow: err instanceof Error && /maxBuffer|ENOBUFS/.test(err.message) };
+      const commands = darwinProcessQuery(batch, false, options);
+      queries++;
+      const commandsAndEnvironment = darwinProcessQuery(batch, true, options);
+      queries++;
+      if (!commands.complete || !commandsAndEnvironment.complete) {
+        if (
+          batch === undefined
+          && (commands.overflow || commandsAndEnvironment.overflow)
+          && queries < MAX_DARWIN_PS_QUERIES
+        ) {
+          const inventory = darwinProcessIds(options);
+          queries++;
+          if (!inventory.complete) {
+            complete = false;
+            continue;
+          }
+          for (let offset = inventory.pids.length; offset > 0; offset -= DARWIN_PS_BATCH_SIZE) {
+            batches.unshift(inventory.pids.slice(
+              Math.max(0, offset - DARWIN_PS_BATCH_SIZE),
+              offset,
+            ));
+          }
+          continue;
         }
-      };
-      const commands = query(false);
-      const commandsAndEnvironment = commands.processes === undefined ? undefined : query(true);
-      if (commands.processes === undefined || commandsAndEnvironment?.processes === undefined) {
-        // A large argv/environment can overflow a multi-process result. Split
-        // only maxBuffer failures, and cap total queries so hostile records
-        // cannot turn recovery into an unbounded number of `ps` executions.
-        if (batch.length > 1 && (commands.overflow || commandsAndEnvironment?.overflow)) {
+        if (
+          batch !== undefined
+          && batch.length > 1
+          && (commands.overflow || commandsAndEnvironment.overflow)
+        ) {
           const middle = Math.ceil(batch.length / 2);
           batches.unshift(batch.slice(middle), batch.slice(0, middle));
+        } else {
+          complete = false;
         }
         continue;
+      }
+      const observedPids = new Set([
+        ...commands.processes.keys(),
+        ...commandsAndEnvironment.processes.keys(),
+      ]);
+      if ([...observedPids].some((pid) =>
+        !commands.processes.has(pid) || !commandsAndEnvironment.processes.has(pid))) {
+        complete = false;
       }
       for (const expanded of commandsAndEnvironment.processes.values()) {
         const command = commands.processes.get(expanded.pid);
         if (
           command === undefined ||
           command.pgrp !== expanded.pgrp ||
-          command.starttime !== expanded.starttime ||
-          !expanded.command.startsWith(`${command.command} `)
+          command.starttime !== expanded.starttime
         ) {
+          complete = false;
+          continue;
+        }
+        const environment = expanded.command === command.command
+          ? ''
+          : expanded.command.startsWith(`${command.command} `)
+            ? expanded.command.slice(command.command.length + 1)
+            : null;
+        if (environment === null) {
+          complete = false;
           continue;
         }
         // `ps -E` appends the launch environment to the normal command field.
         // Subtract a separately-read argv field so argv text cannot impersonate
         // lifecycle markers; identity must remain stable across both reads.
-        const environment = expanded.command.slice(command.command.length + 1);
         const token = [...environment.matchAll(/(?:^|\s)ULTRACODE_WORKER_TOKEN=([a-f0-9]{32})(?=\s|$)/g)]
           .map((entry) => entry[1])
           .find((value): value is string => isWorkerToken(value) && accepted.has(value));
@@ -244,9 +430,13 @@ export function findWorkerProcessesForTokens(
         });
       }
     }
-    return found;
+    if (found.length > MAX_DARWIN_CANDIDATE_PROCESSES) complete = false;
+    return {
+      processes: found.slice(0, MAX_DARWIN_CANDIDATE_PROCESSES),
+      complete,
+    };
   }
-  if (process.platform !== 'linux') return [];
+  if (platform !== 'linux') return { processes: [], complete: false };
   let entries: string[];
   if (candidates !== undefined) {
     entries = candidates.map(String);
@@ -254,7 +444,7 @@ export function findWorkerProcessesForTokens(
     try {
       entries = readdirSync('/proc');
     } catch {
-      return [];
+      return { processes: [], complete: false };
     }
   }
   const tokenPrefix = `${WORKER_TOKEN_ENV}=`;
@@ -281,7 +471,18 @@ export function findWorkerProcessesForTokens(
     if (!after || after.starttime !== before.starttime || after.pgrp !== before.pgrp) continue;
     found.push({ pid, token, ...after });
   }
-  return found;
+  return { processes: found, complete: true };
+}
+
+/** Find marked processes while preserving the legacy Linux-only scan behavior. */
+export function findWorkerProcessesForTokens(
+  tokens: Iterable<string>,
+  scope?: string,
+  candidatePids?: Iterable<number>,
+  options: ProcessInspectionOptions = {},
+): TrackedWorkerProcess[] {
+  if (inspectionPlatform(options) === 'darwin' && candidatePids === undefined) return [];
+  return discoverWorkerProcessesForTokens(tokens, scope, candidatePids, options).processes;
 }
 
 /** Find processes carrying one exact token and optional run scope. */
@@ -295,22 +496,47 @@ export interface WorkerSignalResult {
   identities: Set<string>;
 }
 
-/** Signal an already-discovered Linux snapshot after one final identity check. */
+/** Signal an authenticated snapshot after one final platform-capable identity check. */
 export function signalTrackedWorkerProcesses(
   tracked: Iterable<TrackedWorkerProcess>,
   signal: NodeJS.Signals,
+  options: ProcessInspectionOptions = {},
 ): WorkerSignalResult {
+  const processesToSignal = [...tracked];
+  const platform = inspectionPlatform(options);
   const signaledTokens = new Set<string>();
   const signaledIdentities = new Set<string>();
   let processes = 0;
-  for (const proc of tracked) {
-    const live = readProcStat(proc.pid);
+  const signalProcess = options.signalProcess ?? ((pid: number, sent: NodeJS.Signals | 0) => {
+    process.kill(pid, sent);
+  });
+  if (platform === 'linux') {
+    for (const proc of processesToSignal) {
+      const live = readProcStat(proc.pid);
+      if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
+      try {
+        signalProcess(proc.pgrp === proc.pid ? -proc.pid : proc.pid, signal);
+        processes++;
+        signaledTokens.add(proc.token);
+        signaledIdentities.add(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`);
+      } catch {
+        /* raced with exit */
+      }
+    }
+    return { processes, tokens: signaledTokens, identities: signaledIdentities };
+  }
+  const liveIdentities = readProcessIdentities(
+    processesToSignal.map((proc) => proc.pid),
+    options,
+  );
+  for (const proc of processesToSignal) {
+    const live = liveIdentities.get(proc.pid);
     if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
     try {
       // An authenticated session leader may have same-group descendants that
       // deliberately replaced their environment. Cover those children without
       // extending group signaling to a marked process inside another PGID.
-      process.kill(proc.pgrp === proc.pid ? -proc.pid : proc.pid, signal);
+      signalProcess(proc.pgrp === proc.pid ? -proc.pid : proc.pid, signal);
       processes++;
       signaledTokens.add(proc.token);
       signaledIdentities.add(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`);
@@ -326,10 +552,11 @@ export function signalWorkerProcessTokens(
   tokens: Iterable<string>,
   signal: NodeJS.Signals,
   scope?: string,
+  options: ProcessInspectionOptions = {},
 ): WorkerSignalResult {
   const accepted = new Set([...tokens].filter(isWorkerToken));
   if (accepted.size === 0) return { processes: 0, tokens: new Set(), identities: new Set() };
-  return signalTrackedWorkerProcesses(findWorkerProcessesForTokens(accepted, scope), signal);
+  return signalTrackedWorkerProcesses(findWorkerProcessesForTokens(accepted, scope, undefined, options), signal, options);
 }
 
 /** Asynchronously re-scan until the token set is stably absent or grace ends. */
@@ -338,6 +565,7 @@ export async function signalWorkerProcessTokensUntilGone(
   signal: NodeJS.Signals,
   scope?: string,
   graceMs = 100,
+  options: ProcessInspectionOptions = {},
 ): Promise<WorkerSignalResult> {
   const accepted = new Set([...tokens].filter(isWorkerToken));
   const aggregate: WorkerSignalResult = { processes: 0, tokens: new Set(), identities: new Set() };
@@ -346,12 +574,12 @@ export async function signalWorkerProcessTokensUntilGone(
   let delayMs = 5;
   let emptyPasses = 0;
   for (;;) {
-    const found = findWorkerProcessesForTokens(accepted, scope);
+    const found = findWorkerProcessesForTokens(accepted, scope, undefined, options);
     emptyPasses = found.length === 0 ? emptyPasses + 1 : 0;
     const batch = found.filter(
       (proc) => !aggregate.identities.has(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`),
     );
-    const result = signalTrackedWorkerProcesses(batch, signal);
+    const result = signalTrackedWorkerProcesses(batch, signal, options);
     aggregate.processes += result.processes;
     for (const token of result.tokens) aggregate.tokens.add(token);
     for (const identity of result.identities) aggregate.identities.add(identity);
@@ -364,8 +592,13 @@ export async function signalWorkerProcessTokensUntilGone(
 /** Signal every currently-live process carrying `token`. Re-read procfs on
  *  every call so a later SIGKILL sweep also catches descendants forked while
  *  the graceful signal was in flight. */
-export function signalWorkerProcesses(token: string, signal: NodeJS.Signals, scope?: string): number {
-  return signalWorkerProcessTokens([token], signal, scope).processes;
+export function signalWorkerProcesses(
+  token: string,
+  signal: NodeJS.Signals,
+  scope?: string,
+  options: ProcessInspectionOptions = {},
+): number {
+  return signalWorkerProcessTokens([token], signal, scope, options).processes;
 }
 
 /**

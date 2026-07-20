@@ -195,6 +195,10 @@ describe('complete row freezing and strict native evidence', () => {
 
 describe('evaluator ownership and empty predictions', () => {
   it('requires exact repository, post-baseline ownership, start time, and output mount', () => {
+    const imageIdentities = new Map([['task', {
+      reference: 'jefzda/sweap-images:task',
+      localId: `sha256:${'e'.repeat(64)}`,
+    }]]);
     const labels = (taskId: string) => ({
       'ultracode.benchmark.schema': '2',
       'ultracode.benchmark.suite': 'swebench-pro',
@@ -206,10 +210,10 @@ describe('evaluator ownership and empty predictions', () => {
       'ultracode.benchmark.ownership': '1',
     });
     const records = [
-      { Id: 'a'.repeat(64), Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task' }] },
-      { Id: 'b'.repeat(64), Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task' }] },
-      { Id: 'c'.repeat(64), Config: { Image: 'jefzda/sweap-images-evil:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task' }] },
-      { Id: 'd'.repeat(64), Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/other' }] },
+      { Id: 'a'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
+      { Id: 'b'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
+      { Id: 'c'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: 'jefzda/sweap-images-evil:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
+      { Id: 'd'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/other', Destination: '/workspace' }] },
     ];
     expect(ownedEvaluatorContainerIds(records, {
       outputDirectory: '/run/output',
@@ -218,6 +222,7 @@ describe('evaluator ownership and empty predictions', () => {
       armLabel: 'a',
       invocationId: 'invocation-1',
       taskIds: new Set(['task']),
+      imageIdentities,
       invocationStartedMs: Date.parse('2026-07-20T12:00:00Z'),
       nowMs: Date.parse('2026-07-20T13:00:00Z'),
       maximumAgeMs: null,
@@ -249,6 +254,53 @@ describe('evaluator ownership and empty predictions', () => {
     ], 'pilot1', new Set(['task-a']), new Set())).toEqual(['a'.repeat(64)]);
   });
 
+  it('requires exact verifier image, workspace mount, and invocation start evidence for run cleanup', () => {
+    const invocation = '11111111-1111-4111-8111-111111111111';
+    const labels = {
+      'ultracode.benchmark.schema': '2',
+      'ultracode.benchmark.suite': 'swebench-pro',
+      'ultracode.benchmark.run': 'pilot1',
+      'ultracode.benchmark.task': 'task-a',
+      'ultracode.benchmark.arm': 'a',
+      'ultracode.benchmark.purpose': 'verifier',
+      'ultracode.benchmark.ownership': '1',
+      'ultracode.benchmark.invocation': invocation,
+    };
+    const exact = {
+      Id: 'e'.repeat(64),
+      Image: `sha256:${'f'.repeat(64)}`,
+      Config: { Image: 'jefzda/sweap-images:task-a', Labels: labels },
+      State: { StartedAt: '2026-07-20T12:01:00Z' },
+      Mounts: [{
+        Type: 'bind',
+        Source: '/run/native/verifier/armA/output/task-a/workspace',
+        Destination: '/workspace',
+      }],
+    };
+    const evidence = {
+      runDirectory: '/run',
+      imageIdentities: new Map([['task-a', {
+        reference: 'jefzda/sweap-images:task-a',
+        localId: `sha256:${'f'.repeat(64)}`,
+      }]]),
+      invocationStartedMs: new Map([[invocation, Date.parse('2026-07-20T12:00:00Z')]]),
+    };
+    expect(ownedRunContainerIds(
+      [exact],
+      'pilot1',
+      new Set(['task-a']),
+      new Set([invocation]),
+      evidence,
+    )).toEqual(['e'.repeat(64)]);
+    expect(ownedRunContainerIds(
+      [{ ...exact, Image: `sha256:${'0'.repeat(64)}` }],
+      'pilot1',
+      new Set(['task-a']),
+      new Set([invocation]),
+      evidence,
+    )).toEqual([]);
+  });
+
   it('does not launch an evaluator or fabricate eval_results for an empty prediction set', async () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-bench-pro-empty-'));
     temporaryRoots.push(root);
@@ -268,6 +320,8 @@ describe('evaluator ownership and empty predictions', () => {
       predictions: [],
       instances: [instanceFromRow(row('task-a'))],
       containerPolicy,
+      imageIdentities: new Map(),
+      invocationStartedMs: new Map(),
       docker: async () => { throw new Error('docker must not be called'); },
     });
     expect(result.resultRelativePath).toBeNull();
@@ -279,6 +333,7 @@ describe('evaluator ownership and empty predictions', () => {
     const runtime = mkdtempSync(join(tmpdir(), 'uc-bench-pro-runtime-'));
     temporaryRoots.push(runtime);
     mkdirSync(join(runtime, 'codex-home'), { mode: 0o700 });
+    mkdirSync(join(runtime, 'home'), { mode: 0o700 });
     writeFileSync(join(runtime, 'ownership.json'), `${JSON.stringify({
       schemaVersion: 2,
       kind: 'ultracode-swebench-pro-session-runtime',

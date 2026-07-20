@@ -7,7 +7,9 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +18,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { acquireBenchLock } from '../../bench/src/shared/locks.js';
 import type { FeatureBenchManifest } from '../../bench/src/shared/manifest.js';
 import { createBenchPathRoots, writePrivateJsonAtomic } from '../../bench/src/shared/paths.js';
+import { sha256Tree } from '../../bench/src/shared/provenance.js';
 import type { TaskResult } from '../../bench/src/shared/report.js';
 import type { BenchRunState, BenchRunStateStore } from '../../bench/src/shared/run-state.js';
 import { featureBenchAdapter } from '../../bench/src/suites/featurebench/adapter.js';
@@ -31,8 +34,15 @@ import {
 } from '../../bench/src/suites/featurebench/config.js';
 import { validateFeatureBenchHost } from '../../bench/src/suites/featurebench/host.js';
 import {
+  assertNoFeatureBenchPythonCacheArtifacts,
+  assertNoFeatureBenchStageReferences,
   FEATUREBENCH_DATASET_MEMBERSHIP_SCRIPT,
+  featureBenchEnvironmentIdentity,
+  makeFeatureBenchEnvironmentRelocatable,
   parseFeatureBenchDatasetMap,
+  prepareFeatureBenchInputs,
+  preflightFeatureBenchUv,
+  removeFeatureBenchPythonCacheArtifacts,
   type PreparedFeatureBenchInputs,
 } from '../../bench/src/suites/featurebench/prepare.js';
 import {
@@ -159,6 +169,28 @@ function prepared(): PreparedFeatureBenchInputs {
   } as PreparedFeatureBenchInputs;
 }
 
+function stagedFeatureBenchEnvironment(stage: string): { environment: string; fb: string } {
+  const environment = join(stage, 'source', '.venv');
+  const bin = join(environment, 'bin');
+  mkdirSync(bin, { recursive: true });
+  const python = join(bin, 'python');
+  writeFileSync(python, `#!/bin/sh
+MOCK_ADJACENT_PYTHON="$0" exec python3 "$@"
+`);
+  chmodSync(python, 0o755);
+  const fb = join(bin, 'fb');
+  writeFileSync(fb, `#!${python}
+import os
+import sys
+print(f"interpreter={os.environ['MOCK_ADJACENT_PYTHON']}")
+print(f"entrypoint={sys.argv[0]}")
+print(f"argument={sys.argv[1]}")
+print(f"working={os.getcwd()}")
+`);
+  chmodSync(fb, 0o755);
+  return { environment, fb };
+}
+
 function predictionRoot(
   runDirectory: string,
   timestamp: string,
@@ -218,6 +250,107 @@ describe('FeatureBench immutable inputs and host policy', () => {
       split: FEATUREBENCH_SPLIT,
       tasks: { 'task-alpha': 'example.test/image:tag' },
     })).toThrow(/pinned dataset/);
+  });
+
+  it('preflights uv on PATH before creating preparation state or invoking Docker', async () => {
+    const roots = createBenchPathRoots(temporary());
+    const commands: string[][] = [];
+    const executor = async (command: string, argv: readonly string[]) => {
+      commands.push([command, ...argv]);
+      throw new Error('spawn uv ENOENT');
+    };
+    await expect(prepareFeatureBenchInputs(roots, {
+      nodeVersion: 'v22.17.0',
+      nodeDistribution: 'nodejs',
+      codexBinary: '/unused/codex',
+    }, executor)).rejects.toThrow('FeatureBench prep requires uv on PATH');
+    expect(commands).toEqual([['uv', '--version']]);
+    expect(existsSync(join(roots.cacheRoot, 'featurebench'))).toBe(false);
+  });
+
+  it('accepts only a successful uv version probe', async () => {
+    await expect(preflightFeatureBenchUv(async () => ({ stdout: 'uv 0.8.3\n', stderr: '' }), '/bench'))
+      .resolves.toBeUndefined();
+    await expect(preflightFeatureBenchUv(async () => ({ stdout: '', stderr: '' }), '/bench'))
+      .rejects.toThrow('FeatureBench prep requires uv on PATH');
+  });
+
+  it('replaces the broken staged shebang with a launcher executable from its final digest path', () => {
+    const root = temporary();
+    const oldStage = join(root, 'old-stage');
+    const oldEnvironment = stagedFeatureBenchEnvironment(oldStage);
+    const beforeMove = spawnSync(oldEnvironment.fb, ['--help'], { cwd: root, encoding: 'utf8' });
+    expect(beforeMove.status, beforeMove.stderr).toBe(0);
+    const oldFinal = join(root, sha256Tree(oldStage));
+    renameSync(oldStage, oldFinal);
+    const broken = spawnSync(join(oldFinal, 'source', '.venv', 'bin', 'fb'), ['--help'], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    expect((broken.error as NodeJS.ErrnoException | undefined)?.code).toBe('ENOENT');
+
+    const newStage = join(root, 'new-stage');
+    const relocated = stagedFeatureBenchEnvironment(newStage);
+    const activation = join(relocated.environment, 'bin', 'activate');
+    writeFileSync(activation, `VIRTUAL_ENV=${newStage}/source/.venv\n`);
+    const distInfo = join(relocated.environment, 'lib', 'python3.13', 'site-packages', 'featurebench.dist-info');
+    mkdirSync(distInfo, { recursive: true });
+    const directUrl = join(distInfo, 'direct_url.json');
+    writeFileSync(directUrl, `${JSON.stringify({ url: `file://${newStage}/source` })}\n`);
+    const record = join(distInfo, 'RECORD');
+    writeFileSync(record, 'featurebench.dist-info/direct_url.json,sha256=old,1\nfeaturebench/__init__.py,,\n');
+
+    makeFeatureBenchEnvironmentRelocatable(newStage, relocated.environment);
+    expect(existsSync(activation)).toBe(false);
+    expect(existsSync(directUrl)).toBe(false);
+    expect(readFileSync(record, 'utf8')).toBe('featurebench/__init__.py,,\n');
+    expect(() => assertNoFeatureBenchStageReferences(newStage, newStage)).not.toThrow();
+    const digest = sha256Tree(newStage);
+    const final = join(root, digest);
+    renameSync(newStage, final);
+    const publishedFb = join(final, 'source', '.venv', 'bin', 'fb');
+    const result = spawnSync(publishedFb, ['--help'], { cwd: root, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`interpreter=${join(final, 'source', '.venv', 'bin', 'python')}`);
+    expect(result.stdout).toContain(`entrypoint=${publishedFb}`);
+    expect(result.stdout).toContain('argument=--help');
+    expect(result.stdout).toContain(`working=${root}`);
+  });
+
+  it('removes Python bytecode before hashing and rejects it on every load boundary', () => {
+    const root = temporary();
+    const cache = join(root, 'source', '.venv', 'lib', 'python3.13', 'site-packages', '__pycache__');
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'featurebench.cpython-313.pyc'), 'executable bytecode');
+    expect(() => assertNoFeatureBenchPythonCacheArtifacts(root)).toThrow(/Python cache artifacts/);
+    const before = sha256Tree(root);
+    removeFeatureBenchPythonCacheArtifacts(root);
+    expect(() => assertNoFeatureBenchPythonCacheArtifacts(root)).not.toThrow();
+    expect(sha256Tree(root)).not.toBe(before);
+  });
+
+  it('rejects environment links outside the published tree or attested Python runtime', () => {
+    const root = temporary();
+    const environment = join(root, '.venv');
+    const bin = join(environment, 'bin');
+    const packages = join(environment, 'lib', 'python3.13', 'site-packages');
+    const external = join(root, 'mutable-cache');
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(packages, { recursive: true });
+    mkdirSync(external);
+    writeFileSync(join(bin, 'python'), 'mock interpreter');
+    symlinkSync(external, join(packages, 'escaped-cache'));
+    expect(() => featureBenchEnvironmentIdentity(environment)).toThrow(/unattested external links/);
+    rmSync(join(packages, 'escaped-cache'));
+    expect(() => featureBenchEnvironmentIdentity(environment)).not.toThrow();
+  });
+
+  it('isolates uv configuration and copies package payloads during sync', () => {
+    const source = readFileSync(resolve('bench/src/suites/featurebench/prepare.ts'), 'utf8');
+    expect(source).toContain("'--no-config'");
+    expect(source).toContain("'--link-mode'");
+    expect(source).toContain("'copy'");
+    expect(source).toContain("'--managed-python'");
   });
 
   it('projects the exact pinned-shape source inventory from top-level image_name values', () => {
@@ -527,6 +660,7 @@ describe('pinned native fb commands', () => {
     const run = planFeatureBenchRun(prepared(), manifest(), {
       brokerUrl: 'https://broker.test/v1', restrictedNetwork: 'featurebench-private',
     }, '/run/native', '/private/config.toml');
+    expect(run.infer.command).toBe('/prepared/.venv/bin/fb');
     expect(run.infer.argv).toEqual([
       'infer', '--config-path', '/private/config.toml', '--agent', 'codex', '--model', 'gpt-test',
       '--dataset', FEATUREBENCH_DATASET, '--split', FEATUREBENCH_SPLIT,
@@ -541,6 +675,7 @@ describe('pinned native fb commands', () => {
       brokerUrl: 'https://broker.test/v1', restrictedNetwork: 'featurebench-private',
     }, '/run/native').config).not.toContain('FEATUREBENCH_PROMPT_PREFIX');
     const evaluation = planFeatureBenchEval(prepared(), manifest(), '/run/native/output.jsonl', '/private/config.toml');
+    expect(evaluation.command).toBe('/prepared/.venv/bin/fb');
     expect(evaluation.argv).toEqual([
       'eval', '--config-path', '/private/config.toml', '--predictions-path', '/run/native/output.jsonl',
       '--dataset', FEATUREBENCH_DATASET, '--split', FEATUREBENCH_SPLIT,
@@ -549,12 +684,14 @@ describe('pinned native fb commands', () => {
   });
 
   it('keeps native resume on the original complete inference root', () => {
-    expect(planFeatureBenchResume(
+    const resume = planFeatureBenchResume(
       prepared(),
       manifest(),
       '/run/native/2026-07-19__13-00-41',
       '/private/config.toml',
-    ).argv).toEqual([
+    );
+    expect(resume.command).toBe('/prepared/.venv/bin/fb');
+    expect(resume.argv).toEqual([
       'infer', '--resume', '/run/native/2026-07-19__13-00-41',
       '--config-path', '/private/config.toml', '--n-concurrent', '4', '--timeout', '60',
     ]);

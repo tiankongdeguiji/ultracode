@@ -1,14 +1,19 @@
 /** Content-addressed preparation of the pinned FeatureBench source and CPU inputs. */
 import { randomBytes } from 'node:crypto';
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { BenchPathRoots } from '../../shared/contracts.js';
 import type { ToolchainConfig } from '../../shared/config.js';
 import {
@@ -22,7 +27,6 @@ import {
 import { allowlistedEnvironment, runBenchProcess, type BenchProcessOptions } from '../../shared/process.js';
 import {
   canonicalJson,
-  pythonEnvironmentSha256,
   sha256CanonicalJson,
   sha256File,
   sha256Tree,
@@ -54,6 +58,7 @@ export interface FeatureBenchExecOptions {
   workerScope?: string;
   onLifecycleToken?: (token: string) => void;
   onLifecycleStarted?: (token: string, pid: number | null, processStartIdentity: string | null) => void;
+  onLifecycleCandidates?: BenchProcessOptions['onLifecycleCandidates'];
   onLifecycleRecovered?: (token: string, recovery: 'complete' | 'failed') => void;
 }
 
@@ -75,12 +80,13 @@ export interface FeatureBenchTaskInput {
 }
 
 interface FeatureBenchContentManifest {
-  schemaVersion: 2;
+  schemaVersion: 3;
   kind: 'ultracode-featurebench-inputs';
   payloadSha256: string;
   source: SourceProvenance;
   pythonVersion: string;
   environmentSha256: string;
+  pythonRuntimeSha256: string;
   fbSha256: string;
   patchSha256: string;
   datasetMapSha256: string;
@@ -97,6 +103,7 @@ export interface PreparedFeatureBenchInputs {
   source: SourceProvenance;
   pythonVersion: string;
   environmentSha256: string;
+  pythonRuntimeSha256: string;
   patchSha256: string;
   datasetMapSha256: string;
   tasks: FeatureBenchTaskInput[];
@@ -140,6 +147,7 @@ async function execute(
   if (options.workerScope !== undefined) processOptions.workerScope = options.workerScope;
   if (options.onLifecycleToken !== undefined) processOptions.onLifecycleToken = options.onLifecycleToken;
   if (options.onLifecycleStarted !== undefined) processOptions.onLifecycleStarted = options.onLifecycleStarted;
+  if (options.onLifecycleCandidates !== undefined) processOptions.onLifecycleCandidates = options.onLifecycleCandidates;
   if (options.onLifecycleRecovered !== undefined) processOptions.onLifecycleRecovered = options.onLifecycleRecovered;
   const result = await runBenchProcess(command, argv, processOptions);
   return { stdout: result.stdout, stderr: result.stderr };
@@ -153,6 +161,19 @@ async function command(
   env?: NodeJS.ProcessEnv,
 ): Promise<string> {
   return (await executor(file, argv, { cwd, env })).stdout.trim();
+}
+
+/** Fail before preparation creates state or contacts Docker when uv is unavailable. */
+export async function preflightFeatureBenchUv(
+  executor: FeatureBenchExecutor,
+  cwd: string,
+): Promise<void> {
+  try {
+    const version = await command(executor, 'uv', ['--version'], cwd);
+    if (!/^uv\s+\S+/u.test(version)) throw new Error('malformed uv version output');
+  } catch {
+    throw new Error('FeatureBench prep requires uv on PATH (`uv --version` failed)');
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -304,15 +325,234 @@ function parseImageInspect(stdout: string, requested: string): Omit<FeatureBench
 function sourceTreeSha256(sourceDirectory: string): string {
   return sha256Tree(sourceDirectory, {
     exclude: ['.git', '.venv'],
-    excludePythonCacheArtifacts: true,
   });
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const path = relative(resolve(root), resolve(candidate));
+  return path === '' || (!path.startsWith('..') && !path.startsWith('/'));
+}
+
+function pythonRuntimeRoot(environmentDirectory: string): string {
+  const binary = realpathSync(join(environmentDirectory, 'bin', 'python'));
+  const root = resolve(binary, '..', '..');
+  const info = lstatSync(root);
+  if (!info.isDirectory() || info.isSymbolicLink() || !isWithin(root, binary)) {
+    throw new Error('FeatureBench Python runtime is not a real self-contained directory');
+  }
+  return root;
+}
+
+function assertFeatureBenchEnvironmentLinks(environmentDirectory: string, runtimeRoot: string): void {
+  const unexpected: string[] = [];
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const info = lstatSync(path);
+      if (info.isSymbolicLink()) {
+        let target: string;
+        try {
+          target = realpathSync(path);
+        } catch {
+          unexpected.push(relative(environmentDirectory, path));
+          continue;
+        }
+        if (!isWithin(environmentDirectory, target) && !isWithin(runtimeRoot, target)) {
+          unexpected.push(relative(environmentDirectory, path));
+        }
+      } else if (info.isDirectory()) {
+        walk(path);
+      }
+    }
+  };
+  walk(environmentDirectory);
+  if (unexpected.length > 0) {
+    throw new Error(`FeatureBench environment contains unattested external links: ${unexpected.sort().join(', ')}`);
+  }
+}
+
+/** Remove executable Python cache artifacts before publishing immutable inputs. */
+export function removeFeatureBenchPythonCacheArtifacts(root: string): void {
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const info = lstatSync(path);
+      if (entry.name === '__pycache__' || entry.name.endsWith('.pyc')) {
+        rmSync(path, { recursive: info.isDirectory(), force: true });
+      } else if (info.isDirectory()) {
+        walk(path);
+      }
+    }
+  };
+  walk(root);
+}
+
+export function assertNoFeatureBenchPythonCacheArtifacts(root: string): void {
+  const found: string[] = [];
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const info = lstatSync(path);
+      if (entry.name === '__pycache__' || entry.name.endsWith('.pyc')) {
+        found.push(relative(root, path));
+      } else if (info.isDirectory()) {
+        walk(path);
+      }
+    }
+  };
+  walk(root);
+  if (found.length > 0) {
+    throw new Error(`prepared FeatureBench inputs contain Python cache artifacts: ${found.sort().join(', ')}`);
+  }
+}
+
+export function featureBenchEnvironmentIdentity(environmentDirectory: string): {
+  environmentSha256: string;
+  pythonRuntimeSha256: string;
+} {
+  const runtimeRoot = pythonRuntimeRoot(environmentDirectory);
+  assertFeatureBenchEnvironmentLinks(environmentDirectory, runtimeRoot);
+  assertFeatureBenchEnvironmentLinks(runtimeRoot, runtimeRoot);
+  const pythonRuntimeSha256 = sha256Tree(runtimeRoot);
+  return {
+    pythonRuntimeSha256,
+    environmentSha256: sha256CanonicalJson({
+      treeSha256: sha256Tree(environmentDirectory),
+      pythonBinarySha256: sha256File(realpathSync(join(environmentDirectory, 'bin', 'python'))),
+      pythonRuntimeSha256,
+    }),
+  };
+}
+
+const RELOCATABLE_PYTHON_ENTRYPOINT_HEADER = `#!/bin/sh
+""":"
+launcher_dir=$(CDPATH= cd "$(dirname "$0")" && pwd -P)
+exec "$launcher_dir/python" "$0" "$@"
+":"""
+`;
+
+const ACTIVATION_SCRIPT_RE = /^(?:activate|deactivate)(?:[._-]|$)/iu;
+
+function containsStageReference(contents: Buffer | string, stageDirectory: string): boolean {
+  const value = typeof contents === 'string' ? Buffer.from(contents, 'utf8') : contents;
+  const stage = resolve(stageDirectory);
+  return value.includes(Buffer.from(stage, 'utf8'))
+    || value.includes(Buffer.from(pathToFileURL(stage).href, 'utf8'));
+}
+
+function removeRecordedDirectUrl(path: string, environmentDirectory: string): void {
+  const record = join(dirname(path), 'RECORD');
+  if (existsSync(record)) {
+    const contents = readFileSync(record, 'utf8');
+    const lines = contents.trimEnd().split(/\r?\n/u);
+    const retained = lines.filter((line) => {
+      const delimiter = line.indexOf(',');
+      const recordedPath = delimiter < 0 ? line : line.slice(0, delimiter);
+      return recordedPath !== 'direct_url.json' && !recordedPath.endsWith('/direct_url.json');
+    });
+    const mode = lstatSync(record).mode & 0o777;
+    writePrivateFileAtomic(environmentDirectory, record, `${retained.join('\n')}\n`);
+    chmodSync(record, mode);
+  }
+  rmSync(path);
+}
+
+function removeStageBoundMetadata(
+  directory: string,
+  stageDirectory: string,
+  environmentDirectory: string,
+): void {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    const info = lstatSync(path);
+    if (info.isDirectory()) {
+      removeStageBoundMetadata(path, stageDirectory, environmentDirectory);
+    } else if (info.isFile() && entry.name === 'direct_url.json') {
+      const contents = readFileSync(path);
+      if (containsStageReference(contents, stageDirectory)) removeRecordedDirectUrl(path, environmentDirectory);
+    }
+  }
+}
+
+function relocatePythonEntryPoint(path: string, environmentDirectory: string): boolean {
+  const contents = readFileSync(path);
+  const lineEnd = contents.indexOf(0x0a);
+  if (lineEnd < 0) return false;
+  const firstLine = contents.subarray(0, lineEnd).toString('utf8').replace(/\r$/u, '');
+  const pythonPrefix = `#!${join(environmentDirectory, 'bin', 'python')}`;
+  const suffix = firstLine.startsWith(pythonPrefix) ? firstLine.slice(pythonPrefix.length) : null;
+  if (suffix === null || !/^(?:3(?:\.\d+)?)?$/u.test(suffix)) return false;
+  const mode = lstatSync(path).mode & 0o777;
+  writePrivateFileAtomic(
+    environmentDirectory,
+    path,
+    Buffer.concat([Buffer.from(RELOCATABLE_PYTHON_ENTRYPOINT_HEADER, 'utf8'), contents.subarray(lineEnd + 1)]),
+  );
+  chmodSync(path, mode);
+  return true;
+}
+
+/** Replace stage-bound Python entry points with adjacent-interpreter launchers. */
+export function makeFeatureBenchEnvironmentRelocatable(
+  stageDirectory: string,
+  environmentDirectory: string,
+): void {
+  const binDirectory = join(environmentDirectory, 'bin');
+  let relocatedFb = false;
+  for (const entry of readdirSync(binDirectory, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const path = join(binDirectory, entry.name);
+    if (relocatePythonEntryPoint(path, environmentDirectory)) {
+      if (entry.name === 'fb') relocatedFb = true;
+      continue;
+    }
+    if (ACTIVATION_SCRIPT_RE.test(entry.name)
+      && containsStageReference(readFileSync(path), stageDirectory)) {
+      rmSync(path);
+    }
+  }
+  if (!relocatedFb) throw new Error('FeatureBench uv environment did not produce the expected fb entry point');
+  removeStageBoundMetadata(environmentDirectory, stageDirectory, environmentDirectory);
+  assertNoFeatureBenchStageReferences(environmentDirectory, stageDirectory);
+}
+
+/** Reject any literal or file-URL reference to the random preparation stage. */
+export function assertNoFeatureBenchStageReferences(root: string, stageDirectory: string): void {
+  const references: string[] = [];
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const info = lstatSync(path);
+      if (info.isSymbolicLink()) {
+        if (containsStageReference(readlinkSync(path), stageDirectory)) references.push(relative(root, path));
+      } else if (info.isDirectory()) {
+        walk(path);
+      } else if (info.isFile() && containsStageReference(readFileSync(path), stageDirectory)) {
+        references.push(relative(root, path));
+      }
+    }
+  };
+  walk(root);
+  if (references.length > 0) {
+    throw new Error(`FeatureBench preparation retains stage-path references: ${references.sort().join(', ')}`);
+  }
+}
+
+function requireRelocatableFeatureBenchLauncher(path: string): void {
+  const info = lstatSync(path);
+  const header = Buffer.from(RELOCATABLE_PYTHON_ENTRYPOINT_HEADER, 'utf8');
+  const contents = readFileSync(path);
+  if (!info.isFile() || (info.mode & 0o111) === 0 || !contents.subarray(0, header.length).equals(header)) {
+    throw new Error('prepared FeatureBench fb launcher is not relocation-safe');
+  }
 }
 
 function contentManifest(directory: string): FeatureBenchContentManifest {
   const value = readPrivateJson(directory, join(directory, CONTENT_MANIFEST)) as Partial<FeatureBenchContentManifest>;
   const sha = (candidate: unknown): candidate is string => typeof candidate === 'string' && /^[a-f0-9]{64}$/.test(candidate);
-  if (value.schemaVersion !== 2 || value.kind !== 'ultracode-featurebench-inputs'
+  if (value.schemaVersion !== 3 || value.kind !== 'ultracode-featurebench-inputs'
     || !sha(value.payloadSha256) || !sha(value.environmentSha256) || !sha(value.fbSha256)
+    || !sha(value.pythonRuntimeSha256)
     || !sha(value.patchSha256) || !sha(value.datasetMapSha256) || !sha(value.toolchainPayloadSha256)
     || value.pythonVersion !== FEATUREBENCH_PYTHON_VERSION || value.source === undefined
     || value.source.repository !== FEATUREBENCH_REPOSITORY || value.source.revision !== FEATUREBENCH_SOURCE_REVISION
@@ -333,7 +573,8 @@ function contentManifest(directory: string): FeatureBenchContentManifest {
 export function loadPreparedFeatureBenchInputs(directory: string): PreparedFeatureBenchInputs {
   const resolved = resolve(directory);
   const manifest = contentManifest(resolved);
-  const payloadSha256 = sha256Tree(resolved, { exclude: [CONTENT_MANIFEST], excludePythonCacheArtifacts: true });
+  assertNoFeatureBenchPythonCacheArtifacts(resolved);
+  const payloadSha256 = sha256Tree(resolved, { exclude: [CONTENT_MANIFEST] });
   const identity: Partial<FeatureBenchContentManifest> = { ...manifest };
   delete identity.payloadSha256;
   if (payloadSha256 !== manifest.payloadSha256 || resolved !== resolve(resolved, '..', payloadSha256)
@@ -344,12 +585,15 @@ export function loadPreparedFeatureBenchInputs(directory: string): PreparedFeatu
   const environmentDirectory = join(sourceDirectory, '.venv');
   const pythonBinary = join(environmentDirectory, 'bin', 'python');
   const fbBinary = join(environmentDirectory, 'bin', 'fb');
+  requireRelocatableFeatureBenchLauncher(fbBinary);
   const mapPath = join(sourceDirectory, ...FEATUREBENCH_DATASET_MAP.split('/'));
+  const environmentIdentity = featureBenchEnvironmentIdentity(environmentDirectory);
   const parsedMap = parseFeatureBenchDatasetMap(JSON.parse(
     readRegularFileWithinRoot(sourceDirectory, FEATUREBENCH_DATASET_MAP).toString('utf8'),
   ));
   if (sourceTreeSha256(sourceDirectory) !== manifest.source.treeSha256
-    || pythonEnvironmentSha256(environmentDirectory) !== manifest.environmentSha256
+    || environmentIdentity.environmentSha256 !== manifest.environmentSha256
+    || environmentIdentity.pythonRuntimeSha256 !== manifest.pythonRuntimeSha256
     || sha256File(fbBinary) !== manifest.fbSha256 || sha256File(mapPath) !== manifest.datasetMapSha256
     || canonicalJson(Object.keys(parsedMap.tasks)) !== canonicalJson(manifest.tasks.map((task) => task.taskId))
     || manifest.tasks.some((task) => task.imageRequested !== parsedMap.tasks[task.taskId]
@@ -372,6 +616,7 @@ export function loadPreparedFeatureBenchInputs(directory: string): PreparedFeatu
     source: manifest.source,
     pythonVersion: manifest.pythonVersion,
     environmentSha256: manifest.environmentSha256,
+    pythonRuntimeSha256: manifest.pythonRuntimeSha256,
     patchSha256: manifest.patchSha256,
     datasetMapSha256: manifest.datasetMapSha256,
     tasks: manifest.tasks,
@@ -384,7 +629,7 @@ export function loadCurrentPreparedFeatureBenchInputs(roots: BenchPathRoots): Pr
     schemaVersion?: unknown;
     identity?: unknown;
   };
-  if (current.schemaVersion !== 2 || typeof current.identity !== 'string' || !/^[a-f0-9]{64}$/.test(current.identity)) {
+  if (current.schemaVersion !== 3 || typeof current.identity !== 'string' || !/^[a-f0-9]{64}$/.test(current.identity)) {
     throw new Error('FeatureBench current preparation pointer is malformed');
   }
   return loadPreparedFeatureBenchInputs(featureBenchPreparedDir(roots, current.identity));
@@ -396,6 +641,7 @@ export async function prepareFeatureBenchInputs(
   toolchainConfig: ToolchainConfig,
   executor: FeatureBenchExecutor = execute,
 ): Promise<PreparedFeatureBenchInputs> {
+  await preflightFeatureBenchUv(executor, roots.benchRoot);
   requireFeatureBenchHost();
   const plan = planFeatureBenchPreparation(roots);
   const cache = ensureRealDirectoryWithin(roots.cacheRoot, featureBenchCacheRoot(roots));
@@ -418,7 +664,27 @@ export async function prepareFeatureBenchInputs(
     await command(executor, 'git', ['-C', sourceDirectory, 'apply', plan.patch], sourceDirectory);
     const env = allowlistedEnvironment(process.env);
     env.PYTHONDONTWRITEBYTECODE = '1';
-    await command(executor, 'uv', ['sync', '--frozen', '--python', plan.pythonVersion], sourceDirectory, env);
+    env.UV_LINK_MODE = 'copy';
+    env.UV_NO_CONFIG = '1';
+    await command(
+      executor,
+      'uv',
+      [
+        'sync',
+        '--frozen',
+        '--no-editable',
+        '--no-config',
+        '--link-mode',
+        'copy',
+        '--managed-python',
+        '--python',
+        plan.pythonVersion,
+      ],
+      sourceDirectory,
+      env,
+    );
+    const environmentDirectory = join(sourceDirectory, '.venv');
+    makeFeatureBenchEnvironmentRelocatable(stage, environmentDirectory);
     const pythonBinary = join(sourceDirectory, '.venv', 'bin', 'python');
     const fbBinary = join(sourceDirectory, '.venv', 'bin', 'fb');
     const pythonVersion = await command(executor, pythonBinary, ['--version'], sourceDirectory, env);
@@ -452,18 +718,20 @@ export async function prepareFeatureBenchInputs(
         ...parseImageInspect(inspect, imageRequested),
       });
     }
+    removeFeatureBenchPythonCacheArtifacts(stage);
+    assertNoFeatureBenchStageReferences(stage, stage);
     const source: SourceProvenance = {
       repository: plan.repository,
       revision: plan.revision,
       treeSha256: sourceTreeSha256(sourceDirectory),
     };
-    const environmentDirectory = join(sourceDirectory, '.venv');
+    const environmentIdentity = featureBenchEnvironmentIdentity(environmentDirectory);
     const manifestWithoutPayload = {
-      schemaVersion: 2 as const,
+      schemaVersion: 3 as const,
       kind: 'ultracode-featurebench-inputs' as const,
       source,
       pythonVersion: plan.pythonVersion,
-      environmentSha256: pythonEnvironmentSha256(environmentDirectory),
+      ...environmentIdentity,
       fbSha256: sha256File(fbBinary),
       patchSha256: sha256File(plan.patch),
       datasetMapSha256: sha256File(mapPath),
@@ -471,16 +739,26 @@ export async function prepareFeatureBenchInputs(
       toolchainPayloadSha256: toolchain.provenance.payloadSha256,
     };
     writePrivateJsonAtomic(stage, join(stage, PREPARED_IDENTITY), manifestWithoutPayload);
-    const payloadSha256 = sha256Tree(stage, { excludePythonCacheArtifacts: true });
+    const payloadSha256 = sha256Tree(stage);
     writePrivateJsonAtomic(stage, join(stage, CONTENT_MANIFEST), { ...manifestWithoutPayload, payloadSha256 });
     const target = featureBenchPreparedDir(roots, payloadSha256);
+    let publishedTarget = false;
     if (existsSync(target)) rmSync(stage, { recursive: true, force: true });
     else {
       mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
       renameSync(stage, target);
+      publishedTarget = true;
     }
-    writePrivateJsonAtomic(cache, featureBenchCurrentFile(roots), { schemaVersion: 2, identity: payloadSha256 });
-    return loadPreparedFeatureBenchInputs(target);
+    try {
+      let prepared = loadPreparedFeatureBenchInputs(target);
+      await command(executor, prepared.fbBinary, ['--help'], cache, env);
+      prepared = loadPreparedFeatureBenchInputs(target);
+      writePrivateJsonAtomic(cache, featureBenchCurrentFile(roots), { schemaVersion: 3, identity: payloadSha256 });
+      return prepared;
+    } catch (error) {
+      if (publishedTarget) rmSync(target, { recursive: true, force: true });
+      throw error;
+    }
   } catch (error) {
     rmSync(stage, { recursive: true, force: true });
     throw error;

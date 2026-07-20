@@ -53,6 +53,7 @@ describe('suite registry contracts', () => {
     ]);
     for (const suite of suiteRegistry.list()) {
       expect(Object.keys(suite.commands)).toEqual([...SUITE_COMMANDS[suite.suite]]);
+      expect(suite.cleanup, `${suite.suite} runtime cleanup`).toBeTypeOf('function');
     }
   });
 
@@ -67,6 +68,12 @@ describe('suite registry contracts', () => {
     expect(() => createSuiteRegistry([adapter('featurebench'), adapter('swe-marathon')])).toThrow(
       /missing swebench-pro/,
     );
+  });
+
+  it('settles every production suite resource hook when its registry is empty', async () => {
+    for (const suite of suiteRegistry.list()) {
+      await expect(suite.cleanup!(), suite.suite).resolves.toBeUndefined();
+    }
   });
 
   it('keeps leaf contracts independent of registry and adapters', () => {

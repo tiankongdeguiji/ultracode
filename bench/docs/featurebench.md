@@ -17,11 +17,15 @@ another grader.
 | Runtime | Linux x64, CPU only |
 
 `prep` checks out the exact source revision, verifies and applies
-`bench/suites/featurebench/codex-chatgpt.patch`, performs a frozen `uv sync`,
+`bench/suites/featurebench/codex-chatgpt.patch`, performs a frozen,
+configuration-isolated `uv sync` with copied packages and managed Python,
 pulls the pinned split, and writes the complete task-to-image map inside Git
 metadata. Every image is resolved to one repository digest and local image ID.
 The prepared source, environment, patch, dataset map, task inventory, images,
 and common toolchain are content-addressed and re-attested before native work.
+Python bytecode caches are removed and forbidden in published inputs. The
+external managed-Python base runtime is hashed in full, and environment links
+may resolve only within the publication or that re-attested runtime.
 
 The patch preserves upstream inference and evaluation while adding the
 experiment controls: digest-pinned images, CPU and memory limits, CPU-only

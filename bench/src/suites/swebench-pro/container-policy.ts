@@ -5,8 +5,23 @@ import { readRegularFileWithinRoot } from '../../shared/paths.js';
 import { sha256CanonicalJson } from '../../shared/provenance.js';
 import type { SwebenchProConfig } from './config.js';
 
+const PREFERRED_SESSION_TASK_ID = 1_000;
+
+export interface SessionTaskIdentity {
+  uid: number;
+  gid: number;
+}
+
+/** Choose a stable positive task identity distinct from both host owner ids. */
+export function sessionTaskIdentity(artifactOwner: SessionTaskIdentity): SessionTaskIdentity {
+  const distinct = (owner: number): number => owner === PREFERRED_SESSION_TASK_ID
+    ? PREFERRED_SESSION_TASK_ID + 1
+    : PREFERRED_SESSION_TASK_ID;
+  return { uid: distinct(artifactOwner.uid), gid: distinct(artifactOwner.gid) };
+}
+
 const boundedPolicySchema = z.strictObject({
-  pidsLimit: z.number().int().positive(),
+  pidsLimit: z.literal(1_024),
   securityOpt: z.tuple([z.literal('no-new-privileges')]),
   capDrop: z.tuple([z.literal('ALL')]),
   capAdd: z.array(z.enum(['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'])),
@@ -32,8 +47,12 @@ const containerPolicySchema = z.strictObject({
 
 export type SwebenchProContainerPolicy = z.infer<typeof containerPolicySchema>;
 
+/** Reviewed canonical JSON identity of the complete static container policy. */
+export const SWEBENCH_PRO_CONTAINER_POLICY_SHA256 =
+  '7eb4bcc8ae3ccfec738390ceb2fe97076abc3a6b12a4df2342aaa8333e0b8c7d';
+
 export interface EvaluatorContainerPolicy {
-  pidsLimit: number;
+  pidsLimit: 1_024;
   securityOpt: ['no-new-privileges'];
   capDrop: ['ALL'];
   capAdd: [];
@@ -42,14 +61,20 @@ export interface EvaluatorContainerPolicy {
 }
 
 export function loadSwebenchProContainerPolicy(roots: BenchPathRoots): SwebenchProContainerPolicy {
-  return containerPolicySchema.parse(JSON.parse(readRegularFileWithinRoot(
+  const policy = containerPolicySchema.parse(JSON.parse(readRegularFileWithinRoot(
     roots.benchRoot,
     'suites/swebench-pro/container-policy.json',
   ).toString('utf8')));
+  containerPolicySha256(policy);
+  return policy;
 }
 
 export function containerPolicySha256(policy: SwebenchProContainerPolicy): string {
-  return sha256CanonicalJson(policy);
+  const observed = sha256CanonicalJson(policy);
+  if (observed !== SWEBENCH_PRO_CONTAINER_POLICY_SHA256) {
+    throw new Error('SWE-bench Pro static container policy does not match its reviewed canonical hash');
+  }
+  return observed;
 }
 
 /** Exact Docker CLI policy segment used for every agent session container. */
@@ -57,12 +82,18 @@ export function sessionContainerPolicyArgv(
   policy: SwebenchProContainerPolicy,
   docker: SwebenchProConfig['docker'],
 ): string[] {
+  containerPolicySha256(policy);
+  assertManifestResources(docker);
+  const nanoCpus = dockerNanoCpus(docker.cpus);
+  const wholeCpus = Math.floor(nanoCpus / 1_000_000_000);
+  const fractionalCpus = String(nanoCpus % 1_000_000_000).padStart(9, '0').replace(/0+$/u, '');
+  const cpus = fractionalCpus === '' ? String(wholeCpus) : `${wholeCpus}.${fractionalCpus}`;
   return [
     '--pids-limit', String(policy.session.pidsLimit),
     ...policy.session.securityOpt.flatMap((option) => ['--security-opt', option]),
     ...policy.session.capDrop.flatMap((capability) => ['--cap-drop', capability]),
     ...policy.session.capAdd.flatMap((capability) => ['--cap-add', capability]),
-    '--cpus', String(docker.cpus),
+    '--cpus', cpus,
     '--memory', String(docker.memoryBytes),
   ];
 }
@@ -72,10 +103,9 @@ export function evaluatorContainerPolicy(
   policy: SwebenchProContainerPolicy,
   docker: SwebenchProConfig['docker'],
 ): EvaluatorContainerPolicy {
-  const nanoCpus = Math.round(docker.cpus * 1_000_000_000);
-  if (!Number.isSafeInteger(nanoCpus) || nanoCpus <= 0) {
-    throw new Error('SWE-bench Pro evaluator CPU limit cannot be represented as NanoCPUs');
-  }
+  containerPolicySha256(policy);
+  assertManifestResources(docker);
+  const nanoCpus = dockerNanoCpus(docker.cpus);
   return {
     pidsLimit: policy.evaluator.pidsLimit,
     securityOpt: [...policy.evaluator.securityOpt],
@@ -84,4 +114,25 @@ export function evaluatorContainerPolicy(
     nanoCpus,
     memoryBytes: docker.memoryBytes,
   };
+}
+
+/** Convert a manifest CPU limit to Docker's exact shared nanocore unit. */
+export function dockerNanoCpus(cpus: number): number {
+  if (typeof cpus !== 'number' || !Number.isFinite(cpus)) {
+    throw new Error('SWE-bench Pro manifest CPU limit is invalid');
+  }
+  const nanoCpus = cpus * 1_000_000_000;
+  if (!Number.isSafeInteger(nanoCpus) || nanoCpus <= 0) {
+    throw new Error('SWE-bench Pro CPU limit must be an exact positive number of nanocores');
+  }
+  return nanoCpus;
+}
+
+function assertManifestResources(docker: SwebenchProConfig['docker']): void {
+  dockerNanoCpus(docker.cpus);
+  if (typeof docker.memoryBytes !== 'number'
+    || !Number.isSafeInteger(docker.memoryBytes)
+    || docker.memoryBytes <= 0) {
+    throw new Error('SWE-bench Pro manifest memory limit is invalid');
+  }
 }

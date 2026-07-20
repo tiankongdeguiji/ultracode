@@ -1,10 +1,14 @@
 /** Native task status and fail-closed patch/session classification. */
-import { existsSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { FAILURE_CODES, type FailureCode } from '../../shared/contracts.js';
-import { readRegularFileWithinRoot, replaceArtifactFile } from '../../shared/paths.js';
-import type { SessionMeta, TaskStatus } from './types.js';
+import {
+  readRegularFileWithinRoot,
+  replaceArtifactFile,
+  resolveRegularFileWithinRoot,
+} from '../../shared/paths.js';
+import type { PatchArtifactRead, SessionMeta, TaskStatus } from './types.js';
 
 const statusSchema = z.strictObject({
   schemaVersion: z.literal(2),
@@ -38,9 +42,10 @@ const sessionMetaSchema = z.strictObject({
   }
 });
 
-const PATCH_FAIL_BYTES = 10_000_000;
+export const PATCH_FAIL_BYTES = 10_000_000;
 const PATCH_FLAG_BYTES = 2_000_000;
 const EXCLUDED_SEGMENTS = new Set(['.ultracode', '.agents', '.codex']);
+const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 
 export interface PatchValidation {
   failure: FailureCode | null;
@@ -77,6 +82,36 @@ export function parseSessionMeta(value: unknown): SessionMeta {
   return sessionMetaSchema.parse(value);
 }
 
+/** Distinguish absence, zero bytes, oversize evidence, and unsafe reads without allocating oversize patches. */
+export function readPatchArtifact(taskDirectory: string): PatchArtifactRead {
+  try {
+    const path = resolveRegularFileWithinRoot(taskDirectory, 'out/patch.diff', 'patch artifact');
+    const fd = openSync(path, constants.O_RDONLY | NOFOLLOW);
+    let patchBytes = 0;
+    try {
+      const info = fstatSync(fd);
+      const leaf = lstatSync(path);
+      if (!info.isFile() || info.nlink !== 1 || leaf.isSymbolicLink()
+        || leaf.dev !== info.dev || leaf.ino !== info.ino) {
+        throw new Error(`patch artifact changed while it was inspected: ${path}`);
+      }
+      patchBytes = info.size;
+    } finally {
+      closeSync(fd);
+    }
+    if (patchBytes === 0) return { kind: 'empty', patchBytes: 0 };
+    if (patchBytes > PATCH_FAIL_BYTES) return { kind: 'too-large', patchBytes };
+    const bytes = readRegularFileWithinRoot(taskDirectory, 'out/patch.diff', PATCH_FAIL_BYTES);
+    if (bytes.length === 0) return { kind: 'empty', patchBytes: 0 };
+    return { kind: 'patch', patch: bytes.toString('utf8'), patchBytes: bytes.length };
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return { kind: 'missing', patchBytes: 0 };
+    }
+    return { kind: 'unsafe', failure: error };
+  }
+}
+
 function excludedPathLeak(patch: string): boolean {
   for (const line of patch.split('\n')) {
     if (!line.startsWith('diff --git ')) continue;
@@ -93,9 +128,31 @@ export function validatePatch(patch: string): PatchValidation {
   const annotations: string[] = [];
   if (bytes > PATCH_FLAG_BYTES) annotations.push('large-patch');
   if (excludedPathLeak(patch)) annotations.push('excluded-path-leak');
-  if (patch.trim() === '') return { failure: 'empty-patch', annotations };
+  if (bytes === 0) return { failure: 'empty-patch', annotations };
   if (bytes > PATCH_FAIL_BYTES) return { failure: 'patch-too-large', annotations };
   return { failure: null, annotations };
+}
+
+/** Convert a typed patch read into durable status evidence without collapsing unsafe reads into absence. */
+export function classifyPatchArtifact(read: PatchArtifactRead): {
+  phase: 'session-done' | 'patched';
+  patchBytes?: number;
+  validation: PatchValidation;
+} {
+  if (read.kind === 'patch') {
+    return { phase: 'patched', patchBytes: read.patchBytes, validation: validatePatch(read.patch) };
+  }
+  if (read.kind === 'too-large') {
+    return {
+      phase: 'patched',
+      patchBytes: read.patchBytes,
+      validation: { failure: 'patch-too-large', annotations: ['large-patch'] },
+    };
+  }
+  if (read.kind === 'unsafe') {
+    return { phase: 'session-done', validation: { failure: 'artifact-unsafe', annotations: [] } };
+  }
+  return { phase: 'session-done', patchBytes: 0, validation: validatePatch('') };
 }
 
 /** Driver backstops are infrastructure; only native timeout exits are agent losses. */
@@ -104,6 +161,9 @@ export function classifyOutcome(
   patch: PatchValidation | null,
 ): { failure: FailureCode | null; annotations: string[] } {
   const annotations = [...(patch?.annotations ?? [])];
+  if (patch?.failure === 'artifact-unsafe' || patch?.failure === 'patch-too-large') {
+    return { failure: patch.failure, annotations };
+  }
   if (meta === null) return { failure: 'driver-watchdog', annotations: [...annotations, 'backstop-kill'] };
   if (meta.baseSha && meta.expectedBase && meta.baseSha !== meta.expectedBase) annotations.push('base-sha-mismatch');
   if (meta.patchBytes === 0 && meta.ucRuns.length > 0) annotations.push('unmerged-workspace');

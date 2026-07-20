@@ -113,5 +113,9 @@ export const featureBenchAdapter: SuiteAdapter<'featurebench'> = {
   suite: 'featurebench',
   displayName: 'FeatureBench',
   description: 'Pinned CPU FeatureBench inference and official native evaluation',
+  async cleanup() {
+    const runner = await import('./runner.js');
+    await runner.cleanupFeatureBenchRuntime();
+  },
   commands: { prep: prepSpec, run: runSpec, report: reportSpec },
 };

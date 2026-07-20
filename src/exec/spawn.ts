@@ -7,10 +7,16 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
+  discoverWorkerProcessesForTokens,
   findWorkerProcessesForTokens,
+  MAX_DARWIN_CANDIDATE_PROCESSES,
+  readProcessIdentitySnapshot,
   signalTrackedWorkerProcesses,
   signalWorkerProcessTokens,
   signalWorkerProcesses,
+  type ProcessInspectionOptions,
+  type TrackedProcess,
+  type TrackedWorkerProcess,
   WORKER_SCOPE_ENV,
   WORKER_TOKEN_ENV,
   workerScopeValue,
@@ -57,6 +63,14 @@ export interface SpawnAgentOptions {
   workerScope?: string;
   /** Persist the lifecycle token before the backend process can start. */
   onWorkerToken?: (token: string) => void;
+  /** Persist macOS identities before a cleanup signal can act on them. */
+  onWorkerCandidates?: (
+    token: string,
+    candidates: readonly TrackedProcess[],
+    complete: boolean,
+  ) => void;
+  /** Explicit platform/process seam for deterministic supervision tests. */
+  processInspection?: ProcessInspectionOptions;
 }
 
 export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentOptions): SpawnedAgent {
@@ -82,29 +96,36 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
   }
 
   const pid = child.pid;
-  const groupAlive = (): boolean => {
-    if (!pid) return false;
+  const platform = opts.processInspection?.platform ?? process.platform;
+  const processGroupStatus = (): 'alive' | 'absent' | 'unknown' => {
+    if (!pid) return 'absent';
     try {
       process.kill(-pid, 0);
-      return true;
-    } catch {
-      return false;
+      return 'alive';
+    } catch (error) {
+      if (platform !== 'darwin') return 'absent';
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH') return 'absent';
+      if (code === 'EPERM') return 'alive';
+      return 'unknown';
     }
   };
   let groupTargetRetired = false;
   const retireGroupIfGone = (): boolean => {
-    if (!groupTargetRetired && !groupAlive()) groupTargetRetired = true;
+    if (!groupTargetRetired && processGroupStatus() === 'absent') groupTargetRetired = true;
     return groupTargetRetired;
   };
 
   const signalGroup = (signal: NodeJS.Signals): boolean => {
     if (!pid || groupTargetRetired) return false;
-    if (!groupAlive()) {
+    const status = processGroupStatus();
+    if (status === 'absent') {
       // Never target this numeric PGID after observing it absent; a later
       // process group may reuse the id during or after cleanup.
       groupTargetRetired = true;
       return false;
     }
+    if (status === 'unknown') return false;
     try {
       process.kill(-pid, signal);
       return true;
@@ -127,11 +148,103 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     // Codex's Linux sandbox calls setsid()/bwrap --new-session, so descendants
     // can leave the worker PGID. The inherited token is the containment
     // boundary for those escaped sessions.
-    signalWorkerProcesses(workerToken, signal, opts.workerScope);
+    if (platform === 'darwin') {
+      signalWorkerProcesses(workerToken, signal, opts.workerScope, opts.processInspection);
+    } else {
+      signalWorkerProcesses(workerToken, signal, opts.workerScope);
+    }
   };
+
+  const retainedDarwinCandidates = new Map<string, TrackedWorkerProcess>();
+  let darwinInventoryComplete = false;
+  let darwinCandidateOverflow = false;
+  let persistedDarwinInventory = '';
 
   const cleanupEscaped = async (graceMs = 500): Promise<number> => {
     retireGroupIfGone();
+    if (platform === 'darwin') {
+      const retained = retainedDarwinCandidates;
+      const identityKey = (proc: TrackedProcess): string => `${proc.pid}:${proc.starttime}:${proc.pgrp}`;
+      const persistCandidates = (complete: boolean): void => {
+        const candidates = [...retained.values()]
+          .map(({ token: _token, ...proc }) => proc)
+          .sort((left, right) => left.pid - right.pid);
+        const fingerprint = `${Number(complete)}:${candidates.map(identityKey).join(',')}`;
+        if (fingerprint === persistedDarwinInventory) return;
+        opts.onWorkerCandidates?.(workerToken, candidates, complete);
+        persistedDarwinInventory = fingerprint;
+      };
+      const discoverCandidates = (): boolean => {
+        const discovery = discoverWorkerProcessesForTokens(
+          [workerToken],
+          opts.workerScope,
+          undefined,
+          opts.processInspection,
+        );
+        for (const candidate of discovery.processes) {
+          const key = identityKey(candidate);
+          if (retained.has(key)) continue;
+          if (retained.size >= MAX_DARWIN_CANDIDATE_PROCESSES) {
+            darwinCandidateOverflow = true;
+            continue;
+          }
+          retained.set(key, candidate);
+        }
+        darwinInventoryComplete = discovery.complete
+          && !darwinCandidateOverflow;
+        persistCandidates(darwinInventoryComplete);
+        return darwinInventoryComplete;
+      };
+      let emptyPasses = 0;
+      const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
+        let delayMs = 25;
+        for (;;) {
+          signalGroup(signal);
+          const discoveredCompletely = discoverCandidates();
+          const candidates = [...retained.values()];
+          signalTrackedWorkerProcesses(candidates, signal, opts.processInspection);
+          const live = readProcessIdentitySnapshot(
+            candidates.map((candidate) => candidate.pid),
+            opts.processInspection,
+          );
+          retireGroupIfGone();
+          const candidatesAbsent = live.complete && candidates.every((candidate) => {
+            const identity = live.identities.get(candidate.pid);
+            return identity === undefined
+              || identity.starttime !== candidate.starttime
+              || identity.pgrp !== candidate.pgrp;
+          });
+          emptyPasses = discoveredCompletely && candidatesAbsent && groupTargetRetired
+            ? emptyPasses + 1
+            : 0;
+          if (emptyPasses >= 2) return true;
+          if (Date.now() >= deadline) return false;
+          await sleep(delayMs);
+          delayMs = Math.min(delayMs * 2, 100);
+        }
+      };
+      if (await sweepUntil('SIGTERM', Date.now() + graceMs)) {
+        ACTIVE_WORKERS.delete(workerToken);
+        return 0;
+      }
+      if (await sweepUntil('SIGKILL', Date.now() + graceMs)) {
+        ACTIVE_WORKERS.delete(workerToken);
+        return 0;
+      }
+      retireGroupIfGone();
+      const finalIdentities = readProcessIdentitySnapshot(
+        [...retained.values()].map((candidate) => candidate.pid),
+        opts.processInspection,
+      );
+      const liveCandidates = [...retained.values()].filter((candidate) => {
+        const identity = finalIdentities.identities.get(candidate.pid);
+        return identity?.starttime === candidate.starttime && identity.pgrp === candidate.pgrp;
+      }).length;
+      return liveCandidates
+        + Number(!groupTargetRetired)
+        + Number(!darwinInventoryComplete || !finalIdentities.complete)
+        + 1;
+    }
     const tokenProcesses = () => findWorkerProcessesForTokens([workerToken], opts.workerScope);
     const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
       let delayMs = 25;

@@ -12,6 +12,16 @@ export class OwnershipUnsafeCleanupError extends Error {
   }
 }
 
+/** Native artifact evidence could not be read without weakening containment checks. */
+export class ArtifactUnsafeError extends Error {
+  readonly code = 'artifact-unsafe' as const;
+
+  constructor(message: string, failure?: unknown) {
+    super(message, failure === undefined ? undefined : { cause: failure });
+    this.name = 'ArtifactUnsafeError';
+  }
+}
+
 export function ownershipUnsafe(message: string, failure?: unknown): OwnershipUnsafeCleanupError {
   if (failure instanceof OwnershipUnsafeCleanupError) return failure;
   return new OwnershipUnsafeCleanupError(message, failure === undefined ? [] : [failure]);

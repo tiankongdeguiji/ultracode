@@ -15,6 +15,7 @@ import {
 import {
   evaluatorProcessArgv,
   evaluatorPolicyDocument,
+  evaluatorPolicyDocumentSha256,
   runOfficialEvaluator,
   type EvaluatorProcessExecutor,
 } from '../../bench/src/suites/swebench-pro/verifier.js';
@@ -101,9 +102,22 @@ const emptyDocker = async (argv: readonly string[]): Promise<string> => {
   throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
 };
 
+const evaluatorImages = new Map(['task-a', 'task-b'].map((taskId) => [taskId, {
+  reference: 'jefzda/sweap-images:owner.repo-task',
+  localId: `sha256:${'c'.repeat(64)}`,
+}]));
+const evaluatorInvocationStarts = new Map([
+  ['11111111-1111-4111-8111-111111111111', 0],
+]);
+
 describe('official SWE-bench Pro evaluator seam', () => {
   it('records exact non-empty invocation and artifacts while filtering native output', async () => {
     const { runDirectory, evaluatorDirectory } = evaluatorFixture();
+    const dockerTimeouts: number[] = [];
+    const boundedDocker = async (argv: readonly string[], timeoutMs?: number): Promise<string> => {
+      dockerTimeouts.push(timeoutMs!);
+      return emptyDocker(argv);
+    };
     const calls: Array<{ command: string; argv: readonly string[]; options: BenchProcessOptions }> = [];
     const processExecutor: EvaluatorProcessExecutor = async (command, argv, options) => {
       calls.push({ command, argv, options });
@@ -127,7 +141,9 @@ describe('official SWE-bench Pro evaluator seam', () => {
       predictions: [prediction],
       instances: [instanceFromRow(row('task-a')), instanceFromRow(row('task-b'))],
       containerPolicy,
-      docker: emptyDocker,
+      imageIdentities: evaluatorImages,
+      invocationStartedMs: evaluatorInvocationStarts,
+      docker: boundedDocker,
       processExecutor,
     });
     const verifierRoot = join(runDirectory, 'native/verifier/armA');
@@ -135,6 +151,7 @@ describe('official SWE-bench Pro evaluator seam', () => {
     const predictions = join(verifierRoot, 'predictions.json');
     const output = join(verifierRoot, 'output');
     const policy = join(verifierRoot, 'evaluator-policy.json');
+    const policyDocument = evaluatorPolicyDocument(config, containerPolicy);
     expect(calls).toEqual([{
       command: '/test/python',
       argv: evaluatorProcessArgv({
@@ -142,6 +159,7 @@ describe('official SWE-bench Pro evaluator seam', () => {
         predictions,
         outputDirectory: output,
         policy,
+        policySha256: evaluatorPolicyDocumentSha256(policyDocument),
         workers: 3,
         runId: 'pilot1',
         armLabel: 'a',
@@ -152,13 +170,15 @@ describe('official SWE-bench Pro evaluator seam', () => {
     expect(result.verdicts).toEqual({ 'task-a': true });
     expect(result.malformedTaskIds).toEqual([]);
     expect(result.processFailure).toBeNull();
+    expect(dockerTimeouts.length).toBeGreaterThan(0);
+    expect(dockerTimeouts.every((timeoutMs) => Number.isSafeInteger(timeoutMs) && timeoutMs > 0)).toBe(true);
     expect(result.resultRelativePath).toBe('native/verifier/armA/output/eval_results.json');
     expect(readFileSync(rawSamples, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
       expect.objectContaining({ instance_id: 'task-a', before_repo_set_cmd: 'prepare' }),
       expect.objectContaining({ instance_id: 'task-b', selected_test_files_to_run: 'test.ts' }),
     ]);
     expect(JSON.parse(readFileSync(predictions, 'utf8'))).toEqual([prediction]);
-    expect(JSON.parse(readFileSync(policy, 'utf8'))).toEqual(evaluatorPolicyDocument(config, containerPolicy));
+    expect(JSON.parse(readFileSync(policy, 'utf8'))).toEqual(policyDocument);
     expect(JSON.parse(readFileSync(join(verifierRoot, 'invocation.json'), 'utf8'))).toMatchObject({
       launched: true,
       exitCode: 0,
@@ -204,6 +224,8 @@ describe('official SWE-bench Pro evaluator seam', () => {
       predictions: [{ instance_id: 'task-a', patch: 'diff', prefix: 'armA' }],
       instances: [instanceFromRow(row('task-a'))],
       containerPolicy,
+      imageIdentities: evaluatorImages,
+      invocationStartedMs: evaluatorInvocationStarts,
       docker: emptyDocker,
       processExecutor,
     });

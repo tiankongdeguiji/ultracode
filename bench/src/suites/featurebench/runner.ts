@@ -276,6 +276,7 @@ function currentControlPlaneHashes(roots: BenchPathRoots): FeatureBenchManifest[
     failurePolicySha256: sourcePolicyHash(roots, FAILURE_POLICY_SHA256, ['src/shared/failure.ts']),
     reportPolicySha256: sourcePolicyHash(roots, REPORT_POLICY_SHA256, ['src/shared/report.ts']),
     adapterPolicySha256: sourcePolicyHash(roots, FEATUREBENCH_ADAPTER_POLICY_SHA256, [
+      'src/cli.ts',
       'src/shared/config.ts',
       'src/shared/contracts.ts',
       'src/shared/locks.ts',
@@ -291,6 +292,8 @@ function currentControlPlaneHashes(roots: BenchPathRoots): FeatureBenchManifest[
       'src/shared/run-state.ts',
       'src/shared/toolchain.ts',
       'src/shared/verifier.ts',
+      '../src/exec/procinfo.ts',
+      '../src/exec/spawn.ts',
       'src/suites/featurebench/adapter.ts',
       'src/suites/featurebench/config.ts',
       'src/suites/featurebench/host.ts',
@@ -625,6 +628,7 @@ async function nativeExecute(
   if (options.workerScope !== undefined) processOptions.workerScope = options.workerScope;
   if (options.onLifecycleToken !== undefined) processOptions.onLifecycleToken = options.onLifecycleToken;
   if (options.onLifecycleStarted !== undefined) processOptions.onLifecycleStarted = options.onLifecycleStarted;
+  if (options.onLifecycleCandidates !== undefined) processOptions.onLifecycleCandidates = options.onLifecycleCandidates;
   if (options.onLifecycleRecovered !== undefined) processOptions.onLifecycleRecovered = options.onLifecycleRecovered;
   const result = await runBenchProcess(command, argv, processOptions);
   return { stdout: result.stdout, stderr: result.stderr };
@@ -639,6 +643,8 @@ function ownershipLabels(runId: string, arm: Arm): Record<string, string> {
     'ultracode.benchmark.ownership': '1',
   };
 }
+
+const FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS = 30_000;
 
 /** Remove only exact run-owned FeatureBench session/prep containers. */
 export async function cleanupFeatureBenchContainers(
@@ -657,6 +663,7 @@ export async function cleanupFeatureBenchContainers(
   const filters = Object.entries(labels).flatMap(([name, value]) => ['--filter', `label=${name}=${value}`]);
   const listed = await executor('docker', ['ps', '--all', '--quiet', ...filters], {
     env: allowlistedEnvironment(process.env),
+    timeoutMs: FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS,
   });
   const candidates = listed.stdout.split(/\s+/u).filter(Boolean);
   if (candidates.some((id) => !/^[a-f0-9]{12,64}$/.test(id))) {
@@ -674,6 +681,7 @@ export async function cleanupFeatureBenchContainers(
   for (const candidate of candidates) {
     const inspected = oneRow<DockerContainerInspect>((await executor('docker', ['inspect', candidate], {
       env: allowlistedEnvironment(process.env),
+      timeoutMs: FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS,
     })).stdout, 'owned FeatureBench container');
     const observed = inspected.Config?.Labels !== null && typeof inspected.Config?.Labels === 'object'
       && !Array.isArray(inspected.Config.Labels) ? inspected.Config.Labels as Record<string, unknown> : {};
@@ -691,9 +699,67 @@ export async function cleanupFeatureBenchContainers(
     verified.add(inspected.Id);
   }
   for (const id of verified) {
-    await executor('docker', ['rm', '--force', id], { env: allowlistedEnvironment(process.env), stream: true });
+    await executor('docker', ['rm', '--force', id], {
+      env: allowlistedEnvironment(process.env),
+      stream: true,
+      timeoutMs: FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS,
+    });
   }
   return verified.size;
+}
+
+interface ActiveFeatureBenchExecution {
+  runId: string;
+  arm: Arm;
+  taskIds: readonly string[];
+  executor: FeatureBenchExecutor;
+  cleanupRuntime(): void;
+  cleanupPromise?: Promise<void>;
+}
+
+const ACTIVE_FEATUREBENCH_EXECUTIONS = new Map<string, ActiveFeatureBenchExecution>();
+
+function trackFeatureBenchExecution(key: string, execution: ActiveFeatureBenchExecution): void {
+  if (ACTIVE_FEATUREBENCH_EXECUTIONS.has(key)) {
+    throw new Error(`FeatureBench execution is already tracked: ${execution.runId}/${execution.arm}`);
+  }
+  ACTIVE_FEATUREBENCH_EXECUTIONS.set(key, execution);
+}
+
+async function cleanupTrackedFeatureBenchExecution(key: string): Promise<void> {
+  const execution = ACTIVE_FEATUREBENCH_EXECUTIONS.get(key);
+  if (execution === undefined) return;
+  execution.cleanupPromise ??= (async () => {
+    const failures: unknown[] = [];
+    try {
+      await cleanupFeatureBenchContainers(execution.runId, execution.arm, execution.taskIds, execution.executor);
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      execution.cleanupRuntime();
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) throw new AggregateError(failures, 'FeatureBench active execution cleanup failed');
+    ACTIVE_FEATUREBENCH_EXECUTIONS.delete(key);
+  })();
+  const cleanup = execution.cleanupPromise;
+  try {
+    await cleanup;
+  } finally {
+    if (ACTIVE_FEATUREBENCH_EXECUTIONS.get(key) === execution && execution.cleanupPromise === cleanup) {
+      execution.cleanupPromise = undefined;
+    }
+  }
+}
+
+/** Settle every tracked container set and exact ephemeral runtime binding. */
+export async function cleanupFeatureBenchRuntime(): Promise<void> {
+  const keys = [...ACTIVE_FEATUREBENCH_EXECUTIONS.keys()];
+  const settled = await Promise.allSettled(keys.map(cleanupTrackedFeatureBenchExecution));
+  const failures = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+  if (failures.length > 0) throw new AggregateError(failures, 'FeatureBench runtime cleanup failed');
 }
 
 async function attestRuntime(
@@ -1214,8 +1280,20 @@ async function executeNativeRun(
   cleanupFeatureBenchRuntimeHomes(manifest.runId, arm);
   const runtimeBindingHome = createFeatureBenchRuntimeHome(manifest.runId, arm);
   const runtimeHome = runtimeBindingHome.directory;
+  const activeKey = runtimeHome;
   let failure: unknown;
   try {
+    trackFeatureBenchExecution(activeKey, {
+      runId: manifest.runId,
+      arm,
+      taskIds: manifest.experiment.taskIds,
+      executor,
+      cleanupRuntime() {
+        if (!existsSync(runtimeHome)) return;
+        assertFeatureBenchRuntimeDirectory(runtimeHome, manifest.runId, arm, runtimeBindingHome.nonce);
+        rmSync(runtimeHome, { recursive: true });
+      },
+    });
     await executeNativeRunWithHome(
       context,
       config,
@@ -1232,21 +1310,9 @@ async function executeNativeRun(
     failure = error;
   } finally {
     try {
-      await cleanupFeatureBenchContainers(
-        manifest.runId,
-        manifest.experiment.arm as Arm,
-        manifest.experiment.taskIds,
-        executor,
-      );
+      await cleanupTrackedFeatureBenchExecution(activeKey);
     } catch (error) {
-      failure ??= new Error('FeatureBench final ownership cleanup failed', { cause: error });
-    } finally {
-      try {
-        assertFeatureBenchRuntimeDirectory(runtimeHome, manifest.runId, arm, runtimeBindingHome.nonce);
-        rmSync(runtimeHome, { recursive: true });
-      } catch (error) {
-        failure ??= new Error('FeatureBench runtime binding cleanup failed', { cause: error });
-      }
+      failure ??= new Error('FeatureBench final resource cleanup failed', { cause: error });
     }
   }
   if (failure !== undefined) throw failure;

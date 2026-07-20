@@ -12,6 +12,25 @@ export type BenchCliRoute =
   | { kind: 'command-help'; suite: BenchSuite; command: string }
   | { kind: 'command'; suite: BenchSuite; command: string; argv: string[] };
 
+type AsyncCleanup = () => Promise<unknown>;
+
+export interface BenchExecutableDependencies {
+  /** Root process-registry cleanup, replaceable only by offline boundary tests. */
+  cleanupActiveProcesses?: AsyncCleanup;
+  /** Fatal-cleanup deadline, replaceable only by offline boundary tests. */
+  signalCleanupTimeoutMs?: number;
+  /** Signal re-delivery seam used only by offline boundary tests. */
+  resendSignal?: (signal: NodeJS.Signals) => void;
+}
+
+interface BenchSignalCoordinator {
+  signalReceived(): boolean;
+  waitForSignalCleanup(): Promise<void>;
+  settle(): void;
+}
+
+let activeSignalCoordinator: BenchSignalCoordinator | null = null;
+
 function suiteNames(): string {
   return BENCH_SUITES.join('|');
 }
@@ -111,18 +130,77 @@ function commandHelp(suite: BenchSuite, command: string, registry: SuiteRegistry
   return `${lines.join('\n')}\n`;
 }
 
-/** Validate command options before the command lazily imports native code. */
-export async function runBenchCli(
-  argv: readonly string[],
-  registry: SuiteRegistry = suiteRegistry,
-  context: CommandContext = {
-    stdout: process.stdout,
-    stderr: process.stderr,
-    paths: DEFAULT_BENCH_PATH_ROOTS,
-    clock: SYSTEM_CLOCK,
-  },
+function singleFlightAsync(cleanup: AsyncCleanup): AsyncCleanup {
+  let pending: Promise<unknown> | null = null;
+  return () => {
+    pending ??= Promise.resolve().then(cleanup).finally(() => { pending = null; });
+    return pending;
+  };
+}
+
+function installSignalCoordinator(
+  cleanupActiveProcesses: AsyncCleanup,
+  selectedSuiteCleanup: () => AsyncCleanup | undefined,
+  timeoutMs: number,
+  resendSignal: (signal: NodeJS.Signals) => void,
+): BenchSignalCoordinator {
+  if (activeSignalCoordinator !== null) return activeSignalCoordinator;
+  let signalCleanup: Promise<void> | null = null;
+  let installed = true;
+  const remove = (): void => {
+    if (!installed) return;
+    installed = false;
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
+    activeSignalCoordinator = null;
+  };
+  const resend = (signal: NodeJS.Signals): void => {
+    remove();
+    resendSignal(signal);
+  };
+  const handle = (signal: NodeJS.Signals): void => {
+    if (signalCleanup !== null) {
+      resend(signal);
+      return;
+    }
+    const suiteCleanup = selectedSuiteCleanup();
+    const cleanup = async (): Promise<void> => {
+      await Promise.allSettled([cleanupActiveProcesses()]);
+      await Promise.allSettled([suiteCleanup?.() ?? Promise.resolve()]);
+      await Promise.allSettled([cleanupActiveProcesses()]);
+      await Promise.allSettled([suiteCleanup?.() ?? Promise.resolve()]);
+    };
+    const boundedCleanup = new Promise<void>((resolvePromise) => {
+      const timer = setTimeout(resolvePromise, timeoutMs);
+      timer.unref();
+      void cleanup().finally(() => {
+        clearTimeout(timer);
+        resolvePromise();
+      });
+    });
+    signalCleanup = boundedCleanup.then(() => { resend(signal); });
+  };
+  const onSigint = (): void => handle('SIGINT');
+  const onSigterm = (): void => handle('SIGTERM');
+  const coordinator: BenchSignalCoordinator = {
+    signalReceived: () => signalCleanup !== null,
+    waitForSignalCleanup: () => signalCleanup ?? Promise.resolve(),
+    settle: () => {
+      if (signalCleanup === null) remove();
+    },
+  };
+  activeSignalCoordinator = coordinator;
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+  return coordinator;
+}
+
+async function dispatchBenchCliRoute(
+  route: BenchCliRoute,
+  registry: SuiteRegistry,
+  context: CommandContext,
+  cleanup?: AsyncCleanup,
 ): Promise<void> {
-  const route = parseBenchCliRoute(argv, registry);
   if (route.kind === 'root-help') {
     context.stdout.write(`${BENCH_USAGE}\n`);
     return;
@@ -143,7 +221,6 @@ export async function runBenchCli(
   try {
     await spec.run(options, context);
   } catch (error) {
-    const cleanup = registry.get(route.suite).cleanup;
     if (cleanup !== undefined) {
       try {
         await cleanup();
@@ -160,12 +237,68 @@ export async function runBenchCli(
   }
 }
 
+/** Validate command options before the command lazily imports native code. */
+export async function runBenchCli(
+  argv: readonly string[],
+  registry: SuiteRegistry = suiteRegistry,
+  context: CommandContext = {
+    stdout: process.stdout,
+    stderr: process.stderr,
+    paths: DEFAULT_BENCH_PATH_ROOTS,
+    clock: SYSTEM_CLOCK,
+  },
+): Promise<void> {
+  const route = parseBenchCliRoute(argv, registry);
+  const cleanup = 'suite' in route ? registry.get(route.suite).cleanup : undefined;
+  await dispatchBenchCliRoute(route, registry, context, cleanup);
+}
+
+/** Run the terminal executable with one signal owner and one final diagnostic. */
+export async function runBenchExecutable(
+  argv: readonly string[],
+  registry: SuiteRegistry = suiteRegistry,
+  context: CommandContext = {
+    stdout: process.stdout,
+    stderr: process.stderr,
+    paths: DEFAULT_BENCH_PATH_ROOTS,
+    clock: SYSTEM_CLOCK,
+  },
+  dependencies: BenchExecutableDependencies = {},
+): Promise<void> {
+  const cleanupActiveProcesses = singleFlightAsync(
+    dependencies.cleanupActiveProcesses ?? cleanupActiveBenchProcesses,
+  );
+  let selectedSuiteCleanup: AsyncCleanup | undefined;
+  const signalCleanupTimeoutMs = dependencies.signalCleanupTimeoutMs ?? 30_000;
+  if (!Number.isSafeInteger(signalCleanupTimeoutMs) || signalCleanupTimeoutMs <= 0) {
+    throw new Error('signal cleanup timeout must be a positive safe integer');
+  }
+  const coordinator = installSignalCoordinator(
+    cleanupActiveProcesses,
+    () => selectedSuiteCleanup,
+    signalCleanupTimeoutMs,
+    dependencies.resendSignal ?? ((signal) => { process.kill(process.pid, signal); }),
+  );
+  try {
+    const route = parseBenchCliRoute(argv, registry);
+    const cleanup = 'suite' in route ? registry.get(route.suite).cleanup : undefined;
+    selectedSuiteCleanup = cleanup === undefined ? undefined : singleFlightAsync(cleanup);
+    await dispatchBenchCliRoute(route, registry, context, selectedSuiteCleanup);
+  } catch (error) {
+    if (coordinator.signalReceived()) {
+      await coordinator.waitForSignalCleanup();
+      return;
+    }
+    try { await cleanupActiveProcesses(); } catch { /* terminal diagnostic remains singular */ }
+    const message = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
+    context.stderr.write(`bench: ${message.replace(/[\r\n]+/g, ' ').trim() || 'benchmark command failed'}\n`);
+    process.exitCode = 1;
+  } finally {
+    coordinator.settle();
+  }
+}
+
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;
 if (invokedPath === import.meta.url) {
-  runBenchCli(process.argv.slice(2)).catch(async (error: unknown) => {
-    try { await cleanupActiveBenchProcesses(); } catch { /* terminal diagnostic remains singular */ }
-    const message = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
-    process.stderr.write(`bench: ${message.replace(/[\r\n]+/g, ' ').trim() || 'benchmark command failed'}\n`);
-    process.exitCode = 1;
-  });
+  void runBenchExecutable(process.argv.slice(2));
 }

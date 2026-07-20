@@ -1,14 +1,19 @@
 /** Benchmark process environment, diagnostics, and bounded-output behavior. */
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { describe, expect, it } from 'vitest';
 import {
   BenchProcessError,
+  ByteTailBuffer,
   allowlistedEnvironment,
   cleanupActiveBenchProcesses,
   runBenchProcess,
   sanitizeDiagnostic,
 } from '../../bench/src/shared/process.js';
+import { readProcessIdentity, workerScopeValue } from '../../src/exec/procinfo.js';
 
 class GatedSink extends Writable {
   readonly chunks: Buffer[] = [];
@@ -70,7 +75,58 @@ async function waitForBlocked(...sinks: GatedSink[]): Promise<void> {
   }
 }
 
+async function waitForProcessGone(pid: number): Promise<boolean> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (readProcessIdentity(pid) === undefined) return true;
+    await sleep(10);
+  }
+  return false;
+}
+
 describe('benchmark process boundary', () => {
+  it('keeps byte-tail copying linear and materializes at most once per mutation', () => {
+    let copiedBytes = 0;
+    const tail = new ByteTailBuffer(32, (bytes) => { copiedBytes += bytes; });
+    for (let index = 0; index < 4_096; index++) tail.push(Buffer.from([97 + (index % 26)]));
+    expect(copiedBytes).toBe(4_096);
+    expect(tail.text).toBe(Array.from(
+      { length: 32 },
+      (_, offset) => String.fromCharCode(97 + ((4_096 - 32 + offset) % 26)),
+    ).join(''));
+    expect(copiedBytes).toBe(4_096 + 32);
+    void tail.text;
+    expect(copiedBytes).toBe(4_096 + 32);
+    tail.push(Buffer.alloc(0));
+    void tail.text;
+    expect(copiedBytes).toBe(4_096 + 32);
+    tail.push(Buffer.from('abc'));
+    expect(copiedBytes).toBe(4_096 + 32 + 3);
+    void tail.text;
+    expect(copiedBytes).toBe(4_096 + 32 + 3 + 32);
+  });
+
+  it('handles zero, equal, oversized, partial-head, and owned tail chunks exactly', () => {
+    const zero = new ByteTailBuffer(0);
+    zero.push(Buffer.from('discarded'));
+    expect(zero.text).toBe('');
+
+    const tail = new ByteTailBuffer(5);
+    tail.push(Buffer.from('abc'));
+    tail.push(Buffer.from('de'));
+    expect(tail.text).toBe('abcde');
+    tail.push(Buffer.from('12345'));
+    expect(tail.text).toBe('12345');
+    tail.push(Buffer.from('oversized'));
+    expect(tail.text).toBe('sized');
+    tail.push(Buffer.from('12'));
+    expect(tail.text).toBe('zed12');
+    const mutable = Buffer.from('owned');
+    tail.push(mutable);
+    mutable.fill('x');
+    expect(tail.text).toBe('owned');
+  });
+
   it('forwards only base and explicitly selected environment values', () => {
     expect(allowlistedEnvironment({
       PATH: '/bin',
@@ -130,6 +186,111 @@ describe('benchmark process boundary', () => {
       drainMs: 1_000,
     });
     expect(result.stdout).toBe('😀');
+  });
+
+  it('uses a complete Darwin inventory to reap a setsid descendant', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const directory = mkdtempSync(join(tmpdir(), 'uc-bench-darwin-setsid-'));
+    const pidFile = join(directory, 'escaped.pid');
+    const scope = workerScopeValue(directory);
+    const started = 'Mon Jul 20 12:00:00 2026';
+    let token = '';
+    let escapedPid = 0;
+    const inventories: Array<{ candidates: readonly { pid: number }[]; complete: boolean }> = [];
+    const source = [
+      "const { spawn } = require('node:child_process')",
+      "const { writeFileSync } = require('node:fs')",
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], { detached: true, stdio: 'ignore', env: process.env })",
+      `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
+      'child.unref()',
+    ].join(';');
+    try {
+      const result = await runBenchProcess(process.execPath, ['-e', source], {
+        cwd: directory,
+        workerScope: directory,
+        terminationGraceMs: 1_000,
+        onLifecycleToken: (value) => { token = value; },
+        onLifecycleCandidates: (_token, candidates, complete) => {
+          inventories.push({ candidates, complete });
+        },
+        processInspection: {
+          platform: 'darwin',
+          executePs: (argv) => {
+            if (argv.includes('command=')) {
+              try {
+                escapedPid = Number(readFileSync(pidFile, 'utf8'));
+              } catch {
+                return '';
+              }
+              if (readProcessIdentity(escapedPid) === undefined) return '';
+              const command = `${escapedPid} ${escapedPid} ${started} /usr/bin/node escaped.js`;
+              return argv.includes('-E')
+                ? `${command} ULTRACODE_WORKER_TOKEN=${token} ULTRACODE_WORKER_SCOPE=${scope}`
+                : command;
+            }
+            const requested = argv[argv.indexOf('-p') + 1]?.split(',').map(Number) ?? [];
+            return requested.flatMap((pid) => readProcessIdentity(pid) === undefined
+              ? []
+              : [`${pid} ${pid} ${started}`]).join('\n');
+          },
+          signalProcess: (pid, signal) => { process.kill(pid, signal); },
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(escapedPid).toBeGreaterThan(1);
+      expect(await waitForProcessGone(escapedPid)).toBe(true);
+      expect(inventories.some((inventory) =>
+        inventory.complete && inventory.candidates.some((candidate) => candidate.pid === escapedPid))).toBe(true);
+    } finally {
+      if (escapedPid > 1) {
+        try {
+          process.kill(-escapedPid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  });
+
+  it('completes Darwin cleanup only after a normal same-group helper is absent', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
+    const directory = mkdtempSync(join(tmpdir(), 'uc-bench-darwin-group-'));
+    const pidFile = join(directory, 'helper.pid');
+    const started = 'Mon Jul 20 12:00:00 2026';
+    const source = [
+      "const { spawn } = require('node:child_process')",
+      "const { writeFileSync } = require('node:fs')",
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], { stdio: 'ignore', env: process.env })",
+      `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
+      'child.unref()',
+    ].join(';');
+    let helperPid = 0;
+    try {
+      const result = await runBenchProcess(process.execPath, ['-e', source], {
+        cwd: directory,
+        workerScope: directory,
+        terminationGraceMs: 1_000,
+        processInspection: {
+          platform: 'darwin',
+          executePs: (argv) => {
+            if (argv.includes('command=')) return '';
+            const pid = Number(argv[argv.indexOf('-p') + 1]);
+            return readProcessIdentity(pid) === undefined ? '' : `${pid} ${pid} ${started}`;
+          },
+        },
+      });
+      helperPid = Number(readFileSync(pidFile, 'utf8'));
+      expect(result.exitCode).toBe(0);
+      expect(await waitForProcessGone(helperPid)).toBe(true);
+    } finally {
+      if (helperPid > 1) {
+        try {
+          process.kill(helperPid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+    }
   });
 
   it('propagates destination errors without an uncaught event or target teardown', async () => {

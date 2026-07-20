@@ -8,11 +8,17 @@ import { ownershipUnsafe, ownershipUnsafeAggregate } from './cleanup.js';
 
 export const BASE_IMAGE_REPOSITORY = 'jefzda/sweap-images';
 const PULL_BACKOFF_MS = [10_000, 30_000, 90_000];
+const IMAGE_QUERY_TIMEOUT_MS = 60_000;
+const IMAGE_TRANSFER_TIMEOUT_MS = 30 * 60_000;
 
-export type DockerExecutor = (argv: readonly string[]) => Promise<string>;
+export type DockerExecutor = (argv: readonly string[], timeoutMs?: number) => Promise<string>;
 
-export const defaultDockerExecutor: DockerExecutor = async (argv) => {
-  const result = await runBenchProcess('docker', argv, { cwd: process.cwd(), tailBytes: 64 * 1_024 * 1_024 });
+export const defaultDockerExecutor: DockerExecutor = async (argv, timeoutMs) => {
+  const result = await runBenchProcess('docker', argv, {
+    cwd: process.cwd(),
+    tailBytes: 64 * 1_024 * 1_024,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
   return result.stdout;
 };
 
@@ -51,7 +57,7 @@ export function repositoryDigest(record: ImageInspect, repository = BASE_IMAGE_R
 }
 
 async function inspect(reference: string, docker: DockerExecutor): Promise<ImageInspect> {
-  return parseInspect(await docker(['image', 'inspect', reference]), reference);
+  return parseInspect(await docker(['image', 'inspect', reference], IMAGE_QUERY_TIMEOUT_MS), reference);
 }
 
 async function ensurePulled(requested: string, docker: DockerExecutor): Promise<void> {
@@ -64,7 +70,7 @@ async function ensurePulled(requested: string, docker: DockerExecutor): Promise<
   let failure: unknown;
   for (let attempt = 0; attempt < PULL_BACKOFF_MS.length; attempt += 1) {
     try {
-      await docker(['pull', requested]);
+      await docker(['pull', requested], IMAGE_TRANSFER_TIMEOUT_MS);
       return;
     } catch (error) {
       failure = error;
@@ -109,7 +115,7 @@ export async function prepareTaskImage(
     '--build-arg', `BASE_IMAGE=${resolvedDigest}`,
     '-t', overlayName,
     options.toolchainDirectory,
-  ]);
+  ], IMAGE_TRANSFER_TIMEOUT_MS);
   const overlay = identity(await inspect(overlayName, docker), overlayName);
   return {
     requested,
@@ -145,7 +151,7 @@ export async function removeTaskImages(
     let removed = 0;
     const exact = new Map(attestations.map((entry) => [entry.overlayLocalId, entry]));
     const localImageIds = async (): Promise<Set<string>> => {
-      const ids = (await docker(['image', 'ls', '-q', '--no-trunc']))
+      const ids = (await docker(['image', 'ls', '-q', '--no-trunc'], IMAGE_QUERY_TIMEOUT_MS))
         .split('\n').map((entry) => entry.trim()).filter(Boolean);
       if (ids.some((id) => !/^sha256:[a-f0-9]{64}$/.test(id))) {
         throw new Error('Docker returned an invalid local image id');
@@ -156,7 +162,7 @@ export async function removeTaskImages(
       await reattestTaskImage(attestation, docker);
       let removalFailure: unknown;
       try {
-        await docker(['image', 'rm', attestation.overlayLocalId]);
+        await docker(['image', 'rm', attestation.overlayLocalId], IMAGE_QUERY_TIMEOUT_MS);
       } catch (error) {
         removalFailure = error;
       }

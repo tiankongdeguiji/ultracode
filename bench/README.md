@@ -7,10 +7,20 @@ state, receipts, metrics, failures, and reports.
 
 ## Requirements
 
-- Linux or macOS for the CLI; native container suites have stricter host checks
 - Node 20 or newer and dependencies installed with `npm ci`
-- Git and Docker
-- Suite preparation dependencies documented in the suite guides
+- Git, Docker, and the configured Codex binary for shared toolchain preparation
+
+Preparation prerequisites are suite-scoped:
+
+| Suite | Host and preparation tools |
+| --- | --- |
+| SWE-bench Pro | Linux or macOS, plus Python 3 with `venv`; it does not require `uv` or GNU `patch` |
+| SWE-Marathon | Linux x64 with a Linux amd64 Docker daemon, plus `uv` and GNU `patch` |
+| FeatureBench | Linux x64 with a Linux amd64 Docker daemon, plus `uv` |
+
+Where `uv` or `patch` is listed, preparation preflights that suite-only tool
+before network access or environment construction. Network access is still
+required later to fetch pinned sources, dependencies, toolchains, and images.
 
 Copy `bench/bench.example.config.json` to the ignored, operator-owned
 `bench/bench.config.json`, set its mode to `0600`, and fill in the requested
@@ -140,8 +150,13 @@ environment. Manifests store the mechanism and hashes of operator-provided
 public identities, never API keys, auth-file paths or contents, broker URLs, or
 runtime Docker names.
 
-- SWE-bench Pro and SWE-Marathon support their documented ChatGPT or API-key
-  runtime mechanisms. Use narrowly scoped benchmark accounts.
+- SWE-bench Pro ChatGPT mode requires `CODEX_AUTH_JSON_PATH` to name a
+  current-user-owned, singly-linked regular ChatGPT auth file no larger than
+  4 MiB with mode `0600`;
+  its API-key mode uses `CODEX_API_KEY`.
+- SWE-Marathon ChatGPT mode uses the same `CODEX_AUTH_JSON_PATH` file contract,
+  but its API-key mode deliberately uses `OPENAI_API_KEY`, not
+  `CODEX_API_KEY`.
 - FeatureBench task containers receive no reusable credential. They attach to
   a dedicated internal Docker network whose only pre-existing endpoint is a
   separately managed, labeled HTTPS credential broker. A host-wide policy lock

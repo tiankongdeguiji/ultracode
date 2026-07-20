@@ -6,7 +6,11 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Writable, type Readable } from 'node:stream';
 import { spawnAgentProcess, type SpawnedAgent } from '../../../src/exec/spawn.js';
-import { readProcessIdentity } from '../../../src/exec/procinfo.js';
+import {
+  readProcessIdentity,
+  type ProcessInspectionOptions,
+  type TrackedProcess,
+} from '../../../src/exec/procinfo.js';
 
 const BASE_CHILD_ENV = [
   'HOME',
@@ -48,12 +52,20 @@ export interface BenchProcessOptions {
   timeoutMs?: number | null;
   drainMs?: number;
   terminationGraceMs?: number;
+  /** Explicit platform/process seam for deterministic supervision tests. */
+  processInspection?: ProcessInspectionOptions;
   /** Stable run/cache scope attached to descendant lifecycle tokens. */
   workerScope?: string;
   /** Synchronous durable-record hook invoked before the child can start. */
   onLifecycleToken?: (token: string) => void;
   /** Enrich the pre-spawn token with the direct-child process identity. */
   onLifecycleStarted?: (token: string, pid: number | null, processStartIdentity: string | null) => void;
+  /** Persist a bounded authenticated macOS candidate inventory before cleanup signals it. */
+  onLifecycleCandidates?: (
+    token: string,
+    candidates: readonly TrackedProcess[],
+    complete: boolean,
+  ) => void;
   /** Durable-record hook invoked after escaped-descendant cleanup settles. */
   onLifecycleRecovered?: (token: string, recovery: 'complete' | 'failed') => void;
 }
@@ -104,26 +116,87 @@ interface StreamEndWait {
   cleanup(): void;
 }
 
-class ByteTailBuffer {
-  private bytes = Buffer.alloc(0);
+/** Retain an owned byte-exact tail with amortized-linear ingestion. */
+export class ByteTailBuffer {
+  private chunks: Buffer[] = [];
+  private headIndex = 0;
+  private headOffset = 0;
+  private length = 0;
+  private materialized: Buffer | null = Buffer.alloc(0);
 
-  constructor(private readonly maximumBytes: number) {}
+  constructor(
+    private readonly maximumBytes: number,
+    private readonly observeCopiedBytes?: (bytes: number) => void,
+  ) {}
 
   push(chunk: Buffer): void {
+    if (chunk.length === 0) return;
+    this.materialized = null;
     if (this.maximumBytes === 0) {
-      this.bytes = Buffer.alloc(0);
-    } else if (chunk.length >= this.maximumBytes) {
-      this.bytes = Buffer.from(chunk.subarray(chunk.length - this.maximumBytes));
-    } else {
-      const combined = Buffer.concat([this.bytes, chunk]);
-      this.bytes = combined.length <= this.maximumBytes
-        ? combined
-        : Buffer.from(combined.subarray(combined.length - this.maximumBytes));
+      this.clear();
+      return;
     }
+    if (chunk.length >= this.maximumBytes) {
+      const tail = chunk.subarray(chunk.length - this.maximumBytes);
+      this.observeCopiedBytes?.(tail.length);
+      this.chunks = [Buffer.from(tail)];
+      this.headIndex = 0;
+      this.headOffset = 0;
+      this.length = tail.length;
+      return;
+    }
+
+    this.observeCopiedBytes?.(chunk.length);
+    this.chunks.push(Buffer.from(chunk));
+    this.length += chunk.length;
+    this.trimHead(this.length - this.maximumBytes);
   }
 
   get text(): string {
-    return this.bytes.toString('utf8');
+    return this.bytes().toString('utf8');
+  }
+
+  private bytes(): Buffer {
+    if (this.materialized !== null) return this.materialized;
+    const bytes = Buffer.allocUnsafe(this.length);
+    let targetOffset = 0;
+    for (let index = this.headIndex; index < this.chunks.length; index++) {
+      const chunk = this.chunks[index]!;
+      const sourceOffset = index === this.headIndex ? this.headOffset : 0;
+      targetOffset += chunk.copy(bytes, targetOffset, sourceOffset);
+    }
+    this.observeCopiedBytes?.(this.length);
+    this.materialized = bytes;
+    return bytes;
+  }
+
+  private clear(): void {
+    this.chunks = [];
+    this.headIndex = 0;
+    this.headOffset = 0;
+    this.length = 0;
+  }
+
+  private trimHead(bytes: number): void {
+    if (bytes <= 0) return;
+    this.length -= bytes;
+    let remaining = bytes;
+    while (remaining > 0) {
+      const head = this.chunks[this.headIndex]!;
+      const available = head.length - this.headOffset;
+      if (remaining < available) {
+        this.headOffset += remaining;
+        remaining = 0;
+      } else {
+        remaining -= available;
+        this.headIndex++;
+        this.headOffset = 0;
+      }
+    }
+    if (this.headIndex > 0 && this.headIndex * 2 >= this.chunks.length) {
+      this.chunks = this.chunks.slice(this.headIndex);
+      this.headIndex = 0;
+    }
   }
 }
 
@@ -285,11 +358,15 @@ export async function runBenchProcess(
     stdinData: options.stdinData,
     workerScope: options.workerScope ?? options.cwd,
     onWorkerToken: options.onLifecycleToken,
+    onWorkerCandidates: options.onLifecycleCandidates,
+    processInspection: options.processInspection,
   });
   ACTIVE_BENCH_PROCESSES.add(spawned);
   try {
     const childPid = spawned.child.pid ?? null;
-    const childIdentity = childPid === null ? null : readProcessIdentity(childPid)?.starttime ?? null;
+    const childIdentity = childPid === null
+      ? null
+      : readProcessIdentity(childPid, options.processInspection)?.starttime ?? null;
     options.onLifecycleStarted?.(spawned.workerToken, childPid, childIdentity);
   } catch (error) {
     spawned.killTree('SIGTERM');

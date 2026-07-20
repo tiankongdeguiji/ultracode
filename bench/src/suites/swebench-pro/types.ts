@@ -65,6 +65,14 @@ export interface EvalPrediction {
   prefix: string;
 }
 
+/** Security-sensitive result of inspecting and, when bounded, reading a native patch. */
+export type PatchArtifactRead =
+  | { kind: 'missing'; patchBytes: 0 }
+  | { kind: 'empty'; patchBytes: 0 }
+  | { kind: 'patch'; patch: string; patchBytes: number }
+  | { kind: 'too-large'; patchBytes: number }
+  | { kind: 'unsafe'; failure: unknown };
+
 export interface DockerImageAttestation {
   requested: string;
   resolvedDigest: string;

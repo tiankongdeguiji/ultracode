@@ -43,7 +43,10 @@ export const swebenchProConfigSchema = z.strictObject({
     verifier: z.number().int().positive(),
   }),
   docker: z.strictObject({
-    cpus: z.number().finite().positive(),
+    cpus: z.number().finite().positive().refine(
+      (cpus) => Number.isSafeInteger(cpus * 1_000_000_000),
+      'CPU limit must be an exact positive number of nanocores',
+    ),
     memoryBytes: z.number().int().positive(),
     keepImages: z.boolean(),
   }),

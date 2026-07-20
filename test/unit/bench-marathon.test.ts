@@ -35,6 +35,7 @@ import {
 } from '../../bench/src/suites/swe-marathon/config.js';
 import {
   planMarathonPreparation,
+  preflightMarathonPreparation,
   taskImageReference,
   validateHarborCodexApiKeyContract,
   type PreparedMarathonInputs,
@@ -49,6 +50,7 @@ import {
   marathonTaskInputs,
   marathonTaskFailure,
   planHarborRun,
+  prepCommand,
   shouldResumeHarborJob,
   sweMarathonAnalysisHook,
 } from '../../bench/src/suites/swe-marathon/runner.js';
@@ -88,6 +90,68 @@ describe('SWE-Marathon configuration and preparation', () => {
       ownershipPatch: join(root, 'suites/swe-marathon/harbor-ownership.patch'),
       bridge: join(root, 'suites/swe-marathon/arm_b_codex.py'),
     });
+  });
+
+  it('preflights uv and patch before any Marathon preparation side effect', async () => {
+    const calls: Array<{ file: string; argv: readonly string[]; cwd: string }> = [];
+    await preflightMarathonPreparation('/bench', '/opt/uv', async (file, argv, cwd) => {
+      calls.push({ file, argv, cwd });
+      return file === '/opt/uv' ? 'uv 0.8.0' : 'GNU patch 2.7.6';
+    });
+    expect(calls).toEqual([
+      { file: '/opt/uv', argv: ['--version'], cwd: '/bench' },
+      { file: 'patch', argv: ['--version'], cwd: '/bench' },
+    ]);
+
+    const source = readFileSync(resolve('bench/src/suites/swe-marathon/prepare.ts'), 'utf8');
+    const body = source.slice(source.indexOf('export async function prepareMarathonInputs'));
+    const preflight = body.indexOf('await preflightMarathonPreparation');
+    expect(preflight).toBeGreaterThan(0);
+    expect(preflight).toBeLessThan(body.indexOf('ensureRealDirectoryWithin'));
+    expect(preflight).toBeLessThan(body.indexOf("command('docker'"));
+    expect(preflight).toBeLessThan(body.indexOf('prepareSharedToolchain'));
+  });
+
+  it.each(['/opt/uv', 'patch'])('fails the Marathon tool preflight at unavailable %s', async (failedTool) => {
+    const calls: string[] = [];
+    await expect(preflightMarathonPreparation('/bench', '/opt/uv', async (file) => {
+      calls.push(file);
+      if (file === failedTool) throw new Error(`${file} unavailable`);
+      return 'uv 0.8.0';
+    })).rejects.toThrow(failedTool === '/opt/uv' ? /requires uv on PATH/ : /requires GNU patch on PATH/);
+    expect(calls).toEqual(failedTool === '/opt/uv' ? ['/opt/uv'] : ['/opt/uv', 'patch']);
+  });
+
+  it('documents Marathon-only prep tools and API-key binding', () => {
+    const readme = readFileSync(resolve('bench/README.md'), 'utf8');
+    const guide = readFileSync(resolve('bench/docs/swe-marathon.md'), 'utf8');
+    expect(readme).toContain('plus `uv` and GNU `patch`');
+    expect(readme).toContain('uses `OPENAI_API_KEY`, not\n  `CODEX_API_KEY`');
+    expect(guide).toContain('preflights both before\nnetwork access, cache staging');
+    expect(guide).toContain('set `OPENAI_API_KEY` (not SWE-bench Pro\'s `CODEX_API_KEY`)');
+    expect(guide).toContain('singly-linked\n  regular file no larger than 4 MiB');
+    const proPreparation = readFileSync(resolve('bench/src/suites/swebench-pro/toolchain.ts'), 'utf8');
+    expect(proPreparation).not.toMatch(/(?:command|runBenchProcess)\(['"]uv['"]/u);
+  });
+
+  it('runs the public prep preflight before acquiring cache locks', async () => {
+    const root = temporaryDirectory();
+    const paths: BenchPathRoots = {
+      benchRoot: root,
+      cacheRoot: join(root, '.cache'),
+      resultsRoot: join(root, 'results'),
+    };
+    await expect(prepCommand(
+      { recoverStaleLock: false } as never,
+      {
+        paths,
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+        clock: { now: () => new Date(0), monotonicMs: () => 0 },
+      } as never,
+      async () => { throw new Error('missing preparation tool'); },
+    )).rejects.toThrow('missing preparation tool');
+    expect(existsSync(paths.cacheRoot)).toBe(false);
   });
 
   it('accepts only immutable task image declarations', () => {

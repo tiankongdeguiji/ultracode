@@ -1,5 +1,24 @@
 # SWE-bench Pro provenance and containment
 
+## Prerequisites and authentication
+
+SWE-bench Pro uses the shared Node 20+, Git, Docker, and configured Codex
+toolchain prerequisites. Its evaluator preparation additionally requires
+Python 3 with `venv`. It does not use or require `uv` or GNU `patch`
+executable; those tools belong to other suites. Preparation and native runs can
+access the network and remain manual.
+
+Select one runtime mechanism in the private operator config and supply it again
+for every run invocation:
+
+- `chatgpt`: set `CODEX_AUTH_JSON_PATH` to a current-user-owned, singly-linked
+  regular ChatGPT auth file no larger than 4 MiB whose mode is exactly `0600`.
+- `api-key`: set `CODEX_API_KEY` to a non-empty key.
+
+These variables are specific to SWE-bench Pro. In particular, SWE-Marathon
+API-key mode uses `OPENAI_API_KEY` instead of `CODEX_API_KEY`. Credentials and
+auth paths are runtime-only and are not stored in manifests or reports.
+
 ## Dataset pin and acquisition
 
 The cache is not the dataset authority. `dataset-pin.json` commits the reviewed
@@ -54,9 +73,11 @@ unknown columns, or publish the mismatching candidate to the cache.
 
 ## Container policy
 
-`container-policy.json` is the single frozen policy for both Docker launch
-paths. Session containers have a 1,024-process cgroup bound,
-`no-new-privileges`, `cap-drop ALL`, manifest CPU/memory limits, and only
+`container-policy.json` freezes the process, privilege, and capability policy
+for both Docker launch paths. CPU and memory values are instead derived from
+the immutable run manifest. Session containers have a 1,024-process cgroup
+bound, `no-new-privileges`, `cap-drop ALL`, those manifest-derived CPU and
+memory limits, and only
 `CHOWN`, `DAC_OVERRIDE`, `SETGID`, `SETPCAP`, and `SETUID` for an explicit uid-0
 immutable setup over base-image files that may not be root-writable. `SETPCAP`
 exists only so `setpriv` can drop the capability bounding set during the uid
@@ -64,11 +85,13 @@ transition. Codex, detached task work, and the immutable post-task Git capture
 run as the task uid with bounding, inheritable, and ambient capability sets
 cleared.
 
-Official evaluator containers have the same process, privilege, and
-CPU/memory bounds with `cap-drop ALL` and an empty capability-add tuple. The
-patched evaluator consumes the host-written `evaluator-policy.json`; its
-checked-in Python translator rejects any missing, extra, or weakened policy
-field before calling the Docker SDK. Any task-level evaluator exception or
+Official evaluator containers have the same static process and privilege
+bounds with `cap-drop ALL`, an empty capability-add tuple, and the same
+manifest-derived CPU and memory values. The patched evaluator consumes the
+host-written `evaluator-policy.json`; its checked-in Python translator requires
+the exact top-level and nested schemas, the reviewed canonical static-policy
+hash, and a host-supplied digest of the complete generated policy before every
+Docker SDK call. Any task-level evaluator exception or
 container rejection makes the evaluator process fail after preserving partial
 native booleans for attribution. Policy files, translators, Git helpers,
 patches, and their hashes are native manifest assets and prepared-input

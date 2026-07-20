@@ -178,6 +178,33 @@ async function command(file: string, argv: readonly string[], cwd: string, env?:
   return (await runBenchProcess(file, argv, { cwd, env, tailBytes: 64 * 1_024 * 1_024 })).stdout.trim();
 }
 
+export type MarathonPreparationCommand = (
+  file: string,
+  argv: readonly string[],
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+) => Promise<string>;
+
+/** Fail before preparation side effects when suite-specific host tools are unavailable. */
+export async function preflightMarathonPreparation(
+  cwd: string,
+  uvBinary = 'uv',
+  executor: MarathonPreparationCommand = command,
+): Promise<void> {
+  try {
+    const version = await executor(uvBinary, ['--version'], cwd);
+    if (!/^uv\s+\S+/u.test(version)) throw new Error('malformed uv version output');
+  } catch (error) {
+    throw new Error('SWE-Marathon prep requires uv on PATH (`uv --version` failed)', { cause: error });
+  }
+  try {
+    const version = await executor('patch', ['--version'], cwd);
+    if (!/\bGNU patch\b/iu.test(version)) throw new Error('unsupported patch implementation');
+  } catch (error) {
+    throw new Error('SWE-Marathon prep requires GNU patch on PATH (`patch --version` failed)', { cause: error });
+  }
+}
+
 function assertHostPlatform(): void {
   if (process.platform !== 'linux' || process.arch !== 'x64') {
     throw new Error(`SWE-Marathon requires a Linux x64 host, got ${process.platform}-${process.arch}`);
@@ -291,6 +318,7 @@ export async function prepareMarathonInputs(
   uvBinary = 'uv',
 ): Promise<PreparedMarathonInputs> {
   assertHostPlatform();
+  await preflightMarathonPreparation(roots.benchRoot, uvBinary);
   const plan = planMarathonPreparation(roots);
   const cache = ensureRealDirectoryWithin(roots.cacheRoot, marathonCacheRoot(roots));
   const stage = join(cache, `.stage-${process.pid}-${randomBytes(12).toString('hex')}`);

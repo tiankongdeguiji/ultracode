@@ -2,8 +2,14 @@
 import { existsSync } from 'node:fs';
 import { z } from 'zod';
 import {
+  discoverWorkerProcessesForTokens,
   findWorkerProcessesForTokens,
+  MAX_DARWIN_CANDIDATE_PROCESSES,
+  readProcessIdentitySnapshot,
   signalTrackedWorkerProcesses,
+  type ProcessInspectionOptions,
+  type TrackedProcess,
+  type TrackedWorkerProcess,
 } from '../../../src/exec/procinfo.js';
 import { FAILURE_CODES, type BenchPathRoots, type BenchSuite, type FailureCode } from './contracts.js';
 import type { BenchLockHandle } from './locks.js';
@@ -30,6 +36,29 @@ const commandSchema = z.enum(['fetch', 'prep', 'run', 'eval', 'report', 'status'
 const failureSchema = z.enum(FAILURE_CODES);
 const timestampSchema = z.string().datetime({ offset: true });
 const relativePathSchema = z.string().transform(validateRelativeArtifactPath);
+const lifecycleCandidateSchema = z.strictObject({
+  pid: z.number().int().min(2).max(2_147_483_647),
+  pgrp: z.number().int().nonnegative().max(2_147_483_647),
+  starttime: z.string().min(1),
+});
+
+function processGroupStatus(
+  pgrp: number,
+  inspection: ProcessInspectionOptions,
+): 'alive' | 'absent' | 'unknown' {
+  const signalProcess = inspection.signalProcess ?? ((pid: number, signal: NodeJS.Signals | 0) => {
+    process.kill(pid, signal);
+  });
+  try {
+    signalProcess(-pgrp, 0);
+    return 'alive';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return 'absent';
+    if (code === 'EPERM') return 'alive';
+    return 'unknown';
+  }
+}
 
 export const invocationRecordSchema = z.strictObject({
   invocationId: z.string().uuid(),
@@ -43,6 +72,10 @@ export const invocationRecordSchema = z.strictObject({
     token: z.string().regex(/^[a-f0-9]{32}$/),
     pid: z.number().int().positive().nullable(),
     processStartIdentity: z.string().min(1).nullable(),
+    darwinCandidateInventory: z.strictObject({
+      complete: z.boolean(),
+      processes: z.array(lifecycleCandidateSchema).max(MAX_DARWIN_CANDIDATE_PROCESSES),
+    }).optional(),
     recovery: z.enum(['pending', 'complete', 'failed']),
   })),
   failure: failureSchema.nullable(),
@@ -341,6 +374,7 @@ export class BenchRunStateStore {
   lifecycleHooks(invocationId: string): {
     onLifecycleToken(token: string): void;
     onLifecycleStarted(token: string, pid: number | null, processStartIdentity: string | null): void;
+    onLifecycleCandidates(token: string, candidates: readonly TrackedProcess[], complete: boolean): void;
     onLifecycleRecovered(token: string, recovery: 'complete' | 'failed'): void;
   } {
     return {
@@ -390,6 +424,35 @@ export class BenchRunStateStore {
           return { ...state, invocations };
         });
       },
+      onLifecycleCandidates: (token, candidates, complete) => {
+        this.updateCurrentSync((state) => {
+          let matchedInvocation = false;
+          let matchedToken = false;
+          const inventory = {
+            complete,
+            processes: [...new Map(candidates.map((candidate) => [
+              `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`,
+              candidate,
+            ])).values()].sort((left, right) => left.pid - right.pid),
+          };
+          const invocations = state.invocations.map((invocation) => {
+            if (invocation.invocationId !== invocationId) return invocation;
+            matchedInvocation = true;
+            return {
+              ...invocation,
+              lifecycleProcesses: invocation.lifecycleProcesses.map((process) => {
+                if (process.token !== token) return process;
+                matchedToken = true;
+                if (process.recovery !== 'pending') throw new Error(`lifecycle token ${token} has already settled`);
+                return { ...process, darwinCandidateInventory: inventory };
+              }),
+            };
+          });
+          if (!matchedInvocation) throw new Error(`unknown lifecycle invocation ${invocationId}`);
+          if (!matchedToken) throw new Error(`unknown lifecycle token ${token}`);
+          return { ...state, invocations };
+        });
+      },
       onLifecycleRecovered: (token, recovery) => {
         this.updateCurrentSync((state) => {
           let matchedInvocation = false;
@@ -416,37 +479,168 @@ export class BenchRunStateStore {
   }
 
   /** Recover token-bearing descendants from an interrupted prior invocation. */
-  async recoverPendingLifecycleProcesses(workerScope: string, graceMs = 1_000): Promise<number> {
+  async recoverPendingLifecycleProcesses(
+    workerScope: string,
+    graceMs = 1_000,
+    inspection: ProcessInspectionOptions = {},
+  ): Promise<number> {
     this.lease.assertHeld();
     const state = this.load();
     const recoverable = state.invocations.flatMap((invocation) => invocation.lifecycleProcesses)
       .filter((process) => process.recovery !== 'complete');
     if (recoverable.length === 0) return 0;
+    const platform = inspection.platform ?? process.platform;
+    if (platform === 'darwin') {
+      const unverifiableTokens = new Set<string>();
+      const candidatesByToken = new Map<string, Map<string, TrackedWorkerProcess>>();
+      const identityKey = (candidate: TrackedProcess): string =>
+        `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`;
+      for (const entry of recoverable) {
+        const inventory = entry.darwinCandidateInventory;
+        if (
+          entry.pid === null
+          || entry.processStartIdentity === null
+          || inventory === undefined
+          || !inventory.complete
+        ) {
+          unverifiableTokens.add(entry.token);
+          continue;
+        }
+        const candidates = new Map<string, TrackedWorkerProcess>();
+        const leader = {
+          pid: entry.pid,
+          pgrp: entry.pid,
+          starttime: entry.processStartIdentity,
+          token: entry.token,
+        };
+        candidates.set(identityKey(leader), leader);
+        for (const candidate of inventory.processes) {
+          candidates.set(identityKey(candidate), { ...candidate, token: entry.token });
+        }
+        if (candidates.size > MAX_DARWIN_CANDIDATE_PROCESSES) {
+          unverifiableTokens.add(entry.token);
+          continue;
+        }
+        candidatesByToken.set(entry.token, candidates);
+      }
+
+      const validTokens = [...candidatesByToken.keys()];
+      const emptyPasses = new Map(validTokens.map((token) => [token, 0]));
+      let deadline = Date.now() + Math.max(0, graceMs);
+      let signal: NodeJS.Signals = 'SIGTERM';
+      for (;;) {
+        const discovery = discoverWorkerProcessesForTokens(
+          validTokens,
+          workerScope,
+          undefined,
+          inspection,
+        );
+        let candidatesChanged = false;
+        for (const candidate of discovery.processes) {
+          const candidates = candidatesByToken.get(candidate.token);
+          if (candidates === undefined) continue;
+          const key = identityKey(candidate);
+          if (!candidates.has(key)) {
+            candidates.set(key, candidate);
+            candidatesChanged = true;
+          }
+          if (candidates.size > MAX_DARWIN_CANDIDATE_PROCESSES) {
+            unverifiableTokens.add(candidate.token);
+            candidatesByToken.delete(candidate.token);
+          }
+        }
+        if (candidatesChanged) {
+          this.updateCurrentSync((current) => ({
+            ...current,
+            invocations: current.invocations.map((invocation) => ({
+              ...invocation,
+              lifecycleProcesses: invocation.lifecycleProcesses.map((entry) => {
+                const candidates = candidatesByToken.get(entry.token);
+                if (entry.recovery === 'complete' || candidates === undefined) return entry;
+                return {
+                  ...entry,
+                  darwinCandidateInventory: {
+                    complete: true,
+                    processes: [...candidates.values()]
+                      .map(({ token: _token, ...candidate }) => candidate)
+                      .sort((left, right) => left.pid - right.pid),
+                  },
+                };
+              }),
+            })),
+          }));
+        }
+
+        const allCandidates = [...candidatesByToken.values()].flatMap((candidates) => [...candidates.values()]);
+        signalTrackedWorkerProcesses(allCandidates, signal, inspection);
+        const identities = readProcessIdentitySnapshot(
+          allCandidates.map((candidate) => candidate.pid),
+          inspection,
+        );
+        const discoveredTokens = new Set(discovery.processes.map((candidate) => candidate.token));
+        for (const entry of recoverable) {
+          const candidates = candidatesByToken.get(entry.token);
+          if (candidates === undefined || entry.pid === null) continue;
+          const candidatesAbsent = identities.complete && [...candidates.values()].every((candidate) => {
+            const live = identities.identities.get(candidate.pid);
+            return live === undefined
+              || live.starttime !== candidate.starttime
+              || live.pgrp !== candidate.pgrp;
+          });
+          const absent = discovery.complete
+            && !discoveredTokens.has(entry.token)
+            && candidatesAbsent
+            && processGroupStatus(entry.pid, inspection) === 'absent';
+          emptyPasses.set(entry.token, absent ? (emptyPasses.get(entry.token) ?? 0) + 1 : 0);
+        }
+        if (
+          validTokens.length > 0
+          && validTokens.every((token) => (emptyPasses.get(token) ?? 0) >= 2)
+        ) {
+          break;
+        }
+        if (Date.now() >= deadline) {
+          if (signal === 'SIGKILL') break;
+          signal = 'SIGKILL';
+          deadline = Date.now() + Math.max(0, graceMs);
+        } else {
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+        }
+      }
+      const liveTokens = new Set([
+        ...unverifiableTokens,
+        ...validTokens.filter((token) => (emptyPasses.get(token) ?? 0) < 2),
+      ]);
+      this.updateCurrentSync((current) => ({
+        ...current,
+        invocations: current.invocations.map((invocation) => ({
+          ...invocation,
+          lifecycleProcesses: invocation.lifecycleProcesses.map((entry) =>
+            entry.recovery === 'complete' ? entry : {
+              ...entry,
+              recovery: liveTokens.has(entry.token) ? 'failed' as const : 'complete' as const,
+            }),
+        })),
+      }));
+      if (liveTokens.size > 0) throw new Error('interrupted benchmark descendants could not be recovered safely');
+      return recoverable.length;
+    }
+
     const tokens = recoverable.map((process) => process.token);
-    const pendingByToken = new Map(recoverable.map((entry) => [entry.token, entry]));
-    const unverifiableTokens = new Set(recoverable.flatMap((entry) => {
-      if (process.platform === 'linux') return [];
-      if (process.platform === 'darwin' && entry.pid !== null && entry.processStartIdentity !== null) return [];
-      return [entry.token];
-    }));
-    const candidatePids = recoverable.flatMap((entry) =>
-      entry.pid === null || unverifiableTokens.has(entry.token) ? [] : [entry.pid]);
+    const unverifiableTokens = new Set(platform === 'linux' ? [] : tokens);
     const findRecoverableProcesses = () => findWorkerProcessesForTokens(
       tokens,
       workerScope,
-      process.platform === 'darwin' ? candidatePids : undefined,
-    ).filter((entry) => {
-      if (process.platform !== 'darwin') return true;
-      const recorded = pendingByToken.get(entry.token);
-      return recorded?.pid === entry.pid && recorded.processStartIdentity === entry.starttime;
-    });
+      undefined,
+      inspection,
+    );
     const deadline = Date.now() + Math.max(0, graceMs);
     let signal: NodeJS.Signals = 'SIGTERM';
     let emptyPasses = 0;
     for (;;) {
       const found = findRecoverableProcesses();
       emptyPasses = found.length === 0 ? emptyPasses + 1 : 0;
-      signalTrackedWorkerProcesses(found, signal);
+      signalTrackedWorkerProcesses(found, signal, inspection);
       if (emptyPasses >= 2) break;
       if (Date.now() >= deadline) {
         if (signal === 'SIGKILL') break;

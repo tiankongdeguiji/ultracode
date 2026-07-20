@@ -2,9 +2,10 @@
 # In-container driver for one SWE-bench Pro instance x arm. Contract with
 # bench/src/suites/swebench-pro/runner.ts: the arm dir is bind-mounted at /bench; env carries
 # BENCH_ARM (a|b), BENCH_TIMEOUT_SECS, BENCH_MODEL, BENCH_EFFORT,
-# BENCH_BASE_COMMIT, BENCH_CHOWN (uid:gid), BENCH_SANITIZE=1,
+# BENCH_BASE_COMMIT, host-distinct nonzero BENCH_TASK_UID/BENCH_TASK_GID,
+# BENCH_ARTIFACT_OWNER (host uid:gid), BENCH_SANITIZE=1,
 # CODEX_HOME=/bench/codex-home, ULTRACODE_HOME=/bench/uc, and optionally
-# CODEX_API_KEY / BENCH_REPO_DIR. Everything of value is written under /bench
+# CODEX_API_KEY. The repository is fixed at /app. Everything of value is written under /bench
 # before exit, and the script always exits 0 — failures are reported in
 # /bench/out/meta.json, never as a container error.
 set -uo pipefail
@@ -14,7 +15,7 @@ BENCH=/bench
 NODE=/opt/bench/node-sel
 CODEX=/opt/bench/bin/codex
 UC_MAIN=/opt/bench/ultracode/dist/cli/main.js
-REPO_DIR=${BENCH_REPO_DIR:-/app}
+REPO_DIR=${BENCH_REPO_DIR:-}
 export HOME=${HOME:-/root}
 export PATH=/opt/bench/bin:$PATH
 
@@ -76,7 +77,10 @@ finish() {
   rm -f "$CODEX_HOME/auth.json" # container-side scrub; the driver scrubs again
   cleanup_git_audit
   write_meta
-  [ -n "${BENCH_CHOWN:-}" ] && chown -R "$BENCH_CHOWN" "$BENCH" 2>/dev/null
+  if [[ ${BENCH_ARTIFACT_OWNER:-} =~ ^[0-9]+:[0-9]+$ ]]; then
+    chown -R "$BENCH_ARTIFACT_OWNER" "$BENCH" "$HOME" "$CODEX_HOME" 2>/dev/null
+    chmod 0700 "$BENCH" "$HOME" "$CODEX_HOME" 2>/dev/null
+  fi
   sync
   exit 0
 }
@@ -84,6 +88,7 @@ finish() {
 log "entrypoint arm=$BENCH_ARM timeout=${BENCH_TIMEOUT_SECS}s model=${BENCH_MODEL:-<unset>}"
 "$NODE" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
 "$CODEX" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
+[ "$REPO_DIR" = /app ] || { META_FAILURE="harness-setup-failed"; finish; }
 cd "$REPO_DIR" 2>/dev/null || { META_FAILURE="harness-setup-failed"; finish; }
 
 # --- git preflight: uid-mismatch + identity so agent-side git always works ---
@@ -101,12 +106,21 @@ BASE_SHA=$(git rev-parse HEAD 2>/dev/null) || { META_FAILURE="harness-setup-fail
   META_FAILURE="base-mismatch"
   finish
 }
-if ! [[ ${BENCH_CHOWN:-} =~ ^[0-9]+:[0-9]+$ ]]; then
+if ! [[ ${BENCH_TASK_UID:-} =~ ^[0-9]+$ ]] \
+  || ! [[ ${BENCH_TASK_GID:-} =~ ^[0-9]+$ ]] \
+  || [ "$BENCH_TASK_UID" = 0 ] || [ "$BENCH_TASK_GID" = 0 ] \
+  || ! [[ ${BENCH_ARTIFACT_OWNER:-} =~ ^[0-9]+:[0-9]+$ ]]; then
   META_FAILURE="harness-setup-failed"
   finish
 fi
-TASK_UID=${BENCH_CHOWN%%:*}
-TASK_GID=${BENCH_CHOWN##*:}
+ARTIFACT_UID=${BENCH_ARTIFACT_OWNER%%:*}
+ARTIFACT_GID=${BENCH_ARTIFACT_OWNER##*:}
+if [ "$BENCH_TASK_UID" = "$ARTIFACT_UID" ] || [ "$BENCH_TASK_GID" = "$ARTIFACT_GID" ]; then
+  META_FAILURE="harness-setup-failed"
+  finish
+fi
+TASK_UID=$BENCH_TASK_UID
+TASK_GID=$BENCH_TASK_GID
 if ! git status --porcelain > "$BENCH/out/pre-status.txt" 2>&1; then
   log "image checkout status is unreadable; refusing to launch"
   META_FAILURE="invalid-instance"
