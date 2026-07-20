@@ -12,7 +12,6 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { pythonEnvironmentSha256, sha256Tree } from '../../bench/src/shared/provenance.js';
 import { parsePublishedArchiveChecksum } from '../../bench/src/shared/toolchain.js';
-import { resolvedRequirementsFromPipReport } from '../../bench/src/suites/swebench-pro/toolchain.js';
 
 const roots: string[] = [];
 
@@ -82,43 +81,5 @@ describe('published toolchain checksums', () => {
     expect(() => parsePublishedArchiveChecksum(manifest, 'other.tar.xz')).toThrow(/uniquely bind/);
     expect(() => parsePublishedArchiveChecksum(Buffer.concat([manifest, manifest]),
       'node-v22.14.0-linux-x64.tar.xz')).toThrow(/uniquely bind/);
-  });
-});
-
-describe('Pro evaluator dependency locks', () => {
-  it('reduces the full install report to sorted hashes without persisting download URLs', () => {
-    const lock = resolvedRequirementsFromPipReport({
-      install: [{
-        download_info: {
-          url: 'https://secret@example.invalid/pkg.whl?token=private',
-          archive_info: { hashes: { sha256: 'b'.repeat(64) } },
-        },
-        metadata: { name: 'Z_Pkg', version: '2.0' },
-      }, {
-        download_info: {
-          url: 'https://example.invalid/dep.whl',
-          archive_info: { hashes: { sha256: 'a'.repeat(64) } },
-        },
-        metadata: { name: 'a.dep', version: '1.0+cpu' },
-      }],
-    });
-    expect(lock).toBe([
-      `a-dep==1.0+cpu --hash=sha256:${'a'.repeat(64)}`,
-      `z-pkg==2.0 --hash=sha256:${'b'.repeat(64)}`,
-      '',
-    ].join('\n'));
-    expect(lock).not.toContain('secret');
-    expect(lock).not.toContain('token');
-  });
-
-  it('rejects missing hashes and duplicate normalized package names', () => {
-    const install = (name: string, hash?: string): unknown => ({
-      download_info: { archive_info: { hashes: hash === undefined ? {} : { sha256: hash } } },
-      metadata: { name, version: '1.0' },
-    });
-    expect(() => resolvedRequirementsFromPipReport({ install: [install('pkg')] })).toThrow(/unhashed/);
-    expect(() => resolvedRequirementsFromPipReport({
-      install: [install('some_pkg', 'a'.repeat(64)), install('some-pkg', 'b'.repeat(64))],
-    })).toThrow(/duplicate/);
   });
 });

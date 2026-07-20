@@ -51,6 +51,7 @@ import {
   runLeaseFile,
   validateRelativeArtifactPath,
   validateRunId,
+  validateTaskId,
   writePrivateFileAtomic,
   writePrivateJsonAtomic,
 } from '../../shared/paths.js';
@@ -75,6 +76,8 @@ import {
   type VerifierBinding,
 } from '../../shared/verifier.js';
 import {
+  OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY,
+  OFFICIAL_SWEBENCH_PRO_EVALUATOR_REVISION,
   loadRuntimeBindings,
   loadSwebenchProOperatorConfig,
   resolveSwebenchProConfig,
@@ -91,7 +94,9 @@ import {
 } from './image.js';
 import {
   containerPolicySha256,
+  dockerNanoCpus,
   loadSwebenchProContainerPolicy,
+  reclamationContainerPolicyArgv,
   sessionContainerPolicyArgv,
   sessionTaskIdentity,
   type SwebenchProContainerPolicy,
@@ -99,8 +104,12 @@ import {
 import {
   ArtifactUnsafeError,
   OwnershipUnsafeCleanupError,
+  cleanupActiveReclamationHelpers,
   ownershipUnsafe,
   ownershipUnsafeAggregate,
+  releaseActiveReclamationHelper,
+  trackActiveReclamationHelper,
+  type ActiveReclamationHelper,
 } from './cleanup.js';
 import {
   datasetDescriptorSha256,
@@ -127,7 +136,14 @@ import {
   loadPreparedSwebenchProInputs,
   prepareSwebenchProInputs,
 } from './toolchain.js';
-import type { DockerImageAttestation, SessionMeta, SwebenchProInstance, TaskStatus } from './types.js';
+import type {
+  DockerImageAttestation,
+  ReclamationContainerInspect,
+  ReclamationContainerSpec,
+  SessionMeta,
+  SwebenchProInstance,
+  TaskStatus,
+} from './types.js';
 import {
   cleanupActiveSwebenchProEvaluators,
   collectPredictions,
@@ -143,6 +159,8 @@ import { ARM_B_PREFIX_PATH } from '../../shared/prompt.js';
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const SESSION_BACKSTOP_EXTRA_MS = 15 * 60_000;
 const SESSION_CLEANUP_RESERVE_MS = 2 * 60_000;
+const RECLAMATION_ATTEMPTS = 2;
+const RECLAMATION_COMMAND = '/bin/chown -R -- "$1" "${@:2}" && /bin/chmod 0700 "${@:2}"';
 const TERMINAL_PHASES = new Set(['session-done', 'patched', 'evaluated']);
 const TOOLCHAIN_CACHE_LOCK = '.locks/toolchain.lock';
 const SUITE_CACHE_LOCK = '.locks/swebench-pro.lock';
@@ -153,12 +171,12 @@ export const SWEBENCH_PRO_ADAPTER_POLICY_SHA256 = sha256CanonicalJson({
   runLayout: 'suite-run/native/tasks/artifact-key/arm',
   fresh: 'claim-exclusive-directory',
   resume: 'manifest-exists-complete-immutable-projection',
-  redo: 'task-arm-exact-receipt-first-invalidation',
+  redo: 'task-arm-exact-helper-absence-before-invalidation',
   verifier: 'strict-partial-native-booleans',
   credentials: 'runtime-only-outside-results',
   dataset: 'audited-canonical-descriptor-v1',
   cleanup: 'typed-command-fatal-after-settlement-retry',
-  containers: 'host-distinct-task-identity-stopped-reclamation-exact-evaluator-ownership',
+  containers: 'host-distinct-task-identity-owned-reclamation-lifecycle-exact-evaluator-ownership',
 });
 
 export interface RunOptions {
@@ -280,7 +298,9 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SwebenchProManifest['
 
 function currentPolicies(
   roots: BenchPathRoots,
+  evaluatorDependencyTarget: string,
   requirementsSha256: string,
+  requirementsProvenanceSha256: string,
   resolvedRequirementsSha256: string,
   ownershipPatchSha256: string,
   evaluatorPolicyHelperSha256: string,
@@ -316,13 +336,17 @@ function currentPolicies(
     cleanupSha256: sha256CanonicalJson({
       sessionLabels: 'schema-suite-run-task-arm-purpose-ownership-runtime',
       verifierLabels: 'schema-suite-run-task-arm-purpose-ownership-invocation',
+      reclamationLabels: 'schema-suite-run-task-arm-purpose-ownership-artifact-owner-optional-runtime',
+      reclamationOwnership: 'exact-name-id-image-command-user-policy-resources-mounts',
       verifierOwnership: 'post-baseline-exact-local-image-workspace-mount-invocation-start',
       artifactTree: 'stopped-reclaimed-owned-real-single-link',
       ambiguity: 'requery-exact-identity-retain-until-absent',
       fatality: 'ownership-unsafe-command-fatal',
     }),
     evaluatorSha256: sha256CanonicalJson({
+      evaluatorDependencyTarget,
       requirementsSha256,
+      requirementsProvenanceSha256,
       resolvedRequirementsSha256,
       ownershipPatchSha256,
       evaluatorPolicyHelperSha256,
@@ -346,6 +370,7 @@ function swebenchProNativeAssets(roots: BenchPathRoots): SwebenchProManifest['pr
     'suites/swebench-pro/evaluator-policy.py',
     'suites/swebench-pro/evaluator-ownership.patch',
     'suites/swebench-pro/evaluator-requirements.lock',
+    'suites/swebench-pro/evaluator-requirements.provenance.json',
     relative(roots.benchRoot, ARM_B_PREFIX_PATH).split(sep).join('/'),
   ].map((path) => ({
     path: validateRelativeArtifactPath(path),
@@ -403,7 +428,9 @@ function buildManifest(
   const controlPlane = currentControlPlaneHashes(roots);
   const policies = currentPolicies(
     roots,
+    prepared.evaluatorDependencyTarget,
     prepared.requirementsSha256,
+    prepared.requirementsProvenanceSha256,
     prepared.resolvedRequirementsSha256,
     prepared.ownershipPatchSha256,
     prepared.evaluatorPolicyHelperSha256,
@@ -542,6 +569,10 @@ function assertExplicitResumeOptions(options: RunOptions, manifest: SwebenchProM
 }
 
 function resumeConfig(operator: SwebenchProConfig, manifest: SwebenchProManifest): SwebenchProConfig {
+  if (manifest.provenance.suiteSource.repository !== OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY
+    || manifest.provenance.suiteSource.revision !== OFFICIAL_SWEBENCH_PRO_EVALUATOR_REVISION) {
+    throw new Error('manifest evaluator source is not the canonical official pin');
+  }
   const config: SwebenchProConfig = {
     ...operator,
     model: manifest.experiment.model,
@@ -568,8 +599,8 @@ function resumeConfig(operator: SwebenchProConfig, manifest: SwebenchProManifest
     },
     evaluator: {
       ...operator.evaluator,
-      repository: manifest.provenance.suiteSource.repository,
-      revision: manifest.provenance.suiteSource.revision,
+      repository: OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY,
+      revision: OFFICIAL_SWEBENCH_PRO_EVALUATOR_REVISION,
     },
     pricing: manifest.pricing === null ? undefined : {
       [manifest.pricing.model]: {
@@ -601,7 +632,9 @@ function assertPreparedProvenance(
     || canonicalJson(swebenchProNativeAssets(roots)) !== canonicalJson(manifest.provenance.nativeAssets)
     || canonicalJson(currentPolicies(
       roots,
+      prepared.evaluatorDependencyTarget,
       prepared.requirementsSha256,
+      prepared.requirementsProvenanceSha256,
       prepared.resolvedRequirementsSha256,
       prepared.ownershipPatchSha256,
       prepared.evaluatorPolicyHelperSha256,
@@ -762,6 +795,8 @@ interface ActiveSessionContainer {
   taskDirectory: string;
   artifactOwner: SessionArtifactOwner;
   image: DockerImageAttestation;
+  docker: SwebenchProConfig['docker'];
+  policy: SwebenchProContainerPolicy;
   attemptDeadline: number;
   lifecycle: ProcessLifecycle;
   executor: SessionDockerExecutor;
@@ -842,6 +877,18 @@ function containerName(runId: string, taskId: string, arm: Arm): string {
   return `ucbench-${createHash('sha256').update(`${runId}\0${taskId}\0${arm}`, 'utf8').digest('hex').slice(0, 32)}`;
 }
 
+/** Derive the one validated Docker name shared by all reclamation attempts for a task arm. */
+export function reclamationContainerName(runId: string, taskId: string, arm: Arm): string {
+  validateRunId(runId);
+  validateTaskId(taskId);
+  if (arm !== 'a' && arm !== 'b') throw new Error('invalid reclamation helper arm');
+  const digest = createHash('sha256')
+    .update(`reclamation\0${runId}\0${taskId}\0${arm}`, 'utf8')
+    .digest('hex')
+    .slice(0, 32);
+  return `ucbench-reclaim-${digest}`;
+}
+
 export async function stopPersistedSessionContainer(
   name: string,
   runId: string,
@@ -854,6 +901,8 @@ export async function stopPersistedSessionContainer(
     taskDirectory?: string;
     artifactOwner?: SessionArtifactOwner;
     image?: DockerImageAttestation;
+    docker?: SwebenchProConfig['docker'];
+    policy?: SwebenchProContainerPolicy;
     runtimeDirectory?: string;
   } = {},
 ): Promise<void> {
@@ -878,23 +927,30 @@ export async function stopPersistedSessionContainer(
     if (listed.length === 0) {
       if (options.taskDirectory !== undefined && existsSync(options.taskDirectory)) {
         if (image === undefined) throw new Error('session recovery has no exact overlay image identity');
+        if (options.docker === undefined || options.policy === undefined) {
+          throw new Error('session recovery has no exact reclamation policy');
+        }
         const runtime = options.runtimeDirectory === undefined
           ? findSessionRuntimeDirectory(runId, taskId, arm)
           : trustedSessionRuntimeDirectory(options.runtimeDirectory, runId, taskId, arm);
-        await reclaimSessionOwnership(
-          options.taskDirectory,
+        const marker = runtime === undefined ? undefined : readPrivateJson(
           runtime,
+          join(runtime, SESSION_RUNTIME_MARKER),
+        ) as { runtimeNonce: string };
+        await reclaimSessionOwnership({
+          runId,
+          taskId,
+          arm,
+          taskDirectory: options.taskDirectory,
+          runtimeDirectory: runtime,
+          runtimeNonce: marker?.runtimeNonce,
           artifactOwner,
           image,
-          lifecycle,
-          executor,
-          timeout,
-        );
+          docker: options.docker,
+          policy: options.policy,
+        }, lifecycle, executor, timeout);
         reclaimAndAssertArtifactTree(options.taskDirectory);
-        if (runtime !== undefined) {
-          const marker = readPrivateJson(runtime, join(runtime, SESSION_RUNTIME_MARKER)) as {
-            runtimeNonce: string;
-          };
+        if (runtime !== undefined && marker !== undefined) {
           assertSessionRuntimeDirectory(
             runtime,
             join(runtime, 'codex-home'),
@@ -961,15 +1017,21 @@ export async function stopPersistedSessionContainer(
     } else if (parsed[0]!.State?.Running !== false) {
       throw new Error('owned session container running state is not proven');
     }
-    await reclaimSessionOwnership(
+    if (options.docker === undefined || options.policy === undefined) {
+      throw new Error('session cleanup has no exact reclamation policy');
+    }
+    await reclaimSessionOwnership({
+      runId,
+      taskId,
+      arm,
       taskDirectory,
-      runtime,
+      runtimeDirectory: runtime,
+      runtimeNonce,
       artifactOwner,
       image,
-      lifecycle,
-      executor,
-      timeout,
-    );
+      docker: options.docker,
+      policy: options.policy,
+    }, lifecycle, executor, timeout);
     reclaimAndAssertArtifactTree(taskDirectory);
     sessionRuntimeDirectory(parsed[0]!, runId, taskId, arm, runtimeNonce);
     let removalFailure: unknown;
@@ -1012,6 +1074,8 @@ async function cleanupTrackedContainer(name: string): Promise<void> {
         taskDirectory: container.taskDirectory,
         artifactOwner: container.artifactOwner,
         image: container.image,
+        docker: container.docker,
+        policy: container.policy,
         runtimeDirectory: container.runtime,
       },
     );
@@ -1042,6 +1106,81 @@ export async function cleanupActiveSwebenchProContainers(): Promise<number> {
     throw ownershipUnsafeAggregate('active SWE-bench Pro container cleanup failed', failures);
   }
   return entries.length;
+}
+
+export interface ReclamationDockerRunArgvOptions extends ReclamationContainerSpec {
+  policy: SwebenchProContainerPolicy;
+}
+
+function reclamationLabels(options: ReclamationContainerSpec): Record<string, string> {
+  return {
+    'ultracode.benchmark.schema': '2',
+    'ultracode.benchmark.suite': 'swebench-pro',
+    'ultracode.benchmark.run': options.runId,
+    'ultracode.benchmark.task': options.taskId,
+    'ultracode.benchmark.arm': options.arm,
+    'ultracode.benchmark.purpose': 'reclamation',
+    'ultracode.benchmark.ownership': '1',
+    'ultracode.benchmark.artifact-uid': String(options.artifactOwner.uid),
+    'ultracode.benchmark.artifact-gid': String(options.artifactOwner.gid),
+    ...(options.runtimeNonce === undefined
+      ? {}
+      : { 'ultracode.benchmark.runtime': options.runtimeNonce }),
+  };
+}
+
+function reclamationTargets(options: ReclamationContainerSpec): string[] {
+  return options.runtimeDirectory === undefined
+    ? ['/bench']
+    : ['/bench', '/runtime/home', '/runtime/codex-home'];
+}
+
+function reclamationCommandArgv(options: ReclamationContainerSpec): string[] {
+  return [
+    '-c', RECLAMATION_COMMAND,
+    'ultracode-reclaim',
+    `${options.artifactOwner.uid}:${options.artifactOwner.gid}`,
+    ...reclamationTargets(options),
+  ];
+}
+
+function assertReclamationSpec(options: ReclamationContainerSpec): void {
+  if (options.name !== reclamationContainerName(options.runId, options.taskId, options.arm)) {
+    throw new Error('reclamation helper name does not match its validated run/task/arm identity');
+  }
+  if (!Number.isSafeInteger(options.artifactOwner.uid) || options.artifactOwner.uid < 0
+    || !Number.isSafeInteger(options.artifactOwner.gid) || options.artifactOwner.gid < 0) {
+    throw new Error('reclamation helper host owner ids are invalid');
+  }
+  const hasRuntime = options.runtimeDirectory !== undefined;
+  const hasNonce = options.runtimeNonce !== undefined;
+  if (hasRuntime !== hasNonce || (hasNonce && !/^[a-f0-9]{64}$/.test(options.runtimeNonce!))) {
+    throw new Error('reclamation helper runtime binding is incomplete');
+  }
+}
+
+/** Build the complete named and labelled root reclamation invocation for offline inspection. */
+export function reclamationDockerRunArgv(options: ReclamationDockerRunArgvOptions): string[] {
+  assertReclamationSpec(options);
+  const labels = Object.entries(reclamationLabels(options)).flatMap(([key, value]) => [
+    '--label', `${key}=${value}`,
+  ]);
+  const mounts = [
+    '--mount', `type=bind,src=${options.taskDirectory},dst=/bench`,
+    ...(options.runtimeDirectory === undefined ? [] : [
+      '--mount', `type=bind,src=${join(options.runtimeDirectory, 'home')},dst=/runtime/home`,
+      '--mount', `type=bind,src=${join(options.runtimeDirectory, 'codex-home')},dst=/runtime/codex-home`,
+    ]),
+  ];
+  return [
+    'run', '--rm', '--name', options.name,
+    ...labels,
+    ...reclamationContainerPolicyArgv(options.policy, options.docker),
+    ...mounts,
+    '--entrypoint', '/bin/bash',
+    options.image.overlayLocalId,
+    ...reclamationCommandArgv(options),
+  ];
 }
 
 interface SessionResult {
@@ -1111,6 +1250,7 @@ async function runSession(
     SESSION_CLEANUP_RESERVE_MS,
   );
   const imageExecutor: DockerExecutor = (argv) => executor(argv, processLifecycle, activeTimeout());
+  const policy = loadSwebenchProContainerPolicy(roots);
   await reattestTaskImage(image, imageExecutor);
   const name = containerName(manifest.runId, instance.instanceId, arm);
   await stopPersistedSessionContainer(
@@ -1125,6 +1265,8 @@ async function runSession(
       taskDirectory,
       artifactOwner,
       image,
+      docker: config.docker,
+      policy,
     },
   );
   resetArtifactDirectory(runDirFromTask(taskDirectory), taskDirectory);
@@ -1186,7 +1328,7 @@ async function runSession(
     artifactOwner,
     image: image.overlayName,
     docker: config.docker,
-    policy: loadSwebenchProContainerPolicy(roots),
+    policy,
   });
   let endedAt = startedAt;
   let backstop = false;
@@ -1200,6 +1342,8 @@ async function runSession(
       taskDirectory,
       artifactOwner,
       image,
+      docker: config.docker,
+      policy,
       attemptDeadline,
       lifecycle: processLifecycle,
       executor,
@@ -1291,8 +1435,10 @@ async function invalidateRedo(
   state: BenchRunStateStore,
   invocationId: string,
   now: Date,
+  proveExternalAbsence: () => Promise<void>,
 ): Promise<void> {
   if (targets.size === 0) return;
+  await proveExternalAbsence();
   const current = receipt.load();
   await receipt.update(current.revision, (bindings) => retainVerifierBindingsAfterRedo(bindings, targets));
   rmSync(join(directory, 'report.json'), { force: true });
@@ -1390,10 +1536,34 @@ async function recordCompletedAttempt(
   }
 }
 
+async function cleanupActiveSessionResources(): Promise<void> {
+  const failures: unknown[] = [];
+  try {
+    await cleanupActiveReclamationHelpers();
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length === 0) {
+    try {
+      await cleanupActiveSwebenchProContainers();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  try {
+    await cleanupActiveReclamationHelpers();
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length > 0) {
+    throw ownershipUnsafeAggregate('active SWE-bench Pro session-resource cleanup failed', failures);
+  }
+}
+
 /** Settle every worker, retry active cleanup once, and retain the original fatal aggregate. */
 export async function settleSessionWorkers(
   workers: readonly Promise<void>[],
-  cleanupRetry: () => Promise<unknown> = cleanupActiveSwebenchProContainers,
+  cleanupRetry: () => Promise<unknown> = cleanupActiveSessionResources,
 ): Promise<void> {
   const settled = await Promise.allSettled(workers);
   const rejected = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
@@ -1557,6 +1727,16 @@ export async function runCommand(
         stores.state,
         invocationId,
         context.clock.now(),
+        async () => {
+          await cleanRunContainers(
+            context.paths,
+            stores.manifest,
+            new Map(stores.state.load().invocations.map((invocation) => [
+              invocation.invocationId,
+              Date.parse(invocation.startedAt),
+            ])),
+          );
+        },
       );
       await executeSessions(
         context,
@@ -2065,13 +2245,7 @@ export async function statusCommand(options: RunIdentityOptions, context: Comman
   }
 }
 
-interface ContainerInspect {
-  Id?: string;
-  Image?: string;
-  Config?: { Image?: string; Labels?: Record<string, string> };
-  State?: { Running?: boolean; StartedAt?: string };
-  Mounts?: Array<{ Type?: string; Source?: string; Destination?: string }>;
-}
+type ContainerInspect = ReclamationContainerInspect;
 
 function uniqueSessionBindMount(record: ContainerInspect, destination: string): string {
   const mounts = (record.Mounts ?? []).filter((mount) => mount.Type === 'bind'
@@ -2146,6 +2320,23 @@ function trustedSessionRuntimeDirectory(
   arm: Arm,
   expectedNonce?: string,
 ): string {
+  trustedSessionRuntimeRoot(runtime, runId, taskId, arm, expectedNonce);
+  for (const path of [join(runtime, 'home'), join(runtime, 'codex-home')]) {
+    const info = lstatSync(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error('owned session writable runtime mount is unsafe');
+    }
+  }
+  return runtime;
+}
+
+function trustedSessionRuntimeRoot(
+  runtime: string,
+  runId: string,
+  taskId: string,
+  arm: Arm,
+  expectedNonce?: string,
+): string {
   const relativeRuntime = relative(tmpdir(), runtime);
   if (!/^uc-bench-pro-runtime-[A-Za-z0-9]+$/.test(relativeRuntime) || relativeRuntime.includes(sep)) {
     throw new Error('owned session credential runtime is outside the exact temporary namespace');
@@ -2155,12 +2346,6 @@ function trustedSessionRuntimeDirectory(
   if (runtimeInfo.isSymbolicLink() || !runtimeInfo.isDirectory() || (runtimeInfo.mode & 0o777) !== 0o700
     || (uid !== undefined && runtimeInfo.uid !== uid)) {
     throw new Error('owned session runtime is unsafe');
-  }
-  for (const path of [join(runtime, 'home'), join(runtime, 'codex-home')]) {
-    const info = lstatSync(path);
-    if (info.isSymbolicLink() || !info.isDirectory()) {
-      throw new Error('owned session writable runtime mount is unsafe');
-    }
   }
   const marker = readPrivateJson(runtime, join(runtime, SESSION_RUNTIME_MARKER));
   const observedNonce = marker !== null && typeof marker === 'object' && !Array.isArray(marker)
@@ -2201,39 +2386,265 @@ function findSessionRuntimeDirectory(runId: string, taskId: string, arm: Arm): s
   return matches[0];
 }
 
-async function reclaimSessionOwnership(
-  taskDirectory: string,
-  runtime: string | undefined,
-  artifactOwner: SessionArtifactOwner,
-  image: DockerImageAttestation,
+function sameStrings(actual: readonly string[] | null | undefined, expected: readonly string[]): boolean {
+  return canonicalJson([...(actual ?? [])].sort()) === canonicalJson([...expected].sort());
+}
+
+function reclamationBindSource(record: ReclamationContainerInspect, destination: string): string {
+  const matches = (record.Mounts ?? []).filter((mount) =>
+    mount.Type === 'bind' && mount.Destination === destination && typeof mount.Source === 'string');
+  if (matches.length !== 1) throw new Error(`reclamation helper has no unique ${destination} bind mount`);
+  return matches[0]!.Source!;
+}
+
+function compatibleReclamationSpec(
+  record: ReclamationContainerInspect,
+  base: ReclamationContainerSpec,
+): ReclamationContainerSpec {
+  const nonce = record.Config?.Labels?.['ultracode.benchmark.runtime'];
+  if (nonce === undefined) {
+    return { ...base, runtimeDirectory: undefined, runtimeNonce: undefined };
+  }
+  if (!/^[a-f0-9]{64}$/.test(nonce)) throw new Error('reclamation helper runtime nonce is invalid');
+  const runtimeHome = reclamationBindSource(record, '/runtime/home');
+  const runtimeCodex = reclamationBindSource(record, '/runtime/codex-home');
+  const runtime = dirname(runtimeCodex);
+  if (resolve(runtimeHome) !== resolve(runtime, 'home')
+    || resolve(runtimeCodex) !== resolve(runtime, 'codex-home')) {
+    throw new Error('reclamation helper runtime bind sources are not one exact runtime');
+  }
+  trustedSessionRuntimeDirectory(runtime, base.runId, base.taskId, base.arm, nonce);
+  return { ...base, runtimeDirectory: runtime, runtimeNonce: nonce };
+}
+
+function assertExactReclamationHelper(
+  record: ReclamationContainerInspect,
+  listedId: string,
+  options: ReclamationContainerSpec,
+  policy: SwebenchProContainerPolicy,
+): void {
+  assertReclamationSpec(options);
+  const expectedLabels = reclamationLabels(options);
+  const observedLabels = Object.fromEntries(Object.entries(record.Config?.Labels ?? {})
+    .filter(([key]) => key.startsWith('ultracode.benchmark.')));
+  const expectedMounts = [
+    { Source: options.taskDirectory, Destination: '/bench' },
+    ...(options.runtimeDirectory === undefined ? [] : [
+      { Source: join(options.runtimeDirectory, 'home'), Destination: '/runtime/home' },
+      { Source: join(options.runtimeDirectory, 'codex-home'), Destination: '/runtime/codex-home' },
+    ]),
+  ];
+  const exactMounts = (record.Mounts ?? []).length === expectedMounts.length
+    && expectedMounts.every((expected) => (record.Mounts ?? []).filter((mount) =>
+      mount.Type === 'bind'
+      && mount.RW === true
+      && mount.Destination === expected.Destination
+      && typeof mount.Source === 'string'
+      && resolve(mount.Source) === resolve(expected.Source)).length === 1);
+  const command = reclamationCommandArgv(options);
+  const host = record.HostConfig;
+  if (record.Id !== listedId
+    || !/^[a-f0-9]{64}$/.test(record.Id)
+    || record.Name !== `/${options.name}`
+    || record.Config?.Image !== options.image.overlayLocalId
+    || record.Image !== options.image.overlayLocalId
+    || canonicalJson(observedLabels) !== canonicalJson(expectedLabels)
+    || record.Config?.User !== policy.reclamation.user
+    || canonicalJson(record.Config?.Entrypoint) !== canonicalJson(['/bin/bash'])
+    || canonicalJson(record.Config?.Cmd) !== canonicalJson(command)
+    || record.Path !== '/bin/bash'
+    || canonicalJson(record.Args) !== canonicalJson(command)
+    || host?.AutoRemove !== true
+    || host?.NetworkMode !== policy.reclamation.networkMode
+    || host.Privileged !== false
+    || host.ReadonlyRootfs !== false
+    || host.PublishAllPorts !== false
+    || !sameStrings((host.Devices ?? []).map((device) => canonicalJson(device)), [])
+    || host.PidMode !== ''
+    || host.IpcMode !== 'private'
+    || canonicalJson(host.RestartPolicy) !== canonicalJson({ Name: 'no', MaximumRetryCount: 0 })
+    || host.PidsLimit !== policy.reclamation.pidsLimit
+    || !sameStrings(host.SecurityOpt, policy.reclamation.securityOpt)
+    || !sameStrings(host.CapDrop, policy.reclamation.capDrop)
+    || !sameStrings(host.CapAdd, policy.reclamation.capAdd)
+    || host.NanoCpus !== dockerNanoCpus(options.docker.cpus)
+    || host.Memory !== options.docker.memoryBytes
+    || !exactMounts) {
+    throw new Error(`refusing to act on unowned container with reclamation name ${options.name}`);
+  }
+}
+
+async function inspectExactReclamationName(
+  base: ReclamationContainerSpec,
+  expected: ReclamationContainerSpec | null,
+  policy: SwebenchProContainerPolicy,
   lifecycle: ProcessLifecycle,
   executor: SessionDockerExecutor,
   timeout: () => number,
+): Promise<{ record: ReclamationContainerInspect; spec: ReclamationContainerSpec } | null> {
+  const listed = (await executor([
+    'ps', '-aq', '--no-trunc', '--filter', `name=^/${base.name}$`,
+  ], lifecycle, timeout())).split('\n').map((entry) => entry.trim()).filter(Boolean);
+  if (listed.length > 1 || listed.some((id) => !/^[a-f0-9]{64}$/.test(id))) {
+    throw new Error(`reclamation helper name is not uniquely bound to one exact id: ${base.name}`);
+  }
+  if (listed.length === 0) return null;
+  const parsed = JSON.parse(await executor(['inspect', listed[0]!], lifecycle, timeout())) as unknown;
+  if (!Array.isArray(parsed) || parsed.length !== 1 || parsed[0] === null || typeof parsed[0] !== 'object') {
+    throw new Error(`Docker inspection did not exactly bind reclamation helper ${base.name}`);
+  }
+  const record = parsed[0] as ReclamationContainerInspect;
+  const observed = compatibleReclamationSpec(record, base);
+  if (expected !== null && (observed.runtimeNonce !== expected.runtimeNonce
+    || (observed.runtimeDirectory === undefined) !== (expected.runtimeDirectory === undefined)
+    || (observed.runtimeDirectory !== undefined && expected.runtimeDirectory !== undefined
+      && resolve(observed.runtimeDirectory) !== resolve(expected.runtimeDirectory)))) {
+    throw new Error(`reclamation helper runtime binding changed for ${base.name}`);
+  }
+  const spec = expected ?? observed;
+  assertExactReclamationHelper(record, listed[0]!, spec, policy);
+  return { record, spec };
+}
+
+async function reconcileReclamationHelper(
+  base: ReclamationContainerSpec,
+  expected: ReclamationContainerSpec | null,
+  policy: SwebenchProContainerPolicy,
+  lifecycle: ProcessLifecycle,
+  executor: SessionDockerExecutor,
+  timeout: () => number,
+): Promise<boolean> {
+  const existing = await inspectExactReclamationName(base, expected, policy, lifecycle, executor, timeout);
+  if (existing === null) return false;
+  const id = existing.record.Id!;
+  if (existing.record.State?.Running === true) {
+    let stopFailure: unknown;
+    try {
+      await executor(['stop', '--time', '10', id], lifecycle, timeout());
+    } catch (error) {
+      stopFailure = error;
+    }
+    const stopped = await inspectExactReclamationName(base, existing.spec, policy, lifecycle, executor, timeout);
+    if (stopped === null) return true;
+    if (stopped.record.Id !== id || stopped.record.State?.Running !== false) {
+      throw ownershipUnsafeAggregate('owned reclamation helper could not be proven stopped', [stopFailure]);
+    }
+  } else if (existing.record.State?.Running !== false) {
+    throw new Error('owned reclamation helper running state is not proven');
+  }
+  let removalFailure: unknown;
+  try {
+    await executor(['rm', '-f', id], lifecycle, timeout());
+  } catch (error) {
+    removalFailure = error;
+  }
+  let remaining: Awaited<ReturnType<typeof inspectExactReclamationName>>;
+  try {
+    remaining = await inspectExactReclamationName(base, existing.spec, policy, lifecycle, executor, timeout);
+  } catch (error) {
+    throw ownershipUnsafeAggregate('reclamation helper removal could not be re-queried exactly', [
+      removalFailure,
+      error,
+    ]);
+  }
+  if (remaining !== null) {
+    throw ownershipUnsafeAggregate('reclamation helper absence was not proven after removal', [
+      removalFailure,
+      new Error(`reclamation helper name remains present: ${base.name}`),
+    ]);
+  }
+  return true;
+}
+
+export interface ReclamationOwnershipOptions {
+  runId: string;
+  taskId: string;
+  arm: Arm;
+  taskDirectory: string;
+  runtimeDirectory?: string;
+  runtimeNonce?: string;
+  artifactOwner: SessionArtifactOwner;
+  image: DockerImageAttestation;
+  docker: SwebenchProConfig['docker'];
+  policy: SwebenchProContainerPolicy;
+}
+
+/** Reconcile, run, and prove absence of one exact root ownership-reclamation helper. */
+export async function reclaimSessionOwnership(
+  options: ReclamationOwnershipOptions,
+  lifecycle: ProcessLifecycle = {},
+  executor: SessionDockerExecutor = defaultSessionDockerExecutor,
+  timeout: () => number = () => 30_000,
 ): Promise<void> {
-  const taskInfo = lstatSync(taskDirectory);
-  if (taskInfo.isSymbolicLink() || !taskInfo.isDirectory()) {
-    throw new Error('owned session task directory is unsafe before reclamation');
+  const spec: ReclamationContainerSpec = {
+    ...options,
+    name: reclamationContainerName(options.runId, options.taskId, options.arm),
+  };
+  try {
+    assertReclamationSpec(spec);
+    const taskInfo = lstatSync(spec.taskDirectory);
+    if (taskInfo.isSymbolicLink() || !taskInfo.isDirectory()) {
+      throw new Error('owned session task directory is unsafe before reclamation');
+    }
+    if (spec.runtimeDirectory !== undefined) {
+      trustedSessionRuntimeDirectory(
+        spec.runtimeDirectory,
+        spec.runId,
+        spec.taskId,
+        spec.arm,
+        spec.runtimeNonce,
+      );
+    }
+    await reconcileReclamationHelper(spec, null, options.policy, lifecycle, executor, timeout);
+    let absenceProven = true;
+    const active: ActiveReclamationHelper = {
+      name: spec.name,
+      cleanup: async () => {
+        const cleanupDeadline = performance.now() + SESSION_CLEANUP_RESERVE_MS;
+        const cleanupTimeout = (): number => remainingSessionOperationTimeout(cleanupDeadline);
+        await reconcileReclamationHelper(
+          spec,
+          spec,
+          options.policy,
+          lifecycle,
+          executor,
+          cleanupTimeout,
+        );
+      },
+    };
+    trackActiveReclamationHelper(active);
+    try {
+      const argv = reclamationDockerRunArgv({ ...spec, policy: options.policy });
+      for (let attempt = 0; attempt < RECLAMATION_ATTEMPTS; attempt += 1) {
+        absenceProven = false;
+        let launchFailure: unknown;
+        try {
+          await executor(argv, lifecycle, timeout());
+        } catch (error) {
+          launchFailure = error;
+        }
+        try {
+          await reconcileReclamationHelper(spec, spec, options.policy, lifecycle, executor, timeout);
+          absenceProven = true;
+        } catch (error) {
+          throw ownershipUnsafeAggregate('reclamation helper outcome could not be reconciled', [
+            launchFailure,
+            error,
+          ]);
+        }
+        if (launchFailure === undefined) return;
+        if (attempt === RECLAMATION_ATTEMPTS - 1) {
+          throw ownershipUnsafeAggregate('root ownership reclamation failed after an idempotent retry', [
+            launchFailure,
+          ]);
+        }
+      }
+    } finally {
+      if (absenceProven) releaseActiveReclamationHelper(active);
+    }
+  } catch (error) {
+    throw ownershipUnsafe(`unsafe SWE-bench Pro ownership reclamation for ${options.taskId}/${options.arm}`, error);
   }
-  const mounts = ['--mount', `type=bind,src=${taskDirectory},dst=/bench`];
-  const targets = ['/bench'];
-  if (runtime !== undefined) {
-    mounts.push(
-      '--mount', `type=bind,src=${join(runtime, 'home')},dst=/runtime/home`,
-      '--mount', `type=bind,src=${join(runtime, 'codex-home')},dst=/runtime/codex-home`,
-    );
-    targets.push('/runtime/home', '/runtime/codex-home');
-  }
-  const owner = `${artifactOwner.uid}:${artifactOwner.gid}`;
-  await executor([
-    'run', '--rm', '--network', 'none', '--pids-limit', '64',
-    '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL',
-    '--cap-add', 'CHOWN', '--cap-add', 'DAC_OVERRIDE', '--cap-add', 'FOWNER', '--user', '0:0',
-    ...mounts,
-    '--entrypoint', '/bin/bash',
-    image.overlayLocalId,
-    '-c', '/bin/chown -R -- "$1" "${@:2}" && /bin/chmod 0700 "${@:2}"',
-    'ultracode-reclaim', owner, ...targets,
-  ], lifecycle, timeout());
 }
 
 function assertSessionRuntimeDirectory(
@@ -2267,8 +2678,30 @@ function removeSessionRuntime(
   rmSync(runtime, { recursive: true });
 }
 
-/** Remove exact manifest-owned runtime homes that survived without a container. */
-export function cleanupProRuntimeHomes(manifest: SwebenchProManifest): number {
+/** Prove every immutable task/arm reclamation name absent before filesystem cleanup. */
+export async function proveManifestReclamationNamesAbsent(
+  manifest: SwebenchProManifest,
+  executor: DockerExecutor,
+  timeout: () => number,
+): Promise<void> {
+  for (const execution of manifest.artifacts.executions) {
+    const name = reclamationContainerName(manifest.runId, execution.taskId, execution.arm);
+    const listed = (await executor([
+      'ps', '-aq', '--no-trunc', '--filter', `name=^/${name}$`,
+    ], timeout())).split('\n').map((entry) => entry.trim()).filter(Boolean);
+    if (listed.length > 0) {
+      throw new Error(`reclamation helper name remains occupied before runtime cleanup: ${name}`);
+    }
+  }
+}
+
+/** Remove exact manifest-owned runtime homes only after every helper name is absent. */
+export async function cleanupProRuntimeHomes(
+  manifest: SwebenchProManifest,
+  executor: DockerExecutor = defaultDockerExecutor,
+  timeout: () => number = () => 30_000,
+): Promise<number> {
+  await proveManifestReclamationNamesAbsent(manifest, executor, timeout);
   const executions = new Set(manifest.artifacts.executions.map((execution) =>
     `${execution.taskId}\0${execution.arm}`));
   const candidates = readdirSync(tmpdir(), { withFileTypes: true })
@@ -2292,23 +2725,75 @@ export function cleanupProRuntimeHomes(manifest: SwebenchProManifest): number {
           runtimeNonce,
         };
         if (canonicalJson(marker) !== canonicalJson(expected)) return [];
-        assertSessionRuntimeDirectory(runtime, join(runtime, 'codex-home'), manifest.runId, taskId, arm, runtimeNonce);
+        trustedSessionRuntimeRoot(runtime, manifest.runId, taskId, arm, runtimeNonce);
+        const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+        for (const child of [join(runtime, 'home'), join(runtime, 'codex-home')]) {
+          if (!existsSync(child)) continue;
+          const info = lstatSync(child);
+          if (info.isSymbolicLink() || !info.isDirectory()
+            || (uid !== undefined && info.uid !== uid)) {
+            throw new Error('owned session partial runtime child is unsafe');
+          }
+        }
         return [{ runtime, taskId, arm, runtimeNonce }];
       } catch (error) {
+        if (error !== null && typeof error === 'object' && 'code' in error
+          && error.code === 'ENOENT' && !existsSync(runtime)) return [];
         throw new Error(`unsafe SWE-bench Pro runtime namespace entry: ${runtime}`, { cause: error });
       }
     });
   if (new Set(candidates.map((candidate) => candidate.runtimeNonce)).size !== candidates.length) {
     throw new Error('SWE-bench Pro session runtime nonce is not unique');
   }
-  for (const candidate of candidates) removeSessionRuntime(
-    candidate.runtime,
-    manifest.runId,
-    candidate.taskId,
-    candidate.arm,
-    candidate.runtimeNonce,
-  );
+  for (const candidate of candidates) {
+    trustedSessionRuntimeRoot(
+      candidate.runtime,
+      manifest.runId,
+      candidate.taskId,
+      candidate.arm,
+      candidate.runtimeNonce,
+    );
+    rmSync(candidate.runtime, { recursive: true });
+  }
   return candidates.length;
+}
+
+export interface ReclamationRunOwnershipEvidence {
+  taskDirectories: ReadonlyMap<string, string>;
+  imageAttestations: ReadonlyMap<string, DockerImageAttestation>;
+  artifactOwner: SessionArtifactOwner;
+  docker: SwebenchProConfig['docker'];
+  policy: SwebenchProContainerPolicy;
+}
+
+function exactRunReclamationHelper(
+  record: ContainerInspect,
+  evidence: ReclamationRunOwnershipEvidence,
+): boolean {
+  try {
+    const labels = record.Config?.Labels ?? {};
+    const taskId = labels['ultracode.benchmark.task'] ?? '';
+    const arm = labels['ultracode.benchmark.arm'];
+    if (arm !== 'a' && arm !== 'b') return false;
+    const taskDirectory = evidence.taskDirectories.get(`${taskId}\0${arm}`);
+    const image = evidence.imageAttestations.get(taskId);
+    if (taskDirectory === undefined || image === undefined || record.Id === undefined) return false;
+    const base: ReclamationContainerSpec = {
+      name: reclamationContainerName(labels['ultracode.benchmark.run'] ?? '', taskId, arm),
+      runId: labels['ultracode.benchmark.run'] ?? '',
+      taskId,
+      arm,
+      taskDirectory,
+      artifactOwner: evidence.artifactOwner,
+      image,
+      docker: evidence.docker,
+    };
+    const observed = compatibleReclamationSpec(record, base);
+    assertExactReclamationHelper(record, record.Id, observed, evidence.policy);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function ownedRunContainerIds(
@@ -2321,6 +2806,7 @@ export function ownedRunContainerIds(
     imageIdentities: ReadonlyMap<string, EvaluatorImageIdentity>;
     invocationStartedMs: ReadonlyMap<string, number>;
   },
+  reclamationEvidence?: ReclamationRunOwnershipEvidence,
 ): string[] {
   return records.flatMap((record) => {
     const labels = record.Config?.Labels ?? {};
@@ -2328,7 +2814,9 @@ export function ownedRunContainerIds(
     const arm = labels['ultracode.benchmark.arm'];
     const exactPurpose = purpose === 'session'
       ? (arm === 'a' || arm === 'b') && /^[a-f0-9]{64}$/.test(labels['ultracode.benchmark.runtime'] ?? '')
-      : purpose === 'verifier' && verifierEvidence !== undefined
+      : purpose === 'reclamation' && reclamationEvidence !== undefined
+        ? exactRunReclamationHelper(record, reclamationEvidence)
+        : purpose === 'verifier' && verifierEvidence !== undefined
         && ['a', 'b', 'gold', 'nullcheck'].includes(arm ?? '')
         && invocationIds.has(labels['ultracode.benchmark.invocation'] ?? '')
         && existingEvaluatorContainerIds([record], {
@@ -2397,6 +2885,43 @@ async function cleanRunContainers(
         localId: task.image.base.localId,
       }] as const;
     }));
+    const taskDirectories = new Map(manifest.artifacts.executions.map((execution) => [
+      `${execution.taskId}\0${execution.arm}`,
+      executionDirectory(runDir(roots, 'swebench-pro', runId), execution.nativeRoot),
+    ]));
+    const taskImages = imageAttestations(manifest);
+    const artifactOwner = hostArtifactOwner();
+    const policy = loadSwebenchProContainerPolicy(roots);
+    const sessionExecutor: SessionDockerExecutor = (argv, _lifecycle, timeoutMs) =>
+      executor(argv, timeoutMs);
+    for (const execution of manifest.artifacts.executions) {
+      const taskDirectory = taskDirectories.get(`${execution.taskId}\0${execution.arm}`);
+      const image = taskImages.get(execution.taskId);
+      if (taskDirectory === undefined || image === undefined) {
+        throw new Error('manifest reclamation helper has no complete ownership evidence');
+      }
+      const base: ReclamationContainerSpec = {
+        name: reclamationContainerName(runId, execution.taskId, execution.arm),
+        runId,
+        taskId: execution.taskId,
+        arm: execution.arm,
+        taskDirectory,
+        artifactOwner,
+        image,
+        docker: manifest.suiteConfig.docker,
+      };
+      const current = await inspectExactReclamationName(
+        base,
+        null,
+        policy,
+        {},
+        sessionExecutor,
+        timeout,
+      );
+      if (current !== null) {
+        await reclaimSessionOwnership({ ...current.spec, policy }, {}, sessionExecutor, timeout);
+      }
+    }
     const owned = ownedRunContainerIds(
       parsed,
       runId,
@@ -2407,18 +2932,26 @@ async function cleanRunContainers(
         imageIdentities: verifierImageIdentities,
         invocationStartedMs,
       },
+      {
+        taskDirectories,
+        imageAttestations: taskImages,
+        artifactOwner,
+        docker: manifest.suiteConfig.docker,
+        policy,
+      },
     );
     if (owned.length !== parsed.length) {
       throw new Error('run-labelled Docker resources do not have complete manifest ownership');
     }
-    const taskDirectories = new Map(manifest.artifacts.executions.map((execution) => [
-      `${execution.taskId}\0${execution.arm}`,
-      executionDirectory(runDir(roots, 'swebench-pro', runId), execution.nativeRoot),
-    ]));
-    const taskImages = imageAttestations(manifest);
-    const artifactOwner = hostArtifactOwner();
-    for (const id of owned) {
-      const record = parsed.find((candidate) => candidate.Id === id)!;
+    const ordered = parsed.filter((record) => owned.includes(record.Id!)).sort((left, right) => {
+      const rank = (record: ContainerInspect): number => {
+        const purpose = record.Config?.Labels?.['ultracode.benchmark.purpose'];
+        return purpose === 'session' ? 0 : purpose === 'reclamation' ? 1 : 2;
+      };
+      return rank(left) - rank(right);
+    });
+    for (const record of ordered) {
+      const id = record.Id!;
       const labels = record.Config?.Labels ?? {};
       if (labels['ultracode.benchmark.purpose'] === 'session') {
         const taskId = labels['ultracode.benchmark.task']!;
@@ -2427,8 +2960,6 @@ async function cleanRunContainers(
         const image = taskImages.get(taskId);
         if (taskDirectory === undefined) throw new Error('owned session has no manifest task directory');
         if (image === undefined) throw new Error('owned session has no manifest image identity');
-        const sessionExecutor: SessionDockerExecutor = (argv, _lifecycle, timeoutMs) =>
-          executor(argv, timeoutMs);
         await stopPersistedSessionContainer(
           containerName(runId, taskId, arm),
           runId,
@@ -2436,8 +2967,46 @@ async function cleanRunContainers(
           arm,
           {},
           sessionExecutor,
-          { attemptDeadline: cleanupDeadline, taskDirectory, artifactOwner, image },
+          {
+            attemptDeadline: cleanupDeadline,
+            taskDirectory,
+            artifactOwner,
+            image,
+            docker: manifest.suiteConfig.docker,
+            policy,
+          },
         );
+        continue;
+      }
+      if (labels['ultracode.benchmark.purpose'] === 'reclamation') {
+        const taskId = labels['ultracode.benchmark.task']!;
+        const arm = labels['ultracode.benchmark.arm'] as Arm;
+        const taskDirectory = taskDirectories.get(`${taskId}\0${arm}`)!;
+        const image = taskImages.get(taskId)!;
+        const base: ReclamationContainerSpec = {
+          name: reclamationContainerName(runId, taskId, arm),
+          runId,
+          taskId,
+          arm,
+          taskDirectory,
+          artifactOwner,
+          image,
+          docker: manifest.suiteConfig.docker,
+        };
+        const current = await inspectExactReclamationName(
+          base,
+          null,
+          policy,
+          {},
+          sessionExecutor,
+          timeout,
+        );
+        if (current !== null) {
+          await reclaimSessionOwnership({
+            ...current.spec,
+            policy,
+          }, {}, sessionExecutor, timeout);
+        }
         continue;
       }
       let removalFailure: unknown;
@@ -2458,7 +3027,7 @@ async function cleanRunContainers(
     if (remaining.length > 0) {
       throw new Error(`run-owned containers remain after cleanup: ${remaining.join(', ')}`);
     }
-    cleanupProRuntimeHomes(manifest);
+    await cleanupProRuntimeHomes(manifest, executor, timeout);
     return owned.length;
   } catch (error) {
     throw ownershipUnsafe('unsafe SWE-bench Pro run-owned cleanup', error);
@@ -2502,13 +3071,17 @@ export async function cleanCommand(options: CleanOptions, context: CommandContex
   }
 }
 
-/** Suite cleanup covers every tracked daemon-owned session and evaluator. */
+/** Suite cleanup covers every tracked daemon-owned session, evaluator, and reclamation helper. */
 export async function cleanupSwebenchProRuntime(): Promise<void> {
-  const settled = await Promise.allSettled([
+  const reclamationBefore = await Promise.allSettled([cleanupActiveReclamationHelpers()]);
+  const blocked = reclamationBefore.some((result) => result.status === 'rejected');
+  const primary = await Promise.allSettled([
     cleanupActiveSwebenchProEvaluators(),
-    cleanupActiveSwebenchProContainers(),
+    ...(blocked ? [] : [cleanupActiveSwebenchProContainers()]),
   ]);
-  const failures = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+  const reclamationAfter = await Promise.allSettled([cleanupActiveReclamationHelpers()]);
+  const failures = [...reclamationBefore, ...primary, ...reclamationAfter]
+    .flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
   if (failures.some((error) => error instanceof OwnershipUnsafeCleanupError)) {
     throw ownershipUnsafeAggregate('SWE-bench Pro runtime cleanup failed ownership checks', failures);
   }

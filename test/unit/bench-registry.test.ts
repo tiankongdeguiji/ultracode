@@ -128,8 +128,13 @@ describe('suite registry contracts', () => {
     expect(verifier).not.toMatch(/evaluatorVenvDir|harnessDir/);
     expect(preparation).toContain("const target = swebenchProPreparedDir(roots, payloadSha256)");
     expect(preparation).toContain("'--require-hashes'");
-    expect(preparation).toContain("'--report', '-'");
-    expect(preparation).not.toContain('.resolver-report');
+    expect(preparation).toContain("'--only-binary=:all:', '--no-deps'");
+    expect(preparation).toContain("'venv', '--without-pip'");
+    expect(preparation).not.toContain("'--report'");
+    expect(preparation.indexOf('const dependencies = loadEvaluatorDependencies(roots)'))
+      .toBeLessThan(preparation.indexOf('const targetDependencyPartition = await preflightEvaluatorDependencies'));
+    expect(preparation.indexOf('const targetDependencyPartition = await preflightEvaluatorDependencies'))
+      .toBeLessThan(preparation.indexOf('const toolchain = await prepareSharedToolchain'));
     expect(preparation).not.toMatch(/prepared-v2|evaluator-venv/);
   });
 

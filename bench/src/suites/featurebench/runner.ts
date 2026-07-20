@@ -1063,10 +1063,33 @@ function locateTimestamp(directory: string, before: ReadonlySet<string>): string
   return validateRelativeArtifactPath(`native/${candidates[0]!.name}`);
 }
 
-function originalNativeRoot(state: BenchRunState): string {
-  const root = state.attempts.find((attempt) => attempt.phase === 'inference' && attempt.nativePath !== null)?.nativePath;
-  if (root === undefined || root === null) throw new Error('FeatureBench resume has no state-bound original native run');
-  return root;
+/** Resolve the first state-bound inference root while rejecting native roots absent from state. */
+export function resolveFeatureBenchResumeRoot(
+  outputDirectory: string,
+  state: Pick<BenchRunState, 'attempts'>,
+  requireBaseline: boolean,
+): string | null {
+  const boundRoots = state.attempts
+    .filter((attempt) => attempt.phase === 'inference' && attempt.nativePath !== null)
+    .map((attempt) => attempt.nativePath!);
+  for (const root of boundRoots) {
+    const timestamp = root.startsWith('native/') ? root.slice('native/'.length) : '';
+    if (!TIMESTAMP_RE.test(timestamp)) {
+      throw new Error(`FeatureBench state contains a non-timestamp inference root: ${root}`);
+    }
+  }
+  const bound = new Set<string>(boundRoots);
+  const unbound = [...timestampDirectories(outputDirectory)]
+    .map((timestamp) => `native/${timestamp}`)
+    .filter((root) => !bound.has(root));
+  if (unbound.length > 0) {
+    throw new Error(`FeatureBench resume contains unbound timestamped native state: ${unbound.join(', ')}`);
+  }
+  const originalRoot = boundRoots[0] ?? null;
+  if (requireBaseline && originalRoot === null) {
+    throw new Error('FeatureBench redo requires a state-bound prior inference with a native root');
+  }
+  return originalRoot;
 }
 
 function predictionTaskId(value: unknown): string | null {
@@ -1273,8 +1296,12 @@ async function executeNativeRun(
   stores: { state: BenchRunStateStore; receipt: VerifierReceiptStore },
   invocationId: string,
   redo: ReadonlySet<string>,
+  originalRoot: string | null,
   executor: FeatureBenchExecutor = nativeExecute,
 ): Promise<void> {
+  if (redo.size > 0 && originalRoot === null) {
+    throw new Error('FeatureBench redo requires a state-bound prior inference with a native root');
+  }
   const arm = manifest.experiment.arm as Arm;
   await cleanupFeatureBenchContainers(manifest.runId, arm, manifest.experiment.taskIds, executor);
   cleanupFeatureBenchRuntimeHomes(manifest.runId, arm);
@@ -1303,6 +1330,7 @@ async function executeNativeRun(
       stores,
       invocationId,
       redo,
+      originalRoot,
       runtimeHome,
       executor,
     );
@@ -1327,6 +1355,7 @@ async function executeNativeRunWithHome(
   stores: { state: BenchRunStateStore; receipt: VerifierReceiptStore },
   invocationId: string,
   redo: ReadonlySet<string>,
+  originalRoot: string | null,
   runtimeHome: string,
   executor: FeatureBenchExecutor,
 ): Promise<void> {
@@ -1344,17 +1373,9 @@ async function executeNativeRunWithHome(
   const before = timestampDirectories(outputDirectory);
   const lifecycle = stores.state.lifecycleHooks(invocationId);
   try {
-    const currentState = stores.state.load();
-    const hasPriorInference = currentState.attempts.some((attempt) => attempt.phase === 'inference');
-    if (!hasPriorInference && before.size > 0) {
-      throw new Error('fresh FeatureBench run contains unbound timestamped native state');
-    }
-    if (redo.size > 0 && !hasPriorInference) {
-      throw new Error('FeatureBench redo requires a state-bound prior inference');
-    }
     let infer = plan.infer;
-    if (redo.size === 0 && hasPriorInference) {
-      nativeRoot = originalNativeRoot(currentState);
+    if (redo.size === 0 && originalRoot !== null) {
+      nativeRoot = originalRoot;
       const metadataPath = `${nativeRoot}/run_metadata.json`;
       validateFeatureBenchRunMetadata(
         JSON.parse(readRegularFileWithinRoot(directory, metadataPath).toString('utf8')) as unknown,
@@ -1492,16 +1513,20 @@ function redoTargets(values: readonly string[], manifest: FeatureBenchManifest):
   return targets;
 }
 
-async function invalidateRedo(
+export async function invalidateFeatureBenchRedo(
   roots: BenchPathRoots,
   manifest: FeatureBenchManifest,
   targets: ReadonlySet<string>,
+  originalRoot: string | null,
   receipt: VerifierReceiptStore,
   state: BenchRunStateStore,
   invocationId: string,
   now: Date,
 ): Promise<void> {
   if (targets.size === 0) return;
+  if (originalRoot === null) {
+    throw new Error('FeatureBench redo requires a state-bound prior inference with a native root');
+  }
   const current = receipt.load();
   await receipt.update(current.revision, (bindings) => bindings.filter((binding) => {
     if (binding.scope.kind === 'task-arm' && targets.has(binding.scope.taskId)) return false;
@@ -1566,6 +1591,12 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
         policyLock,
       );
       assertResumeOptions(options, stores.manifest);
+      const targets = redoTargets(options.redo, stores.manifest);
+      const originalRoot = resolveFeatureBenchResumeRoot(
+        nativeDir(context.paths, 'featurebench', options.runId),
+        stores.state.load(),
+        targets.size > 0,
+      );
       const config = resumeConfig(operator.featureBench, stores.manifest);
       locks = await acquireInputLocks(context.paths, options.recoverStaleLock);
       const prepared = loadPreparedFeatureBenchInputs(featureBenchPreparedDir(
@@ -1575,17 +1606,27 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
       const attestation = await attestRuntime(context.paths, options.runId, config, runtime, prepared);
       assertProvenance(context.paths, stores.manifest, prepared, attestation);
       invocationId = await beginInvocation(stores.state, 'run', context.clock.now());
-      const targets = redoTargets(options.redo, stores.manifest);
-      await invalidateRedo(
+      await invalidateFeatureBenchRedo(
         context.paths,
         stores.manifest,
         targets,
+        originalRoot,
         stores.receipt,
         stores.state,
         invocationId,
         context.clock.now(),
       );
-      await executeNativeRun(context, config, runtime, stores.manifest, prepared, stores, invocationId, targets);
+      await executeNativeRun(
+        context,
+        config,
+        runtime,
+        stores.manifest,
+        prepared,
+        stores,
+        invocationId,
+        targets,
+        originalRoot,
+      );
       await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
     } catch (error) {
       if (invocationId !== null && stores !== null) {
@@ -1630,7 +1671,7 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
     const startedMs = performance.now();
     const invocationId = await beginInvocation(stores.state, 'run', context.clock.now());
     try {
-      await executeNativeRun(context, config, runtime, manifest, prepared, stores, invocationId, new Set());
+      await executeNativeRun(context, config, runtime, manifest, prepared, stores, invocationId, new Set(), null);
       await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
     } catch (error) {
       await finishInvocation(stores.state, invocationId, startedMs, context.clock.now(), 'unknown-terminal');

@@ -24,7 +24,7 @@ const boundedPolicySchema = z.strictObject({
   pidsLimit: z.literal(1_024),
   securityOpt: z.tuple([z.literal('no-new-privileges')]),
   capDrop: z.tuple([z.literal('ALL')]),
-  capAdd: z.array(z.enum(['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'])),
+  capAdd: z.array(z.enum(['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETGID', 'SETPCAP', 'SETUID'])),
   resources: z.literal('manifest-docker'),
 });
 
@@ -43,13 +43,23 @@ const containerPolicySchema = z.strictObject({
   evaluator: boundedPolicySchema.extend({
     capAdd: z.tuple([]),
   }),
+  reclamation: boundedPolicySchema.extend({
+    pidsLimit: z.literal(64),
+    capAdd: z.tuple([
+      z.literal('CHOWN'),
+      z.literal('DAC_OVERRIDE'),
+      z.literal('FOWNER'),
+    ]),
+    networkMode: z.literal('none'),
+    user: z.literal('0:0'),
+  }),
 });
 
 export type SwebenchProContainerPolicy = z.infer<typeof containerPolicySchema>;
 
 /** Reviewed canonical JSON identity of the complete static container policy. */
 export const SWEBENCH_PRO_CONTAINER_POLICY_SHA256 =
-  '7eb4bcc8ae3ccfec738390ceb2fe97076abc3a6b12a4df2342aaa8333e0b8c7d';
+  'a8963e9656e5e128ac2b4dfbe7c3d3ddc0457af21ba37e3203c7345d03cc70a0';
 
 export interface EvaluatorContainerPolicy {
   pidsLimit: 1_024;
@@ -84,17 +94,32 @@ export function sessionContainerPolicyArgv(
 ): string[] {
   containerPolicySha256(policy);
   assertManifestResources(docker);
-  const nanoCpus = dockerNanoCpus(docker.cpus);
-  const wholeCpus = Math.floor(nanoCpus / 1_000_000_000);
-  const fractionalCpus = String(nanoCpus % 1_000_000_000).padStart(9, '0').replace(/0+$/u, '');
-  const cpus = fractionalCpus === '' ? String(wholeCpus) : `${wholeCpus}.${fractionalCpus}`;
   return [
     '--pids-limit', String(policy.session.pidsLimit),
     ...policy.session.securityOpt.flatMap((option) => ['--security-opt', option]),
     ...policy.session.capDrop.flatMap((capability) => ['--cap-drop', capability]),
     ...policy.session.capAdd.flatMap((capability) => ['--cap-add', capability]),
-    '--cpus', cpus,
+    '--cpus', dockerCpuString(docker.cpus),
     '--memory', String(docker.memoryBytes),
+  ];
+}
+
+/** Exact Docker CLI policy segment used for each root ownership-reclamation helper. */
+export function reclamationContainerPolicyArgv(
+  policy: SwebenchProContainerPolicy,
+  docker: SwebenchProConfig['docker'],
+): string[] {
+  containerPolicySha256(policy);
+  assertManifestResources(docker);
+  return [
+    '--network', policy.reclamation.networkMode,
+    '--pids-limit', String(policy.reclamation.pidsLimit),
+    ...policy.reclamation.securityOpt.flatMap((option) => ['--security-opt', option]),
+    ...policy.reclamation.capDrop.flatMap((capability) => ['--cap-drop', capability]),
+    ...policy.reclamation.capAdd.flatMap((capability) => ['--cap-add', capability]),
+    '--cpus', dockerCpuString(docker.cpus),
+    '--memory', String(docker.memoryBytes),
+    '--user', policy.reclamation.user,
   ];
 }
 
@@ -126,6 +151,13 @@ export function dockerNanoCpus(cpus: number): number {
     throw new Error('SWE-bench Pro CPU limit must be an exact positive number of nanocores');
   }
   return nanoCpus;
+}
+
+function dockerCpuString(cpus: number): string {
+  const nanoCpus = dockerNanoCpus(cpus);
+  const wholeCpus = Math.floor(nanoCpus / 1_000_000_000);
+  const fractionalCpus = String(nanoCpus % 1_000_000_000).padStart(9, '0').replace(/0+$/u, '');
+  return fractionalCpus === '' ? String(wholeCpus) : `${wholeCpus}.${fractionalCpus}`;
 }
 
 function assertManifestResources(docker: SwebenchProConfig['docker']): void {

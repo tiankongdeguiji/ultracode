@@ -125,13 +125,17 @@ async function fetchPage(offset: number): Promise<HfRowsPage> {
   throw new Error(`failed to fetch SWE-bench Pro rows at offset ${offset}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
+function compareOrdinal(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function byInstanceId(
   left: Record<string, unknown>,
   right: Record<string, unknown>,
 ): number {
   const leftId = instanceFromRow(left).instanceId;
   const rightId = instanceFromRow(right).instanceId;
-  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+  return compareOrdinal(leftId, rightId);
 }
 
 /** Build the only hashable dataset representation, with codepoint-sorted full rows. */
@@ -283,14 +287,14 @@ export function selectInstances(
     const key = selection.stratifyBy === 'repo' ? instance.repo : instance.repoLanguage;
     strata.set(key, [...(strata.get(key) ?? []), instance]);
   }
-  const keys = [...strata.keys()].sort();
+  const keys = [...strata.keys()].sort(compareOrdinal);
   const quota = allocations(keys.map((key) => strata.get(key)!.length), count);
   const random = mulberry32(selection.seed);
   const selected: SwebenchProInstance[] = [];
   keys.forEach((key, index) => {
-    const values = [...strata.get(key)!].sort((left, right) => left.instanceId.localeCompare(right.instanceId));
+    const values = [...strata.get(key)!].sort((left, right) => compareOrdinal(left.instanceId, right.instanceId));
     shuffle(values, random);
     selected.push(...values.slice(0, quota[index]!));
   });
-  return selected.sort((left, right) => left.instanceId.localeCompare(right.instanceId));
+  return selected.sort((left, right) => compareOrdinal(left.instanceId, right.instanceId));
 }

@@ -7,7 +7,7 @@ import re
 
 
 CANONICAL_CONTAINER_POLICY_SHA256 = (
-    "7eb4bcc8ae3ccfec738390ceb2fe97076abc3a6b12a4df2342aaa8333e0b8c7d"
+    "a8963e9656e5e128ac2b4dfbe7c3d3ddc0457af21ba37e3203c7345d03cc70a0"
 )
 TOP_LEVEL_FIELDS = {
     "schemaVersion",

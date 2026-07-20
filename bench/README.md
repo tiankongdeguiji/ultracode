@@ -14,7 +14,7 @@ Preparation prerequisites are suite-scoped:
 
 | Suite | Host and preparation tools |
 | --- | --- |
-| SWE-bench Pro | Linux or macOS, plus Python 3 with `venv`; it does not require `uv` or GNU `patch` |
+| SWE-bench Pro | CPython 3.11 with pip 24.2 and `venv` on reviewed Linux/glibc or macOS targets; it does not require `uv` or GNU `patch` |
 | SWE-Marathon | Linux x64 with a Linux amd64 Docker daemon, plus `uv` and GNU `patch` |
 | FeatureBench | Linux x64 with a Linux amd64 Docker daemon, plus `uv` |
 
@@ -89,10 +89,13 @@ full-state copies.
 
 Suite preparation publishes immutable content-addressed directories. In
 particular, SWE-bench Pro records a complete transitive, artifact-hashed Python
-lock, rebuilds the evaluator environment under hash enforcement, and binds the
-patched evaluator tree, environment tree, Python executable, and resolved lock
-to the prepared identity. A later `prep` changes only the current pointer used
-by fresh runs; resume loads the exact identity frozen by its manifest.
+lock plus reviewed wheel/target provenance, derives the active partition without
+a network resolver, and performs the first environment install with hashes,
+binary-only selection, and dependency resolution disabled. It binds the patched
+evaluator tree, environment tree, Python executable, reviewed assets, and
+resolved target lock to the prepared identity. A later `prep` changes only the
+current pointer used by fresh runs; resume loads the exact identity frozen by
+its manifest.
 
 SWE-bench Pro additionally verifies a reviewed canonical full-row dataset
 digest before publishing or loading its cache. Its session and official
@@ -165,6 +168,11 @@ runtime Docker names.
 All native containers receive the complete `ultracode.benchmark.*` ownership
 label tuple. Cleanup discovers by that tuple, reinspects the full identity, and
 refuses to delete ambiguous or unowned resources.
+SWE-bench Pro root ownership-reclamation helpers additionally use deterministic
+run/task/arm-derived names and are admitted by session, run-wide, and fatal
+cleanup only after exact image, command, user, policy, resource, and bind-mount
+attestation. Artifacts and credential runtime homes remain in place until the
+helper name is proven absent.
 
 Native host processes receive a high-entropy lifecycle token and run-scope
 identity before launch. Run state retains the token, direct-child identity, and

@@ -55,8 +55,8 @@ const config: SwebenchProConfig = {
   concurrency: { tasks: 1, verifier: 3 },
   docker: { cpus: 1.5, memoryBytes: 2_000_000, keepImages: false },
   evaluator: {
-    repository: 'https://example.test/evaluator.git',
-    revision: 'b'.repeat(40),
+    repository: 'https://github.com/scaleapi/SWE-bench_Pro-os',
+    revision: 'ca10a60a5fcae51e6948ffe1485d4153d421e6c5',
     pipIndex: 'https://pypi.org/simple',
   },
   sanitizeGitHistory: true,
@@ -78,6 +78,15 @@ const containerPolicy: SwebenchProContainerPolicy = {
     capDrop: ['ALL'],
     capAdd: [],
     resources: 'manifest-docker',
+  },
+  reclamation: {
+    pidsLimit: 64,
+    securityOpt: ['no-new-privileges'],
+    capDrop: ['ALL'],
+    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'FOWNER'],
+    resources: 'manifest-docker',
+    networkMode: 'none',
+    user: '0:0',
   },
 };
 

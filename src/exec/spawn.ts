@@ -12,6 +12,7 @@ import {
   MAX_DARWIN_CANDIDATE_PROCESSES,
   readProcessIdentitySnapshot,
   signalTrackedWorkerProcesses,
+  signal0Status,
   signalWorkerProcessTokens,
   signalWorkerProcesses,
   type ProcessInspectionOptions,
@@ -99,16 +100,7 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
   const platform = opts.processInspection?.platform ?? process.platform;
   const processGroupStatus = (): 'alive' | 'absent' | 'unknown' => {
     if (!pid) return 'absent';
-    try {
-      process.kill(-pid, 0);
-      return 'alive';
-    } catch (error) {
-      if (platform !== 'darwin') return 'absent';
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === 'ESRCH') return 'absent';
-      if (code === 'EPERM') return 'alive';
-      return 'unknown';
-    }
+    return signal0Status(-pid, opts.processInspection);
   };
   let groupTargetRetired = false;
   const retireGroupIfGone = (): boolean => {

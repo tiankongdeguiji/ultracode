@@ -92,9 +92,14 @@ configuration from that manifest and rejects conflicting CLI overrides. The
 operator's current public broker identity/version must still match the frozen
 hashes, while runtime broker URL and network names are resolved anew from the
 environment and re-attested on every launch. `--redo <task-id>` requires
-`--resume`, invalidates that task and the aggregate receipt bindings, runs a new
-timestamped native inference, and evaluates a complete prediction set
-consolidated from every state-bound inference root in append order.
+`--resume` plus a non-null state-bound inference baseline. The baseline check
+precedes receipt/report invalidation. Ordinary resume targets the first
+non-null inference root with native `--resume`; null-only history retries the
+complete immutable task set fresh only while `native/` has no timestamp root.
+Any timestamp root absent from inference state is ambiguous and rejected. Redo
+runs a new timestamped native inference while preserving that first baseline,
+then evaluates a complete prediction set consolidated from every state-bound
+inference root in append order.
 
 Every run uses the common suite-qualified layout (with `suite` equal to
 `featurebench`):

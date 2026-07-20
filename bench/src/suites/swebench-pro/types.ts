@@ -1,5 +1,6 @@
 /** Native SWE-bench Pro rows, session evidence, and task artifacts. */
-import type { FailureCode } from '../../shared/contracts.js';
+import type { Arm, FailureCode } from '../../shared/contracts.js';
+import type { SwebenchProConfig } from './config.js';
 
 export interface SwebenchProInstance {
   /** Complete source row frozen into the v2 manifest. */
@@ -81,4 +82,61 @@ export interface DockerImageAttestation {
   overlayName: string;
   overlayLocalId: string;
   overlayPlatform: string;
+}
+
+/** Docker inspection fields required to prove an exact reclamation helper. */
+export interface ReclamationContainerInspect {
+  Id?: string;
+  Name?: string;
+  Image?: string;
+  Path?: string;
+  Args?: string[];
+  Config?: {
+    Image?: string;
+    Labels?: Record<string, string>;
+    User?: string;
+    Entrypoint?: string[];
+    Cmd?: string[];
+  };
+  HostConfig?: {
+    AutoRemove?: boolean;
+    NetworkMode?: string;
+    Privileged?: boolean;
+    ReadonlyRootfs?: boolean;
+    PublishAllPorts?: boolean;
+    Devices?: unknown[] | null;
+    PidMode?: string;
+    IpcMode?: string;
+    RestartPolicy?: {
+      Name?: string;
+      MaximumRetryCount?: number;
+    };
+    PidsLimit?: number;
+    SecurityOpt?: string[];
+    CapDrop?: string[] | null;
+    CapAdd?: string[] | null;
+    NanoCpus?: number;
+    Memory?: number;
+  };
+  State?: { Running?: boolean; StartedAt?: string };
+  Mounts?: Array<{
+    Type?: string;
+    Source?: string;
+    Destination?: string;
+    RW?: boolean;
+  }>;
+}
+
+/** Trusted inputs that uniquely bind one root ownership-reclamation helper. */
+export interface ReclamationContainerSpec {
+  name: string;
+  runId: string;
+  taskId: string;
+  arm: Arm;
+  taskDirectory: string;
+  runtimeDirectory?: string;
+  runtimeNonce?: string;
+  artifactOwner: { uid: number; gid: number };
+  image: DockerImageAttestation;
+  docker: SwebenchProConfig['docker'];
 }

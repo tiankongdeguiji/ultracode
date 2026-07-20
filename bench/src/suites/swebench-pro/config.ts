@@ -11,6 +11,11 @@ import {
 } from '../../shared/config.js';
 import { publicLocatorSchema } from '../../shared/provenance.js';
 
+export const OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY =
+  'https://github.com/scaleapi/SWE-bench_Pro-os' as const;
+export const OFFICIAL_SWEBENCH_PRO_EVALUATOR_REVISION =
+  'ca10a60a5fcae51e6948ffe1485d4153d421e6c5' as const;
+
 const selectionSchema = z.strictObject({
   taskIds: z.array(z.string().min(1)).nullable(),
   count: z.number().int().positive(),
@@ -51,8 +56,8 @@ export const swebenchProConfigSchema = z.strictObject({
     keepImages: z.boolean(),
   }),
   evaluator: z.strictObject({
-    repository: publicLocatorSchema,
-    revision: z.string().regex(/^[a-f0-9]{40}$/),
+    repository: z.literal(OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY),
+    revision: z.literal(OFFICIAL_SWEBENCH_PRO_EVALUATOR_REVISION),
     pipIndex: publicLocatorSchema,
   }),
   sanitizeGitHistory: z.literal(true),
@@ -80,8 +85,8 @@ export const DEFAULT_SWEBENCH_PRO_CONFIG: SwebenchProConfig = {
   concurrency: { tasks: 4, verifier: 8 },
   docker: { cpus: 8, memoryBytes: 24 * 1_024 * 1_024 * 1_024, keepImages: false },
   evaluator: {
-    repository: 'https://github.com/scaleapi/SWE-bench_Pro-os',
-    revision: 'ca10a60a5fcae51e6948ffe1485d4153d421e6c5',
+    repository: OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY,
+    revision: OFFICIAL_SWEBENCH_PRO_EVALUATOR_REVISION,
     pipIndex: 'https://pypi.org/simple',
   },
   sanitizeGitHistory: true,
@@ -145,6 +150,6 @@ export function loadRuntimeBindings(config: SwebenchProConfig, env = process.env
 
 export const suiteCacheDir = (roots: BenchPathRoots): string => join(roots.cacheRoot, 'swebench-pro');
 export const instancesFile = (roots: BenchPathRoots): string => join(suiteCacheDir(roots), 'instances-v2.json');
-export const swebenchProCurrentFile = (roots: BenchPathRoots): string => join(suiteCacheDir(roots), 'current-v2.json');
+export const swebenchProCurrentFile = (roots: BenchPathRoots): string => join(suiteCacheDir(roots), 'current-v3.json');
 export const swebenchProPreparedDir = (roots: BenchPathRoots, identity: string): string =>
   join(suiteCacheDir(roots), identity);

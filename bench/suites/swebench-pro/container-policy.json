@@ -28,5 +28,22 @@
     ],
     "capAdd": [],
     "resources": "manifest-docker"
+  },
+  "reclamation": {
+    "pidsLimit": 64,
+    "securityOpt": [
+      "no-new-privileges"
+    ],
+    "capDrop": [
+      "ALL"
+    ],
+    "capAdd": [
+      "CHOWN",
+      "DAC_OVERRIDE",
+      "FOWNER"
+    ],
+    "resources": "manifest-docker",
+    "networkMode": "none",
+    "user": "0:0"
   }
 }

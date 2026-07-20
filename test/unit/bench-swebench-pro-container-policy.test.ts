@@ -9,12 +9,17 @@ import {
   containerPolicySha256,
   evaluatorContainerPolicy,
   loadSwebenchProContainerPolicy,
+  reclamationContainerPolicyArgv,
   sessionContainerPolicyArgv,
   sessionTaskIdentity,
   SWEBENCH_PRO_CONTAINER_POLICY_SHA256,
 } from '../../bench/src/suites/swebench-pro/container-policy.js';
 import type { SwebenchProConfig } from '../../bench/src/suites/swebench-pro/config.js';
-import { sessionDockerRunArgv } from '../../bench/src/suites/swebench-pro/runner.js';
+import {
+  reclamationContainerName,
+  reclamationDockerRunArgv,
+  sessionDockerRunArgv,
+} from '../../bench/src/suites/swebench-pro/runner.js';
 import {
   evaluatorPolicyDocument,
   evaluatorPolicyDocumentSha256,
@@ -27,8 +32,8 @@ const docker = { cpus: 1.5, memoryBytes: 2_000_000, keepImages: false };
 const config = {
   docker,
   evaluator: {
-    repository: 'https://example.test/evaluator.git',
-    revision: 'b'.repeat(40),
+    repository: 'https://github.com/scaleapi/SWE-bench_Pro-os',
+    revision: 'ca10a60a5fcae51e6948ffe1485d4153d421e6c5',
   },
 } as SwebenchProConfig;
 
@@ -113,6 +118,61 @@ describe('SWE-bench Pro container policy', () => {
       '--entrypoint', '/bin/bash',
       'ultracode-swebench-pro:image',
       '/opt/bench/entrypoint.sh',
+    ]);
+    expect(reclamationContainerPolicyArgv(policy, docker)).toEqual([
+      '--network', 'none',
+      '--pids-limit', '64',
+      '--security-opt', 'no-new-privileges',
+      '--cap-drop', 'ALL',
+      '--cap-add', 'CHOWN',
+      '--cap-add', 'DAC_OVERRIDE',
+      '--cap-add', 'FOWNER',
+      '--cpus', '1.5',
+      '--memory', '2000000',
+      '--user', '0:0',
+    ]);
+    const reclamationName = reclamationContainerName('pilot1', 'task-a', 'a');
+    expect(reclamationDockerRunArgv({
+      name: reclamationName,
+      runId: 'pilot1',
+      taskId: 'task-a',
+      arm: 'a',
+      taskDirectory: '/run/task-a',
+      runtimeDirectory: '/runtime/owned',
+      runtimeNonce: 'a'.repeat(64),
+      artifactOwner: { uid: 2_001, gid: 2_002 },
+      image: { overlayLocalId: `sha256:${'c'.repeat(64)}` } as never,
+      docker,
+      policy,
+    })).toEqual([
+      'run', '--rm', '--name', reclamationName,
+      '--label', 'ultracode.benchmark.schema=2',
+      '--label', 'ultracode.benchmark.suite=swebench-pro',
+      '--label', 'ultracode.benchmark.run=pilot1',
+      '--label', 'ultracode.benchmark.task=task-a',
+      '--label', 'ultracode.benchmark.arm=a',
+      '--label', 'ultracode.benchmark.purpose=reclamation',
+      '--label', 'ultracode.benchmark.ownership=1',
+      '--label', 'ultracode.benchmark.artifact-uid=2001',
+      '--label', 'ultracode.benchmark.artifact-gid=2002',
+      '--label', `ultracode.benchmark.runtime=${'a'.repeat(64)}`,
+      '--network', 'none',
+      '--pids-limit', '64',
+      '--security-opt', 'no-new-privileges',
+      '--cap-drop', 'ALL',
+      '--cap-add', 'CHOWN',
+      '--cap-add', 'DAC_OVERRIDE',
+      '--cap-add', 'FOWNER',
+      '--cpus', '1.5',
+      '--memory', '2000000',
+      '--user', '0:0',
+      '--mount', 'type=bind,src=/run/task-a,dst=/bench',
+      '--mount', 'type=bind,src=/runtime/owned/home,dst=/runtime/home',
+      '--mount', 'type=bind,src=/runtime/owned/codex-home,dst=/runtime/codex-home',
+      '--entrypoint', '/bin/bash',
+      `sha256:${'c'.repeat(64)}`,
+      '-c', '/bin/chown -R -- "$1" "${@:2}" && /bin/chmod 0700 "${@:2}"',
+      'ultracode-reclaim', '2001:2002', '/bench', '/runtime/home', '/runtime/codex-home',
     ]);
   });
 

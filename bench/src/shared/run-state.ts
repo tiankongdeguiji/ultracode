@@ -3,9 +3,9 @@ import { existsSync } from 'node:fs';
 import { z } from 'zod';
 import {
   discoverWorkerProcessesForTokens,
-  findWorkerProcessesForTokens,
   MAX_DARWIN_CANDIDATE_PROCESSES,
   readProcessIdentitySnapshot,
+  signal0Status,
   signalTrackedWorkerProcesses,
   type ProcessInspectionOptions,
   type TrackedProcess,
@@ -42,21 +42,97 @@ const lifecycleCandidateSchema = z.strictObject({
   starttime: z.string().min(1),
 });
 
+export interface LifecycleRecoveryOptions extends ProcessInspectionOptions {
+  /** Monotonic-millisecond seam used to bound deterministic Linux recovery phases. */
+  recoveryNow?: () => number;
+  /** Bounded polling seam used by deterministic Linux recovery tests. */
+  recoveryWait?: (delayMs: number) => Promise<void>;
+}
+
 function processGroupStatus(
   pgrp: number,
   inspection: ProcessInspectionOptions,
 ): 'alive' | 'absent' | 'unknown' {
-  const signalProcess = inspection.signalProcess ?? ((pid: number, signal: NodeJS.Signals | 0) => {
-    process.kill(pid, signal);
-  });
-  try {
-    signalProcess(-pgrp, 0);
-    return 'alive';
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ESRCH') return 'absent';
-    if (code === 'EPERM') return 'alive';
-    return 'unknown';
+  return signal0Status(-pgrp, inspection);
+}
+
+interface LinuxLifecycleProcess {
+  token: string;
+  pid: number | null;
+  processStartIdentity: string | null;
+}
+
+async function recoverLinuxPhase(
+  entries: readonly LinuxLifecycleProcess[],
+  workerScope: string,
+  signal: NodeJS.Signals,
+  graceMs: number,
+  inspection: LifecycleRecoveryOptions,
+): Promise<Set<string>> {
+  const byToken = new Map(entries.map((entry) => [entry.token, entry]));
+  const tokens = [...byToken.keys()];
+  const emptyPasses = new Map(tokens.map((token) => [token, 0]));
+  const observe = (separated: boolean) => {
+    const discovery = discoverWorkerProcessesForTokens(
+      tokens,
+      workerScope,
+      undefined,
+      inspection,
+    );
+    const foundTokens = new Set(discovery.processes.map((process) => process.token));
+    const leaderPids = entries.flatMap((entry) => entry.pid === null ? [] : [entry.pid]);
+    const leaders = readProcessIdentitySnapshot(leaderPids, inspection);
+    const signalCandidates = new Map(discovery.processes.map((candidate) => [
+      `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}:${candidate.token}`,
+      candidate,
+    ]));
+    for (const token of tokens) {
+      const entry = byToken.get(token)!;
+      let leaderAbsent = false;
+      if (entry.pid !== null && entry.processStartIdentity !== null) {
+        const identity = leaders.identities.get(entry.pid);
+        if (identity !== undefined) {
+          if (identity.starttime === entry.processStartIdentity && identity.pgrp === entry.pid) {
+            signalCandidates.set(`${entry.pid}:${identity.starttime}:${identity.pgrp}:${token}`, {
+              pid: entry.pid,
+              token,
+              ...identity,
+            });
+          } else if (identity.starttime !== entry.processStartIdentity) {
+            leaderAbsent = true;
+          }
+        } else if (leaders.complete && signal0Status(entry.pid, inspection) === 'absent') {
+          leaderAbsent = true;
+        }
+      }
+      const groupAbsent = entry.pid !== null
+        && processGroupStatus(entry.pid, inspection) === 'absent';
+      const absent = discovery.complete
+        && !foundTokens.has(token)
+        && leaderAbsent
+        && groupAbsent;
+      const prior = emptyPasses.get(token) ?? 0;
+      emptyPasses.set(token, absent ? (separated && prior > 0 ? prior + 1 : 1) : 0);
+    }
+    return [...signalCandidates.values()];
+  };
+  const unsettledTokens = (): Set<string> => new Set(
+    tokens.filter((token) => (emptyPasses.get(token) ?? 0) < 2),
+  );
+  const now = inspection.recoveryNow ?? (() => performance.now());
+  const wait = inspection.recoveryWait
+    ?? ((delayMs: number) => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, delayMs)));
+  const boundedGraceMs = Number.isFinite(graceMs) ? Math.max(0, graceMs) : 0;
+  const deadline = now() + boundedGraceMs;
+  const initial = observe(false);
+  signalTrackedWorkerProcesses(initial, signal, inspection);
+  for (;;) {
+    const unsettled = unsettledTokens();
+    if (unsettled.size === 0) return unsettled;
+    const observedAt = now();
+    if (observedAt >= deadline) return unsettled;
+    await wait(Math.min(25, Math.max(1, deadline - observedAt)));
+    observe(true);
   }
 }
 
@@ -482,7 +558,7 @@ export class BenchRunStateStore {
   async recoverPendingLifecycleProcesses(
     workerScope: string,
     graceMs = 1_000,
-    inspection: ProcessInspectionOptions = {},
+    inspection: LifecycleRecoveryOptions = {},
   ): Promise<number> {
     this.lease.assertHeld();
     const state = this.load();
@@ -626,30 +702,26 @@ export class BenchRunStateStore {
       return recoverable.length;
     }
 
-    const tokens = recoverable.map((process) => process.token);
-    const unverifiableTokens = new Set(platform === 'linux' ? [] : tokens);
-    const findRecoverableProcesses = () => findWorkerProcessesForTokens(
-      tokens,
-      workerScope,
-      undefined,
-      inspection,
-    );
-    const deadline = Date.now() + Math.max(0, graceMs);
-    let signal: NodeJS.Signals = 'SIGTERM';
-    let emptyPasses = 0;
-    for (;;) {
-      const found = findRecoverableProcesses();
-      emptyPasses = found.length === 0 ? emptyPasses + 1 : 0;
-      signalTrackedWorkerProcesses(found, signal, inspection);
-      if (emptyPasses >= 2) break;
-      if (Date.now() >= deadline) {
-        if (signal === 'SIGKILL') break;
-        signal = 'SIGKILL';
+    const tokens = [...new Set(recoverable.map((process) => process.token))];
+    let liveTokens = new Set(tokens);
+    if (platform === 'linux') {
+      liveTokens = await recoverLinuxPhase(
+        recoverable,
+        workerScope,
+        'SIGTERM',
+        graceMs,
+        inspection,
+      );
+      if (liveTokens.size > 0) {
+        liveTokens = await recoverLinuxPhase(
+          recoverable.filter((entry) => liveTokens.has(entry.token)),
+          workerScope,
+          'SIGKILL',
+          graceMs,
+          inspection,
+        );
       }
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
     }
-    const remaining = findRecoverableProcesses();
-    const liveTokens = new Set([...unverifiableTokens, ...remaining.map((entry) => entry.token)]);
     this.updateCurrentSync((current) => ({
       ...current,
       invocations: current.invocations.map((invocation) => {

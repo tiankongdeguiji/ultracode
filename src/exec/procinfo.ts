@@ -26,6 +26,20 @@ export interface ProcessInspectionOptions {
   platform?: NodeJS.Platform;
   /** Headerless `/bin/ps` execution seam; arguments exclude the executable. */
   executePs?: (argv: readonly string[]) => string;
+  /** Complete process-discovery seam for deterministic recovery tests. */
+  discoverWorkerProcesses?: (
+    tokens: readonly string[],
+    scope: string | undefined,
+    candidatePids: readonly number[] | undefined,
+  ) => WorkerProcessDiscovery;
+  /** Process-identity snapshot seam for deterministic recovery tests. */
+  readIdentitySnapshot?: (pids: readonly number[]) => ProcessIdentitySnapshot;
+  /** Linux `/proc` directory seam for deterministic incomplete-scan tests. */
+  listLinuxProcessIds?: () => readonly string[];
+  /** Linux stat seam; undefined means the requested identity was not readable. */
+  readLinuxProcessIdentity?: (pid: number) => ProcStat | undefined;
+  /** Linux environment seam; errors retain their normal unreadable meaning. */
+  readLinuxProcessEnvironment?: (pid: number) => string;
   /** POSIX signal seam, including signal 0 probes. */
   signalProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
 }
@@ -78,6 +92,31 @@ export interface ProcessIdentitySnapshot {
 
 function inspectionPlatform(options: ProcessInspectionOptions): NodeJS.Platform {
   return options.platform ?? process.platform;
+}
+
+function linuxProcessIdentity(pid: number, options: ProcessInspectionOptions): ProcStat | undefined {
+  return options.readLinuxProcessIdentity === undefined
+    ? readProcStat(pid)
+    : options.readLinuxProcessIdentity(pid);
+}
+
+/** Classify one process or process-group signal-0 probe without collapsing permission errors into absence. */
+export function signal0Status(
+  target: number,
+  options: ProcessInspectionOptions = {},
+): 'alive' | 'absent' | 'unknown' {
+  const signalProcess = options.signalProcess ?? ((pid: number, signal: NodeJS.Signals | 0) => {
+    process.kill(pid, signal);
+  });
+  try {
+    signalProcess(target, 0);
+    return 'alive';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return 'absent';
+    if (code === 'EPERM') return 'alive';
+    return 'unknown';
+  }
 }
 
 function executeDarwinPs(argv: readonly string[], options: ProcessInspectionOptions): string {
@@ -140,14 +179,24 @@ export function readProcessIdentitySnapshot(
   options: ProcessInspectionOptions = {},
 ): ProcessIdentitySnapshot {
   const requested = [...new Set(pids)].filter(isSafeProcessId);
+  if (options.readIdentitySnapshot !== undefined) {
+    return options.readIdentitySnapshot(requested);
+  }
   const found = new Map<number, ProcStat>();
   const platform = inspectionPlatform(options);
   if (platform === 'linux') {
+    let complete = true;
     for (const pid of requested) {
-      const stat = readProcStat(pid);
+      let stat: ProcStat | undefined;
+      try {
+        stat = linuxProcessIdentity(pid, options);
+      } catch {
+        stat = undefined;
+      }
       if (stat) found.set(pid, stat);
+      else if (signal0Status(pid, options) !== 'absent') complete = false;
     }
-    return { identities: found, complete: true };
+    return { identities: found, complete };
   }
   if (platform !== 'darwin' || requested.length === 0) {
     return { identities: found, complete: platform === 'darwin' };
@@ -325,6 +374,27 @@ export function discoverWorkerProcessesForTokens(
     candidatePids === undefined
       ? undefined
       : [...new Set(candidatePids)].filter((pid) => isSafeProcessId(pid) && pid !== process.pid);
+  if (options.discoverWorkerProcesses !== undefined) {
+    const discovered = options.discoverWorkerProcesses([...accepted], scope, candidates);
+    const candidateSet = candidates === undefined ? undefined : new Set(candidates);
+    const filtered = discovered.processes.filter((entry) =>
+      accepted.has(entry.token)
+      && isSafeProcessId(entry.pid)
+      && entry.pid !== process.pid
+      && isSafeProcessGroupId(entry.pgrp)
+      && entry.starttime.length > 0
+      && (candidateSet === undefined || candidateSet.has(entry.pid)));
+    const processes = [...new Map(filtered.map((entry) => [
+      `${entry.pid}:${entry.starttime}:${entry.pgrp}:${entry.token}`,
+      entry,
+    ])).values()];
+    return {
+      processes,
+      complete: discovered.complete
+        && filtered.length === discovered.processes.length
+        && processes.length === filtered.length,
+    };
+  }
   const scopeValue = scope === undefined ? undefined : workerScopeValue(scope);
   const platform = inspectionPlatform(options);
 
@@ -437,12 +507,12 @@ export function discoverWorkerProcessesForTokens(
     };
   }
   if (platform !== 'linux') return { processes: [], complete: false };
-  let entries: string[];
+  let entries: readonly string[];
   if (candidates !== undefined) {
     entries = candidates.map(String);
   } else {
     try {
-      entries = readdirSync('/proc');
+      entries = options.listLinuxProcessIds?.() ?? readdirSync('/proc');
     } catch {
       return { processes: [], complete: false };
     }
@@ -450,16 +520,33 @@ export function discoverWorkerProcessesForTokens(
   const tokenPrefix = `${WORKER_TOKEN_ENV}=`;
   const scopeMarker = scopeValue === undefined ? undefined : `${WORKER_SCOPE_ENV}=${scopeValue}`;
   const found: TrackedWorkerProcess[] = [];
+  let complete = true;
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
     if (!isSafeProcessId(pid) || pid === process.pid) continue;
-    const before = readProcStat(pid);
-    if (!before) continue;
+    let before: ProcStat | undefined;
+    try {
+      before = linuxProcessIdentity(pid, options);
+    } catch {
+      before = undefined;
+    }
+    if (!before) {
+      if (signal0Status(pid, options) !== 'absent') complete = false;
+      continue;
+    }
     let environ: string;
     try {
-      environ = readFileSync(`/proc/${pid}/environ`, 'utf8');
+      environ = options.readLinuxProcessEnvironment?.(pid)
+        ?? readFileSync(`/proc/${pid}/environ`, 'utf8');
     } catch {
+      let afterFailure: ProcStat | undefined;
+      try {
+        afterFailure = linuxProcessIdentity(pid, options);
+      } catch {
+        afterFailure = undefined;
+      }
+      if (afterFailure !== undefined || signal0Status(pid, options) !== 'absent') complete = false;
       continue;
     }
     const environment = environ.split('\0');
@@ -467,11 +554,23 @@ export function discoverWorkerProcessesForTokens(
     const tokenEntry = environment.find((entry) => entry.startsWith(tokenPrefix));
     const token = tokenEntry?.slice(tokenPrefix.length);
     if (token === undefined || !accepted.has(token)) continue;
-    const after = readProcStat(pid);
-    if (!after || after.starttime !== before.starttime || after.pgrp !== before.pgrp) continue;
+    let after: ProcStat | undefined;
+    try {
+      after = linuxProcessIdentity(pid, options);
+    } catch {
+      after = undefined;
+    }
+    if (!after) {
+      if (signal0Status(pid, options) !== 'absent') complete = false;
+      continue;
+    }
+    if (after.starttime !== before.starttime || after.pgrp !== before.pgrp) {
+      complete = false;
+      continue;
+    }
     found.push({ pid, token, ...after });
   }
-  return { processes: found, complete: true };
+  return { processes: found, complete };
 }
 
 /** Find marked processes while preserving the legacy Linux-only scan behavior. */
@@ -512,7 +611,9 @@ export function signalTrackedWorkerProcesses(
   });
   if (platform === 'linux') {
     for (const proc of processesToSignal) {
-      const live = readProcStat(proc.pid);
+      const live = options.readIdentitySnapshot === undefined
+        ? linuxProcessIdentity(proc.pid, options)
+        : readProcessIdentitySnapshot([proc.pid], options).identities.get(proc.pid);
       if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
       try {
         signalProcess(proc.pgrp === proc.pid ? -proc.pid : proc.pid, signal);

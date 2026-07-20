@@ -54,11 +54,13 @@ import {
   featureBenchAnalysisHook,
   featureBenchPolicyLockFile,
   hasCompleteFeatureBenchReceipt,
+  invalidateFeatureBenchRedo,
   inspectFeatureBenchTrustBoundary,
   planFeatureBenchEval,
   planFeatureBenchResume,
   planFeatureBenchRun,
   recordFeatureBenchBatchAttempts,
+  resolveFeatureBenchResumeRoot,
 } from '../../bench/src/suites/featurebench/runner.js';
 import { indexFeatureBenchMetrics } from '../../bench/src/suites/featurebench/telemetry.js';
 import { indexFeatureBenchEvidence } from '../../bench/src/suites/featurebench/verifier.js';
@@ -699,6 +701,107 @@ describe('pinned native fb commands', () => {
 });
 
 describe('FeatureBench resume and redo assembly', () => {
+  it('retries the full immutable task set fresh after null-only history with no native root', () => {
+    const outputDirectory = join(temporary(), 'native');
+    mkdirSync(outputDirectory);
+    const state = {
+      attempts: [
+        { phase: 'inference', nativePath: null },
+        { phase: 'verifier', nativePath: null },
+      ],
+    } as BenchRunState;
+
+    expect(resolveFeatureBenchResumeRoot(outputDirectory, state, false)).toBeNull();
+    const fresh = planFeatureBenchRun(prepared(), manifest(), {
+      brokerUrl: 'https://broker.test/v1', restrictedNetwork: 'featurebench-private',
+    }, outputDirectory);
+    expect(fresh.infer.argv.slice(fresh.infer.argv.indexOf('--task-id') + 1, fresh.infer.argv.indexOf('--n-attempts')))
+      .toEqual(TASK_IDS);
+    expect(fresh.infer.argv).not.toContain('--resume');
+  });
+
+  it('rejects a timestamp root unbound by null-only inference history', () => {
+    const outputDirectory = join(temporary(), 'native');
+    mkdirSync(join(outputDirectory, TIMESTAMP), { recursive: true });
+    const state = {
+      attempts: [{ phase: 'inference', nativePath: null }],
+    } as BenchRunState;
+
+    expect(() => resolveFeatureBenchResumeRoot(outputDirectory, state, false))
+      .toThrow(/unbound timestamped native state/);
+  });
+
+  it('ignores null and non-inference history when resolving a mixed resume baseline', () => {
+    const outputDirectory = join(temporary(), 'native');
+    mkdirSync(join(outputDirectory, TIMESTAMP), { recursive: true });
+    const state = {
+      attempts: [
+        { phase: 'inference', nativePath: null },
+        { phase: 'verifier', nativePath: 'native/2026-07-19__13-00-40' },
+        { phase: 'inference', nativePath: `native/${TIMESTAMP}` },
+      ],
+    } as BenchRunState;
+
+    expect(resolveFeatureBenchResumeRoot(outputDirectory, state, false)).toBe(`native/${TIMESTAMP}`);
+  });
+
+  it('preserves the first bound root across later redo inference history', () => {
+    const outputDirectory = join(temporary(), 'native');
+    const original = 'native/2026-07-19__13-00-41';
+    const firstRedo = 'native/2026-07-19__13-00-42';
+    const secondRedo = 'native/2026-07-19__13-00-43';
+    for (const root of [original, firstRedo, secondRedo]) {
+      mkdirSync(join(outputDirectory, root.slice('native/'.length)), { recursive: true });
+    }
+    const state = {
+      attempts: [
+        { phase: 'inference', nativePath: null },
+        { phase: 'inference', nativePath: original },
+        { phase: 'inference', nativePath: firstRedo },
+        { phase: 'inference', nativePath: secondRedo },
+      ],
+    } as BenchRunState;
+
+    expect(resolveFeatureBenchResumeRoot(outputDirectory, state, false)).toBe(original);
+    expect(resolveFeatureBenchResumeRoot(outputDirectory, state, true)).toBe(original);
+  });
+
+  it('rejects redo before receipt, report, or cleanup-state mutation without a bound baseline', async () => {
+    const roots = createBenchPathRoots(temporary());
+    const redoManifest = { ...manifest(), runId: 'feature-redo-order' } as FeatureBenchManifest;
+    const directory = join(roots.resultsRoot, 'featurebench', redoManifest.runId);
+    mkdirSync(directory, { recursive: true });
+    const jsonReport = join(directory, 'report.json');
+    const markdownReport = join(directory, 'report.md');
+    writeFileSync(jsonReport, 'existing report');
+    writeFileSync(markdownReport, 'existing report');
+    const mutations: string[] = [];
+    const receipt = {
+      load() {
+        mutations.push('receipt-load');
+        return { revision: 0, bindings: [] };
+      },
+      async update() { mutations.push('receipt-update'); },
+    } as never;
+    const state = {
+      async updateCurrent() { mutations.push('state-update'); },
+    } as never;
+
+    await expect(invalidateFeatureBenchRedo(
+      roots,
+      redoManifest,
+      new Set(['task-alpha']),
+      null,
+      receipt,
+      state,
+      '00000000-0000-4000-8000-000000000012',
+      new Date('2026-07-20T00:00:00.000Z'),
+    )).rejects.toThrow(/state-bound prior inference with a native root/);
+    expect(mutations).toEqual([]);
+    expect(readFileSync(jsonReport, 'utf8')).toBe('existing report');
+    expect(readFileSync(markdownReport, 'utf8')).toBe('existing report');
+  });
+
   it('keeps redo predictions on a subsequent ordinary resume', () => {
     const runDirectory = temporary();
     const original = predictionRoot(runDirectory, '2026-07-19__13-00-41', {

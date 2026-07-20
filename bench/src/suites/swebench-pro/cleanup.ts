@@ -38,3 +38,54 @@ export function ownershipUnsafeAggregate(
         ? failure.failures
         : [failure]));
 }
+
+export interface ActiveReclamationHelper {
+  /** Deterministic exact Docker name; also the registry key. */
+  name: string;
+  /** Reinspect and remove only a helper satisfying the complete ownership proof. */
+  cleanup: () => Promise<void>;
+  cleanupPromise?: Promise<void>;
+}
+
+const ACTIVE_RECLAMATION_HELPERS = new Map<string, ActiveReclamationHelper>();
+
+/** Register a helper before launch so root fatal cleanup can reconcile daemon survivors. */
+export function trackActiveReclamationHelper(entry: ActiveReclamationHelper): void {
+  if (ACTIVE_RECLAMATION_HELPERS.has(entry.name)) {
+    throw new Error(`reclamation helper is already tracked: ${entry.name}`);
+  }
+  ACTIVE_RECLAMATION_HELPERS.set(entry.name, entry);
+}
+
+/** Release only the exact tracked entry after its Docker name is proven absent. */
+export function releaseActiveReclamationHelper(entry: ActiveReclamationHelper): void {
+  if (ACTIVE_RECLAMATION_HELPERS.get(entry.name) === entry) {
+    ACTIVE_RECLAMATION_HELPERS.delete(entry.name);
+  }
+}
+
+async function cleanupTrackedReclamationHelper(entry: ActiveReclamationHelper): Promise<void> {
+  if (ACTIVE_RECLAMATION_HELPERS.get(entry.name) !== entry) return;
+  entry.cleanupPromise ??= entry.cleanup().then(() => {
+    releaseActiveReclamationHelper(entry);
+  });
+  const cleanup = entry.cleanupPromise;
+  try {
+    await cleanup;
+  } finally {
+    if (ACTIVE_RECLAMATION_HELPERS.get(entry.name) === entry && entry.cleanupPromise === cleanup) {
+      entry.cleanupPromise = undefined;
+    }
+  }
+}
+
+/** Retry exact proof-based reclamation-helper cleanup during root fatal handling. */
+export async function cleanupActiveReclamationHelpers(): Promise<number> {
+  const active = [...ACTIVE_RECLAMATION_HELPERS.values()];
+  const settled = await Promise.allSettled(active.map(cleanupTrackedReclamationHelper));
+  const failures = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+  if (failures.length > 0) {
+    throw ownershipUnsafeAggregate('active SWE-bench Pro reclamation-helper cleanup failed', failures);
+  }
+  return active.length;
+}

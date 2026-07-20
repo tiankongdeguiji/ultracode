@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { swebenchProAdapter } from '../../bench/src/suites/swebench-pro/adapter.js';
 import { resolveSwebenchProConfig, type SwebenchProConfig } from '../../bench/src/suites/swebench-pro/config.js';
 import { repositoryDigest } from '../../bench/src/suites/swebench-pro/image.js';
@@ -25,6 +25,7 @@ import { createBenchPathRoots } from '../../bench/src/shared/paths.js';
 const temporaryRoots: string[] = [];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -58,8 +59,8 @@ const config: SwebenchProConfig = {
   concurrency: { tasks: 1, verifier: 1 },
   docker: { cpus: 1, memoryBytes: 1_000_000, keepImages: false },
   evaluator: {
-    repository: 'https://example.test/evaluator.git',
-    revision: 'b'.repeat(40),
+    repository: 'https://github.com/scaleapi/SWE-bench_Pro-os',
+    revision: 'ca10a60a5fcae51e6948ffe1485d4153d421e6c5',
     pipIndex: 'https://pypi.org/simple',
   },
   sanitizeGitHistory: true,
@@ -81,6 +82,15 @@ const containerPolicy: SwebenchProContainerPolicy = {
     capDrop: ['ALL'],
     capAdd: [],
     resources: 'manifest-docker',
+  },
+  reclamation: {
+    pidsLimit: 64,
+    securityOpt: ['no-new-privileges'],
+    capDrop: ['ALL'],
+    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'FOWNER'],
+    resources: 'manifest-docker',
+    networkMode: 'none',
+    user: '0:0',
   },
 };
 
@@ -126,6 +136,20 @@ describe('SWE-bench Pro adapter parsing', () => {
     }, { sanitizeGitHistory: false } as never)).toThrow();
   });
 
+  it('rejects operator-selected evaluator repositories and revisions', () => {
+    const operator = {
+      schemaVersion: 2,
+      toolchain: { nodeVersion: '22.0.0', nodeDistribution: 'nodejs', codexBinary: '/bin/false' },
+      swebenchPro: config,
+    } as const;
+    expect(() => resolveSwebenchProConfig(operator as never, {
+      evaluator: { repository: 'https://example.test/evaluator.git' },
+    } as never)).toThrow();
+    expect(() => resolveSwebenchProConfig(operator as never, {
+      evaluator: { revision: 'b'.repeat(40) },
+    } as never)).toThrow();
+  });
+
   it('does not treat a partial Pro verifier receipt as complete', () => {
     const invocationId = '11111111-1111-4111-8111-111111111111';
     const bindings = ['raw-samples', 'predictions', 'verifier-invocation', 'native-config'].map((role) => ({
@@ -157,6 +181,60 @@ describe('complete row freezing and strict native evidence', () => {
       rows: [row('task-b'), row('task-a')],
     }, { taskIds: ['task-a'], count: 1, seed: 0, stratifyBy: 'repo' });
     expect(selected.map((entry) => entry.instanceId)).toEqual(['task-a']);
+  });
+
+  it('keeps task-aa/task-az seeded selection stable under en-US and da-DK collation', () => {
+    const cohort = ['task-aa', 'task-az'];
+    const snapshot = {
+      schemaVersion: 1 as const,
+      kind: 'ultracode-swebench-pro-dataset-descriptor' as const,
+      dataset: 'ScaleAI/SWE-bench_Pro' as const,
+      config: 'default' as const,
+      split: 'test' as const,
+      rows: [row('task-az'), row('task-aa')],
+    };
+    const localeOrders = ['en-US', 'da-DK'].map((locale) =>
+      [...cohort].sort(new Intl.Collator(locale).compare));
+    expect(localeOrders).toEqual([
+      ['task-aa', 'task-az'],
+      ['task-az', 'task-aa'],
+    ]);
+    const selectUnderLocale = (locale: string, count: number): string[] => {
+      const collator = new Intl.Collator(locale);
+      const localeCompare = vi.spyOn(String.prototype, 'localeCompare').mockImplementation(function (
+        this: string,
+        value: string,
+      ) {
+        return collator.compare(String(this), value);
+      });
+      try {
+        return selectInstances(snapshot, {
+          taskIds: null,
+          count,
+          seed: 7,
+          stratifyBy: 'repo',
+        }).map((entry) => entry.instanceId);
+      } finally {
+        localeCompare.mockRestore();
+      }
+    };
+
+    expect(selectUnderLocale('en-US', 1)).toEqual(['task-az']);
+    expect(selectUnderLocale('da-DK', 1)).toEqual(['task-az']);
+    expect(selectUnderLocale('en-US', 2)).toEqual(['task-aa', 'task-az']);
+    expect(selectUnderLocale('da-DK', 2)).toEqual(['task-aa', 'task-az']);
+  });
+
+  it('preserves explicit task caller order', () => {
+    const selected = selectInstances({
+      schemaVersion: 1,
+      kind: 'ultracode-swebench-pro-dataset-descriptor',
+      dataset: 'ScaleAI/SWE-bench_Pro',
+      config: 'default',
+      split: 'test',
+      rows: [row('task-aa'), row('task-az')],
+    }, { taskIds: ['task-az', 'task-aa'], count: 2, seed: 7, stratifyBy: 'repo' });
+    expect(selected.map((entry) => entry.instanceId)).toEqual(['task-az', 'task-aa']);
   });
 
   it('rejects task IDs that the pinned evaluator could treat as host paths', () => {
@@ -329,7 +407,7 @@ describe('evaluator ownership and empty predictions', () => {
     expect(existsSync(join(runDirectory, 'native/verifier/armA/output/eval_results.json'))).toBe(false);
   });
 
-  it('sweeps an exact manifest-owned credential runtime even without a container', () => {
+  it('sweeps an exact manifest-owned credential runtime even without a container', async () => {
     const runtime = mkdtempSync(join(tmpdir(), 'uc-bench-pro-runtime-'));
     temporaryRoots.push(runtime);
     mkdirSync(join(runtime, 'codex-home'), { mode: 0o700 });
@@ -346,10 +424,54 @@ describe('evaluator ownership and empty predictions', () => {
       runId: 'pilot1',
       artifacts: { executions: [{ taskId: 'task-a', arm: 'a' }] },
     } as never;
-    expect(cleanupProRuntimeHomes({
+    const noContainers = async () => '';
+    await expect(cleanupProRuntimeHomes({
       runId: 'other', artifacts: { executions: [{ taskId: 'task-a', arm: 'a' }] },
-    } as never)).toBe(0);
-    expect(cleanupProRuntimeHomes(manifest)).toBe(1);
+    } as never, noContainers)).resolves.toBe(0);
+    await expect(cleanupProRuntimeHomes(manifest, noContainers)).resolves.toBe(1);
     expect(existsSync(runtime)).toBe(false);
+  });
+
+  it('removes a partial exact runtime instead of leaving its credential mount behind', async () => {
+    const runtime = mkdtempSync(join(tmpdir(), 'uc-bench-pro-runtime-'));
+    temporaryRoots.push(runtime);
+    mkdirSync(join(runtime, 'codex-home'), { mode: 0o700 });
+    writeFileSync(join(runtime, 'codex-home', 'auth.json'), '{}\n', { mode: 0o600 });
+    writeFileSync(join(runtime, 'ownership.json'), `${JSON.stringify({
+      schemaVersion: 2,
+      kind: 'ultracode-swebench-pro-session-runtime',
+      runId: 'pilot1',
+      taskId: 'task-a',
+      arm: 'a',
+      runtimeNonce: 'b'.repeat(64),
+    })}\n`, { mode: 0o600 });
+    const manifest = {
+      runId: 'pilot1',
+      artifacts: { executions: [{ taskId: 'task-a', arm: 'a' }] },
+    } as never;
+    await expect(cleanupProRuntimeHomes(manifest, async () => '')).resolves.toBe(1);
+    expect(existsSync(runtime)).toBe(false);
+  });
+
+  it('retains an exact runtime while its deterministic helper name is occupied', async () => {
+    const runtime = mkdtempSync(join(tmpdir(), 'uc-bench-pro-runtime-'));
+    temporaryRoots.push(runtime);
+    mkdirSync(join(runtime, 'codex-home'), { mode: 0o700 });
+    mkdirSync(join(runtime, 'home'), { mode: 0o700 });
+    writeFileSync(join(runtime, 'ownership.json'), `${JSON.stringify({
+      schemaVersion: 2,
+      kind: 'ultracode-swebench-pro-session-runtime',
+      runId: 'pilot1',
+      taskId: 'task-a',
+      arm: 'a',
+      runtimeNonce: 'c'.repeat(64),
+    })}\n`, { mode: 0o600 });
+    const manifest = {
+      runId: 'pilot1',
+      artifacts: { executions: [{ taskId: 'task-a', arm: 'a' }] },
+    } as never;
+    await expect(cleanupProRuntimeHomes(manifest, async () => 'd'.repeat(64)))
+      .rejects.toThrow(/name remains occupied/);
+    expect(existsSync(runtime)).toBe(true);
   });
 });

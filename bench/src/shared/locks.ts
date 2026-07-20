@@ -15,7 +15,11 @@ import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
-import { readProcessIdentity } from '../../../src/exec/procinfo.js';
+import {
+  readProcessIdentity,
+  readProcessIdentitySnapshot,
+  type ProcessInspectionOptions,
+} from '../../../src/exec/procinfo.js';
 import { canonicalJson, sha256Schema } from './provenance.js';
 import {
   ensurePrivateDirectoryWithin,
@@ -47,6 +51,8 @@ export interface AcquireBenchLockOptions {
   observationDelayMs?: number;
   /** Create a missing lock parent. Existing-run leases set this to false. */
   createParent?: boolean;
+  /** Explicit platform/process seam for deterministic stale-recovery tests. */
+  processInspection?: ProcessInspectionOptions;
 }
 
 function hostIdentitySha256(): string {
@@ -111,10 +117,29 @@ function readOwner(privateRoot: string, path: string): LockOwner {
   }
 }
 
-function trackedOwnerAbsent(owner: LockOwner): boolean {
-  if (owner.processStartIdentity === null) return false;
-  const observed = readProcessIdentity(owner.pid);
-  return observed === undefined || observed.starttime !== owner.processStartIdentity;
+function trackedOwnerObservation(
+  owner: LockOwner,
+  inspection: ProcessInspectionOptions,
+): 'absent' | 'live' | 'unverifiable' {
+  if (owner.processStartIdentity === null) return 'unverifiable';
+  const snapshot = readProcessIdentitySnapshot([owner.pid], inspection);
+  const observed = snapshot.identities.get(owner.pid);
+  if (observed !== undefined) {
+    return observed.starttime === owner.processStartIdentity ? 'live' : 'absent';
+  }
+  if (!snapshot.complete) return 'unverifiable';
+  const signalProcess = inspection.signalProcess ?? ((pid: number, signal: NodeJS.Signals | 0) => {
+    process.kill(pid, signal);
+  });
+  try {
+    signalProcess(owner.pid, 0);
+    return 'live';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return 'absent';
+    if (code === 'EPERM') return 'live';
+    return 'unverifiable';
+  }
 }
 
 async function recoverStaleLock(
@@ -130,13 +155,22 @@ async function recoverStaleLock(
   if (owner.hostIdentitySha256 !== hostIdentitySha256()) {
     throw new Error(`benchmark lock belongs to another host and cannot be recovered automatically: ${path}`);
   }
-  if (!trackedOwnerAbsent(owner)) throw new Error(`benchmark lock owner is still running or unverifiable: ${path}`);
+  const inspection = options.processInspection ?? {};
+  if (trackedOwnerObservation(owner, inspection) !== 'absent') {
+    throw new Error(`benchmark lock owner is still running or unverifiable: ${path}`);
+  }
   await sleep(Math.max(1, options.observationDelayMs ?? 50));
-  if (!trackedOwnerAbsent(owner)) throw new Error(`benchmark lock owner identity is not stably absent: ${path}`);
+  if (trackedOwnerObservation(owner, inspection) !== 'absent') {
+    throw new Error(`benchmark lock owner identity is not stably absent: ${path}`);
+  }
   const current = readOwner(privateRoot, path);
   if (canonicalJson(current) !== canonicalJson(owner)) throw new Error(`benchmark lock changed during recovery: ${path}`);
   unlinkSync(path);
   return owner;
+}
+
+function recoveryGuardPath(path: string): string {
+  return `${path}.recovery`;
 }
 
 /** A held lock remains actionable only while its exact nonce-bearing file exists. */
@@ -178,10 +212,20 @@ export async function acquireBenchLock(
   let owner = currentOwner(now);
   if (createLockFile(path, owner)) return new BenchLockHandle(privateRoot, path, owner);
   if (!options.recoverStale) throw new Error(`benchmark lock is already held: ${path}`);
-  const recoveredOwner = await recoverStaleLock(privateRoot, path, options);
-  owner = currentOwner(now);
-  if (!createLockFile(path, owner)) throw new Error(`benchmark lock was reacquired concurrently: ${path}`);
-  return new BenchLockHandle(privateRoot, path, owner, recoveredOwner);
+  const guardPath = recoveryGuardPath(path);
+  const guardOwner = currentOwner(now);
+  if (!createLockFile(guardPath, guardOwner)) {
+    throw new Error(`benchmark lock recovery is already in progress or requires manual guard recovery: ${path}`);
+  }
+  const guard = new BenchLockHandle(privateRoot, guardPath, guardOwner);
+  try {
+    const recoveredOwner = await recoverStaleLock(privateRoot, path, options);
+    owner = currentOwner(now);
+    if (!createLockFile(path, owner)) throw new Error(`benchmark lock was reacquired concurrently: ${path}`);
+    return new BenchLockHandle(privateRoot, path, owner, recoveredOwner);
+  } finally {
+    guard.release();
+  }
 }
 
 const RUN_CLAIM_MARKER = '.creation-claim.json';
