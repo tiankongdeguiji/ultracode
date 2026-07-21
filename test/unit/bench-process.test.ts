@@ -13,7 +13,15 @@ import {
   runBenchProcess,
   sanitizeDiagnostic,
 } from '../../bench/src/shared/process.js';
-import { readProcessIdentity, workerScopeValue } from '../../src/exec/procinfo.js';
+import {
+  readProcessIdentity,
+  type ProcessInspectionOptions,
+  workerScopeValue,
+} from '../../src/exec/procinfo.js';
+
+const COMPLETE_EMPTY_PROCESS_DISCOVERY: ProcessInspectionOptions = {
+  discoverWorkerProcesses: () => ({ processes: [], complete: true }),
+};
 
 class GatedSink extends Writable {
   readonly chunks: Buffer[] = [];
@@ -162,6 +170,7 @@ describe('benchmark process boundary', () => {
       tailBytes: 8,
       drainMs: 100,
       terminationGraceMs: 250,
+      processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY,
       onLifecycleToken: (token) => lifecycle.push(`token:${token}`),
       onLifecycleStarted: (token, pid) => lifecycle.push(`started:${token}:${pid ?? 'none'}`),
       onLifecycleRecovered: (token, recovery) => lifecycle.push(`recovered:${token}:${recovery}`),
@@ -184,6 +193,7 @@ describe('benchmark process boundary', () => {
       cwd: process.cwd(),
       tailBytes: 4,
       drainMs: 1_000,
+      processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY,
     });
     expect(result.stdout).toBe('😀');
   });
@@ -301,6 +311,7 @@ describe('benchmark process boundary', () => {
       stream: true,
       stdout: target,
       drainMs: 1_000,
+      processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY,
     })).rejects.toThrow(/output forwarding failed.*destination exploded/);
     expect(target.writableEnded).toBe(false);
     expect(target.destroyed).toBe(false);
@@ -323,6 +334,7 @@ describe('benchmark process boundary', () => {
       stderr,
       tailBytes: 8,
       drainMs: 1_000,
+      processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY,
     });
     let settled = false;
     void running.then(() => { settled = true; }, () => { settled = true; });
@@ -357,6 +369,7 @@ describe('benchmark process boundary', () => {
       stderr: target,
       tailBytes: 64,
       drainMs: 1_000,
+      processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY,
     });
     await waitForBlocked(target);
     target.release();
@@ -383,6 +396,7 @@ describe('benchmark process boundary', () => {
       timeoutMs: 1_000,
       terminationGraceMs: 25,
       drainMs: 10,
+      processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY,
     });
     const failed = running.then(() => undefined, (error: unknown) => error);
     let failure: unknown;
@@ -413,6 +427,7 @@ describe('benchmark process boundary', () => {
       timeoutMs: 25,
       terminationGraceMs: 25,
       drainMs: 25,
+      processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY,
     })).rejects.toThrow(/timed out/);
     expect(performance.now() - startedAt).toBeLessThan(2_000);
     await expect(cleanupActiveBenchProcesses(0)).resolves.toBe(0);

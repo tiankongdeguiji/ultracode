@@ -10,8 +10,13 @@ import { AgentCallExecutor, resumableSessionId } from '../../src/engine/agentcal
 import { usageFromEvents } from '../../src/backends/usage.js';
 import { parseJsonLine } from '../../src/backends/ndjson.js';
 import type { AgentEvent, AgentRequest, AgentSpec, BackendAdapter, ExitClass, SpawnPlan } from '../../src/backends/types.js';
+import type { ProcessInspectionOptions } from '../../src/exec/procinfo.js';
 
 const SIGNAL = new AbortController().signal;
+// Keep real process-group spawn/kill while isolating these tests from host-wide discovery.
+const COMPLETE_EMPTY_PROCESS_DISCOVERY: ProcessInspectionOptions = {
+  discoverWorkerProcesses: () => ({ processes: [], complete: true }),
+};
 
 function spec(overrides: Partial<AgentSpec> = {}): AgentSpec {
   return { seq: 0, prompt: 'task', label: 't', backend: 'mock', cwd: process.cwd(), retries: 0, ...overrides };
@@ -86,6 +91,10 @@ class ScriptedAdapter implements BackendAdapter {
   }
 }
 
+function scriptedExecutor(adapter: BackendAdapter): AgentCallExecutor {
+  return new AgentCallExecutor(adapter, { processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY });
+}
+
 describe('resumableSessionId', () => {
   it('accepts plain ids and rejects flag-shaped or oversized ones', () => {
     expect(resumableSessionId('019f6a24-bb42-78a1-bb08-526b1e6d8853')).toBe('019f6a24-bb42-78a1-bb08-526b1e6d8853');
@@ -105,7 +114,7 @@ describe('task-retry resume', () => {
       { lines: [{ session: 's1' }, { text: 'partial' }], exit: 1 },
       { lines: [{ session: 's1' }, { text: 'finished after resume' }, { done: true }], exit: 0 },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect((outcome as { value?: unknown }).value).toBe('finished after resume');
     expect(outcome.attempts).toBe(2);
@@ -121,7 +130,7 @@ describe('task-retry resume', () => {
       { lines: [{ text: 'no session surfaced' }], exit: 1 },
       { lines: [{ text: 'ok fresh' }, { done: true }], exit: 0 },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect(adapter.resumeCalls).toHaveLength(0);
     expect(adapter.spawnCalls).toBe(2);
@@ -132,7 +141,7 @@ describe('task-retry resume', () => {
       { lines: [{ session: '--dangerously-bypass' }], exit: 1 },
       { lines: [{ text: 'ok fresh' }, { done: true }], exit: 0 },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect(adapter.resumeCalls).toHaveLength(0);
     expect(adapter.spawnCalls).toBe(2);
@@ -144,7 +153,7 @@ describe('task-retry resume', () => {
       { lines: [{ text: 'ok fresh' }, { done: true }], exit: 0 },
     ]);
     adapter.resumeSupported = false;
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect(adapter.resumeCalls).toHaveLength(0);
     expect(adapter.spawnCalls).toBe(2);
@@ -156,7 +165,7 @@ describe('task-retry resume', () => {
       { lines: [], exit: 1 }, // attempt 2 resume: reattach failure, zero events
       { lines: [{ text: 'ok fresh' }, { done: true }], exit: 0 }, // attempt 2 fresh fallback
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect((outcome as { value?: unknown }).value).toBe('ok fresh');
     expect(outcome.attempts).toBe(2);
@@ -172,7 +181,7 @@ describe('task-retry resume', () => {
       { lines: [{ diagnostic: 'error: session not found' }], exit: 1 },
       { lines: [{ text: 'ok fresh' }, { done: true }], exit: 0 },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect((outcome as { value?: unknown }).value).toBe('ok fresh');
     expect(outcome.attempts).toBe(2);
@@ -193,7 +202,7 @@ describe('task-retry resume', () => {
         exit: 0,
       },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     // exactly the cumulative figure: no chars/4 estimate stacked on top, and
     // the total is not flagged estimated (no '~' in the panel)
@@ -208,7 +217,7 @@ describe('task-retry resume', () => {
       // the resume does further work but is killed before reporting — NOT covered by attempt 1's figure
       { lines: [{ session: 's1' }], exit: 1 },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(false);
     // 1000 real + ceil(4-char prompt / 4) = 1 estimated for the uncovered resume
     expect(outcome.usage.totalTokens).toBe(1001);
@@ -221,7 +230,7 @@ describe('task-retry resume', () => {
       // retry resumes but lands on a fresh backend session that reports cumulatively
       { lines: [{ session: 's2' }, { usage: { inputTokens: 900, outputTokens: 100 }, cumulative: true }, { done: true }], exit: 0 },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect(outcome.usage.totalTokens).toBe(1001); // 1000 real + 1 estimated for s1
     expect(outcome.usage.estimated).toBe(true);
@@ -232,7 +241,7 @@ describe('task-retry resume', () => {
       { lines: [{ session: 's1' }], exit: 1 }, // attempt 1 fails retryably
       { lines: [], exit: 0, hang: true }, // resume hangs silently → stall watchdog kill
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, stallMs: 250 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1, stallMs: 250 }), SIGNAL);
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toContain('stall watchdog');
     expect(adapter.resumeCalls).toHaveLength(1);
@@ -246,7 +255,7 @@ describe('task-retry resume', () => {
       { lines: [{ session: 's2' }], exit: 1 }, // attempt 2 fresh fallback: new session, fails retryably
       { lines: [{ session: 's2' }, { text: 'ok on s2' }, { done: true }], exit: 0 }, // attempt 3 resumes s2
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 2 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 2 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect((outcome as { value?: unknown }).value).toBe('ok on s2');
     expect(outcome.attempts).toBe(3);
@@ -260,7 +269,7 @@ describe('task-retry resume', () => {
       { lines: [{ session: '--evil' }, { text: 'not json' }, { done: true }], exit: 0 },
       { lines: [{ text: '{"a":1}' }, { done: true }], exit: 0 }, // fresh repair attempt
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ schema: { type: 'object' } }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ schema: { type: 'object' } }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect((outcome as { value?: unknown }).value).toEqual({ a: 1 });
     expect(adapter.resumeCalls).toHaveLength(0); // '--evil' must never reach buildResume
@@ -272,7 +281,7 @@ describe('task-retry resume', () => {
       { lines: [{ session: 's1' }, { usage: { inputTokens: 100, outputTokens: 10 } }], exit: 1 },
       { lines: [{ session: 's1' }, { usage: { inputTokens: 200, outputTokens: 20 } }, { done: true }], exit: 0 },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     // per-attempt (non-thread-cumulative) figures add up — no dedupe, no estimate
     expect(outcome.usage.totalTokens).toBe(330);
@@ -281,7 +290,7 @@ describe('task-retry resume', () => {
 
   it('a timeoutMs beyond the setTimeout range never insta-kills the attempt', async () => {
     const adapter = new ScriptedAdapter([{ lines: [{ text: 'quick' }, { done: true }], exit: 0 }]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ timeoutMs: 2 ** 31 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ timeoutMs: 2 ** 31 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect((outcome as { value?: unknown }).value).toBe('quick');
   });
@@ -293,7 +302,7 @@ describe('task-retry resume', () => {
       { lines: [{ session: 's1' }, { text: 'work' }, { session: 'sibling-target' }], exit: 1 },
       { lines: [{ session: 's1' }, { text: 'resumed' }, { done: true }], exit: 0 },
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(true);
     expect(adapter.resumeCalls.map((r) => r.sessionId)).toEqual(['s1']);
   });
@@ -304,11 +313,7 @@ describe('task-retry resume', () => {
       { lines: [], exit: 1, delayMs: 3_500 }, // resume: zero events, dies on its own late in the budget
       { lines: [], exit: 0, hang: true }, // fresh fallback: hangs → must be killed at the REMAINING budget
     ]);
-    const outcome = await new AgentCallExecutor(adapter, {
-      processInspection: {
-        discoverWorkerProcesses: () => ({ processes: [], complete: true }),
-      },
-    }).execute(spec({ retries: 1, timeoutMs: 6_000 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 6_000 }), SIGNAL);
     expect(outcome.ok).toBe(false);
     // Deterministic shape assertion, no wall-clock race: the fallback's kill
     // message carries ITS timer value — a remainder (6000 − ~3500 − overhead)
@@ -325,11 +330,7 @@ describe('task-retry resume', () => {
       { lines: [{ session: 's1' }], exit: 1 }, // fails fast, retryably
       { lines: [], exit: 1, delayMs: 1_000 }, // resume: zero events, leaves <1s of the 1.5s budget
     ]);
-    const outcome = await new AgentCallExecutor(adapter, {
-      processInspection: {
-        discoverWorkerProcesses: () => ({ processes: [], complete: true }),
-      },
-    }).execute(spec({ retries: 1, timeoutMs: 1_500 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 1_500 }), SIGNAL);
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toBe('attempt timed out after 1500ms'); // synthesized: names the FULL budget
     expect(adapter.resumeCalls).toHaveLength(1);

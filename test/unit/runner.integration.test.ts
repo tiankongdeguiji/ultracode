@@ -78,6 +78,16 @@ async function waitProcessGone(pid: number, timeoutMs = 5_000): Promise<boolean>
   return false;
 }
 
+async function waitForFile(file: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(file)) return;
+    await sleep(50);
+  }
+  if (existsSync(file)) return;
+  throw new Error(`timed out after ${timeoutMs}ms waiting for file: ${file}`);
+}
+
 function writeEscapingClaude(binDir: string, pidsFile: string): string {
   const fake = join(binDir, 'fake-claude.cjs');
   const escapedSource = "process.on('SIGTERM', () => {}); setInterval(() => {}, 60_000)";
@@ -221,7 +231,9 @@ describe('detached runner', () => {
 
     // The prompt is on disk while the agent is still running (early write) —
     // the panel's detail view depends on this.
-    expect(readFileSync(join(dir, 'agents/0000-sleeper/prompt.md'), 'utf8')).toContain('MOCK:delay 15000');
+    const promptFile = join(dir, 'agents/0000-sleeper/prompt.md');
+    await waitForFile(promptFile);
+    expect(readFileSync(promptFile, 'utf8')).toContain('MOCK:delay 15000');
 
     process.kill(pid, 'SIGTERM');
     const status = await waitTerminal(dir, 10_000);

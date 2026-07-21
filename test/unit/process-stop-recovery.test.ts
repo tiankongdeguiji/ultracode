@@ -106,6 +106,82 @@ function writeRecoveryRecord(
 }
 
 describe('persisted stop recovery', () => {
+  it('allows one delayed Darwin proof after global discovery consumes the KILL grace', async () => {
+    let clock = 0;
+    let observations = 0;
+    const waits: number[] = [];
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      processInspection: {
+        platform: 'darwin',
+        discoverWorkerProcesses: (_tokens, _scope, candidates) => {
+          if (candidates !== undefined) return { processes: [], complete: true };
+          observations++;
+          clock += 50;
+          return { processes: [], complete: true };
+        },
+        readIdentitySnapshot: () => ({ identities: new Map(), complete: true }),
+        signalProcess: (_pid, signal) => {
+          if (signal !== 0) return;
+          if (observations >= 2) {
+            throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+          }
+          throw Object.assign(new Error('inspection unavailable'), { code: 'EIO' });
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => {
+          waits.push(delayMs);
+          clock += delayMs;
+        },
+      },
+    });
+    await new Promise<void>((resolvePromise) => spawned.child.once('exit', () => resolvePromise()));
+
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+
+    expect(observations).toBe(3);
+    expect(waits).toEqual([1]);
+  });
+
+  it('keeps zero-grace Darwin cleanup fail-closed without a proof wait', async () => {
+    let clock = 0;
+    let observations = 0;
+    let zeroGrace = true;
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      processInspection: {
+        platform: 'darwin',
+        discoverWorkerProcesses: (_tokens, _scope, candidates) => {
+          if (candidates !== undefined) return { processes: [], complete: true };
+          observations++;
+          return { processes: [], complete: true };
+        },
+        readIdentitySnapshot: () => ({ identities: new Map(), complete: true }),
+        signalProcess: (_pid, signal) => {
+          if (signal === 0) {
+            throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+          }
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => {
+          if (zeroGrace) throw new Error('zero-grace cleanup must not wait');
+          clock += delayMs;
+        },
+      },
+    });
+    await new Promise<void>((resolvePromise) => spawned.child.once('exit', () => resolvePromise()));
+
+    try {
+      await expect(spawned.cleanupEscaped(0)).resolves.toBeGreaterThan(0);
+      expect(observations).toBe(2);
+    } finally {
+      zeroGrace = false;
+      await spawned.cleanupEscaped(1);
+    }
+  });
+
   it('keeps a point-in-time Darwin inventory unsealed when live cleanup does not settle', async () => {
     const workerScope = mkdtempSync(join(tmpdir(), 'uc-darwin-hook-'));
     roots.push(workerScope);

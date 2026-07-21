@@ -115,7 +115,7 @@ describe('Linux worker-token publication', () => {
     const order: string[] = [];
     let published = false;
     let clock = 0;
-    const spawned = spawnAgentProcess('/bin/true', [], {
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
       cwd: process.cwd(),
       env: {},
       onWorkerToken: () => {
@@ -794,7 +794,7 @@ describe('Linux benchmark process settlement', () => {
     let clock = 0;
     const signals: Array<[number, NodeJS.Signals]> = [];
 
-    const result = await runBenchProcess('/bin/true', [], {
+    const result = await runBenchProcess(process.execPath, ['-e', ''], {
       cwd: process.cwd(),
       workerScope: scope,
       terminationGraceMs: 100,
@@ -837,7 +837,7 @@ describe('Linux benchmark process settlement', () => {
     let observations = 0;
     const signals: Array<[number, NodeJS.Signals]> = [];
     let recovered = false;
-    const result = await runBenchProcess('/bin/true', [], {
+    const result = await runBenchProcess(process.execPath, ['-e', ''], {
       cwd: process.cwd(),
       terminationGraceMs: 100,
       processInspection: {
@@ -884,7 +884,7 @@ describe('Linux benchmark process settlement', () => {
     };
 
     try {
-      await expect(runBenchProcess('/bin/true', [], {
+      await expect(runBenchProcess(process.execPath, ['-e', ''], {
         cwd: directory,
         workerScope: directory,
         terminationGraceMs: 10,
@@ -924,7 +924,7 @@ describe('Linux benchmark process settlement', () => {
     };
 
     try {
-      await expect(runBenchProcess('/bin/true', [], {
+      await expect(runBenchProcess(process.execPath, ['-e', ''], {
         cwd: process.cwd(),
         terminationGraceMs: 0,
         processInspection: inspection,

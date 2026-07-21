@@ -200,9 +200,12 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     retireGroupIfGone();
     if (platform === 'darwin') {
       const retained = retainedDarwinCandidates;
-      let emptyPasses = 0;
+      const now = opts.processInspection?.observationNow ?? (() => performance.now());
+      const wait = opts.processInspection?.observationWait ?? sleep;
       const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
         let delayMs = 25;
+        let emptyPasses = 0;
+        let finalProofUsed = false;
         for (;;) {
           const discoveredCompletely = discoverDarwinCandidates();
           signalGroup(signal);
@@ -226,16 +229,24 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
             persistDarwinCandidates(true);
             return true;
           }
-          if (Date.now() >= deadline) return false;
-          await sleep(delayMs);
+          const observedAt = now();
+          if (observedAt >= deadline) {
+            if (graceMs > 0 && !finalProofUsed && groupTargetRetired && emptyPasses === 1) {
+              finalProofUsed = true;
+              await wait(1);
+              continue;
+            }
+            return false;
+          }
+          await wait(Math.min(delayMs, Math.max(1, deadline - observedAt)));
           delayMs = Math.min(delayMs * 2, 100);
         }
       };
-      if (await sweepUntil('SIGTERM', Date.now() + graceMs)) {
+      if (await sweepUntil('SIGTERM', now() + graceMs)) {
         ACTIVE_WORKERS.delete(workerToken);
         return 0;
       }
-      if (await sweepUntil('SIGKILL', Date.now() + graceMs)) {
+      if (await sweepUntil('SIGKILL', now() + graceMs)) {
         ACTIVE_WORKERS.delete(workerToken);
         return 0;
       }

@@ -120,6 +120,9 @@ function fixtureSource(): string {
             ], {
               cwd: process.cwd(),
               terminationGraceMs: 20,
+              processInspection: {
+                discoverWorkerProcesses: () => ({ processes: [], complete: true }),
+              },
               onLifecycleStarted: (_token, activePid) => {
                 process.stdout.write(JSON.stringify({
                   ready: true,
