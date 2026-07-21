@@ -33,6 +33,7 @@ import { DEFAULT_METRICS_POLICY, METRICS_POLICY_SHA256, normalizeBenchMetrics } 
 import {
   createPrivateRunDirectory,
   artifactKey,
+  canonicalHostPath,
   ensurePrivateDirectoryWithin,
   manifestFile,
   readPrivateJson,
@@ -63,7 +64,7 @@ import {
   writeBenchReport,
   type TaskReportInput,
 } from '../../shared/report.js';
-import { BenchRunStateStore, type BenchRunState } from '../../shared/run-state.js';
+import { BenchRunStateStore, type AttemptRecord, type BenchRunState } from '../../shared/run-state.js';
 import {
   createVerifierBinding,
   UNVERIFIED_NATIVE_RESULT,
@@ -177,6 +178,9 @@ const RECLAMATION_COMMAND = `owner=$1; shift; ${TRUSTED_MUSL_LOADER} ${TRUSTED_B
 const RECLAMATION_NAME_PREFIX = 'ucbench-reclaim-';
 const RECLAMATION_NAME_RE = /^\/ucbench-reclaim-[a-f0-9]{32}$/;
 const RECLAMATION_NAMESPACE_LIMIT = 16_384;
+const SANITIZED_BOOTSTRAP_ENV = [
+  'BASH_ENV=', 'ENV=', 'LD_PRELOAD=', 'LD_AUDIT=', 'LD_LIBRARY_PATH=', 'NODE_OPTIONS=',
+] as const;
 const RECLAMATION_INSPECT_BATCH_SIZE = 512;
 const TERMINAL_PHASES = new Set(['session-done', 'patched', 'evaluated']);
 const TOOLCHAIN_CACHE_LOCK = '.locks/toolchain.lock';
@@ -584,13 +588,15 @@ function overrideConfig(config: SwebenchProConfig, options: RunOptions): Swebenc
   });
 }
 
-function assertExplicitResumeOptions(options: RunOptions, manifest: SwebenchProManifest): void {
+export function assertExplicitResumeOptions(options: RunOptions, manifest: SwebenchProManifest): void {
   const checks: Array<[string, unknown, unknown]> = [
     ['model', options.model, manifest.experiment.model],
     ['requested-effort', options.requestedEffort, manifest.experiment.requestedEffort],
     ['arm', options.arm, manifest.experiment.arm],
     ['task-concurrency', options.taskConcurrency, manifest.limits.taskConcurrency],
     ['session-timeout-ms', options.sessionTimeoutMs, manifest.limits.hostTaskTimeoutMs],
+    ['count', options.count, manifest.experiment.taskIds.length],
+    ['seed', options.seed, manifest.suiteConfig.selection.seed ?? 0],
   ];
   if (options.taskIds !== undefined) checks.push(['task-id', canonicalJson(options.taskIds), canonicalJson(manifest.experiment.taskIds)]);
   for (const [name, actual, expected] of checks) {
@@ -1440,7 +1446,7 @@ export async function cleanupActiveSwebenchProContainers(): Promise<number> {
   return entries.length;
 }
 
-export interface ReclamationDockerRunArgvOptions extends ReclamationContainerSpec {
+export interface ReclamationDockerCreateArgvOptions extends ReclamationContainerSpec {
   policy: SwebenchProContainerPolicy;
 }
 
@@ -1491,8 +1497,8 @@ function assertReclamationSpec(options: ReclamationContainerSpec): void {
   }
 }
 
-/** Build the complete named and labelled root reclamation invocation for offline inspection. */
-export function reclamationDockerRunArgv(options: ReclamationDockerRunArgvOptions): string[] {
+/** Build a stopped, fully attestable root reclamation helper. */
+export function reclamationDockerCreateArgv(options: ReclamationDockerCreateArgvOptions): string[] {
   assertReclamationSpec(options);
   const labels = Object.entries(reclamationLabels(options)).flatMap(([key, value]) => [
     '--label', `${key}=${value}`,
@@ -1505,8 +1511,10 @@ export function reclamationDockerRunArgv(options: ReclamationDockerRunArgvOption
     ]),
   ];
   return [
-    'run', '--rm', '--name', options.name,
+    'create', '--rm', '--name', options.name,
     ...labels,
+    '--no-healthcheck',
+    ...SANITIZED_BOOTSTRAP_ENV.flatMap((value) => ['--env', value]),
     ...reclamationContainerPolicyArgv(options.policy, options.docker),
     ...mounts,
     '--entrypoint', TRUSTED_MUSL_LOADER,
@@ -1603,12 +1611,7 @@ export function sessionDockerCreateArgv(options: SessionDockerCreateArgvOptions)
     ...sessionContainerPolicyArgv(options.policy, options.docker),
     '--network', options.restrictedNetwork,
     '--user', '0:0',
-    '--env', 'BASH_ENV=',
-    '--env', 'ENV=',
-    '--env', 'LD_PRELOAD=',
-    '--env', 'LD_AUDIT=',
-    '--env', 'LD_LIBRARY_PATH=',
-    '--env', 'NODE_OPTIONS=',
+    ...SANITIZED_BOOTSTRAP_ENV.flatMap((value) => ['--env', value]),
     '--env-file', options.envFile,
     '--mount', `type=bind,src=${options.taskDirectory},dst=/bench`,
     '--mount', `type=bind,src=${options.runtimeHome},dst=/runtime/home`,
@@ -1955,50 +1958,64 @@ export function retainVerifierBindingsAfterRedo(
   });
 }
 
-async function recordCompletedAttempt(
+export async function recordCompletedAttempt(
   state: BenchRunStateStore,
   invocationId: string,
   execution: SwebenchProManifest['artifacts']['executions'][number],
   status: TaskStatus,
   meta: SessionMeta | null,
+  nextOrdinal: (taskId: string, arm: Arm, count: number) => number,
 ): Promise<void> {
   const startedAt = meta?.startedAt ? new Date(meta.startedAt * 1_000).toISOString() : status.startedAt ?? new Date().toISOString();
   const endedAt = meta?.endedAt ? new Date(meta.endedAt * 1_000).toISOString() : status.endedAt ?? startedAt;
   const elapsedMs = meta === null ? status.wallClockMs ?? 0 : Math.max(0, (meta.endedAt - meta.startedAt) * 1_000);
-  await state.updateCurrent((current) => ({
-    ...current,
-    attempts: [...current.attempts, {
-      attemptId: randomUUID(),
-      invocationId,
-      taskId: execution.taskId,
-      arm: execution.arm,
-      ordinal: current.attempts.filter((entry) => entry.taskId === execution.taskId && entry.arm === execution.arm).length + 1,
-      phase: 'session',
-      startedAt,
-      endedAt,
-      elapsedMs,
-      nativePath: execution.nativeRoot,
-      exitCode: meta?.codexExit ?? null,
-      signal: null,
-      status: status.failure === null ? 'succeeded' : 'failed',
-      failures: status.failure === null ? [] : [status.failure],
-      annotations: status.annotations,
-    }],
-  }));
+  const recordCount = meta !== null && meta.waitedForTerminalMs > 0 ? 2 : 1;
+  const ordinal = nextOrdinal(execution.taskId, execution.arm, recordCount);
+  const records: AttemptRecord[] = [{
+    attemptId: randomUUID(),
+    invocationId,
+    taskId: execution.taskId,
+    arm: execution.arm,
+    ordinal,
+    phase: 'session',
+    startedAt,
+    endedAt,
+    elapsedMs,
+    nativePath: execution.nativeRoot,
+    exitCode: meta?.codexExit ?? null,
+    signal: null,
+    status: status.failure === null ? 'succeeded' : 'failed',
+    failures: status.failure === null ? [] : [status.failure],
+    annotations: status.annotations,
+  }];
   if (meta !== null && meta.waitedForTerminalMs > 0) {
     const waitEnd = new Date(meta.endedAt * 1_000 + meta.waitedForTerminalMs);
     const waitStart = new Date(meta.endedAt * 1_000);
-    await state.updateCurrent((current) => ({
-      ...current,
-      attempts: [...current.attempts, {
-        attemptId: randomUUID(), invocationId, taskId: execution.taskId, arm: execution.arm,
-        ordinal: current.attempts.filter((entry) => entry.taskId === execution.taskId && entry.arm === execution.arm).length + 1,
-        phase: 'detached-wait', startedAt: waitStart.toISOString(), endedAt: waitEnd.toISOString(),
-        elapsedMs: meta.waitedForTerminalMs, nativePath: execution.nativeRoot, exitCode: 0, signal: null,
-        status: 'succeeded', failures: [], annotations: [],
-      }],
-    }));
+    records.push({
+      attemptId: randomUUID(), invocationId, taskId: execution.taskId, arm: execution.arm,
+      ordinal: ordinal + 1,
+      phase: 'detached-wait', startedAt: waitStart.toISOString(), endedAt: waitEnd.toISOString(),
+      elapsedMs: meta.waitedForTerminalMs, nativePath: execution.nativeRoot, exitCode: 0, signal: null,
+      status: 'succeeded', failures: [], annotations: [],
+    });
   }
+  await state.appendAttempts(null, records);
+}
+
+export function attemptOrdinalTracker(
+  runState: BenchRunState,
+): (taskId: string, arm: Arm, count: number) => number {
+  const ordinals = new Map<string, number>();
+  for (const attempt of runState.attempts) {
+    const key = `${attempt.taskId}\0${attempt.arm}`;
+    ordinals.set(key, Math.max(ordinals.get(key) ?? 0, attempt.ordinal));
+  }
+  return (taskId, arm, count) => {
+    const key = `${taskId}\0${arm}`;
+    const first = (ordinals.get(key) ?? 0) + 1;
+    ordinals.set(key, first + count - 1);
+    return first;
+  };
 }
 
 async function cleanupActiveSessionResources(): Promise<void> {
@@ -2059,10 +2076,11 @@ async function executeSessions(
   sessionDocker: SessionDockerExecutor = defaultSessionDockerExecutor,
 ): Promise<void> {
   const directory = runDir(context.paths, 'swebench-pro', manifest.runId);
+  const initialState = state.load();
   await cleanRunContainers(
     context.paths,
     manifest,
-    new Map(state.load().invocations.map((invocation) => [
+    new Map(initialState.invocations.map((invocation) => [
       invocation.invocationId,
       Date.parse(invocation.startedAt),
     ])),
@@ -2074,6 +2092,7 @@ async function executeSessions(
   );
   const byId = new Map(manifestInstances(manifest).map((instance) => [instance.instanceId, instance]));
   const images = imageAttestations(manifest);
+  const nextOrdinal = attemptOrdinalTracker(initialState);
   let cursor = 0;
   let ownershipFailure = false;
   const fatalController = new SwebenchProRunFatalController();
@@ -2089,6 +2108,7 @@ async function executeSessions(
       if (previous !== null && !forced && !resume) throw new Error(`unexpected native state for ${execution.taskId}/${execution.arm}`);
       const instance = byId.get(execution.taskId)!;
       const image = images.get(execution.taskId)!;
+      let attemptRecordStarted = false;
       try {
         const result = await runSession(
           context.paths,
@@ -2104,10 +2124,14 @@ async function executeSessions(
           fatalController,
         );
         fatalController.throwIfAborted();
-        await recordCompletedAttempt(state, invocationId, execution, result.status, result.meta);
+        attemptRecordStarted = true;
+        await recordCompletedAttempt(
+          state, invocationId, execution, result.status, result.meta, nextOrdinal,
+        );
         fatalController.throwIfAborted();
         output(context, `${execution.taskId} ${execution.arm}: ${result.status.phase}${result.status.failure ? ` (${result.status.failure})` : ''}`);
       } catch (error) {
+        if (attemptRecordStarted) throw error;
         if (error instanceof OwnershipUnsafeCleanupError) {
           ownershipFailure = true;
           throw error;
@@ -2129,7 +2153,7 @@ async function executeSessions(
         } catch {
           // Durable shared state below still records the exact scoped failure.
         }
-        await recordCompletedAttempt(state, invocationId, execution, status, null);
+        await recordCompletedAttempt(state, invocationId, execution, status, null, nextOrdinal);
         output(context, `${execution.taskId} ${execution.arm}: pending (${failure})`);
         if (error instanceof SwebenchProTransportAttestationError
           || isRunFatalTransportFailure(failure)) {
@@ -2894,6 +2918,10 @@ function uniqueSessionBindMount(record: ContainerInspect, destination: string): 
   return mounts[0]!.Source!;
 }
 
+function physicalPath(path: string): string {
+  return canonicalHostPath(path);
+}
+
 function sessionTaskDirectory(record: ContainerInspect, expected: string | undefined): string {
   if (expected === undefined) throw new Error('owned session cleanup has no trusted task directory');
   const observed = uniqueSessionBindMount(record, '/bench');
@@ -2911,8 +2939,8 @@ function sessionTaskDirectory(record: ContainerInspect, expected: string | undef
   if (writableMounts.length !== writableDestinations.size
     || writableMounts.some((mount) => mount.Type !== 'bind'
       || !writableDestinations.has(mount.Destination!))
-    || resolve(observed) !== resolve(expected)
-    || resolve(sessions) !== resolve(expected, 'codex-home', 'sessions')) {
+    || physicalPath(observed) !== physicalPath(expected)
+    || physicalPath(sessions) !== physicalPath(resolve(expected, 'codex-home', 'sessions'))) {
     throw new Error('owned session task mount does not match the trusted task directory');
   }
   return expected;
@@ -2923,13 +2951,13 @@ function sessionRuntimePaths(record: ContainerInspect): {
   runtimeHome: string;
   runtimeCodex: string;
 } {
-  const runtimeHome = uniqueSessionBindMount(record, '/runtime/home');
-  const runtimeCodex = uniqueSessionBindMount(record, '/runtime/codex-home');
+  const runtimeHome = physicalPath(uniqueSessionBindMount(record, '/runtime/home'));
+  const runtimeCodex = physicalPath(uniqueSessionBindMount(record, '/runtime/codex-home'));
   const runtime = dirname(runtimeCodex);
-  const relativeRuntime = relative(tmpdir(), runtime);
+  const relativeRuntime = relative(physicalPath(tmpdir()), runtime);
   if (!/^uc-bench-pro-runtime-[A-Za-z0-9]+$/.test(relativeRuntime) || relativeRuntime.includes(sep)
-    || resolve(runtimeHome) !== resolve(runtime, 'home')
-    || resolve(runtimeCodex) !== resolve(runtime, 'codex-home')) {
+    || runtimeHome !== physicalPath(resolve(runtime, 'home'))
+    || runtimeCodex !== physicalPath(resolve(runtime, 'codex-home'))) {
     throw new Error('owned session credential mounts are outside the exact temporary namespace');
   }
   return { runtime, runtimeHome, runtimeCodex };
@@ -3049,8 +3077,8 @@ function compatibleReclamationSpec(
   const runtimeHome = reclamationBindSource(record, '/runtime/home');
   const runtimeCodex = reclamationBindSource(record, '/runtime/codex-home');
   const runtime = dirname(runtimeCodex);
-  if (resolve(runtimeHome) !== resolve(runtime, 'home')
-    || resolve(runtimeCodex) !== resolve(runtime, 'codex-home')) {
+  if (physicalPath(runtimeHome) !== physicalPath(resolve(runtime, 'home'))
+    || physicalPath(runtimeCodex) !== physicalPath(resolve(runtime, 'codex-home'))) {
     throw new Error('reclamation helper runtime bind sources are not one exact runtime');
   }
   trustedSessionRuntimeDirectory(runtime, base.runId, base.taskId, base.arm, nonce);
@@ -3080,8 +3108,15 @@ function assertExactReclamationHelper(
       && mount.RW === true
       && mount.Destination === expected.Destination
       && typeof mount.Source === 'string'
-      && resolve(mount.Source) === resolve(expected.Source)).length === 1);
+      && physicalPath(mount.Source) === physicalPath(expected.Source)).length === 1);
   const command = reclamationCommandArgv(options);
+  const environment = record.Config?.Env;
+  const sanitizedEnvironment = Array.isArray(environment)
+    && SANITIZED_BOOTSTRAP_ENV.every((expected) => {
+      const name = expected.slice(0, -1);
+      return environment.filter((entry) => entry === expected).length === 1
+        && !environment.some((entry) => entry.startsWith(`${name}=`) && entry !== expected);
+    });
   const host = record.HostConfig;
   if (record.Id !== listedId
     || !/^[a-f0-9]{64}$/.test(record.Id)
@@ -3092,6 +3127,8 @@ function assertExactReclamationHelper(
     || record.Config?.User !== policy.reclamation.user
     || canonicalJson(record.Config?.Entrypoint) !== canonicalJson([TRUSTED_MUSL_LOADER])
     || canonicalJson(record.Config?.Cmd) !== canonicalJson(command)
+    || !sanitizedEnvironment
+    || canonicalJson(record.Config?.Healthcheck?.Test) !== canonicalJson(['NONE'])
     || record.Path !== TRUSTED_MUSL_LOADER
     || canonicalJson(record.Args) !== canonicalJson(command)
     || host?.AutoRemove !== true
@@ -3138,7 +3175,7 @@ async function inspectExactReclamationName(
   if (expected !== null && (observed.runtimeNonce !== expected.runtimeNonce
     || (observed.runtimeDirectory === undefined) !== (expected.runtimeDirectory === undefined)
     || (observed.runtimeDirectory !== undefined && expected.runtimeDirectory !== undefined
-      && resolve(observed.runtimeDirectory) !== resolve(expected.runtimeDirectory)))) {
+      && physicalPath(observed.runtimeDirectory) !== physicalPath(expected.runtimeDirectory)))) {
     throw new Error(`reclamation helper runtime binding changed for ${base.name}`);
   }
   const spec = expected ?? observed;
@@ -3252,29 +3289,60 @@ export async function reclaimSessionOwnership(
     };
     trackActiveReclamationHelper(active);
     try {
-      const argv = reclamationDockerRunArgv({ ...spec, policy: options.policy });
+      const argv = reclamationDockerCreateArgv({ ...spec, policy: options.policy });
       for (let attempt = 0; attempt < RECLAMATION_ATTEMPTS; attempt += 1) {
         const attemptTimeout = attempt === 0 ? timeout : survivorCleanupTimeout();
         absenceProven = false;
-        let launchFailure: unknown;
+        let createFailure: unknown;
+        let createdId = '';
         try {
-          await executor(argv, lifecycle, attemptTimeout());
+          createdId = (await executor(argv, lifecycle, attemptTimeout())).trim();
         } catch (error) {
-          launchFailure = error;
+          createFailure = error;
+        }
+        let created: Awaited<ReturnType<typeof inspectExactReclamationName>>;
+        try {
+          created = await inspectExactReclamationName(
+            spec, spec, options.policy, lifecycle, executor, attemptTimeout,
+          );
+        } catch (error) {
+          throw ownershipUnsafeAggregate('reclamation helper creation could not be attested', [
+            createFailure,
+            error,
+          ]);
+        }
+        if (created === null) {
+          absenceProven = true;
+          if (attempt === RECLAMATION_ATTEMPTS - 1) {
+            throw ownershipUnsafeAggregate('root ownership reclamation creation failed after an idempotent retry', [
+              createFailure,
+            ]);
+          }
+          continue;
+        }
+        if (created.record.State?.Running !== false
+          || (createdId !== '' && createdId !== created.record.Id)) {
+          throw new Error('reclamation helper was not created as the exact stopped container');
+        }
+        let startFailure: unknown;
+        try {
+          await executor(['start', '-a', created.record.Id!], lifecycle, attemptTimeout());
+        } catch (error) {
+          startFailure = error;
         }
         try {
           await reconcileReclamationHelper(spec, spec, options.policy, lifecycle, executor, attemptTimeout);
           absenceProven = true;
         } catch (error) {
           throw ownershipUnsafeAggregate('reclamation helper outcome could not be reconciled', [
-            launchFailure,
+            startFailure,
             error,
           ]);
         }
-        if (launchFailure === undefined) return;
+        if (startFailure === undefined) return;
         if (attempt === RECLAMATION_ATTEMPTS - 1) {
           throw ownershipUnsafeAggregate('root ownership reclamation failed after an idempotent retry', [
-            launchFailure,
+            startFailure,
           ]);
         }
       }

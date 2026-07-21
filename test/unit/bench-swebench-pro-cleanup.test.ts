@@ -26,7 +26,7 @@ import {
   SwebenchProRunFatalController,
   reclaimSessionOwnership,
   reclamationContainerName,
-  reclamationDockerRunArgv,
+  reclamationDockerCreateArgv,
   cleanupActiveSwebenchProContainers,
   launchTrackedSessionContainer,
   ownedRunContainerIds,
@@ -120,8 +120,7 @@ function isReclamationQuery(argv: readonly string[]): boolean {
   return argv.some((entry) => entry.includes('ucbench-reclaim-'));
 }
 
-function reclamationFixture(taskId = 'task-a') {
-  const fixture = sessionFixture(taskId);
+function reclamationFixture(taskId = 'task-a', fixture = sessionFixture(taskId)) {
   const name = reclamationContainerName('pilot1', taskId, 'a');
   const options = {
     runId: 'pilot1',
@@ -135,7 +134,7 @@ function reclamationFixture(taskId = 'task-a') {
     docker,
     policy,
   };
-  const argv = reclamationDockerRunArgv({ ...options, name });
+  const argv = reclamationDockerCreateArgv({ ...options, name });
   const labels: Record<string, string> = {};
   const mounts: Array<{ Type: string; Source: string; Destination: string; RW: boolean }> = [];
   for (let index = 0; index < argv.length; index += 1) {
@@ -164,6 +163,10 @@ function reclamationFixture(taskId = 'task-a') {
       User: '0:0',
       Entrypoint: [entrypoint],
       Cmd: command,
+      Env: [
+        'BASH_ENV=', 'ENV=', 'LD_PRELOAD=', 'LD_AUDIT=', 'LD_LIBRARY_PATH=', 'NODE_OPTIONS=',
+      ],
+      Healthcheck: { Test: ['NONE'] },
     },
     HostConfig: {
       AutoRemove: true,
@@ -188,9 +191,64 @@ function reclamationFixture(taskId = 'task-a') {
   return { ...fixture, name, options, argv, id, record };
 }
 
+function successfulReclamation(
+  fixture: ReturnType<typeof reclamationFixture>,
+  onStart: () => void = () => {},
+): (argv: readonly string[]) => string | undefined {
+  let present = false;
+  let record = fixture.record;
+  return (argv) => {
+    if (argv[0] === 'ps' && isReclamationQuery(argv)) return present ? fixture.id : '';
+    if (argv[0] === 'create') {
+      expect(argv).toContain('--no-healthcheck');
+      const labels: Record<string, string> = {};
+      const mounts: Array<{ Type: string; Source: string; Destination: string; RW: boolean }> = [];
+      for (let index = 0; index < argv.length; index += 1) {
+        if (argv[index] === '--label') {
+          const [key, ...value] = argv[index + 1]!.split('=');
+          labels[key!] = value.join('=');
+        }
+        if (argv[index] === '--mount') {
+          const fields = Object.fromEntries(argv[index + 1]!.split(',').map((field) => field.split('=')));
+          mounts.push({ Type: 'bind', Source: fields.src!, Destination: fields.dst!, RW: true });
+        }
+      }
+      const imageIndex = argv.indexOf(fixture.image.overlayLocalId);
+      const entrypoint = argv[argv.indexOf('--entrypoint') + 1]!;
+      const command = argv.slice(imageIndex + 1);
+      record = {
+        ...fixture.record,
+        Name: `/${argv[argv.indexOf('--name') + 1]}`,
+        Path: entrypoint,
+        Args: command,
+        Config: {
+          ...fixture.record.Config,
+          Labels: labels,
+          Entrypoint: [entrypoint],
+          Cmd: command,
+        },
+        Mounts: mounts,
+      };
+      present = true;
+      return fixture.id;
+    }
+    if (argv[0] === 'inspect' && argv[1] === fixture.id) {
+      return JSON.stringify([record]);
+    }
+    if (argv[0] === 'start' && argv[1] === '-a' && argv[2] === fixture.id) {
+      onStart();
+      present = false;
+      return '';
+    }
+    return undefined;
+  };
+}
+
 describe('SWE-bench Pro ownership cleanup', () => {
   it('adopts a paused launch that appears after the first absent cleanup query', async () => {
-    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = sessionFixture();
+    const fixture = sessionFixture();
+    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = fixture;
+    const handleReclamation = successfulReclamation(reclamationFixture('task-a', fixture));
     const events: string[] = [];
     let present = false;
     let launchReleased = false;
@@ -209,6 +267,8 @@ describe('SWE-bench Pro ownership cleanup', () => {
     const timeouts: number[] = [];
     const executor: SessionDockerExecutor = async (argv, _lifecycle, timeoutMs) => {
       timeouts.push(timeoutMs!);
+      const reclamationResult = handleReclamation(argv);
+      if (reclamationResult !== undefined) return reclamationResult;
       if (argv[0] === 'run' && !isReclamationQuery(argv)) {
         events.push('launch-started');
         announceLaunch();
@@ -240,7 +300,6 @@ describe('SWE-bench Pro ownership cleanup', () => {
         return present ? id : '';
       }
       if (argv[0] === 'inspect') return inspect;
-      if (argv[0] === 'run') return '';
       if (argv[0] === 'rm') {
         present = false;
         events.push('removed');
@@ -301,12 +360,15 @@ describe('SWE-bench Pro ownership cleanup', () => {
   });
 
   it('reclaims artifacts and runtime homes after the owned container vanished', async () => {
-    const { runtime, taskDirectory, image, artifactOwner, reclamation } = sessionFixture();
+    const fixture = sessionFixture();
+    const { runtime, taskDirectory, image, artifactOwner, reclamation } = fixture;
+    const handleReclamation = successfulReclamation(reclamationFixture('task-a', fixture));
     const calls: string[][] = [];
     const executor: SessionDockerExecutor = async (argv) => {
       calls.push([...argv]);
+      const reclamationResult = handleReclamation(argv);
+      if (reclamationResult !== undefined) return reclamationResult;
       if (argv[0] === 'ps') return '';
-      if (argv[0] === 'run') return '';
       throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
     };
     await stopPersistedSessionContainer(
@@ -318,25 +380,30 @@ describe('SWE-bench Pro ownership cleanup', () => {
       executor,
       { taskDirectory, image, artifactOwner, runtimeDirectory: runtime, ...reclamation },
     );
-    expect(calls.map((argv) => argv[0])).toEqual(['ps', 'ps', 'run', 'ps']);
+    expect(calls.map((argv) => argv[0])).toEqual([
+      'ps', 'ps', 'create', 'ps', 'inspect', 'start', 'ps',
+    ]);
     expect(calls[2]).toContain('FOWNER');
     expect(existsSync(runtime)).toBe(false);
     expect(statSync(taskDirectory).mode & 0o777).toBe(0o700);
   });
 
   it('accepts an ambiguous rm failure only after the exact name is proven absent', async () => {
-    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = sessionFixture();
+    const fixture = sessionFixture();
+    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = fixture;
+    const handleReclamation = successfulReclamation(reclamationFixture('task-a', fixture));
     const calls: string[][] = [];
     let listed = true;
     const executor: SessionDockerExecutor = async (argv) => {
       calls.push([...argv]);
+      const reclamationResult = handleReclamation(argv);
+      if (reclamationResult !== undefined) return reclamationResult;
       if (argv[0] === 'ps') {
         if (isReclamationQuery(argv)) return '';
         if (listed) return id;
         return '';
       }
       if (argv[0] === 'inspect') return inspect;
-      if (argv[0] === 'run') return '';
       if (argv[0] === 'rm') {
         listed = false;
         throw new Error('daemon connection ended after accepting removal');
@@ -348,17 +415,20 @@ describe('SWE-bench Pro ownership cleanup', () => {
       { taskDirectory, image, artifactOwner, ...reclamation },
     )).resolves.toBeUndefined();
     expect(calls.map((argv) => argv[0])).toEqual([
-      'ps', 'inspect', 'ps', 'run', 'ps', 'rm', 'ps',
+      'ps', 'inspect', 'ps', 'create', 'ps', 'inspect', 'start', 'ps', 'rm', 'ps',
     ]);
     expect(existsSync(runtime)).toBe(false);
   });
 
   it('retains the runtime and raises a typed command-fatal error while the name remains', async () => {
-    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = sessionFixture();
+    const fixture = sessionFixture();
+    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = fixture;
+    const handleReclamation = successfulReclamation(reclamationFixture('task-a', fixture));
     const executor: SessionDockerExecutor = async (argv) => {
+      const reclamationResult = handleReclamation(argv);
+      if (reclamationResult !== undefined) return reclamationResult;
       if (argv[0] === 'ps') return isReclamationQuery(argv) ? '' : id;
       if (argv[0] === 'inspect') return inspect;
-      if (argv[0] === 'run') return '';
       if (argv[0] === 'rm') throw new Error('removal failed');
       throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
     };
@@ -372,25 +442,28 @@ describe('SWE-bench Pro ownership cleanup', () => {
   });
 
   it('reclaims trusted writable mounts before removing a running crash survivor', async () => {
-    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = sessionFixture();
+    const fixture = sessionFixture();
+    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = fixture;
     const artifact = join(taskDirectory, 'task-output.txt');
     writeFileSync(artifact, 'result');
     chmodSync(taskDirectory, 0o000);
     let running = true;
     const calls: Array<{ argv: string[]; timeoutMs: number | undefined }> = [];
     let listed = true;
+    const handleReclamation = successfulReclamation(
+      reclamationFixture('task-a', fixture),
+      () => { chmodSync(taskDirectory, 0o700); },
+    );
     const executor: SessionDockerExecutor = async (argv, _lifecycle, timeoutMs) => {
       calls.push({ argv: [...argv], timeoutMs });
+      const reclamationResult = handleReclamation(argv);
+      if (reclamationResult !== undefined) return reclamationResult;
       if (argv[0] === 'ps') return isReclamationQuery(argv) ? '' : listed ? id : '';
       if (argv[0] === 'inspect') {
         return JSON.stringify([{ ...JSON.parse(inspect)[0], State: { Running: running } }]);
       }
       if (argv[0] === 'stop') {
         running = false;
-        return '';
-      }
-      if (argv[0] === 'run') {
-        chmodSync(taskDirectory, 0o700);
         return '';
       }
       if (argv[0] === 'rm') {
@@ -415,7 +488,8 @@ describe('SWE-bench Pro ownership cleanup', () => {
       },
     );
     expect(calls.map(({ argv }) => argv[0])).toEqual([
-      'ps', 'inspect', 'stop', 'inspect', 'ps', 'run', 'ps', 'rm', 'ps',
+      'ps', 'inspect', 'stop', 'inspect', 'ps', 'create', 'ps', 'inspect',
+      'start', 'ps', 'rm', 'ps',
     ]);
     expect(calls[5]!.argv).toContain(image.overlayLocalId);
     expect(calls.every(({ timeoutMs }) => typeof timeoutMs === 'number' && timeoutMs > 0)).toBe(true);
@@ -489,7 +563,7 @@ describe('SWE-bench Pro ownership cleanup', () => {
     expect(calls).toEqual(['ps', 'inspect']);
   });
 
-  it('reconciles daemon acceptance followed by client failure and reruns reclamation idempotently', async () => {
+  it('attests daemon acceptance after a create-client failure before starting reclamation', async () => {
     const { options, argv: expectedArgv, id, record } = reclamationFixture('task-client-failure');
     const calls: string[][] = [];
     let present = false;
@@ -502,22 +576,23 @@ describe('SWE-bench Pro ownership cleanup', () => {
         present = false;
         return '';
       }
-      if (argv[0] === 'run') {
+      if (argv[0] === 'create') {
         expect(argv).toEqual(expectedArgv);
         launches += 1;
-        if (launches === 1) {
-          present = true;
-          throw new Error('daemon accepted helper before client disconnect');
-        }
+        present = true;
+        throw new Error('daemon accepted helper before client disconnect');
+      }
+      if (argv[0] === 'start') {
+        present = false;
         return '';
       }
       throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
     };
     await expect(reclaimSessionOwnership(options, {}, executor)).resolves.toBeUndefined();
     expect(calls.map((argv) => argv[0])).toEqual([
-      'ps', 'run', 'ps', 'inspect', 'rm', 'ps', 'run', 'ps',
+      'ps', 'create', 'ps', 'inspect', 'start', 'ps',
     ]);
-    expect(launches).toBe(2);
+    expect(launches).toBe(1);
   });
 
   it('stops and removes a valid prior survivor before rerunning reclamation', async () => {
@@ -537,12 +612,21 @@ describe('SWE-bench Pro ownership cleanup', () => {
         present = false;
         return '';
       }
-      if (argv[0] === 'run') return '';
+      if (argv[0] === 'create') {
+        present = true;
+        running = false;
+        return id;
+      }
+      if (argv[0] === 'start') {
+        present = false;
+        return '';
+      }
       throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
     };
     await reclaimSessionOwnership(options, {}, executor);
     expect(calls.map((argv) => argv[0])).toEqual([
-      'ps', 'inspect', 'stop', 'ps', 'inspect', 'rm', 'ps', 'run', 'ps',
+      'ps', 'inspect', 'stop', 'ps', 'inspect', 'rm', 'ps',
+      'create', 'ps', 'inspect', 'start', 'ps',
     ]);
   });
 
@@ -550,19 +634,31 @@ describe('SWE-bench Pro ownership cleanup', () => {
     const { options, id, record } = reclamationFixture('task-auto-remove');
     const calls: string[] = [];
     let present = true;
+    let running = true;
     const executor: SessionDockerExecutor = async (argv) => {
       calls.push(argv[0]!);
       if (argv[0] === 'ps') return present ? id : '';
-      if (argv[0] === 'inspect') return JSON.stringify([{ ...record, State: { Running: true } }]);
+      if (argv[0] === 'inspect') return JSON.stringify([{ ...record, State: { Running: running } }]);
       if (argv[0] === 'stop') {
+        present = false;
+        running = false;
+        return '';
+      }
+      if (argv[0] === 'create') {
+        present = true;
+        running = false;
+        return id;
+      }
+      if (argv[0] === 'start') {
         present = false;
         return '';
       }
-      if (argv[0] === 'run') return '';
       throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
     };
     await expect(reclaimSessionOwnership(options, {}, executor)).resolves.toBeUndefined();
-    expect(calls).toEqual(['ps', 'inspect', 'stop', 'ps', 'run', 'ps']);
+    expect(calls).toEqual([
+      'ps', 'inspect', 'stop', 'ps', 'create', 'ps', 'inspect', 'start', 'ps',
+    ]);
   });
 
   it('retains and rejects a spoofed same-name reclamation container', async () => {
@@ -688,7 +784,11 @@ describe('SWE-bench Pro ownership cleanup', () => {
     const executor: SessionDockerExecutor = async (argv) => {
       if (argv[0] === 'ps') return present ? id : '';
       if (argv[0] === 'inspect') return JSON.stringify([{ ...record, State: { Running: running } }]);
-      if (argv[0] === 'run') {
+      if (argv[0] === 'create') {
+        present = true;
+        return id;
+      }
+      if (argv[0] === 'start') {
         present = true;
         running = true;
         announceLaunch();
@@ -722,10 +822,11 @@ describe('SWE-bench Pro ownership cleanup', () => {
       expect(timeoutMs).toBeGreaterThan(0);
       if (argv[0] === 'ps') return present ? id : '';
       if (argv[0] === 'inspect') return JSON.stringify([record]);
-      if (argv[0] === 'run') {
+      if (argv[0] === 'create') {
         present = true;
         throw new Error('daemon accepted helper after the original deadline');
       }
+      if (argv[0] === 'start') throw new Error('helper start remained ambiguous');
       if (argv[0] === 'rm') {
         present = false;
         return '';
@@ -744,15 +845,22 @@ describe('SWE-bench Pro ownership cleanup', () => {
   });
 
   it('gives each idempotent reclamation retry a fresh bounded deadline', async () => {
-    const { options } = reclamationFixture('task-fresh-retry-deadline');
+    const { options, id, record } = reclamationFixture('task-fresh-retry-deadline');
     const launchTimeouts: number[] = [];
     let attempts = 0;
+    let present = false;
     const executor: SessionDockerExecutor = async (argv, _lifecycle, timeoutMs) => {
-      if (argv[0] === 'ps') return '';
-      if (argv[0] === 'run') {
+      if (argv[0] === 'ps') return present ? id : '';
+      if (argv[0] === 'inspect') return JSON.stringify([record]);
+      if (argv[0] === 'create') {
         launchTimeouts.push(timeoutMs!);
         attempts++;
         if (attempts === 1) throw new Error('injected first launch failure');
+        present = true;
+        return id;
+      }
+      if (argv[0] === 'start') {
+        present = false;
         return '';
       }
       throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
@@ -818,10 +926,11 @@ describe('SWE-bench Pro ownership cleanup', () => {
       }
       if (argv[0] === 'ps') return helperPresent ? id : '';
       if (argv[0] === 'inspect') return JSON.stringify([record]);
-      if (argv[0] === 'run') {
+      if (argv[0] === 'create') {
         helperPresent = true;
         throw new Error('client failed after daemon acceptance');
       }
+      if (argv[0] === 'start') throw new Error('helper start failed');
       if (argv[0] === 'rm') throw new Error('helper removal failed');
       throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
     };

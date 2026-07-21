@@ -1,10 +1,11 @@
 /** Final benchmark identity and results-layout contract. */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   artifactKey,
+  canonicalHostPath,
   createBenchPathRoots,
   createPrivateRunDirectory,
   isSafeRunId,
@@ -59,6 +60,16 @@ describe('benchmark identities', () => {
 });
 
 describe('suite-qualified run layout', () => {
+  it('canonicalizes a host symlink alias while retaining an inaccessible suffix', () => {
+    const root = temporary();
+    const physical = join(root, 'physical');
+    const alias = join(root, 'alias');
+    mkdirSync(physical);
+    symlinkSync(physical, alias);
+    expect(canonicalHostPath(join(alias, 'task-owned', 'output')))
+      .toBe(join(physical, 'task-owned', 'output'));
+  });
+
   it('allows the same run id in different suite namespaces', () => {
     const paths = createBenchPathRoots(temporary());
     expect(runDir(paths, 'swebench-pro', 'pilot1')).toBe(join(paths.resultsRoot, 'swebench-pro', 'pilot1'));

@@ -97,6 +97,8 @@ export interface ReclamationContainerInspect {
     User?: string;
     Entrypoint?: string[];
     Cmd?: string[];
+    Env?: string[];
+    Healthcheck?: { Test?: string[] };
   };
   HostConfig?: {
     AutoRemove?: boolean;

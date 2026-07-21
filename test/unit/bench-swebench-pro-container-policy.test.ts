@@ -17,7 +17,7 @@ import {
 import type { SwebenchProConfig } from '../../bench/src/suites/swebench-pro/config.js';
 import {
   reclamationContainerName,
-  reclamationDockerRunArgv,
+  reclamationDockerCreateArgv,
   sessionDockerCreateArgv,
 } from '../../bench/src/suites/swebench-pro/runner.js';
 import {
@@ -141,7 +141,7 @@ describe('SWE-bench Pro container policy', () => {
       '--user', '0:0',
     ]);
     const reclamationName = reclamationContainerName('pilot1', 'task-a', 'a');
-    expect(reclamationDockerRunArgv({
+    expect(reclamationDockerCreateArgv({
       name: reclamationName,
       runId: 'pilot1',
       taskId: 'task-a',
@@ -154,7 +154,7 @@ describe('SWE-bench Pro container policy', () => {
       docker,
       policy,
     })).toEqual([
-      'run', '--rm', '--name', reclamationName,
+      'create', '--rm', '--name', reclamationName,
       '--label', 'ultracode.benchmark.schema=2',
       '--label', 'ultracode.benchmark.suite=swebench-pro',
       '--label', 'ultracode.benchmark.run=pilot1',
@@ -165,6 +165,13 @@ describe('SWE-bench Pro container policy', () => {
       '--label', 'ultracode.benchmark.artifact-uid=2001',
       '--label', 'ultracode.benchmark.artifact-gid=2002',
       '--label', `ultracode.benchmark.runtime=${'a'.repeat(64)}`,
+      '--no-healthcheck',
+      '--env', 'BASH_ENV=',
+      '--env', 'ENV=',
+      '--env', 'LD_PRELOAD=',
+      '--env', 'LD_AUDIT=',
+      '--env', 'LD_LIBRARY_PATH=',
+      '--env', 'NODE_OPTIONS=',
       '--network', 'none',
       '--pids-limit', '64',
       '--security-opt', 'no-new-privileges',
@@ -322,9 +329,10 @@ describe('SWE-bench Pro container policy', () => {
     expect(readme).toContain('it does not require `uv` or GNU `patch`');
     expect(readme).toContain('SWE-bench Pro has no direct ChatGPT/API-key mode');
     expect(guide).toContain('no direct `chatgpt` or `api-key` session mode');
-    expect(guide).toContain('affected task is recorded and the whole run invocation');
+    expect(guide).toContain('records the affected task and fails the whole run\ninvocation closed');
     expect(guide).toContain('Legacy Pro schema version 2 described direct provider auth');
     expect(guide).toContain('manifest-bound immutable local image ID');
+    expect(guide).toContain('com.docker.network.bridge.inhibit_ipv4=true');
     expect(guide).toMatch(/does not inspect\s+an operator firewall/u);
     expect(guide).toContain('CPU and memory values are instead derived from\nthe immutable run manifest');
   });

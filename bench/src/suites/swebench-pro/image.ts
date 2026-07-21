@@ -28,6 +28,7 @@ interface ImageInspect {
   RepoDigests?: string[];
   Os?: string;
   Architecture?: string;
+  Config?: { OnBuild?: unknown };
 }
 
 function parseInspect(output: string, description: string): ImageInspect {
@@ -45,6 +46,13 @@ function identity(record: ImageInspect, description: string): { localId: string;
     throw new Error(`${description} has incomplete local identity`);
   }
   return { localId: record.Id, platform: `${record.Os}/${record.Architecture}` };
+}
+
+function assertNoInheritedBuildTriggers(record: ImageInspect): void {
+  const onBuild = record.Config?.OnBuild;
+  if (onBuild !== null && !(Array.isArray(onBuild) && onBuild.length === 0)) {
+    throw new Error('base image must declare no inherited ONBUILD triggers');
+  }
 }
 
 /** Select only the digest belonging to the requested repository. */
@@ -134,6 +142,7 @@ export async function prepareTaskImage(
   const tagged = await inspect(requested, docker);
   const resolvedDigest = repositoryDigest(tagged);
   const base = await inspect(resolvedDigest, docker);
+  assertNoInheritedBuildTriggers(base);
   const baseIdentity = identity(base, resolvedDigest);
   const overlayKey = createHash('sha256')
     .update(`${runId}\0${resolvedDigest}\0${options.toolchainPayloadSha256}\0${instance.instanceId}`, 'utf8')
@@ -143,6 +152,7 @@ export async function prepareTaskImage(
     await docker([
       'build',
       '--pull=false',
+      '--network=none',
       '--label', 'ultracode.benchmark.schema=2',
       '--label', 'ultracode.benchmark.suite=swebench-pro',
       '--label', 'ultracode.benchmark.purpose=prep',

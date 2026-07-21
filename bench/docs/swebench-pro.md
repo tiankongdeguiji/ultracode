@@ -23,7 +23,7 @@ model grammar is `[A-Za-z0-9][A-Za-z0-9._:/-]*`; effort uses
 `[A-Za-z][A-Za-z0-9_-]*`. Other strings are rejected before TOML generation.
 The private operator config must instead define `modelTransport.relayIdentity`,
 `relayVersion`, and an exact public HTTPS `/v1` `fixedDestination`. Every fresh
-run and resume must also supply these runtime-only bindings:
+`run` and `run --resume` must also supply these runtime-only bindings:
 
 ```bash
 SWEBENCH_PRO_MODEL_RELAY_URL=http://pro-relay:8080/v1 \
@@ -31,13 +31,18 @@ SWEBENCH_PRO_RESTRICTED_NETWORK=swebench-pro-private \
 npm run bench -- --suite swebench-pro run --run-id <run> ...
 ```
 
+Offline `eval --resume`, `report`, and `status` commands use frozen evidence and
+do not require a live relay or restricted-network binding.
+
 The relay URL hostname must equal the relay container name and must be a Docker
 DNS endpoint name; localhost and every IP literal are rejected before Docker
 inspection. The named network
 must be a local, non-attachable, non-ingress Docker bridge created with
-`--internal` and labeled
+`--internal --opt com.docker.network.bridge.inhibit_ipv4=true` and labeled
 `ultracode.egress-policy=codex-responses-via-attested-relay-v1`. Before manifest
-publication it must contain exactly the running relay. During sessions it may
+publication it must contain exactly the running relay. The required bridge
+option prevents Docker from assigning the bridge an IP, so task containers
+cannot reach services on the host through the internal-network gateway. During sessions it may
 contain only that relay and exact active run-owned task containers. Each task
 container is created stopped from its manifest-bound immutable local image ID,
 with the image healthcheck disabled and shell/dynamic-loader bootstrap
@@ -100,9 +105,11 @@ handling, and egress match the declared contract. The harness does not inspect
 an operator firewall and makes no claim about an undocumented firewall.
 Docker-daemon administrators, relay compromise, false relay labels, mutable
 host networking after inspection, and provider behavior remain outside the
-task-container boundary. If the relay, labels, network, or runtime bindings are
-absent or drift, the affected task is recorded and the whole run invocation
-fails closed; there is no unrestricted credential fallback. Docker rejection,
+task-container boundary. Missing bindings or failed initial transport preflight
+abort before invocation start (and before manifest publication for a fresh
+run), so they do not create a task or invocation record. Drift detected after a
+session attempt begins records the affected task and fails the whole run
+invocation closed; there is no unrestricted credential fallback. Docker rejection,
 malformed or ambiguous inspection output, attachment mismatch, topology
 mismatch, and manifest-attestation mismatch all become one typed fatal
 transport error with the failed proof stage retained. A shared fatal signal

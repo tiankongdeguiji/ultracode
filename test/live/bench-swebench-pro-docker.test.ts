@@ -16,7 +16,7 @@ import {
 import {
   reclaimSessionOwnership,
   reclamationContainerName,
-  reclamationDockerRunArgv,
+  reclamationDockerCreateArgv,
   sessionDockerCreateArgv,
   swebenchProSessionAttachment,
 } from '../../bench/src/suites/swebench-pro/runner.js';
@@ -116,9 +116,9 @@ describe.runIf(reclamationEnabled)('live SWE-bench Pro reclamation survivor life
       docker: resources,
       policy,
     };
-    const runArgv = reclamationDockerRunArgv({ ...options, name });
+    const runArgv = reclamationDockerCreateArgv({ ...options, name });
     try {
-      docker(['create', '--rm', ...runArgv.slice(2)]);
+      docker(runArgv);
       docker(['start', name]);
       expect(JSON.parse(docker(['inspect', name]))[0].State.Running).toBe(true);
       await reclaimSessionOwnership(options, {}, async (argv) => docker(argv));
@@ -190,6 +190,7 @@ describe.runIf(relayEnabled)('live SWE-bench Pro restricted model-transport topo
       docker(['image', 'inspect', relayImage]);
       docker([
         'network', 'create', '--internal', '--driver', 'bridge',
+        '--opt', 'com.docker.network.bridge.inhibit_ipv4=true',
         '--label', `ultracode.egress-policy=${SWEBENCH_PRO_NETWORK_POLICY.policyLabel}`,
         networkName,
       ]);

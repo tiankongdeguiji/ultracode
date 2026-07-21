@@ -17,13 +17,14 @@ import {
   openSync,
   readSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path';
+import { dirname, isAbsolute, join, parse, relative, resolve, sep, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BENCH_SUITES, type BenchPathRoots, type BenchSuite } from './contracts.js';
 
@@ -42,6 +43,25 @@ const ARTIFACT_KEY_RE = /^[a-z0-9](?:[a-z0-9-]{0,47}[a-z0-9])?-[a-f0-9]{64}$/;
 const MAX_PRIVATE_FILE_BYTES = 64 * 1_024 * 1_024;
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 let temporarySequence = 0;
+
+/** Canonicalize every accessible path component, retaining an inaccessible suffix verbatim. */
+export function canonicalHostPath(path: string): string {
+  const absolute = resolve(path);
+  const { root } = parse(absolute);
+  const components = relative(root, absolute).split(sep).filter(Boolean);
+  let canonical = root;
+  for (let index = 0; index < components.length; index += 1) {
+    const candidate = join(canonical, components[index]!);
+    try {
+      canonical = realpathSync(candidate);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'EACCES') throw error;
+      return resolve(canonical, ...components.slice(index));
+    }
+  }
+  return canonical;
+}
 
 const BENCH_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 

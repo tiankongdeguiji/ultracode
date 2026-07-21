@@ -67,7 +67,7 @@ function network(containers: Record<string, { Name: string }> = {
     Attachable: false,
     Ingress: false,
     Labels: { 'ultracode.egress-policy': SWEBENCH_PRO_NETWORK_POLICY.policyLabel },
-    Options: { 'com.docker.network.bridge.enable_ip_masquerade': 'false' },
+    Options: { 'com.docker.network.bridge.inhibit_ipv4': 'true' },
     IPAM: { Driver: 'default' },
     Containers: containers,
   }]);
@@ -299,17 +299,18 @@ describe('SWE-bench Pro attested model relay contract', () => {
     }), relay(), config, MODEL, bindings)).toThrow(/outside the attested allowlist/);
   });
 
-  it('rejects a non-internal, attachable, or non-local network', () => {
+  it('rejects a non-internal, attachable, host-reachable, or non-local network', () => {
     for (const drift of [
       { Internal: false },
       { Attachable: true },
       { Scope: 'swarm' },
+      { Options: {} },
     ]) {
       const parsed = JSON.parse(network()) as Array<Record<string, unknown>>;
       Object.assign(parsed[0]!, drift);
       expect(() => inspectSwebenchProTransportBoundary(
         JSON.stringify(parsed), relay(), config, MODEL, bindings,
-      )).toThrow(/internal network|dedicated local bridge/);
+      )).toThrow(/internal network|dedicated local bridge|inhibit the host bridge IP/);
     }
   });
 

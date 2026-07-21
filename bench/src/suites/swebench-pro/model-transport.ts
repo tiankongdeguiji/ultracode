@@ -11,7 +11,7 @@ import {
   inspectInternalDockerNetwork,
   oneDockerInspectRow,
 } from '../../shared/docker-isolation.js';
-import { validatePortableComponent } from '../../shared/paths.js';
+import { canonicalHostPath, validatePortableComponent } from '../../shared/paths.js';
 import { sha256CanonicalJson } from '../../shared/provenance.js';
 
 const sha256Text = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
@@ -69,6 +69,7 @@ export const SWEBENCH_PRO_NETWORK_POLICY = Object.freeze({
   onlyNonTaskEndpoint: 'attested-model-relay',
   taskNetworks: 1,
   taskProviderCredentials: 0,
+  hostGatewayReachability: 'bridge-ip-inhibited',
 });
 
 export const SWEBENCH_PRO_NETWORK_POLICY_SHA256 = sha256CanonicalJson(SWEBENCH_PRO_NETWORK_POLICY);
@@ -306,6 +307,10 @@ function inspectSwebenchProTransportBoundaryUnchecked(
     allowAdditionalNetworkEndpointNames: new Set([endpoint.hostname]),
     dedicatedLocalBridge: true,
   });
+  const networkOptions = dockerObject(network.inspection.Options);
+  if (networkOptions['com.docker.network.bridge.inhibit_ipv4'] !== 'true') {
+    throw new Error('SWE-bench Pro restricted network must inhibit the host bridge IP');
+  }
   const relayEntry = network.containers.filter(([, value]) => value.Name === endpoint.hostname);
   if (relayEntry.length !== 1) {
     throw new Error('SWE-bench Pro restricted network must contain exactly one named model relay');
@@ -463,11 +468,11 @@ function exactSessionMounts(value: unknown, expected: SwebenchProSessionContaine
     const mount = entry as Record<string, unknown>;
     return mount.Type === 'bind' && typeof mount.Source === 'string'
       && typeof mount.Destination === 'string' && mount.RW === true
-      ? [{ source: resolve(mount.Source), destination: mount.Destination }]
+      ? [{ source: canonicalHostPath(mount.Source), destination: mount.Destination }]
       : [];
   }).sort((left, right) => left.destination.localeCompare(right.destination));
   const wanted = expected.map((mount) => ({
-    source: resolve(mount.source),
+    source: canonicalHostPath(mount.source),
     destination: mount.destination,
   })).sort((left, right) => left.destination.localeCompare(right.destination));
   return observed.length === wanted.length && JSON.stringify(observed) === JSON.stringify(wanted);
