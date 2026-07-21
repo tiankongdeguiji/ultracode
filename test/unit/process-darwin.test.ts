@@ -66,6 +66,24 @@ describe('Darwin worker process discovery', () => {
     });
   });
 
+  it('ignores a transient pid that exits between authenticated snapshots', () => {
+    const scope = workerScopeValue(process.cwd());
+    const worker = processLine(101, 101, '/usr/bin/node worker.js');
+    const transient = processLine(999, 999, '/usr/bin/true');
+    const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
+    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), undefined, {
+      platform: 'darwin',
+      executePs: (argv) => {
+        if (argv.join(' ') === '-ax -o pid=') return '101\n999\n';
+        return argv.includes('-E') ? `${worker}${marker}` : `${worker}\n${transient}`;
+      },
+    });
+    expect(discovery).toEqual({
+      complete: true,
+      processes: [{ pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN }],
+    });
+  });
+
   it('distinguishes verified candidate absence from a ps failure', () => {
     const absent = discoverWorkerProcessesForTokens(
       [TOKEN],

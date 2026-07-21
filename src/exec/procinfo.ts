@@ -566,21 +566,10 @@ export function discoverWorkerProcessesForTokens(
         }
         continue;
       }
-      const observedPids = new Set([
-        ...commands.processes.keys(),
-        ...commandsAndEnvironment.processes.keys(),
-      ]);
-      if ([...observedPids].some((pid) =>
-        !commands.processes.has(pid) || !commandsAndEnvironment.processes.has(pid))) {
-        complete = false;
-      }
       for (const expanded of commandsAndEnvironment.processes.values()) {
         const command = commands.processes.get(expanded.pid);
-        if (
-          command === undefined ||
-          command.pgrp !== expanded.pgrp ||
-          command.starttime !== expanded.starttime
-        ) {
+        if (command === undefined) continue;
+        if (command.pgrp !== expanded.pgrp || command.starttime !== expanded.starttime) {
           complete = false;
           continue;
         }
