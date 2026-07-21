@@ -24,12 +24,14 @@ import {
 } from './paths.js';
 import {
   appendRunStateRevision,
+  diffRunStateChanges,
   initializeRunStateLedger,
   loadRunStateMaterialization,
   migrateLegacyRunStateLedger,
   runStateCommitFileSha256,
   runStateLedgerSegmentsUnchanged,
   type RunStateLedgerOptions,
+  type RunStateLedgerChange,
   type RunStateMaterialization,
 } from './run-state-ledger.js';
 
@@ -329,6 +331,10 @@ export function loadBenchRunStateEvidence(
 export class BenchRunStateStore {
   private queue: Promise<void> = Promise.resolve();
   private materialized: RunStateMaterialization | null = null;
+  private indexedState: BenchRunState | null = null;
+  private readonly invocationIndexes = new Map<string, number>();
+  private readonly attemptIndexes = new Map<string, number>();
+  private readonly timingGroupMembers = new Map<string, Set<number>>();
 
   constructor(
     private readonly roots: BenchPathRoots,
@@ -387,6 +393,7 @@ export class BenchRunStateStore {
     return true;
   }
 
+  /** Bulk compatibility mutation; task hot paths should use typed append/replace methods. */
   async update(
     expectedRevision: number,
     mutate: (state: BenchRunState) => Omit<BenchRunState, 'revision'> | BenchRunState,
@@ -413,7 +420,7 @@ export class BenchRunStateStore {
     return result!;
   }
 
-  /** Serialize against the latest disk revision while the exact lease is held. */
+  /** Serialize a bulk mutation against the latest revision under the exact lease. */
   async updateCurrent(
     mutate: (state: BenchRunState) => Omit<BenchRunState, 'revision'> | BenchRunState,
   ): Promise<BenchRunState> {
@@ -435,7 +442,7 @@ export class BenchRunStateStore {
     return result!;
   }
 
-  /** Persist a lifecycle transition synchronously before a native child can start. */
+  /** Persist an infrequent bulk transition synchronously before side effects. */
   updateCurrentSync(
     mutate: (state: BenchRunState) => Omit<BenchRunState, 'revision'> | BenchRunState,
   ): BenchRunState {
@@ -447,6 +454,141 @@ export class BenchRunStateStore {
     return result;
   }
 
+  /** Append one invocation without cloning, parsing, or diffing prior history. */
+  async appendInvocation(expectedRevision: number | null, input: InvocationRecord): Promise<number> {
+    let revision: number | undefined;
+    let failure: unknown;
+    this.queue = this.queue.then(() => {
+      try {
+        this.lease.assertHeld();
+        const current = this.currentMaterialization().state;
+        if (expectedRevision !== null && current.revision !== expectedRevision) {
+          throw new Error(`run-state revision mismatch: expected ${expectedRevision}, found ${current.revision}`);
+        }
+        this.ensureIndexes(current);
+        const record = invocationRecordSchema.parse(input);
+        if (this.invocationIndexes.has(record.invocationId)) {
+          throw new Error(`duplicate invocation id ${record.invocationId}`);
+        }
+        this.validateIncremental([record], []);
+        revision = current.revision + 1;
+        this.commitChanges(revision, [{ op: 'append', path: ['invocations'], value: record }]);
+        this.invocationIndexes.set(record.invocationId, current.invocations.length - 1);
+      } catch (error) {
+        failure = error;
+      }
+    });
+    await this.queue;
+    if (failure !== undefined) throw failure;
+    return revision!;
+  }
+
+  /** Append one task batch using deltas proportional only to the new records. */
+  async appendAttempts(expectedRevision: number | null, inputs: readonly AttemptRecord[]): Promise<number> {
+    let revision: number | undefined;
+    let failure: unknown;
+    this.queue = this.queue.then(() => {
+      try {
+        this.lease.assertHeld();
+        const current = this.currentMaterialization().state;
+        if (expectedRevision !== null && current.revision !== expectedRevision) {
+          throw new Error(`run-state revision mismatch: expected ${expectedRevision}, found ${current.revision}`);
+        }
+        if (inputs.length === 0) throw new Error('attempt append must contain at least one record');
+        this.ensureIndexes(current);
+        const records = inputs.map((input) => attemptRecordSchema.parse(input));
+        const ids = new Set<string>();
+        for (const record of records) {
+          if (ids.has(record.attemptId) || this.attemptIndexes.has(record.attemptId)) {
+            throw new Error(`duplicate attempt id ${record.attemptId}`);
+          }
+          ids.add(record.attemptId);
+        }
+        const groupIds = new Set(records.flatMap((record) => record.timingGroupId === undefined
+          ? []
+          : [record.timingGroupId]));
+        const existing = [...groupIds].flatMap((groupId) =>
+          [...(this.timingGroupMembers.get(groupId) ?? [])].map((index) => current.attempts[index]!));
+        this.validateIncremental([], [...existing, ...records]);
+        revision = current.revision + 1;
+        const start = current.attempts.length;
+        this.commitChanges(revision, records.map((record) => ({
+          op: 'append' as const,
+          path: ['attempts'],
+          value: record,
+        })));
+        records.forEach((record, offset) => {
+          const index = start + offset;
+          this.attemptIndexes.set(record.attemptId, index);
+          if (record.timingGroupId !== undefined) {
+            const members = this.timingGroupMembers.get(record.timingGroupId) ?? new Set<number>();
+            members.add(index);
+            this.timingGroupMembers.set(record.timingGroupId, members);
+          }
+        });
+      } catch (error) {
+        failure = error;
+      }
+    });
+    await this.queue;
+    if (failure !== undefined) throw failure;
+    return revision!;
+  }
+
+  /** Replace complete timing-group batches without rewalking unrelated attempts. */
+  async replaceAttempts(expectedRevision: number | null, inputs: readonly AttemptRecord[]): Promise<number> {
+    let revision: number | undefined;
+    let failure: unknown;
+    this.queue = this.queue.then(() => {
+      try {
+        this.lease.assertHeld();
+        const current = this.currentMaterialization().state;
+        if (expectedRevision !== null && current.revision !== expectedRevision) {
+          throw new Error(`run-state revision mismatch: expected ${expectedRevision}, found ${current.revision}`);
+        }
+        if (inputs.length === 0) throw new Error('attempt replacement must contain at least one record');
+        this.ensureIndexes(current);
+        const replacements = new Map<number, AttemptRecord>();
+        const affectedGroups = new Set<string>();
+        for (const input of inputs) {
+          const record = attemptRecordSchema.parse(input);
+          const index = this.attemptIndexes.get(record.attemptId);
+          if (index === undefined) throw new Error(`unknown attempt ${record.attemptId}`);
+          if (replacements.has(index)) throw new Error(`duplicate attempt replacement ${record.attemptId}`);
+          replacements.set(index, record);
+          const priorGroup = current.attempts[index]!.timingGroupId;
+          if (priorGroup !== undefined) affectedGroups.add(priorGroup);
+          if (record.timingGroupId !== undefined) affectedGroups.add(record.timingGroupId);
+        }
+        const affectedIndexes = new Set<number>(replacements.keys());
+        for (const groupId of affectedGroups) {
+          for (const index of this.timingGroupMembers.get(groupId) ?? []) affectedIndexes.add(index);
+        }
+        const candidates = [...affectedIndexes].map((index) => replacements.get(index) ?? current.attempts[index]!);
+        this.validateIncremental([], candidates);
+        revision = current.revision + 1;
+        this.commitChanges(revision, [...replacements].sort(([left], [right]) => left - right).map(([index, record]) => ({
+          op: 'set' as const,
+          path: ['attempts', index],
+          value: record,
+        })));
+        for (const groupId of affectedGroups) this.timingGroupMembers.delete(groupId);
+        for (const index of affectedIndexes) {
+          const groupId = current.attempts[index]!.timingGroupId;
+          if (groupId === undefined) continue;
+          const members = this.timingGroupMembers.get(groupId) ?? new Set<number>();
+          members.add(index);
+          this.timingGroupMembers.set(groupId, members);
+        }
+      } catch (error) {
+        failure = error;
+      }
+    });
+    await this.queue;
+    if (failure !== undefined) throw failure;
+    return revision!;
+  }
+
   /** Add one exact token before spawn and keep its recovery outcome durable. */
   lifecycleHooks(invocationId: string): {
     onLifecycleToken(token: string): void;
@@ -454,103 +596,55 @@ export class BenchRunStateStore {
     onLifecycleCandidates(token: string, candidates: readonly TrackedProcess[], complete: boolean): void;
     onLifecycleRecovered(token: string, recovery: 'complete' | 'failed'): void;
   } {
+    const replaceToken = (
+      token: string,
+      mutate: (entry: InvocationRecord['lifecycleProcesses'][number]) => InvocationRecord['lifecycleProcesses'][number],
+    ): void => {
+      this.updateInvocationSync(invocationId, (invocation) => {
+        let matched = false;
+        const lifecycleProcesses = invocation.lifecycleProcesses.map((entry) => {
+          if (entry.token !== token) return entry;
+          matched = true;
+          if (entry.recovery !== 'pending') throw new Error(`lifecycle token ${token} has already settled`);
+          return mutate(entry);
+        });
+        if (!matched) throw new Error(`unknown lifecycle token ${token}`);
+        return { ...invocation, lifecycleProcesses };
+      });
+    };
     return {
       onLifecycleToken: (token) => {
-        this.updateCurrentSync((state) => {
-          let matchedInvocation = false;
-          const invocations = state.invocations.map((invocation) => {
-            if (invocation.invocationId !== invocationId) return invocation;
-            matchedInvocation = true;
-            if (invocation.endedAt !== null) throw new Error(`invocation ${invocationId} has already ended`);
-            if (invocation.lifecycleProcesses.some((process) => process.token === token)) {
-              throw new Error(`duplicate lifecycle token for invocation ${invocationId}`);
-            }
-            return {
-              ...invocation,
-              lifecycleProcesses: [...invocation.lifecycleProcesses, {
-                token,
-                pid: null,
-                processStartIdentity: null,
-                recovery: 'pending' as const,
-              }],
-            };
-          });
-          if (!matchedInvocation) throw new Error(`unknown lifecycle invocation ${invocationId}`);
-          return { ...state, invocations };
+        this.updateInvocationSync(invocationId, (invocation) => {
+          if (invocation.endedAt !== null) throw new Error(`invocation ${invocationId} has already ended`);
+          if (invocation.lifecycleProcesses.some((process) => process.token === token)) {
+            throw new Error(`duplicate lifecycle token for invocation ${invocationId}`);
+          }
+          return {
+            ...invocation,
+            lifecycleProcesses: [...invocation.lifecycleProcesses, {
+              token,
+              pid: null,
+              processStartIdentity: null,
+              recovery: 'pending' as const,
+            }],
+          };
         });
       },
       onLifecycleStarted: (token, pid, processStartIdentity) => {
-        this.updateCurrentSync((state) => {
-          let matchedInvocation = false;
-          let matchedToken = false;
-          const invocations = state.invocations.map((invocation) => {
-            if (invocation.invocationId !== invocationId) return invocation;
-            matchedInvocation = true;
-            return {
-              ...invocation,
-              lifecycleProcesses: invocation.lifecycleProcesses.map((process) => {
-                if (process.token !== token) return process;
-                matchedToken = true;
-                if (process.recovery !== 'pending') throw new Error(`lifecycle token ${token} has already settled`);
-                return { ...process, pid, processStartIdentity };
-              }),
-            };
-          });
-          if (!matchedInvocation) throw new Error(`unknown lifecycle invocation ${invocationId}`);
-          if (!matchedToken) throw new Error(`unknown lifecycle token ${token}`);
-          return { ...state, invocations };
-        });
+        replaceToken(token, (entry) => ({ ...entry, pid, processStartIdentity }));
       },
       onLifecycleCandidates: (token, candidates, complete) => {
-        this.updateCurrentSync((state) => {
-          let matchedInvocation = false;
-          let matchedToken = false;
-          const inventory = {
-            complete,
-            processes: [...new Map(candidates.map((candidate) => [
-              `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`,
-              candidate,
-            ])).values()].sort((left, right) => left.pid - right.pid),
-          };
-          const invocations = state.invocations.map((invocation) => {
-            if (invocation.invocationId !== invocationId) return invocation;
-            matchedInvocation = true;
-            return {
-              ...invocation,
-              lifecycleProcesses: invocation.lifecycleProcesses.map((process) => {
-                if (process.token !== token) return process;
-                matchedToken = true;
-                if (process.recovery !== 'pending') throw new Error(`lifecycle token ${token} has already settled`);
-                return { ...process, darwinCandidateInventory: inventory };
-              }),
-            };
-          });
-          if (!matchedInvocation) throw new Error(`unknown lifecycle invocation ${invocationId}`);
-          if (!matchedToken) throw new Error(`unknown lifecycle token ${token}`);
-          return { ...state, invocations };
-        });
+        const inventory = {
+          complete,
+          processes: [...new Map(candidates.map((candidate) => [
+            `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`,
+            candidate,
+          ])).values()].sort((left, right) => left.pid - right.pid),
+        };
+        replaceToken(token, (entry) => ({ ...entry, darwinCandidateInventory: inventory }));
       },
       onLifecycleRecovered: (token, recovery) => {
-        this.updateCurrentSync((state) => {
-          let matchedInvocation = false;
-          let matchedToken = false;
-          const invocations = state.invocations.map((invocation) => {
-            if (invocation.invocationId !== invocationId) return invocation;
-            matchedInvocation = true;
-            return {
-              ...invocation,
-              lifecycleProcesses: invocation.lifecycleProcesses.map((process) => {
-                if (process.token !== token) return process;
-                matchedToken = true;
-                if (process.recovery !== 'pending') throw new Error(`lifecycle token ${token} has already settled`);
-                return { ...process, recovery };
-              }),
-            };
-          });
-          if (!matchedInvocation) throw new Error(`unknown lifecycle invocation ${invocationId}`);
-          if (!matchedToken) throw new Error(`unknown lifecycle token ${token}`);
-          return { ...state, invocations };
-        });
+        replaceToken(token, (entry) => ({ ...entry, recovery }));
       },
     };
   }
@@ -778,6 +872,55 @@ export class BenchRunStateStore {
     }
   }
 
+  private ensureIndexes(state: BenchRunState): void {
+    if (this.indexedState === state) return;
+    this.invocationIndexes.clear();
+    this.attemptIndexes.clear();
+    this.timingGroupMembers.clear();
+    state.invocations.forEach((record, index) => this.invocationIndexes.set(record.invocationId, index));
+    state.attempts.forEach((record, index) => {
+      this.attemptIndexes.set(record.attemptId, index);
+      if (record.timingGroupId === undefined) return;
+      const members = this.timingGroupMembers.get(record.timingGroupId) ?? new Set<number>();
+      members.add(index);
+      this.timingGroupMembers.set(record.timingGroupId, members);
+    });
+    this.indexedState = state;
+  }
+
+  private validateIncremental(
+    invocations: readonly InvocationRecord[],
+    attempts: readonly AttemptRecord[],
+  ): void {
+    const current = this.currentMaterialization().state;
+    const invocationRecords = new Map(invocations.map((record) => [record.invocationId, record]));
+    for (const attempt of attempts) {
+      const index = this.invocationIndexes.get(attempt.invocationId);
+      if (index === undefined) throw new Error(`attempt references unknown invocation ${attempt.invocationId}`);
+      invocationRecords.set(attempt.invocationId, current.invocations[index]!);
+    }
+    benchRunStateSchema.parse({
+      ...current,
+      invocations: [...invocationRecords.values()],
+      attempts,
+    });
+  }
+
+  private updateInvocationSync(
+    invocationId: string,
+    mutate: (record: InvocationRecord) => InvocationRecord,
+  ): void {
+    this.lease.assertHeld();
+    const current = this.currentMaterialization().state;
+    this.ensureIndexes(current);
+    const index = this.invocationIndexes.get(invocationId);
+    if (index === undefined) throw new Error(`unknown lifecycle invocation ${invocationId}`);
+    const record = invocationRecordSchema.parse(mutate(structuredClone(current.invocations[index]!)));
+    if (record.invocationId !== invocationId) throw new Error('invocation replacement changed its identity');
+    this.validateIncremental([record], []);
+    this.commitChanges(current.revision + 1, [{ op: 'set', path: ['invocations', index], value: record }]);
+  }
+
   private identity() {
     return {
       roots: this.roots,
@@ -793,6 +936,7 @@ export class BenchRunStateStore {
       if (commitSha256 !== this.materialized.stateFileSha256
         || !runStateLedgerSegmentsUnchanged(this.identity(), this.materialized)) {
         this.materialized = null;
+        this.indexedState = null;
       }
     }
     if (this.materialized === null) {
@@ -804,16 +948,24 @@ export class BenchRunStateStore {
 
   private commit(next: BenchRunState): void {
     const current = this.materialized ?? this.currentMaterialization();
+    const changes = diffRunStateChanges(current.state, next);
+    this.commitChanges(next.revision, changes);
+    this.indexedState = null;
+  }
+
+  private commitChanges(nextRevision: number, changes: readonly RunStateLedgerChange[]): void {
+    const current = this.materialized ?? this.currentMaterialization();
     try {
       this.materialized = appendRunStateRevision(
         this.identity(),
         current,
-        next,
-        parseBenchRunState,
+        nextRevision,
+        changes,
         this.ledgerOptions,
       );
     } catch (error) {
       this.materialized = null;
+      this.indexedState = null;
       throw error;
     }
   }

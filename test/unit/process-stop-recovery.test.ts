@@ -231,6 +231,33 @@ describe('persisted stop recovery', () => {
     expect(inventory).toEqual({ complete: false, processes: [candidate] });
   });
 
+  it('signals a Darwin worker before retrying failed inventory persistence', async () => {
+    const workerScope = mkdtempSync(join(tmpdir(), 'uc-darwin-persist-failure-'));
+    roots.push(workerScope);
+    let persistenceAttempts = 0;
+    const spawned = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 60_000)'], {
+      cwd: workerScope,
+      workerScope,
+      processInspection: {
+        platform: 'darwin',
+        discoverWorkerProcesses: () => ({ processes: [], complete: true }),
+      },
+      onWorkerCandidates: () => {
+        persistenceAttempts += 1;
+        if (persistenceAttempts === 1) throw new Error('inventory path is not writable');
+      },
+    });
+    try {
+      const exited = new Promise<void>((resolve) => spawned.child.once('exit', () => resolve()));
+      expect(() => spawned.killTree('SIGTERM')).not.toThrow();
+      await exited;
+      await expect(spawned.cleanupEscaped(100)).resolves.toBe(0);
+      expect(persistenceAttempts).toBeGreaterThan(1);
+    } finally {
+      spawned.killTree('SIGKILL');
+    }
+  });
+
   it('re-authenticates live Darwin candidates individually before signaling', async () => {
     const workerScope = mkdtempSync(join(tmpdir(), 'uc-darwin-live-reauth-'));
     roots.push(workerScope);

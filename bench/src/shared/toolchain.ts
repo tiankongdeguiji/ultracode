@@ -2,7 +2,8 @@
  * Shared toolchain prep assembles an immutable container build context from a
  * overlay Dockerfile bakes into /opt/bench — from a pinned Node tarball, the
  * host codex binary, a fresh ultracode release stage, and pre-built codex
- * homes for both arms. The stage keeps the dist/cli/main.js shape because the
+ * homes for both arms. Suite adapters layer their native runner assets on this
+ * shared base. The stage keeps the dist/cli/main.js shape because the
  * detached runner re-invokes itself via that path (src/exec/daemonize.ts) and
  * resolves skill/, workflows/, hostpacks/ relative to it. prepareToolchain()
  * publishes content-addressed inputs and surfaces their v2 provenance.
@@ -318,7 +319,7 @@ async function buildReleaseStage(roots: BenchPathRoots): Promise<{ directory: st
 /**
  * Rebuild the toolchain dir from scratch (cached node tarballs are reused):
  * node runtime, codex binary, ultracode release stage, per-arm codex homes,
- * Pro session helpers, and a manifest.json recording versions + hashes.
+ * and a manifest.json recording versions + hashes.
  */
 async function populateSharedToolchain(
   config: ToolchainConfig,
@@ -372,7 +373,7 @@ async function populateSharedToolchain(
   mkdirSync(homeA);
   writeFileSync(
     join(homeA, 'config.toml'),
-    '# ultracode SWE-bench Pro A/B bench — arm a codex home\n[tools]\nweb_search = false\n',
+    '# ultracode benchmark — arm a codex home\n[tools]\nweb_search = false\n',
     'utf8',
   );
 
@@ -387,9 +388,6 @@ async function populateSharedToolchain(
     const agentsHomeB = join(dir, 'agents-home-b');
     cpSync(join(tmpHome, '.codex'), homeB, { recursive: true });
     cpSync(join(tmpHome, '.agents'), agentsHomeB, { recursive: true });
-    // NOTE: entrypoint.sh later prepends model keys and appends the
-    // [mcp_servers.ultracode.env] table; top-level keys stay ahead of tables
-    // because the installer's MCP block is the only table until this one.
     appendFileSync(join(homeB, 'config.toml'), '\n[tools]\nweb_search = false\n', 'utf8');
     const configB = readFileSync(join(homeB, 'config.toml'), 'utf8');
     if (!configB.includes('mcp_servers.ultracode') || !configB.includes('default_tools_approval_mode')) {
@@ -402,25 +400,6 @@ async function populateSharedToolchain(
   } finally {
     rmSync(tmpHome, { recursive: true, force: true });
   }
-
-  const entrypoint = join(dir, 'entrypoint.sh');
-  writeFileSync(entrypoint, readRegularFileWithinRoot(
-    roots.benchRoot,
-    'suites/swebench-pro/entrypoint.sh',
-    1_024 * 1_024,
-  ), { flag: 'wx', mode: 0o755 });
-  const gitSanitizer = join(dir, 'sanitize-git.sh');
-  writeFileSync(gitSanitizer, readRegularFileWithinRoot(
-    roots.benchRoot,
-    'suites/swebench-pro/sanitize-git.sh',
-    1_024 * 1_024,
-  ), { flag: 'wx', mode: 0o755 });
-  const gitCapture = join(dir, 'capture-git.sh');
-  writeFileSync(gitCapture, readRegularFileWithinRoot(
-    roots.benchRoot,
-    'suites/swebench-pro/capture-git.sh',
-    1_024 * 1_024,
-  ), { flag: 'wx', mode: 0o755 });
 
   const ultracodeRevision = await toolchainCommand('git', ['rev-parse', 'HEAD'], resolve(roots.benchRoot, '..'));
   const payloadSha256 = sha256Tree(dir);

@@ -186,7 +186,9 @@ interface ParsedCumulative {
 interface ParsedRollout {
   session: NormalizedSessionMetrics;
   observedModels: readonly string[];
+  observedEfforts: readonly string[];
   modelEvidenceComplete: boolean;
+  effortEvidenceComplete: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -280,6 +282,7 @@ function parseCodexRolloutWithEvidence(
   let contextWindow: number | null = null;
   let model: string | null = null;
   const observedModels: string[] = [];
+  const observedEfforts: string[] = [];
   let effectiveEffort: string | null = null;
   let metadataSessionId: string | null = null;
   let eventCompactions = 0;
@@ -310,10 +313,16 @@ function parseCodexRolloutWithEvidence(
         model = payload.model;
         observedModels.push(model);
       }
-      if (typeof payload.effort === 'string' && payload.effort.length > 0) effectiveEffort = payload.effort;
+      if (typeof payload.effort === 'string' && payload.effort.length > 0) {
+        effectiveEffort = payload.effort;
+        observedEfforts.push(payload.effort);
+      }
       if (isRecord(payload.collaboration_mode) && isRecord(payload.collaboration_mode.settings)) {
         const nested = payload.collaboration_mode.settings.reasoning_effort;
-        if (typeof nested === 'string' && nested.length > 0) effectiveEffort = nested;
+        if (typeof nested === 'string' && nested.length > 0) {
+          effectiveEffort = nested;
+          observedEfforts.push(nested);
+        }
       }
       return;
     }
@@ -385,7 +394,11 @@ function parseCodexRolloutWithEvidence(
       annotations,
     },
     observedModels,
+    observedEfforts,
     modelEvidenceComplete: stats.malformedLines === 0
+      && stats.oversizeLines === 0
+      && !stats.unterminatedTail,
+    effortEvidenceComplete: stats.malformedLines === 0
       && stats.oversizeLines === 0
       && !stats.unterminatedTail,
   };
@@ -617,7 +630,7 @@ function timingMetrics(state: BenchRunState | null, observations: readonly Timin
     ),
     nativeRunnerMs: elapsedFor(['inference', 'session'], true),
     verifierMs: elapsedFor(['verifier'], true),
-    detachedWorkflowWaitMs: elapsedFor(['detached-wait'], false),
+    detachedWorkflowWaitMs: elapsedFor(['detached-wait'], true),
   };
 }
 
@@ -735,9 +748,21 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
 
   const effortValues: Record<string, number> = {};
   let unknownEffort = 0;
-  for (const session of sessions) {
-    if (session.effectiveEffort === null) unknownEffort += 1;
-    else effortValues[session.effectiveEffort] = (effortValues[session.effectiveEffort] ?? 0) + 1;
+  for (const parsed of parsedSessions) {
+    const { session, observedEfforts, effortEvidenceComplete } = parsed;
+    const distinctEfforts = new Set(observedEfforts);
+    const scope = taskArmScope(session.scope.taskId, session.scope.arm);
+    if (!effortEvidenceComplete) {
+      unknownEffort += 1;
+    } else if (observedEfforts.length === 0) {
+      unknownEffort += 1;
+    } else if (distinctEfforts.size > 1) {
+      session.annotations.push(annotation('effort-multiple', scope));
+      unknownEffort += 1;
+    } else {
+      const effort = observedEfforts[0]!;
+      effortValues[effort] = (effortValues[effort] ?? 0) + 1;
+    }
   }
   const effortVerified = sessions.length > 0 && unknownEffort === 0;
   const workflows = dedupeWorkflows(index.workflows);

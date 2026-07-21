@@ -1,4 +1,5 @@
 /** Common report envelope, evidence binding, and failure policy tests. */
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   FAILURE_CODES,
@@ -279,6 +280,52 @@ describe('shared failure and disposition policy', () => {
 });
 
 describe('common report evidence envelope', () => {
+  it('parses only exact receipt-bound aggregate bytes for suite analysis', () => {
+    const bytes = Buffer.from('{"resolved":1}\n');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    let observed: unknown;
+    const hook: SuiteAnalysisHook<'swebench-pro'> = {
+      suite: 'swebench-pro',
+      analyze: (context) => {
+        observed = context.nativeAnalysisInput;
+        return analysisHook.analyze(context);
+      },
+    };
+    build({
+      verifierReceipt: {
+        ...receipt(),
+        bindings: [...receipt().bindings, {
+          invocationId: INVOCATION,
+          scope: { kind: 'suite-check', name: 'aggregate' },
+          role: 'aggregate-report',
+          path: 'native/aggregate.json',
+          sha256,
+          nativeRecordKey: null,
+        }],
+      },
+      nativeAnalysisArtifact: { path: 'native/aggregate.json', bytes },
+      analysisHook: hook,
+    });
+    expect(observed).toEqual({ resolved: 1 });
+    expect(() => build({
+      nativeAnalysisArtifact: { path: 'native/aggregate.json', bytes },
+    })).toThrow(/not bound/);
+    expect(() => build({
+      verifierReceipt: {
+        ...receipt(),
+        bindings: [...receipt().bindings, {
+          invocationId: INVOCATION,
+          scope: { kind: 'suite-check', name: 'aggregate' },
+          role: 'aggregate-report',
+          path: 'native/aggregate.json',
+          sha256,
+          nativeRecordKey: null,
+        }],
+      },
+      nativeAnalysisArtifact: { path: 'native/aggregate.json', bytes: Buffer.from('{"resolved":0}\n') },
+    })).toThrow(/not bound/);
+  });
+
   it('binds exact native evidence and leaves missing verifier output null/unverified', () => {
     const report = build();
     expect(report).toMatchObject({

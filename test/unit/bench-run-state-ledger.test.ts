@@ -111,11 +111,11 @@ async function createStore(runId: string, options: RunStateLedgerOptions = {}) {
 }
 
 async function addInvocation(store: BenchRunStateStore): Promise<void> {
-  await store.updateCurrent((state) => ({ ...state, invocations: [...state.invocations, invocation()] }));
+  await store.appendInvocation(null, invocation());
 }
 
 async function addAttempt(store: BenchRunStateStore, record: AttemptRecord): Promise<void> {
-  await store.updateCurrent((state) => ({ ...state, attempts: [...state.attempts, record] }));
+  await store.appendAttempts(null, [record]);
 }
 
 function ledgerBytes(directory: string): number {
@@ -177,6 +177,22 @@ describe('run-state append-only ledger', () => {
     const n = await measure('linear-n', 100);
     const twoN = await measure('linear-2n', 200);
     expect(twoN / n).toBeLessThanOrEqual(2.2);
+  });
+
+  it('validates and replaces only the affected timing-group batch', async () => {
+    const { paths, lease, store } = await createStore('typed-batch');
+    await addInvocation(store);
+    const first = { ...attempt(1, 'task-one'), timingGroupId: 'batch' };
+    const second = { ...attempt(2, 'task-two'), timingGroupId: 'batch' };
+    expect(await store.appendAttempts(1, [first, second])).toBe(2);
+    await expect(store.replaceAttempts(2, [{ ...first, elapsedMs: 2_000 }]))
+      .rejects.toThrow(/timing group members/);
+    expect(await store.replaceAttempts(2, [
+      { ...first, nativePath: 'native/one' as never },
+      { ...second, nativePath: 'native/two' as never },
+    ])).toBe(3);
+    const replayed = new BenchRunStateStore(paths, 'featurebench', 'typed-batch', HASH, lease).load();
+    expect(replayed.attempts.map((entry) => entry.nativePath)).toEqual(['native/one', 'native/two']);
   });
 
   it('recovers both sides of rotation commit crashes without changing sealed segments', async () => {

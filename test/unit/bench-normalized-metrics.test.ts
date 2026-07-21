@@ -261,6 +261,30 @@ describe('Codex cumulative rollout normalization', () => {
 });
 
 describe('normalized aggregation invariants', () => {
+  it('does not verify a rollout whose observed efforts conflict', () => {
+    const runDirectory = root();
+    const path = put(runDirectory, 'native/effort-conflict.jsonl', jsonl(
+      { type: 'turn_context', payload: { effort: 'low', model: 'gpt-test' } },
+      { type: 'turn_context', payload: { effort: 'high', model: 'gpt-test' } },
+      tokenCount({ input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 }),
+    ));
+    const metrics = normalizeMetrics({
+      runDirectory,
+      index: { ...emptyMetricsArtifactIndex(), rollouts: [artifact(path)] },
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing: null,
+    });
+    expect(metrics.sessions.items[0]?.effectiveEffort).toBe('high');
+    expect(metrics.effectiveEffort).toEqual({
+      verification: 'unverified',
+      values: {},
+      unknownSessions: 1,
+      matchesRequested: null,
+    });
+    expect(metrics.annotations.map(({ code }) => code)).toContain('effort-multiple');
+  });
+
   it('separates billing classes and prices only billable usage', () => {
     const runDirectory = root();
     const host = put(runDirectory, `native/rollout-host-${HOST_ID}.jsonl`, jsonl(
@@ -738,6 +762,12 @@ describe('normalized aggregation invariants', () => {
       timing('verifier-two', 'task-two', 'verifier',
         '2026-07-20T00:00:00.100Z', '2026-07-20T00:00:00.130Z', 30,
         { timingGroupId: 'verifier-batch' }),
+      timing('detached-one', 'task-one', 'detached-wait',
+        '2026-07-20T00:00:00.130Z', '2026-07-20T00:00:00.150Z', 20,
+        { timingGroupId: 'detached-batch' }),
+      timing('detached-two', 'task-two', 'detached-wait',
+        '2026-07-20T00:00:00.130Z', '2026-07-20T00:00:00.150Z', 20,
+        { timingGroupId: 'detached-batch' }),
     ];
     const normalized = (timings: TimingObservation[]) => normalizeMetrics({
       runDirectory: root(),
@@ -747,14 +777,16 @@ describe('normalized aggregation invariants', () => {
       pricing: null,
     }).timing;
     expect(normalized(grouped)).toMatchObject({
-      summedTaskMs: 130,
+      summedTaskMs: 150,
       nativeRunnerMs: 100,
       verifierMs: 30,
+      detachedWorkflowWaitMs: 20,
     });
     expect(normalized(grouped.map(({ timingGroupId: _timingGroupId, ...entry }) => entry))).toMatchObject({
-      summedTaskMs: 260,
+      summedTaskMs: 300,
       nativeRunnerMs: 200,
       verifierMs: 60,
+      detachedWorkflowWaitMs: 40,
     });
   });
 

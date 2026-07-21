@@ -171,6 +171,12 @@ export interface ReportPolicyHashes {
   adapterPolicySha256: string;
 }
 
+export interface NativeAnalysisArtifactInput {
+  /** Receipt-bound relative path whose exact bytes are parsed for analysis. */
+  path: string;
+  bytes: Uint8Array;
+}
+
 export interface BuildBenchReportOptions<S extends BenchSuite> {
   manifest: Extract<BenchRunManifest, { suite: S }>;
   manifestSha256: string;
@@ -186,7 +192,7 @@ export interface BuildBenchReportOptions<S extends BenchSuite> {
   generatedAt?: Date;
   currentPolicyHashes: ReportPolicyHashes;
   analysisHook: SuiteAnalysisHook<S>;
-  nativeAnalysisInput?: unknown;
+  nativeAnalysisArtifact?: NativeAnalysisArtifactInput;
 }
 
 export interface StoredReportEvidence<S extends BenchSuite = BenchSuite> {
@@ -311,6 +317,26 @@ function uniqueByCanonical<T>(values: readonly T[]): T[] {
   return [...unique.values()];
 }
 
+function bindNativeAnalysisInput(
+  input: NativeAnalysisArtifactInput | undefined,
+  receipt: VerifierReceipt,
+): unknown {
+  if (input === undefined) return null;
+  const path = validateRelativeArtifactPath(input.path);
+  const bytes = Buffer.from(input.bytes);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const matching = receipt.bindings.some((binding) =>
+    binding.role === 'aggregate-report'
+    && binding.path === path
+    && binding.sha256 === sha256);
+  if (!matching) throw new Error('native analysis artifact is not bound by the verifier receipt');
+  try {
+    return JSON.parse(bytes.toString('utf8')) as unknown;
+  } catch {
+    throw new Error(`native analysis artifact is not valid JSON: ${path}`);
+  }
+}
+
 /** Build the common envelope solely from frozen state and receipt-bound evidence. */
 export function buildBenchReport<S extends BenchSuite>(options: BuildBenchReportOptions<S>): BenchReport {
   const { manifest, runState, verifierReceipt, metrics } = options;
@@ -370,7 +396,7 @@ export function buildBenchReport<S extends BenchSuite>(options: BuildBenchReport
     manifest,
     metrics,
     taskResults,
-    nativeAnalysisInput: options.nativeAnalysisInput ?? null,
+    nativeAnalysisInput: bindNativeAnalysisInput(options.nativeAnalysisArtifact, verifierReceipt),
   } as SuiteAnalysisContext<S>;
   const analysis = options.analysisHook.analyze(context);
   if (analysis.suite !== manifest.suite) throw new Error('suite analysis returned the wrong discriminator');

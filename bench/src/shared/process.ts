@@ -6,6 +6,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Writable, type Readable } from 'node:stream';
 import { spawnAgentProcess, type SpawnedAgent } from '../../../src/exec/spawn.js';
+import { chainedTimeout } from '../../../src/exec/timers.js';
 import {
   readProcessIdentity,
   type ProcessInspectionOptions,
@@ -418,8 +419,8 @@ export async function runBenchProcess(
     ? new CallerTargetAdapter(stderrTarget as Writable)
     : null;
 
-  let timeout: NodeJS.Timeout | undefined;
-  let timeoutEscalation: NodeJS.Timeout | undefined;
+  let timeout: ReturnType<typeof chainedTimeout> | undefined;
+  let timeoutEscalation: ReturnType<typeof chainedTimeout> | undefined;
   let timedOut = false;
   let cleanupRemaining: number | null = null;
   let outputDrainFailure: Error | null = null;
@@ -429,11 +430,11 @@ export async function runBenchProcess(
     if (stdoutForwarder !== null) childStdout?.pipe(stdoutForwarder);
     if (stderrForwarder !== null) childStderr?.pipe(stderrForwarder);
     if (options.timeoutMs !== undefined && options.timeoutMs !== null) {
-      timeout = setTimeout(() => {
+      timeout = chainedTimeout(options.timeoutMs, () => {
         timedOut = true;
         spawned.killTree('SIGTERM');
-        timeoutEscalation = setTimeout(() => spawned.killTree('SIGKILL'), terminationGraceMs);
-      }, options.timeoutMs);
+        timeoutEscalation = chainedTimeout(terminationGraceMs, () => spawned.killTree('SIGKILL'));
+      });
     }
     const termination = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, reject) => {
       const cleanup = (): void => {
@@ -451,8 +452,8 @@ export async function runBenchProcess(
       spawned.child.once('error', onError);
       spawned.child.once('exit', onExit);
     });
-    if (timeout !== undefined) clearTimeout(timeout);
-    if (timeoutEscalation !== undefined) clearTimeout(timeoutEscalation);
+    timeout?.clear();
+    timeoutEscalation?.clear();
     try {
       const drained = await waitForOutputDrain(
         childStdout,
@@ -500,8 +501,8 @@ export async function runBenchProcess(
       { ...output, exitCode: termination.code },
     );
   } finally {
-    if (timeout !== undefined) clearTimeout(timeout);
-    if (timeoutEscalation !== undefined) clearTimeout(timeoutEscalation);
+    timeout?.clear();
+    timeoutEscalation?.clear();
     if (cleanupRemaining !== 0) {
       spawned.killTree('SIGKILL');
       try {

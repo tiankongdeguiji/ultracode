@@ -441,6 +441,16 @@ describe('benchmark process boundary', () => {
     await expect(cleanupActiveBenchProcesses(0)).resolves.toBe(0);
   });
 
+  it('does not overflow-fire timeouts above the Node timer ceiling', async () => {
+    const result = await runBenchProcess(process.execPath, ['-e', "process.stdout.write('done')"], {
+      cwd: process.cwd(),
+      timeoutMs: 2 ** 31,
+      processInspection: COMPLETE_EMPTY_PROCESS_DISCOVERY,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('done');
+  });
+
   it('rejects invalid process supervision intervals', async () => {
     await expect(runBenchProcess('/bin/true', [], {
       cwd: process.cwd(),

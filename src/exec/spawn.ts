@@ -136,14 +136,21 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
   let darwinCandidateOverflow = false;
   let persistedDarwinInventory = '';
   const identityKey = (proc: TrackedProcess): string => `${proc.pid}:${proc.starttime}:${proc.pgrp}`;
-  const persistDarwinCandidates = (settled: boolean): void => {
+  const persistDarwinCandidates = (settled: boolean): boolean => {
     const candidates = [...retainedDarwinCandidates.values()]
       .map(({ pid: candidatePid, pgrp, starttime }) => ({ pid: candidatePid, pgrp, starttime }))
       .sort((left, right) => left.pid - right.pid);
     const fingerprint = `${Number(settled)}:${candidates.map(identityKey).join(',')}`;
-    if (fingerprint === persistedDarwinInventory) return;
-    opts.onWorkerCandidates?.(workerToken, candidates, settled);
-    persistedDarwinInventory = fingerprint;
+    if (fingerprint === persistedDarwinInventory) return true;
+    try {
+      opts.onWorkerCandidates?.(workerToken, candidates, settled);
+      persistedDarwinInventory = fingerprint;
+      return true;
+    } catch {
+      // Worker containment uses retained identities even when its durable
+      // inventory path is temporarily unwritable. Cleanup retries persistence.
+      return false;
+    }
   };
   const discoverDarwinCandidates = (): boolean => {
     const discovery = discoverWorkerProcessesForTokens(
@@ -162,9 +169,6 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
       retainedDarwinCandidates.set(key, candidate);
     }
     darwinDiscoveryComplete = discovery.complete && !darwinCandidateOverflow;
-    // A complete point-in-time scan is not a closed inventory while the
-    // worker can still fork. Seal only after stable live cleanup below.
-    persistDarwinCandidates(false);
     return darwinDiscoveryComplete;
   };
   const darwinSignalInspection = darwinWorkerSignalingInspection(
@@ -180,9 +184,14 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     ).processes;
   const signalLiveWorker = (signal: NodeJS.Signals): number => {
     if (platform === 'darwin') {
-      // Persist the bounded identity hint before either signal can remove it.
       discoverDarwinCandidates();
-      return Number(signalGroup(signal)) + signalRetainedDarwinCandidates(signal);
+      try {
+        return Number(signalGroup(signal)) + signalRetainedDarwinCandidates(signal);
+      } finally {
+        // A complete point-in-time scan is not a closed inventory while the
+        // worker can still fork. Seal only after stable live cleanup below.
+        persistDarwinCandidates(false);
+      }
     }
     return Number(signalGroup(signal))
       + signalWorkerProcesses(workerToken, signal, opts.workerScope, tokenInspection);
@@ -210,7 +219,11 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
           const discoveredCompletely = discoverDarwinCandidates();
           signalGroup(signal);
           const candidates = [...retained.values()];
-          signalRetainedDarwinCandidates(signal);
+          try {
+            signalRetainedDarwinCandidates(signal);
+          } finally {
+            persistDarwinCandidates(false);
+          }
           const live = readProcessIdentitySnapshot(
             candidates.map((candidate) => candidate.pid),
             opts.processInspection,
@@ -226,8 +239,7 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
             ? emptyPasses + 1
             : 0;
           if (emptyPasses >= 2) {
-            persistDarwinCandidates(true);
-            return true;
+            if (persistDarwinCandidates(true)) return true;
           }
           const observedAt = now();
           if (observedAt >= deadline) {

@@ -63,7 +63,8 @@ const ledgerChangeSchema = z.discriminatedUnion('op', [
   z.strictObject({ op: z.literal('truncate'), path: changePathSchema, length: z.number().int().nonnegative() }),
 ]);
 
-type LedgerChange = z.infer<typeof ledgerChangeSchema>;
+export type RunStateLedgerChange = z.infer<typeof ledgerChangeSchema>;
+type LedgerChange = RunStateLedgerChange;
 
 const ledgerPayloadSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('snapshot'), state: z.unknown() }),
@@ -523,7 +524,8 @@ function diffValue(before: unknown, after: unknown, path: (string | number)[], o
   output.push({ op: 'set', path, value: structuredClone(after) });
 }
 
-function stateChanges(before: BenchRunState, after: BenchRunState): LedgerChange[] {
+/** Derive deltas for infrequent bulk compatibility mutations. */
+export function diffRunStateChanges(before: BenchRunState, after: BenchRunState): RunStateLedgerChange[] {
   const changes: LedgerChange[] = [];
   diffValue(before.invocations, after.invocations, ['invocations'], changes);
   diffValue(before.attempts, after.attempts, ['attempts'], changes);
@@ -992,15 +994,15 @@ function prepareActiveSegment(identity: LedgerIdentity, head: RunStateLedgerHead
 export function appendRunStateRevision(
   identity: LedgerIdentity,
   materialized: RunStateMaterialization,
-  next: BenchRunState,
-  parseState: ParseState,
+  nextRevision: number,
+  inputChanges: readonly RunStateLedgerChange[],
   options: RunStateLedgerOptions = {},
 ): RunStateMaterialization {
   const head = materialized.head;
   if (head === null) throw new Error('legacy v2 run state is read-only; migrate it explicitly before updating');
   if (materialized.activeSegmentHasher === null) throw new Error('run-state ledger active digest is unavailable');
-  if (next.revision !== materialized.state.revision + 1) throw new Error('run-state ledger append must advance one revision');
-  const changes = stateChanges(materialized.state, next);
+  if (nextRevision !== materialized.state.revision + 1) throw new Error('run-state ledger append must advance one revision');
+  const changes = z.array(ledgerChangeSchema).max(100_000).parse(inputChanges);
   const maximum = segmentMaximum(options);
   let segmentIndex = head.segmentIndex;
   let segmentRecordIndex = head.segmentRecordIndex + 1;
@@ -1010,7 +1012,7 @@ export function appendRunStateRevision(
     segmentIndex,
     segmentRecordIndex,
     recordIndex: head.recordIndex + 1,
-    revision: next.revision,
+    revision: nextRevision,
     revisionIndex: 0,
     revisionRecords: 1,
     previousHash: head.ledgerRootSha256,
@@ -1051,7 +1053,7 @@ export function appendRunStateRevision(
   options.onCrashPoint?.('after-ledger-fsync');
   const nextHead = runStateLedgerHeadSchema.parse({
     ...head,
-    revision: next.revision,
+    revision: nextRevision,
     segmentIndex,
     segmentRecordIndex,
     recordIndex: record.recordIndex,
@@ -1061,8 +1063,10 @@ export function appendRunStateRevision(
   const stateFileSha256 = publishHead(identity, nextHead);
   options.onCrashPoint?.('after-head-fsync');
   appendDelimiter(path);
+  for (const change of changes) applyChange(materialized.state, change);
+  materialized.state.revision = nextRevision;
   return {
-    state: parseState(next),
+    state: materialized.state,
     stateFileSha256,
     ledgerRootSha256: nextHead.ledgerRootSha256,
     head: nextHead,

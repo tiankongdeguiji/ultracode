@@ -755,6 +755,17 @@ export class AgentCallExecutor implements AgentExecutor {
       } else if (abortedAtExit) {
         exit = { ok: false, errorKind: 'interrupted', retryable: false, message: 'aborted' };
       }
+      if (exit.ok && descendantsRemaining !== 0) {
+        descendantsRemaining = await spawned.cleanupEscaped();
+        if (descendantsRemaining !== 0) {
+          exit = {
+            ok: false,
+            errorKind: 'infra',
+            retryable: true,
+            message: 'descendant cleanup failed after bounded retries',
+          };
+        }
+      }
       return { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, outputChars };
     } catch (err) {
       return {
