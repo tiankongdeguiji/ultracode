@@ -16,9 +16,6 @@ export const WORKER_SCOPE_ENV = 'ULTRACODE_WORKER_SCOPE';
 const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
 const WORKER_SCOPE_RE = /^[a-f0-9]{64}$/;
 const DARWIN_PS_BATCH_SIZE = 128;
-const MAX_DARWIN_PS_QUERIES = 66;
-/** Maximum durable macOS identities accepted for one worker lifecycle. */
-export const MAX_DARWIN_CANDIDATE_PROCESSES = 4_096;
 const MAX_PROCESS_ID = 2_147_483_647;
 
 export interface ProcessInspectionOptions {
@@ -431,15 +428,11 @@ function parseDarwinProcesses(raw: string): DarwinProcessParse {
   return { processes, complete };
 }
 
-function isPsOverflow(error: unknown): boolean {
-  return error instanceof Error && /maxBuffer|ENOBUFS/u.test(error.message);
-}
-
 function darwinProcessQuery(
   batch: readonly number[],
   includeEnvironment: boolean,
   options: ProcessInspectionOptions,
-): DarwinProcessParse & { overflow: boolean } {
+): DarwinProcessParse {
   try {
     const raw = executeDarwinPs([
       '-ww',
@@ -455,41 +448,12 @@ function darwinProcessQuery(
       '-p',
       batch.join(','),
     ], options);
-    return { ...parseDarwinProcesses(raw), overflow: false };
+    return parseDarwinProcesses(raw);
   } catch (error) {
     if (isDarwinNoSelection(error)) {
-      return { processes: new Map(), complete: true, overflow: false };
+      return { processes: new Map(), complete: true };
     }
-    return { processes: new Map(), complete: false, overflow: isPsOverflow(error) };
-  }
-}
-
-function darwinProcessIds(options: ProcessInspectionOptions): {
-  pids: number[];
-  complete: boolean;
-} {
-  try {
-    const seen = new Set<number>();
-    for (const line of executeDarwinPs(['-ax', '-o', 'pid='], options).split('\n')) {
-      if (line.trim() === '') continue;
-      const pid = Number(line.trim());
-      if (
-        !/^\d+$/u.test(line.trim())
-        || !Number.isSafeInteger(pid)
-        || pid > MAX_PROCESS_ID
-        || seen.has(pid)
-      ) {
-        return { pids: [], complete: false };
-      }
-      if (!isSafeProcessId(pid)) continue;
-      if (pid !== process.pid) seen.add(pid);
-      if (seen.size > MAX_DARWIN_CANDIDATE_PROCESSES) {
-        return { pids: [], complete: false };
-      }
-    }
-    return { pids: [...seen], complete: true };
-  } catch {
-    return { pids: [], complete: false };
+    return { processes: new Map(), complete: false };
   }
 }
 
@@ -506,6 +470,10 @@ export function discoverWorkerProcessesForTokens(
     candidatePids === undefined
       ? undefined
       : [...new Set(candidatePids)].filter((pid) => isSafeProcessId(pid) && pid !== process.pid);
+  const platform = inspectionPlatform(options);
+  if (platform === 'darwin' && (candidates === undefined || candidates.length === 0)) {
+    return { processes: [], complete: true };
+  }
   if (options.discoverWorkerProcesses !== undefined) {
     const discovered = options.discoverWorkerProcesses([...accepted], scope, candidates);
     const candidateSet = candidates === undefined ? undefined : new Set(candidates);
@@ -528,45 +496,30 @@ export function discoverWorkerProcessesForTokens(
     };
   }
   const scopeValue = scope === undefined ? undefined : workerScopeValue(scope);
-  const platform = inspectionPlatform(options);
 
   if (platform === 'darwin') {
     if (scopeValue === undefined) return { processes: [], complete: false };
-    if (candidates !== undefined && candidates.length === 0) return { processes: [], complete: true };
+    if (candidates === undefined) return { processes: [], complete: true };
     const found: TrackedWorkerProcess[] = [];
-    const inventory = candidates === undefined
-      ? darwinProcessIds(options)
-      : { pids: candidates, complete: true };
-    if (!inventory.complete) return { processes: [], complete: false };
     const batches: number[][] = [];
-    for (let offset = 0; offset < inventory.pids.length; offset += DARWIN_PS_BATCH_SIZE) {
-      batches.push(inventory.pids.slice(offset, offset + DARWIN_PS_BATCH_SIZE));
+    for (let offset = 0; offset < candidates.length; offset += DARWIN_PS_BATCH_SIZE) {
+      batches.push(candidates.slice(offset, offset + DARWIN_PS_BATCH_SIZE));
     }
-    let queries = candidates === undefined ? 1 : 0;
     let complete = true;
     while (batches.length > 0) {
-      if (queries + 2 > MAX_DARWIN_PS_QUERIES) {
-        complete = false;
-        break;
-      }
       const batch = batches.shift()!;
+      const selected = new Set(batch);
       const commands = darwinProcessQuery(batch, false, options);
-      queries++;
       const commandsAndEnvironment = darwinProcessQuery(batch, true, options);
-      queries++;
       if (!commands.complete || !commandsAndEnvironment.complete) {
-        if (
-          batch.length > 1
-          && (commands.overflow || commandsAndEnvironment.overflow)
-        ) {
-          const middle = Math.ceil(batch.length / 2);
-          batches.unshift(batch.slice(0, middle), batch.slice(middle));
-        } else {
-          complete = false;
-        }
+        complete = false;
         continue;
       }
       for (const expanded of commandsAndEnvironment.processes.values()) {
+        if (!selected.has(expanded.pid)) {
+          complete = false;
+          continue;
+        }
         const command = commands.processes.get(expanded.pid);
         if (command === undefined) continue;
         if (command.pgrp !== expanded.pgrp || command.starttime !== expanded.starttime) {
@@ -601,11 +554,7 @@ export function discoverWorkerProcessesForTokens(
         });
       }
     }
-    if (found.length > MAX_DARWIN_CANDIDATE_PROCESSES) complete = false;
-    return {
-      processes: found.slice(0, MAX_DARWIN_CANDIDATE_PROCESSES),
-      complete,
-    };
+    return { processes: found, complete };
   }
   if (platform !== 'linux') return { processes: [], complete: false };
   let entries: readonly string[];

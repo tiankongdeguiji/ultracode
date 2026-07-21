@@ -4,13 +4,10 @@ import { z } from 'zod';
 import {
   darwinWorkerSignalingInspection,
   discoverWorkerProcessesForTokens,
-  MAX_DARWIN_CANDIDATE_PROCESSES,
   readProcessIdentitySnapshot,
   signal0Status,
   signalTrackedWorkerProcesses,
   type ProcessInspectionOptions,
-  type TrackedProcess,
-  type TrackedWorkerProcess,
 } from '../../../src/exec/procinfo.js';
 import { FAILURE_CODES, type BenchPathRoots, type BenchSuite, type FailureCode } from './contracts.js';
 import type { BenchLockHandle } from './locks.js';
@@ -39,11 +36,6 @@ const commandSchema = z.enum(['fetch', 'prep', 'run', 'eval', 'report', 'status'
 const failureSchema = z.enum(FAILURE_CODES);
 const timestampSchema = z.string().datetime({ offset: true });
 const relativePathSchema = z.string().transform(validateRelativeArtifactPath);
-const lifecycleCandidateSchema = z.strictObject({
-  pid: z.number().int().min(2).max(2_147_483_647),
-  pgrp: z.number().int().nonnegative().max(2_147_483_647),
-  starttime: z.string().min(1),
-});
 
 export interface LifecycleRecoveryOptions extends ProcessInspectionOptions {
   /** Monotonic-millisecond seam used to bound deterministic Linux recovery phases. */
@@ -139,6 +131,58 @@ async function recoverLinuxPhase(
   }
 }
 
+/** Recover only persisted Darwin worker leaders; daemonized descendants are outside the contract. */
+async function recoverDarwinPhase(
+  entries: readonly LinuxLifecycleProcess[],
+  workerScope: string,
+  signal: NodeJS.Signals,
+  graceMs: number,
+  inspection: LifecycleRecoveryOptions,
+  retiredPids: Set<number>,
+): Promise<Set<string>> {
+  const completeEntries = entries.filter((entry) =>
+    entry.pid !== null && entry.processStartIdentity !== null);
+  const tokens = [...new Set(completeEntries.map((entry) => entry.token))];
+  const pids = [...new Set(completeEntries.flatMap((entry) => entry.pid === null ? [] : [entry.pid]))];
+  const emptyPasses = new Map(tokens.map((token) => [token, 0]));
+  const signalingInspection = darwinWorkerSignalingInspection(tokens, workerScope, inspection);
+  const now = inspection.recoveryNow ?? (() => performance.now());
+  const wait = inspection.recoveryWait
+    ?? ((delayMs: number) => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, delayMs)));
+  const deadline = now() + Math.max(0, graceMs);
+  for (;;) {
+    const discovery = discoverWorkerProcessesForTokens(tokens, workerScope, pids, inspection);
+    const authenticated = completeEntries.flatMap((entry) => {
+      if (entry.pid === null || retiredPids.has(entry.pid)) return [];
+      const candidate = discovery.processes.find((process) =>
+        process.token === entry.token
+        && process.pid === entry.pid
+        && process.pgrp === entry.pid
+        && process.starttime === entry.processStartIdentity);
+      return candidate === undefined ? [] : [candidate];
+    });
+    signalTrackedWorkerProcesses(authenticated, signal, signalingInspection);
+    const authenticatedKeys = new Set(authenticated.map((candidate) =>
+      `${candidate.token}:${candidate.pid}:${candidate.starttime}`));
+    for (const entry of completeEntries) {
+      const live = authenticatedKeys.has(
+        `${entry.token}:${entry.pid}:${entry.processStartIdentity}`,
+      );
+      const groupStatus = entry.pid === null ? 'unknown' : processGroupStatus(entry.pid, inspection);
+      if (entry.pid !== null && groupStatus === 'absent') retiredPids.add(entry.pid);
+      const absent = discovery.complete
+        && !live
+        && groupStatus === 'absent';
+      emptyPasses.set(entry.token, absent ? (emptyPasses.get(entry.token) ?? 0) + 1 : 0);
+    }
+    const unsettled = new Set(tokens.filter((token) => (emptyPasses.get(token) ?? 0) < 2));
+    if (unsettled.size === 0) return unsettled;
+    const observedAt = now();
+    if (observedAt >= deadline) return unsettled;
+    await wait(Math.min(25, Math.max(1, deadline - observedAt)));
+  }
+}
+
 export const invocationRecordSchema = z.strictObject({
   invocationId: z.string().uuid(),
   command: commandSchema,
@@ -151,10 +195,6 @@ export const invocationRecordSchema = z.strictObject({
     token: z.string().regex(/^[a-f0-9]{32}$/),
     pid: z.number().int().positive().nullable(),
     processStartIdentity: z.string().min(1).nullable(),
-    darwinCandidateInventory: z.strictObject({
-      complete: z.boolean(),
-      processes: z.array(lifecycleCandidateSchema).max(MAX_DARWIN_CANDIDATE_PROCESSES),
-    }).optional(),
     recovery: z.enum(['pending', 'complete', 'failed']),
   })),
   failure: failureSchema.nullable(),
@@ -593,7 +633,6 @@ export class BenchRunStateStore {
   lifecycleHooks(invocationId: string): {
     onLifecycleToken(token: string): void;
     onLifecycleStarted(token: string, pid: number | null, processStartIdentity: string | null): void;
-    onLifecycleCandidates(token: string, candidates: readonly TrackedProcess[], complete: boolean): void;
     onLifecycleRecovered(token: string, recovery: 'complete' | 'failed'): void;
   } {
     const replaceToken = (
@@ -633,16 +672,6 @@ export class BenchRunStateStore {
       onLifecycleStarted: (token, pid, processStartIdentity) => {
         replaceToken(token, (entry) => ({ ...entry, pid, processStartIdentity }));
       },
-      onLifecycleCandidates: (token, candidates, complete) => {
-        const inventory = {
-          complete,
-          processes: [...new Map(candidates.map((candidate) => [
-            `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`,
-            candidate,
-          ])).values()].sort((left, right) => left.pid - right.pid),
-        };
-        replaceToken(token, (entry) => ({ ...entry, darwinCandidateInventory: inventory }));
-      },
       onLifecycleRecovered: (token, recovery) => {
         replaceToken(token, (entry) => ({ ...entry, recovery }));
       },
@@ -662,131 +691,31 @@ export class BenchRunStateStore {
     if (recoverable.length === 0) return 0;
     const platform = inspection.platform ?? process.platform;
     if (platform === 'darwin') {
-      const unverifiableTokens = new Set<string>();
-      const candidatesByToken = new Map<string, Map<string, TrackedWorkerProcess>>();
-      const identityKey = (candidate: TrackedProcess): string =>
-        `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`;
-      for (const entry of recoverable) {
-        const inventory = entry.darwinCandidateInventory;
-        if (
-          entry.pid === null
-          || entry.processStartIdentity === null
-          || inventory === undefined
-          || !inventory.complete
-        ) {
-          unverifiableTokens.add(entry.token);
-          continue;
-        }
-        const candidates = new Map<string, TrackedWorkerProcess>();
-        const leader = {
-          pid: entry.pid,
-          pgrp: entry.pid,
-          starttime: entry.processStartIdentity,
-          token: entry.token,
-        };
-        candidates.set(identityKey(leader), leader);
-        for (const candidate of inventory.processes) {
-          candidates.set(identityKey(candidate), { ...candidate, token: entry.token });
-        }
-        if (candidates.size > MAX_DARWIN_CANDIDATE_PROCESSES) {
-          unverifiableTokens.add(entry.token);
-          continue;
-        }
-        candidatesByToken.set(entry.token, candidates);
-      }
-
-      const validTokens = [...candidatesByToken.keys()];
-      const signalingInspection = darwinWorkerSignalingInspection(
-        validTokens,
+      const valid = recoverable.filter((entry) =>
+        entry.pid !== null && entry.processStartIdentity !== null);
+      const invalidTokens = recoverable
+        .filter((entry) => entry.pid === null || entry.processStartIdentity === null)
+        .map((entry) => entry.token);
+      const retiredPids = new Set<number>();
+      let liveTokens = await recoverDarwinPhase(
+        valid,
         workerScope,
+        'SIGTERM',
+        graceMs,
         inspection,
+        retiredPids,
       );
-      const emptyPasses = new Map(validTokens.map((token) => [token, 0]));
-      let deadline = Date.now() + Math.max(0, graceMs);
-      let signal: NodeJS.Signals = 'SIGTERM';
-      for (;;) {
-        const discovery = discoverWorkerProcessesForTokens(
-          validTokens,
+      if (liveTokens.size > 0) {
+        liveTokens = await recoverDarwinPhase(
+          valid.filter((entry) => liveTokens.has(entry.token)),
           workerScope,
-          undefined,
+          'SIGKILL',
+          graceMs,
           inspection,
+          retiredPids,
         );
-        let candidatesChanged = false;
-        for (const candidate of discovery.processes) {
-          const candidates = candidatesByToken.get(candidate.token);
-          if (candidates === undefined) continue;
-          const key = identityKey(candidate);
-          if (!candidates.has(key)) {
-            candidates.set(key, candidate);
-            candidatesChanged = true;
-          }
-          if (candidates.size > MAX_DARWIN_CANDIDATE_PROCESSES) {
-            unverifiableTokens.add(candidate.token);
-            candidatesByToken.delete(candidate.token);
-          }
-        }
-        if (candidatesChanged) {
-          this.updateCurrentSync((current) => ({
-            ...current,
-            invocations: current.invocations.map((invocation) => ({
-              ...invocation,
-              lifecycleProcesses: invocation.lifecycleProcesses.map((entry) => {
-                const candidates = candidatesByToken.get(entry.token);
-                if (entry.recovery === 'complete' || candidates === undefined) return entry;
-                return {
-                  ...entry,
-                  darwinCandidateInventory: {
-                    complete: true,
-                    processes: [...candidates.values()]
-                      .map(({ token: _token, ...candidate }) => candidate)
-                      .sort((left, right) => left.pid - right.pid),
-                  },
-                };
-              }),
-            })),
-          }));
-        }
-
-        const allCandidates = [...candidatesByToken.values()].flatMap((candidates) => [...candidates.values()]);
-        signalTrackedWorkerProcesses(allCandidates, signal, signalingInspection);
-        const identities = readProcessIdentitySnapshot(
-          allCandidates.map((candidate) => candidate.pid),
-          inspection,
-        );
-        const discoveredTokens = new Set(discovery.processes.map((candidate) => candidate.token));
-        for (const entry of recoverable) {
-          const candidates = candidatesByToken.get(entry.token);
-          if (candidates === undefined || entry.pid === null) continue;
-          const candidatesAbsent = identities.complete && [...candidates.values()].every((candidate) => {
-            const live = identities.identities.get(candidate.pid);
-            return live === undefined
-              || live.starttime !== candidate.starttime
-              || live.pgrp !== candidate.pgrp;
-          });
-          const absent = discovery.complete
-            && !discoveredTokens.has(entry.token)
-            && candidatesAbsent
-            && processGroupStatus(entry.pid, inspection) === 'absent';
-          emptyPasses.set(entry.token, absent ? (emptyPasses.get(entry.token) ?? 0) + 1 : 0);
-        }
-        if (
-          validTokens.length > 0
-          && validTokens.every((token) => (emptyPasses.get(token) ?? 0) >= 2)
-        ) {
-          break;
-        }
-        if (Date.now() >= deadline) {
-          if (signal === 'SIGKILL') break;
-          signal = 'SIGKILL';
-          deadline = Date.now() + Math.max(0, graceMs);
-        } else {
-          await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
-        }
       }
-      const liveTokens = new Set([
-        ...unverifiableTokens,
-        ...validTokens.filter((token) => (emptyPasses.get(token) ?? 0) < 2),
-      ]);
+      for (const token of invalidTokens) liveTokens.add(token);
       this.updateCurrentSync((current) => ({
         ...current,
         invocations: current.invocations.map((invocation) => ({

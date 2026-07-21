@@ -38,7 +38,6 @@ import { createRunDir, getRun } from '../../src/store/runstore.js';
 const HASH = 'a'.repeat(64);
 const INVOCATION = '11111111-1111-4111-8111-111111111111';
 const TOKEN = 'b'.repeat(32);
-const DARWIN_START = 'darwin:Mon_Jul_20_12:00:00_2026';
 const PROCESS_PID = process.pid === 101 ? 102 : 101;
 const PROCESS: TrackedWorkerProcess = {
   pid: PROCESS_PID,
@@ -1020,74 +1019,6 @@ describe('process stop settlement', () => {
     complete = true;
     const recovered = await stopRun(root, runId, inspection);
     expect(recovered).toMatchObject({ ok: true, status: 'stopped' });
-  });
-
-  it('keeps a leader-only Darwin candidate inventory unsettled and PID-restricted', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'uc-stop-darwin-candidates-'));
-    roots.push(root);
-    const runId = newRunId();
-    const directory = createRunDir(root, {
-      runId,
-      name: 'darwin-candidates',
-      source: 'return null',
-      args: null,
-      config: { backend: 'mock', cwd: root },
-    });
-    const run = getRun(root, runId)!;
-    writeManifest(directory, { ...run.manifest, status: 'stopped', endedAt: new Date().toISOString() });
-    mkdirSync(workerRecordDir(directory, 0), { recursive: true });
-    writeFileSync(workerRecordPath(directory, 0, 1), `${PROCESS.pid} ${DARWIN_START} ${TOKEN}`);
-    const discoveries: Array<readonly number[] | undefined> = [];
-    let clock = 0;
-
-    await expect(stopRun(root, runId, {
-      platform: 'darwin',
-      discoverWorkerProcesses: (_tokens, _scope, candidates) => {
-        discoveries.push(candidates);
-        return { processes: [], complete: true };
-      },
-      readIdentitySnapshot: () => ({ identities: new Map(), complete: true }),
-      signalProcess: () => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); },
-      observationNow: () => clock,
-      observationWait: async (delayMs) => { clock += delayMs; },
-    })).resolves.toMatchObject({ ok: false, status: 'stopped' });
-    expect(discoveries.length).toBeGreaterThanOrEqual(2);
-    expect(discoveries.some((candidates) => candidates?.[0] === PROCESS.pid)).toBe(true);
-    expect(discoveries.every((candidates) =>
-      candidates !== undefined && candidates.every((pid) => pid === PROCESS.pid))).toBe(true);
-  });
-
-  it('keeps a Darwin token-only recovery record unsettled', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'uc-stop-darwin-token-only-'));
-    roots.push(root);
-    const runId = newRunId();
-    const directory = createRunDir(root, {
-      runId,
-      name: 'darwin-token-only',
-      source: 'return null',
-      args: null,
-      config: { backend: 'mock', cwd: root },
-    });
-    const run = getRun(root, runId)!;
-    writeManifest(directory, { ...run.manifest, status: 'stopped', endedAt: new Date().toISOString() });
-    mkdirSync(workerRecordDir(directory, 0), { recursive: true });
-    writeFileSync(workerRecordPath(directory, 0, 1), `- - ${TOKEN}`);
-    const discoveries: Array<readonly number[] | undefined> = [];
-    let clock = 0;
-
-    const result = await stopRun(root, runId, {
-      platform: 'darwin',
-      discoverWorkerProcesses: (_tokens, _scope, candidates) => {
-        discoveries.push(candidates);
-        return { processes: [], complete: true };
-      },
-      observationNow: () => clock,
-      observationWait: async (delayMs) => { clock += delayMs; },
-    });
-    expect(result).toMatchObject({ ok: false, status: 'stopped' });
-    expect(result.message).toMatch(/could not verify stable process absence/);
-    expect(discoveries.length).toBeGreaterThanOrEqual(2);
-    expect(discoveries.every((candidates) => candidates?.length === 0)).toBe(true);
   });
 
   it('does not derive a Linux absence floor from a forged future start record', async () => {

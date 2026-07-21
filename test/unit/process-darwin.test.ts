@@ -1,9 +1,7 @@
-/** Deterministic macOS process-discovery and identity-signaling seams. */
+/** Bounded macOS worker discovery and identity-signaling behavior. */
 import { describe, expect, it } from 'vitest';
 import {
   discoverWorkerProcessesForTokens,
-  MAX_DARWIN_CANDIDATE_PROCESSES,
-  readProcessIdentitySnapshot,
   signalTrackedWorkerProcesses,
   workerScopeValue,
 } from '../../src/exec/procinfo.js';
@@ -12,197 +10,114 @@ const TOKEN = 'a'.repeat(32);
 const STARTED = 'Mon Jul 20 12:00:00 2026';
 const START_IDENTITY = 'darwin:Mon_Jul_20_12:00:00_2026';
 
-function processLine(pid: number, pgrp: number, command: string): string {
-  return `${pid} ${pgrp} ${STARTED} ${command}`;
+function processLine(pid: number, pgrp: number, command: string, started = STARTED): string {
+  return `${pid} ${pgrp} ${started} ${command}`;
 }
 
 describe('Darwin worker process discovery', () => {
-  it('authenticates a fixed host inventory containing a setsid descendant', () => {
+  it('returns complete empty discovery without ps when candidates are undefined or empty', () => {
+    let queries = 0;
+    const inspection = {
+      platform: 'darwin' as const,
+      executePs: () => {
+        queries += 1;
+        throw new Error('ps must not run');
+      },
+    };
+    expect(discoverWorkerProcessesForTokens([TOKEN], process.cwd(), undefined, inspection))
+      .toEqual({ processes: [], complete: true });
+    expect(discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [], inspection))
+      .toEqual({ processes: [], complete: true });
+    expect(queries).toBe(0);
+  });
+
+  it('uses only bounded explicit -p queries', () => {
+    const calls: string[][] = [];
+    const candidates = Array.from({ length: 130 }, (_, index) => 100 + index);
+    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), candidates, {
+      platform: 'darwin',
+      executePs: (argv) => {
+        calls.push([...argv]);
+        return '';
+      },
+    });
+    expect(discovery).toEqual({ processes: [], complete: true });
+    expect(calls).toHaveLength(4);
+    for (const argv of calls) {
+      expect(argv).not.toContain('-ax');
+      expect(argv).not.toContain('-A');
+      const selected = argv[argv.indexOf('-p') + 1]!;
+      expect(selected.split(',').length).toBeLessThanOrEqual(128);
+    }
+  });
+
+  it('authenticates token, scope, PID, PGID, and start identity', () => {
     const scope = workerScopeValue(process.cwd());
-    const commands = [
-      processLine(101, 101, '/usr/bin/node worker.js'),
-      processLine(202, 202, '/usr/bin/node escaped.js'),
-    ].join('\n');
+    const command = processLine(202, 303, '/usr/bin/node worker.js');
     const environment = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
-    const discovery = discoverWorkerProcessesForTokens(
-      [TOKEN],
-      process.cwd(),
-      undefined,
-      {
-        platform: 'darwin',
-        executePs: (argv) => {
-          if (argv.join(' ') === '-ax -o pid=') return '101\n202\n';
-          return argv.includes('-E')
-            ? commands.split('\n').map((line) => `${line}${environment}`).join('\n')
-            : commands;
-        },
-      },
-    );
-    expect(discovery).toEqual({
-      complete: true,
-      processes: [
-        { pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN },
-        { pid: 202, pgrp: 202, starttime: START_IDENTITY, token: TOKEN },
-      ],
-    });
-  });
-
-  it('does not compare transient pids from separate host-wide ps processes', () => {
-    const scope = workerScopeValue(process.cwd());
-    const command = processLine(101, 101, '/usr/bin/node worker.js');
-    const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
-    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), undefined, {
+    const calls: string[][] = [];
+    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [202], {
       platform: 'darwin',
       executePs: (argv) => {
-        if (argv.join(' ') === '-ax -o pid=') return '1\n101\n999\n';
-        expect(argv.includes('-ax')).toBe(false);
-        expect(argv.at(-1)).toBe('101,999');
-        return argv.includes('-E') ? `${command}${marker}` : command;
+        calls.push([...argv]);
+        return argv.includes('-E') ? `${command}${environment}` : command;
       },
     });
     expect(discovery).toEqual({
       complete: true,
-      processes: [{ pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN }],
+      processes: [{ pid: 202, pgrp: 303, starttime: START_IDENTITY, token: TOKEN }],
     });
-  });
+    expect(calls.every((argv) => argv.at(-2) === '-p' && argv.at(-1) === '202')).toBe(true);
 
-  it('ignores a transient pid that exits between authenticated snapshots', () => {
-    const scope = workerScopeValue(process.cwd());
-    const worker = processLine(101, 101, '/usr/bin/node worker.js');
-    const transient = processLine(999, 999, '/usr/bin/true');
-    const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
-    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), undefined, {
+    const changed = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [202], {
+      platform: 'darwin',
+      executePs: (argv) => argv.includes('-E')
+        ? `${processLine(202, 303, '/usr/bin/node worker.js', 'Tue Jul 21 12:00:00 2026')}${environment}`
+        : command,
+    });
+    expect(changed).toEqual({ processes: [], complete: false });
+
+    const wrongToken = environment.replace(TOKEN, 'b'.repeat(32));
+    expect(discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [202], {
+      platform: 'darwin',
+      executePs: (argv) => argv.includes('-E') ? `${command}${wrongToken}` : command,
+    }).processes).toEqual([]);
+    const wrongScope = environment.replace(scope, 'c'.repeat(64));
+    expect(discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [202], {
+      platform: 'darwin',
+      executePs: (argv) => argv.includes('-E') ? `${command}${wrongScope}` : command,
+    }).processes).toEqual([]);
+    expect(discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [202], {
+      platform: 'darwin',
+      executePs: (argv) => argv.includes('-E')
+        ? `${processLine(202, 304, '/usr/bin/node worker.js')}${environment}`
+        : command,
+    })).toEqual({ processes: [], complete: false });
+    expect(discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [202], {
       platform: 'darwin',
       executePs: (argv) => {
-        if (argv.join(' ') === '-ax -o pid=') return '101\n999\n';
-        return argv.includes('-E') ? `${worker}${marker}` : `${worker}\n${transient}`;
+        const other = processLine(203, 303, '/usr/bin/node worker.js');
+        return argv.includes('-E') ? `${other}${environment}` : other;
       },
-    });
-    expect(discovery).toEqual({
-      complete: true,
-      processes: [{ pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN }],
-    });
+    })).toEqual({ processes: [], complete: false });
   });
 
-  it('distinguishes verified candidate absence from a ps failure', () => {
-    const absent = discoverWorkerProcessesForTokens(
-      [TOKEN],
-      process.cwd(),
-      [999],
-      { platform: 'darwin', executePs: () => '' },
-    );
-    expect(absent).toEqual({ processes: [], complete: true });
-
+  it('distinguishes explicit candidate absence from a ps failure', () => {
     const noSelection = Object.assign(new Error('ps selected no processes'), {
       status: 1,
       stdout: '',
     });
-    expect(discoverWorkerProcessesForTokens(
-      [TOKEN],
-      process.cwd(),
-      [999],
-      { platform: 'darwin', executePs: () => { throw noSelection; } },
-    )).toEqual({ processes: [], complete: true });
-    expect(readProcessIdentitySnapshot([999], {
+    expect(discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [999], {
       platform: 'darwin',
       executePs: () => { throw noSelection; },
-    })).toEqual({ identities: new Map(), complete: true });
-
-    const failed = discoverWorkerProcessesForTokens(
-      [TOKEN],
-      process.cwd(),
-      [999],
-      {
-        platform: 'darwin',
-        executePs: () => { throw new Error('ps unavailable'); },
-      },
-    );
-    expect(failed).toEqual({ processes: [], complete: false });
-  });
-
-  it('splits an overflowing host-inventory batch', () => {
-    const scope = workerScopeValue(process.cwd());
-    const commands = [
-      processLine(101, 101, '/usr/bin/node worker.js'),
-      processLine(202, 202, '/usr/bin/node escaped.js'),
-    ].join('\n');
-    const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
-    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), undefined, {
+    })).toEqual({ processes: [], complete: true });
+    expect(discoverWorkerProcessesForTokens([TOKEN], process.cwd(), [999], {
       platform: 'darwin',
-      executePs: (argv) => {
-        if (argv.join(' ') === '-ax -o pid=') return '101\n202\n';
-        const selected = argv.at(-1);
-        if (selected === '101,202') throw new Error('stdout maxBuffer length exceeded');
-        const command = selected === '101' ? commands.split('\n')[0]! : commands.split('\n')[1]!;
-        return argv.includes('-E') ? `${command}${marker}` : command;
-      },
-    });
-    expect(discovery).toEqual({
-      complete: true,
-      processes: [
-        { pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN },
-        { pid: 202, pgrp: 202, starttime: START_IDENTITY, token: TOKEN },
-      ],
-    });
+      executePs: () => { throw new Error('ps unavailable'); },
+    })).toEqual({ processes: [], complete: false });
   });
 
-  it('ignores non-actionable system pids in a host inventory', () => {
-    const scope = workerScopeValue(process.cwd());
-    const command = processLine(101, 101, '/usr/bin/node worker.js');
-    const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
-    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), undefined, {
-      platform: 'darwin',
-      executePs: (argv) => {
-        if (argv.join(' ') === '-ax -o pid=') return '0\n1\n101\n';
-        expect(argv.at(-1)).toBe('101');
-        return argv.includes('-E') ? `${command}${marker}` : command;
-      },
-    });
-    expect(discovery).toEqual({
-      complete: true,
-      processes: [{ pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN }],
-    });
-  });
-
-  it('fails closed when an authenticated host inventory exceeds its bound', () => {
-    const pids = Array.from(
-      { length: MAX_DARWIN_CANDIDATE_PROCESSES + 1 },
-      (_, index) => String(10_000 + index),
-    );
-    const discovery = discoverWorkerProcessesForTokens(
-      [TOKEN],
-      process.cwd(),
-      undefined,
-      {
-        platform: 'darwin',
-        executePs: (argv) => {
-          expect(argv.join(' ')).toBe('-ax -o pid=');
-          return pids.join('\n');
-        },
-      },
-    );
-    expect(discovery).toEqual({ processes: [], complete: false });
-  });
-
-  it('splits bounded candidate batches but keeps an unsplittable ps overflow incomplete', () => {
-    let queries = 0;
-    const discovery = discoverWorkerProcessesForTokens(
-      [TOKEN],
-      process.cwd(),
-      [101, 202],
-      {
-        platform: 'darwin',
-        executePs: () => {
-          queries++;
-          throw new Error('stdout maxBuffer length exceeded');
-        },
-      },
-    );
-    expect(discovery).toEqual({ processes: [], complete: false });
-    expect(queries).toBe(6);
-  });
-
-  it('does not signal a reused PID and group-signals an exact session leader', () => {
+  it('never signals a reused PID or PGID', () => {
     const signaled: Array<[number, NodeJS.Signals | 0]> = [];
     const tracked = [{
       pid: 303,
@@ -210,20 +125,12 @@ describe('Darwin worker process discovery', () => {
       starttime: START_IDENTITY,
       token: TOKEN,
     }];
-    const reused = signalTrackedWorkerProcesses(tracked, 'SIGKILL', {
+    const result = signalTrackedWorkerProcesses(tracked, 'SIGKILL', {
       platform: 'darwin',
       executePs: () => `303 303 Tue Jul 21 12:00:00 2026`,
       signalProcess: (pid, signal) => { signaled.push([pid, signal]); },
     });
-    expect(reused.processes).toBe(0);
+    expect(result.processes).toBe(0);
     expect(signaled).toEqual([]);
-
-    const matched = signalTrackedWorkerProcesses(tracked, 'SIGTERM', {
-      platform: 'darwin',
-      executePs: () => `303 303 ${STARTED}`,
-      signalProcess: (pid, signal) => { signaled.push([pid, signal]); },
-    });
-    expect(matched.processes).toBe(1);
-    expect(signaled).toEqual([[-303, 'SIGTERM']]);
   });
 });

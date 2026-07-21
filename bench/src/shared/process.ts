@@ -10,7 +10,6 @@ import { chainedTimeout } from '../../../src/exec/timers.js';
 import {
   readProcessIdentity,
   type ProcessInspectionOptions,
-  type TrackedProcess,
 } from '../../../src/exec/procinfo.js';
 
 const BASE_CHILD_ENV = [
@@ -66,12 +65,6 @@ export interface BenchProcessOptions {
   onLifecycleToken?: (token: string) => void;
   /** Enrich the pre-spawn token with the direct-child process identity. */
   onLifecycleStarted?: (token: string, pid: number | null, processStartIdentity: string | null) => void;
-  /** Persist bounded macOS candidates; `complete` means live cleanup sealed the inventory. */
-  onLifecycleCandidates?: (
-    token: string,
-    candidates: readonly TrackedProcess[],
-    complete: boolean,
-  ) => void;
   /** Durable-record hook invoked after escaped-descendant cleanup settles. */
   onLifecycleRecovered?: (token: string, recovery: 'complete' | 'failed') => void;
 }
@@ -364,7 +357,6 @@ export async function runBenchProcess(
     stdinData: options.stdinData,
     workerScope: options.workerScope ?? options.cwd,
     onWorkerToken: options.onLifecycleToken,
-    onWorkerCandidates: options.onLifecycleCandidates,
     processInspection: options.processInspection,
   });
   let cleanupRecorded = false;

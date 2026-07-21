@@ -23,8 +23,6 @@ import { validateWithSchema } from './ajv.js';
 import { spawnAgentProcess, TailBuffer, type SpawnedAgent } from '../exec/spawn.js';
 import { chainedTimeout } from '../exec/timers.js';
 import {
-  serializeWorkerCandidateInventory,
-  workerCandidateRecordPath,
   workerRecordDir,
   workerRecordPath,
 } from '../exec/worker-record.js';
@@ -521,10 +519,6 @@ export class AgentCallExecutor implements AgentExecutor {
       : artifactDir
         ? join(artifactDir, `pgid.attempt${attempt}${stderrSuffix}`)
         : undefined;
-    const candidateRecordFile = processRecordFile
-      ? workerCandidateRecordPath(processRecordFile)
-      : undefined;
-
     // Schema temp file (codex --output-schema wants a path). Inserted before
     // the trailing '-' stdin positional when present.
     let schemaTmpDir: string | undefined;
@@ -634,15 +628,8 @@ export class AgentCallExecutor implements AgentExecutor {
         // Linux can still find the marked process through procfs.
         onWorkerToken: processRecordFile
           ? (token) => {
-              if (candidateRecordFile) rmSync(candidateRecordFile, { force: true });
               writeFileAtomicNoFollow(processRecordFile, `- - ${token}`);
             }
-          : undefined,
-        onWorkerCandidates: candidateRecordFile
-          ? (token, candidates, complete) => writeFileAtomicNoFollow(
-              candidateRecordFile,
-              serializeWorkerCandidateInventory(token, candidates, complete),
-            )
           : undefined,
         processInspection: this.opts.processInspection,
       });
@@ -800,7 +787,6 @@ export class AgentCallExecutor implements AgentExecutor {
       }
       if (processRecordFile && descendantsRemaining === 0) {
         rmSync(processRecordFile, { force: true });
-        if (candidateRecordFile) rmSync(candidateRecordFile, { force: true });
       }
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }

@@ -9,22 +9,16 @@ import {
   discoverWorkerProcessesForTokens,
   isSafeProcessId,
   isWorkerToken,
-  readProcessIdentitySnapshot,
+  signal0Status,
   signalTrackedWorkerProcesses,
   signalWorkerProcessTokens,
   signalWorkerProcessTokensUntilGone,
   type ProcessInspectionOptions,
-  type TrackedProcess,
 } from './procinfo.js';
 import {
-  DARWIN_START_IDENTITY_RE,
-  MAX_WORKER_CANDIDATE_RECORD_BYTES,
   MAX_WORKER_SEQUENCES,
-  parseWorkerCandidateInventory,
   WORKER_RECORD_FILE_NAMES,
-  workerCandidateRecordPath,
   workerRecordDir,
-  type WorkerCandidateInventory,
 } from './worker-record.js';
 
 // One initial attempt, five task retries, and two schema repairs are the
@@ -159,7 +153,6 @@ interface WorkerGroupRecord {
 }
 
 interface WorkerTokenRecord {
-  candidateInventory?: WorkerCandidateInventory;
   path: string;
   token: string;
 }
@@ -193,18 +186,7 @@ function loadRecoveryRecords(runDir: string): RecoveryRecords {
       });
     }
     if (isWorkerToken(workerToken) && !tokenRecords.has(workerToken)) {
-      const candidateRaw = readWorkerRecord(
-        workerCandidateRecordPath(path),
-        MAX_WORKER_CANDIDATE_RECORD_BYTES,
-      );
-      const candidateInventory = candidateRaw === undefined
-        ? undefined
-        : parseWorkerCandidateInventory(candidateRaw, workerToken);
-      tokenRecords.set(workerToken, {
-        path,
-        token: workerToken,
-        ...(candidateInventory === undefined ? {} : { candidateInventory }),
-      });
+      tokenRecords.set(workerToken, { path, token: workerToken });
     }
   }
   return { groupRecords, legacyGroupIds, tokenRecords };
@@ -284,22 +266,10 @@ export function killWorkerGroups(runDir: string): number {
   // The run scope is checked in each target process's immutable initial
   // environment. Copying another run's readable token into this untrusted
   // record store therefore cannot authorize signaling that run's workers.
-  const platform = process.platform;
-  const darwinCandidates = platform === 'darwin'
-    ? darwinRecoveryCandidates(records)
-    : undefined;
-  const tokenResult = darwinCandidates === undefined
-    ? signalWorkerProcessTokens(records.tokenRecords.keys(), 'SIGKILL', runDir)
-    : signalTrackedWorkerProcesses(
-        discoverWorkerProcessesForTokens(
-          records.tokenRecords.keys(),
-          runDir,
-          darwinCandidates.pids,
-        ).processes,
-        'SIGKILL',
-        darwinWorkerSignalingInspection(records.tokenRecords.keys(), runDir),
-      );
-  recordSignaledTokens(actedRecords, records.tokenRecords, tokenResult.tokens);
+  if (process.platform === 'linux') {
+    const tokenResult = signalWorkerProcessTokens(records.tokenRecords.keys(), 'SIGKILL', runDir);
+    recordSignaledTokens(actedRecords, records.tokenRecords, tokenResult.tokens);
+  }
   return actedRecords.size;
 }
 
@@ -310,65 +280,63 @@ interface WorkerCleanupReport {
   settled: boolean;
 }
 
-function darwinRecoveryCandidates(records: RecoveryRecords): {
-  complete: boolean;
-  identities: TrackedProcess[];
-  pids: number[];
-  unverifiableRecords: number;
-} {
-  const identities = new Map<string, TrackedProcess>();
-  const groupsByToken = new Map<string, WorkerGroupRecord>();
-  for (const record of records.groupRecords.values()) {
-    if (DARWIN_START_IDENTITY_RE.test(record.starttime) && !groupsByToken.has(record.token)) {
-      groupsByToken.set(record.token, record);
-    }
-  }
-  let unverifiableRecords = records.legacyGroupIds.size;
-  for (const record of records.tokenRecords.values()) {
-    const group = groupsByToken.get(record.token);
-    const inventory = record.candidateInventory;
-    if (group !== undefined) {
-      identities.set(`${group.pid}:${group.starttime}:${group.pid}`, {
-        pid: group.pid,
-        pgrp: group.pid,
-        starttime: group.starttime,
-      });
-    }
-    for (const candidate of inventory?.processes ?? []) {
-      identities.set(`${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`, candidate);
-    }
-    // Candidate sidecars are useful bounded hints, but they live in the same
-    // worker-writable store as the primary record. Their `complete` bit cannot
-    // prove that a compromised worker did not omit an escaped descendant.
-    unverifiableRecords++;
-  }
-  const processes = [...identities.values()];
-  return {
-    complete: unverifiableRecords === 0,
-    identities: processes,
-    pids: [...new Set(processes.map((candidate) => candidate.pid))],
-    unverifiableRecords,
-  };
-}
-
-function candidatesAbsent(
-  candidates: readonly TrackedProcess[],
+async function settleDarwinWorkerGroups(
+  runDir: string,
+  records: RecoveryRecords,
+  graceMs: number,
   inspection: ProcessInspectionOptions,
-): { absent: boolean; complete: boolean } {
-  if (candidates.length === 0) return { absent: true, complete: true };
-  const snapshot = readProcessIdentitySnapshot(
-    [...new Set(candidates.map((candidate) => candidate.pid))],
+): Promise<{ settled: boolean; unverifiableRecords: number }> {
+  const groups = [...records.groupRecords.values()];
+  const groupTokens = new Set(groups.map((record) => record.token));
+  const unverifiableRecords = [...records.tokenRecords.keys()]
+    .filter((token) => !groupTokens.has(token)).length;
+  if (groups.length === 0) {
+    return { settled: records.tokenRecords.size === 0, unverifiableRecords };
+  }
+  const tokens = [...new Set(groups.map((record) => record.token))];
+  const pids = [...new Set(groups.map((record) => record.pid))];
+  const passes = new Map(groups.map((record) => [
+    `${record.pid}:${record.starttime}:${record.token}`,
+    0,
+  ]));
+  const retiredPids = new Set<number>();
+  const now = inspection.observationNow ?? (() => performance.now());
+  const wait = inspection.observationWait ?? sleep;
+  const deadline = now() + Math.max(0, graceMs);
+  const signalingInspection = darwinWorkerSignalingInspection(
+    tokens,
+    runDir,
     inspection,
   );
-  return {
-    absent: snapshot.complete && candidates.every((candidate) => {
-      const live = snapshot.identities.get(candidate.pid);
-      return live === undefined
-        || live.starttime !== candidate.starttime
-        || live.pgrp !== candidate.pgrp;
-    }),
-    complete: snapshot.complete,
-  };
+  for (;;) {
+    const discovery = discoverWorkerProcessesForTokens(tokens, runDir, pids, inspection);
+    const live = new Map(discovery.processes.map((candidate) => [
+      `${candidate.pid}:${candidate.starttime}:${candidate.token}`,
+      candidate,
+    ]));
+    const authenticated = groups.flatMap((record) => {
+      if (retiredPids.has(record.pid)) return [];
+      const candidate = live.get(`${record.pid}:${record.starttime}:${record.token}`);
+      return candidate?.pgrp === record.pid ? [candidate] : [];
+    });
+    signalTrackedWorkerProcesses(authenticated, 'SIGKILL', signalingInspection);
+    for (const record of groups) {
+      const key = `${record.pid}:${record.starttime}:${record.token}`;
+      const candidate = live.get(key);
+      const groupStatus = signal0Status(-record.pid, inspection);
+      if (groupStatus === 'absent') retiredPids.add(record.pid);
+      const absent = discovery.complete
+        && candidate === undefined
+        && groupStatus === 'absent';
+      passes.set(key, absent ? (passes.get(key) ?? 0) + 1 : 0);
+    }
+    if ([...passes.values()].every((count) => count >= 2)) {
+      return { settled: unverifiableRecords === 0, unverifiableRecords };
+    }
+    const observedAt = now();
+    if (observedAt >= deadline) return { settled: false, unverifiableRecords };
+    await wait(Math.min(25, Math.max(1, deadline - observedAt)));
+  }
 }
 
 async function cleanupWorkerGroupsUntilGone(
@@ -379,41 +347,35 @@ async function cleanupWorkerGroupsUntilGone(
   const records = loadRecoveryRecords(runDir);
   const platform = inspection.platform ?? process.platform;
   const actedRecords = signalRecordedWorkerGroups(runDir, records, inspection);
-  const darwinCandidates = platform === 'darwin'
-    ? darwinRecoveryCandidates(records)
-    : undefined;
-  const tokenInspection = darwinCandidates === undefined
-    ? inspection
-    : darwinWorkerSignalingInspection(records.tokenRecords.keys(), runDir, inspection);
+  const liveLegacyGroups = countLiveLegacyWorkerGroups(records);
+  if (platform === 'darwin') {
+    const darwin = await settleDarwinWorkerGroups(runDir, records, graceMs, inspection);
+    const settled = darwin.settled && liveLegacyGroups === 0;
+    const manualCleanup = settled
+      ? undefined
+      : darwin.unverifiableRecords > 0
+        ? `${darwin.unverifiableRecords} Darwin recovery record(s) lack an authenticated leader; `
+          + 'manual cleanup required'
+        : 'Darwin detached process-group absence could not be verified; manual cleanup required. '
+          + 'Descendants that changed session or process group may have escaped cleanup';
+    return {
+      killedRecords: actedRecords.size,
+      liveLegacyGroups,
+      ...(manualCleanup === undefined ? {} : { manualCleanup }),
+      settled,
+    };
+  }
   const tokenResult = await signalWorkerProcessTokensUntilGone(
     records.tokenRecords.keys(),
     'SIGKILL',
     runDir,
     graceMs,
-    tokenInspection,
-    darwinCandidates?.pids,
+    inspection,
   );
   recordSignaledTokens(actedRecords, records.tokenRecords, tokenResult.tokens);
-  const darwinAbsence = darwinCandidates === undefined
-    ? undefined
-    : candidatesAbsent(darwinCandidates.identities, inspection);
-  const liveLegacyGroups = countLiveLegacyWorkerGroups(records);
-  const settled = tokenResult.settled
-    && (darwinCandidates?.complete ?? true)
-    && (darwinAbsence?.absent ?? true)
-    && liveLegacyGroups === 0;
+  const settled = tokenResult.settled && liveLegacyGroups === 0;
   let manualCleanup: string | undefined;
-  if (darwinAbsence !== undefined && !darwinAbsence.complete) {
-    manualCleanup = 'Darwin process identity visibility was incomplete; '
-      + 'could not verify stable process absence; manual cleanup required';
-  } else if (darwinAbsence !== undefined && !darwinAbsence.absent) {
-    manualCleanup = 'a Darwin candidate identity remained live after bounded authenticated cleanup; '
-      + 'could not verify stable process absence; manual cleanup required';
-  } else if (darwinCandidates !== undefined && darwinCandidates.unverifiableRecords > 0) {
-    manualCleanup = `${darwinCandidates.unverifiableRecords} Darwin recovery record(s) are permanently unverifiable `
-      + '(legacy, token-only, malformed, incomplete, or worker-writable candidate inventory); '
-      + 'could not verify stable process absence; manual cleanup required';
-  } else if (platform === 'linux' && !settled) {
+  if (platform === 'linux' && !settled) {
     manualCleanup = 'the persisted Linux scan had incomplete process visibility or no trusted containment proof; '
       + 'could not verify stable process absence; manual verification and cleanup required';
   }

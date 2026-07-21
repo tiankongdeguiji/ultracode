@@ -1,28 +1,12 @@
-/** Deterministic persisted worker recovery across Darwin and Linux visibility limits. */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+/** Deterministic bounded Darwin groups and unchanged Linux recovery visibility. */
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type {
-  AgentEvent,
-  AgentRequest,
-  AgentSpec,
-  BackendAdapter,
-  SpawnPlan,
-} from '../../src/backends/types.js';
-import { ZERO_USAGE } from '../../src/backends/types.js';
-import { AgentCallExecutor } from '../../src/engine/agentcall.js';
 import type { ProcessInspectionOptions } from '../../src/exec/procinfo.js';
 import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { stopRun } from '../../src/exec/stop.js';
-import {
-  MAX_WORKER_CANDIDATE_RECORD_BYTES,
-  parseWorkerCandidateInventory,
-  serializeWorkerCandidateInventory,
-  workerCandidateRecordPath,
-  workerRecordDir,
-  workerRecordPath,
-} from '../../src/exec/worker-record.js';
+import { workerRecordDir, workerRecordPath } from '../../src/exec/worker-record.js';
 import { newRunId } from '../../src/store/layout.js';
 import { writeManifest } from '../../src/store/manifest.js';
 import { createRunDir, getRun } from '../../src/store/runstore.js';
@@ -30,39 +14,7 @@ import { createRunDir, getRun } from '../../src/store/runstore.js';
 const TOKEN = 'b'.repeat(32);
 const DARWIN_START = 'darwin:Mon_Jul_20_12:00:00_2026';
 const LEADER = { pid: 20_101, pgrp: 20_101, starttime: DARWIN_START };
-const DESCENDANT = { pid: 20_202, pgrp: 20_202, starttime: DARWIN_START };
-const SECOND_DESCENDANT = { pid: 20_303, pgrp: 20_303, starttime: DARWIN_START };
 const roots: string[] = [];
-const SIGNAL = new AbortController().signal;
-
-class ImmediateAdapter implements BackendAdapter {
-  readonly id = 'mock' as const;
-  readonly structuredOutput = 'emulated' as const;
-
-  probe() {
-    return Promise.resolve({ available: true });
-  }
-
-  buildSpawn(_req: AgentRequest): SpawnPlan {
-    return { bin: process.execPath, argv: ['-e', ''], env: {} };
-  }
-
-  buildResume(): SpawnPlan | null {
-    return null;
-  }
-
-  createParser() {
-    return { push: (_line: string): AgentEvent[] => [], end: (): AgentEvent[] => [] };
-  }
-
-  classifyExit() {
-    return { ok: true as const, retryable: false, message: 'ok' };
-  }
-
-  extractUsage() {
-    return ZERO_USAGE;
-  }
-}
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -89,389 +41,155 @@ function stoppedRun(name: string): { directory: string; root: string; runId: str
   return { directory, root, runId };
 }
 
-function writeRecoveryRecord(
-  directory: string,
-  body: string,
-  candidates?: readonly { pid: number; pgrp: number; starttime: string }[],
-  complete = true,
-): void {
-  const path = workerRecordPath(directory, 0, 1);
-  writeFileSync(path, body);
-  if (candidates !== undefined) {
-    writeFileSync(
-      workerCandidateRecordPath(path),
-      serializeWorkerCandidateInventory(TOKEN, candidates, complete),
-    );
-  }
+function writeLeaderRecord(directory: string): void {
+  writeFileSync(
+    workerRecordPath(directory, 0, 1),
+    `${LEADER.pid} ${LEADER.starttime} ${TOKEN}`,
+  );
 }
 
-describe('persisted stop recovery', () => {
-  it('allows one delayed Darwin proof after global discovery consumes the KILL grace', async () => {
+describe('Darwin live cleanup', () => {
+  it('signals only the detached process group and proves stable absence', async () => {
+    let groupLive = true;
     let clock = 0;
-    let observations = 0;
-    const waits: number[] = [];
+    const signals: Array<[number, NodeJS.Signals]> = [];
     const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
       cwd: process.cwd(),
       env: {},
       processInspection: {
         platform: 'darwin',
-        discoverWorkerProcesses: (_tokens, _scope, candidates) => {
-          if (candidates !== undefined) return { processes: [], complete: true };
-          observations++;
-          clock += 50;
-          return { processes: [], complete: true };
-        },
-        readIdentitySnapshot: () => ({ identities: new Map(), complete: true }),
-        signalProcess: (_pid, signal) => {
-          if (signal !== 0) return;
-          if (observations >= 2) {
-            throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+        discoverWorkerProcesses: () => { throw new Error('live Darwin cleanup must not discover processes'); },
+        signalProcess: (target, signal) => {
+          if (signal === 0) {
+            if (!groupLive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+            return;
           }
-          throw Object.assign(new Error('inspection unavailable'), { code: 'EIO' });
+          signals.push([target, signal]);
+          groupLive = false;
         },
         observationNow: () => clock,
-        observationWait: async (delayMs) => {
-          waits.push(delayMs);
-          clock += delayMs;
-        },
+        observationWait: async (delayMs) => { clock += delayMs; },
       },
     });
-    await new Promise<void>((resolvePromise) => spawned.child.once('exit', () => resolvePromise()));
+    await new Promise<void>((resolve) => spawned.child.once('exit', () => resolve()));
 
     await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
 
-    expect(observations).toBe(3);
-    expect(waits).toEqual([1]);
+    expect(signals).toEqual([[-spawned.child.pid!, 'SIGTERM']]);
   });
 
-  it('keeps zero-grace Darwin cleanup fail-closed without a proof wait', async () => {
-    let clock = 0;
-    let observations = 0;
-    let zeroGrace = true;
+  it('fails closed when group state is unknown', async () => {
+    let nonzeroSignals = 0;
     const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
       cwd: process.cwd(),
       env: {},
       processInspection: {
         platform: 'darwin',
-        discoverWorkerProcesses: (_tokens, _scope, candidates) => {
-          if (candidates !== undefined) return { processes: [], complete: true };
-          observations++;
-          return { processes: [], complete: true };
-        },
-        readIdentitySnapshot: () => ({ identities: new Map(), complete: true }),
-        signalProcess: (_pid, signal) => {
-          if (signal === 0) {
-            throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
-          }
-        },
-        observationNow: () => clock,
-        observationWait: async (delayMs) => {
-          if (zeroGrace) throw new Error('zero-grace cleanup must not wait');
-          clock += delayMs;
+        signalProcess: (_target, signal) => {
+          if (signal === 0) throw Object.assign(new Error('unknown'), { code: 'EIO' });
+          nonzeroSignals += 1;
         },
       },
     });
-    await new Promise<void>((resolvePromise) => spawned.child.once('exit', () => resolvePromise()));
-
-    try {
-      await expect(spawned.cleanupEscaped(0)).resolves.toBeGreaterThan(0);
-      expect(observations).toBe(2);
-    } finally {
-      zeroGrace = false;
-      await spawned.cleanupEscaped(1);
-    }
-  });
-
-  it('keeps a point-in-time Darwin inventory unsealed when live cleanup does not settle', async () => {
-    const workerScope = mkdtempSync(join(tmpdir(), 'uc-darwin-hook-'));
-    roots.push(workerScope);
-    const candidate = { pid: 30_303, pgrp: 30_303, starttime: DARWIN_START };
-    let discoveries = 0;
-    const inspection: ProcessInspectionOptions = {
-      platform: 'darwin',
-      discoverWorkerProcesses: (tokens) => {
-        discoveries++;
-        if (discoveries > 1) throw new Error('inspection failed after durable hook');
-        return {
-          complete: true,
-          processes: [{ ...candidate, token: tokens[0]! }],
-        };
-      },
-      readIdentitySnapshot: (pids) => ({
-        complete: true,
-        identities: new Map(pids.map((pid) => [pid, {
-          pgrp: pid,
-          starttime: DARWIN_START,
-        }])),
-      }),
-      signalProcess: (_pid, signal) => {
-        if (signal === 0) throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
-      },
-    };
-    const spec: AgentSpec = {
-      seq: 0,
-      prompt: 'persist inventory',
-      label: 'inventory',
-      backend: 'mock',
-      cwd: workerScope,
-      retries: 0,
-    };
-
-    await expect(new AgentCallExecutor(new ImmediateAdapter(), {
-      workerScope,
-      processInspection: inspection,
-    }).execute(spec, SIGNAL)).rejects.toThrow(/inspection failed/u);
-
-    const processPath = workerRecordPath(workerScope, 0, 1);
-    const token = readFileSync(processPath, 'utf8').trim().split(/\s+/u)[2]!;
-    const inventory = parseWorkerCandidateInventory(
-      readFileSync(workerCandidateRecordPath(processPath), 'utf8'),
-      token,
-    );
-    expect(inventory).toEqual({ complete: false, processes: [candidate] });
-  });
-
-  it('signals a Darwin worker before retrying failed inventory persistence', async () => {
-    const workerScope = mkdtempSync(join(tmpdir(), 'uc-darwin-persist-failure-'));
-    roots.push(workerScope);
-    let persistenceAttempts = 0;
-    const spawned = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 60_000)'], {
-      cwd: workerScope,
-      workerScope,
-      processInspection: {
-        platform: 'darwin',
-        discoverWorkerProcesses: () => ({ processes: [], complete: true }),
-      },
-      onWorkerCandidates: () => {
-        persistenceAttempts += 1;
-        if (persistenceAttempts === 1) throw new Error('inventory path is not writable');
-      },
-    });
-    try {
-      const exited = new Promise<void>((resolve) => spawned.child.once('exit', () => resolve()));
-      expect(() => spawned.killTree('SIGTERM')).not.toThrow();
-      await exited;
-      await expect(spawned.cleanupEscaped(100)).resolves.toBe(0);
-      expect(persistenceAttempts).toBeGreaterThan(1);
-    } finally {
-      spawned.killTree('SIGKILL');
-    }
-  });
-
-  it('re-authenticates live Darwin candidates individually before signaling', async () => {
-    const workerScope = mkdtempSync(join(tmpdir(), 'uc-darwin-live-reauth-'));
-    roots.push(workerScope);
-    const marked = new Set([DESCENDANT.pid, SECOND_DESCENDANT.pid]);
-    const candidatesByPid = new Map([
-      [DESCENDANT.pid, DESCENDANT],
-      [SECOND_DESCENDANT.pid, SECOND_DESCENDANT],
-    ]);
-    const signals: number[] = [];
-    const inventories: boolean[] = [];
-    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
-      cwd: workerScope,
-      env: {},
-      workerScope,
-      onWorkerCandidates: (_token, _candidates, complete) => inventories.push(complete),
-      processInspection: {
-        platform: 'darwin',
-        discoverWorkerProcesses: (tokens, _scope, candidates) => ({
-          complete: true,
-          processes: (candidates ?? [...candidatesByPid.keys()])
-            .filter((pid) => marked.has(pid))
-            .map((pid) => ({ ...candidatesByPid.get(pid)!, token: tokens[0]! })),
-        }),
-        // Public lstart identity cannot distinguish the same-second replacement.
-        readIdentitySnapshot: (pids) => ({
-          complete: true,
-          identities: new Map(pids.flatMap((pid) => {
-            const candidate = candidatesByPid.get(pid);
-            return candidate === undefined ? [] : [[pid, candidate] as const];
-          })),
-        }),
-        signalProcess: (pid, signal) => {
-          if (signal === 0) throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
-          signals.push(pid);
-          marked.clear();
-        },
-      },
-    });
-    await new Promise<void>((resolvePromise) => spawned.child.once('exit', () => resolvePromise()));
+    await new Promise<void>((resolve) => spawned.child.once('exit', () => resolve()));
 
     await expect(spawned.cleanupEscaped(0)).resolves.toBeGreaterThan(0);
-
-    expect(signals).toEqual([-DESCENDANT.pid]);
-    expect(inventories.length).toBeGreaterThan(0);
-    expect(inventories.every((complete) => !complete)).toBe(true);
+    expect(nonzeroSignals).toBe(0);
   });
 
-  it('re-authenticates a same-second Darwin PID/PGID replacement immediately before signaling', async () => {
-    const run = stoppedRun('darwin-reuse');
-    writeRecoveryRecord(
-      run.directory,
-      `${LEADER.pid} ${LEADER.starttime} ${TOKEN}`,
-      [LEADER],
-    );
-    let discoveries = 0;
+  it('never signals a numeric PGID after observing it absent', async () => {
+    let signals = 0;
     let clock = 0;
-    const signals: Array<[number, NodeJS.Signals | 0]> = [];
+    let probes = 0;
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      processInspection: {
+        platform: 'darwin',
+        signalProcess: (_target, signal) => {
+          if (signal === 0) {
+            probes += 1;
+            if (probes === 1) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+            return;
+          }
+          signals += 1;
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    });
+    await new Promise<void>((resolve) => spawned.child.once('exit', () => resolve()));
+
+    await expect(spawned.cleanupEscaped(50)).resolves.toBeGreaterThan(0);
+    expect(probes).toBeGreaterThan(1);
+    expect(signals).toBe(0);
+  });
+});
+
+describe('persisted Darwin recovery', () => {
+  it('inspects and signals only recorded worker leader PIDs', async () => {
+    const run = stoppedRun('darwin-leader');
+    writeLeaderRecord(run.directory);
+    let live = true;
+    let clock = 0;
+    const candidates: Array<readonly number[] | undefined> = [];
+    const signals: number[] = [];
     const inspection: ProcessInspectionOptions = {
       platform: 'darwin',
-      discoverWorkerProcesses: (tokens, _scope, candidates) => {
-        if (candidates?.length === 0) return { complete: true, processes: [] };
-        discoveries++;
-        expect(candidates).toEqual([LEADER.pid]);
-        return discoveries === 1
-          ? {
-              complete: true,
-              processes: [{ ...LEADER, token: tokens[0]! }],
-            }
-          : { complete: true, processes: [] };
+      discoverWorkerProcesses: (tokens, _scope, candidatePids) => {
+        candidates.push(candidatePids);
+        return {
+          complete: true,
+          processes: live ? [{ ...LEADER, token: tokens[0]! }] : [],
+        };
       },
-      // Darwin lstart has one-second resolution, so the unmarked replacement
-      // is deliberately indistinguishable by public PID/PGID/start identity.
-      readIdentitySnapshot: () => ({
-        complete: true,
-        identities: new Map([[LEADER.pid, LEADER]]),
-      }),
-      signalProcess: (pid, signal) => { signals.push([pid, signal]); },
+      signalProcess: (target, signal) => {
+        if (signal === 0) {
+          if (!live) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+          return;
+        }
+        signals.push(target);
+        live = false;
+      },
       observationNow: () => clock,
       observationWait: async (delayMs) => { clock += delayMs; },
     };
 
     const result = await stopRun(run.root, run.runId, inspection);
 
-    expect(signals).toEqual([]);
-    expect(result).toMatchObject({ ok: false, status: 'stopped' });
-    expect(result.message).toMatch(/remained live after bounded authenticated cleanup.*manual cleanup required/u);
+    expect(result).toMatchObject({ ok: true, status: 'stopped' });
+    expect(signals).toEqual([-LEADER.pid]);
+    expect(candidates.length).toBeGreaterThan(0);
+    expect(candidates.every((value) => value?.length === 1 && value[0] === LEADER.pid)).toBe(true);
   });
 
-  it('re-authenticates every Darwin candidate at its individual signal boundary', async () => {
-    const run = stoppedRun('darwin-batched-reuse');
-    writeRecoveryRecord(
-      run.directory,
-      `${LEADER.pid} ${LEADER.starttime} ${TOKEN}`,
-      [DESCENDANT, SECOND_DESCENDANT],
-    );
-    const marked = new Set([DESCENDANT.pid, SECOND_DESCENDANT.pid]);
-    const candidatesByPid = new Map([
-      [DESCENDANT.pid, DESCENDANT],
-      [SECOND_DESCENDANT.pid, SECOND_DESCENDANT],
-    ]);
-    const signals: number[] = [];
+  it('does not signal a reused recorded PID or PGID', async () => {
+    const run = stoppedRun('darwin-reused-leader');
+    writeLeaderRecord(run.directory);
     let clock = 0;
-
-    const result = await stopRun(run.root, run.runId, {
-      platform: 'darwin',
-      discoverWorkerProcesses: (tokens, _scope, candidates) => ({
-        complete: true,
-        processes: (candidates ?? [])
-          .filter((pid) => marked.has(pid))
-          .map((pid) => ({ ...candidatesByPid.get(pid)!, token: tokens[0]! })),
-      }),
-      // The second process is replaced within the same lstart second after the
-      // first signal, so only its missing lifecycle markers distinguish it.
-      readIdentitySnapshot: () => ({
-        complete: true,
-        identities: new Map([[SECOND_DESCENDANT.pid, SECOND_DESCENDANT]]),
-      }),
-      signalProcess: (pid) => {
-        signals.push(pid);
-        marked.clear();
-      },
-      observationNow: () => clock,
-      observationWait: async (delayMs) => { clock += delayMs; },
-    });
-
-    expect(signals).toEqual([-DESCENDANT.pid]);
-    expect(result).toMatchObject({ ok: false, status: 'stopped' });
-    expect(result.message).toMatch(/remained live after bounded authenticated cleanup/u);
-  });
-
-  it('treats a complete worker-writable Darwin inventory only as bounded signaling hints', async () => {
-    const run = stoppedRun('darwin-inventory');
-    writeRecoveryRecord(
-      run.directory,
-      `${LEADER.pid} ${LEADER.starttime} ${TOKEN}`,
-      [DESCENDANT],
-    );
-    const candidateSets: number[][] = [];
-    let clock = 0;
+    let signals = 0;
     const result = await stopRun(run.root, run.runId, {
       platform: 'darwin',
       discoverWorkerProcesses: (_tokens, _scope, candidates) => {
-        candidateSets.push([...(candidates ?? [])]);
+        expect(candidates).toEqual([LEADER.pid]);
         return { complete: true, processes: [] };
       },
-      readIdentitySnapshot: (pids) => ({
-        complete: true,
-        identities: new Map(pids.map((pid) => [pid, { pgrp: pid, starttime: 'replacement' }])),
-      }),
-      signalProcess: () => { throw new Error('verified-absent candidates must not be signaled'); },
-      observationNow: () => clock,
-      observationWait: async (delayMs) => { clock += delayMs; },
-    });
-
-    expect(result).toMatchObject({ ok: false, status: 'stopped' });
-    expect(result.message).toMatch(/worker-writable candidate inventory.*manual cleanup required/u);
-    expect(candidateSets.length).toBeGreaterThanOrEqual(2);
-    expect(candidateSets.some((pids) => pids.toSorted((left, right) => left - right)
-      .join(',') === `${LEADER.pid},${DESCENDANT.pid}`)).toBe(true);
-  });
-
-  it('reports legacy and token-only Darwin records as permanently manual', async () => {
-    const run = stoppedRun('darwin-manual');
-    writeRecoveryRecord(run.directory, `- - ${TOKEN}`);
-    const legacyDir = join(run.directory, 'agents', '0000-legacy');
-    mkdirSync(legacyDir, { recursive: true });
-    writeFileSync(join(legacyDir, 'pgid'), `2147483000 ${DARWIN_START}`);
-    let clock = 0;
-
-    const result = await stopRun(run.root, run.runId, {
-      platform: 'darwin',
-      discoverWorkerProcesses: (_tokens, _scope, candidates) => {
-        expect(candidates).toEqual([]);
-        return { complete: true, processes: [] };
+      signalProcess: (_target, signal) => {
+        if (signal !== 0) signals += 1;
       },
       observationNow: () => clock,
       observationWait: async (delayMs) => { clock += delayMs; },
     });
 
     expect(result).toMatchObject({ ok: false, status: 'stopped' });
-    expect(result.message).toContain('permanently unverifiable');
-    expect(result.message).toContain('manual cleanup required');
-    expect(result.message).not.toContain('retry required');
+    expect(signals).toBe(0);
   });
+});
 
-  it('rejects an oversized Darwin inventory without broadening recovery discovery', async () => {
-    const run = stoppedRun('darwin-oversized');
-    const path = workerRecordPath(run.directory, 0, 1);
-    writeFileSync(path, `${LEADER.pid} ${LEADER.starttime} ${TOKEN}`);
-    writeFileSync(
-      workerCandidateRecordPath(path),
-      'x'.repeat(MAX_WORKER_CANDIDATE_RECORD_BYTES + 1),
-    );
-    const candidateSets: Array<readonly number[] | undefined> = [];
-    let clock = 0;
-    const result = await stopRun(run.root, run.runId, {
-      platform: 'darwin',
-      discoverWorkerProcesses: (_tokens, _scope, candidates) => {
-        candidateSets.push(candidates);
-        return { complete: true, processes: [] };
-      },
-      readIdentitySnapshot: () => ({ complete: true, identities: new Map() }),
-      observationNow: () => clock,
-      observationWait: async (delayMs) => { clock += delayMs; },
-    });
-
-    expect(candidateSets.every((candidates) => (candidates?.length ?? 0) <= 1)).toBe(true);
-    expect(result).toMatchObject({ ok: false, status: 'stopped' });
-    expect(result.message).toMatch(/permanently unverifiable.*manual cleanup required/u);
-  });
-
-  it('reports inaccessible unrelated Linux processes as a visibility limitation, not a retry promise', async () => {
+describe('persisted Linux recovery', () => {
+  it('reports inaccessible unrelated processes as a visibility limitation, not a retry promise', async () => {
     const run = stoppedRun('linux-inaccessible');
-    writeRecoveryRecord(run.directory, `${LEADER.pid} 100 ${TOKEN}`);
+    writeLeaderRecord(run.directory);
     const inaccessiblePid = 303;
     const inaccessible = { pid: inaccessiblePid, pgrp: inaccessiblePid, starttime: '200' };
     let clock = 0;

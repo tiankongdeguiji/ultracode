@@ -16,7 +16,6 @@ import {
 import {
   readProcessIdentity,
   type ProcessInspectionOptions,
-  workerScopeValue,
 } from '../../src/exec/procinfo.js';
 
 const COMPLETE_EMPTY_PROCESS_DISCOVERY: ProcessInspectionOptions = {
@@ -198,83 +197,10 @@ describe('benchmark process boundary', () => {
     expect(result.stdout).toBe('😀');
   });
 
-  it('uses a complete Darwin inventory to reap a setsid descendant', async () => {
-    if (process.platform !== 'linux' && process.platform !== 'darwin') return;
-    const directory = mkdtempSync(join(tmpdir(), 'uc-bench-darwin-setsid-'));
-    const pidFile = join(directory, 'escaped.pid');
-    const scope = workerScopeValue(directory);
-    const started = 'Mon Jul 20 12:00:00 2026';
-    let token = '';
-    let escapedPid = 0;
-    const inventories: Array<{ candidates: readonly { pid: number }[]; complete: boolean }> = [];
-    const source = [
-      "const { spawn } = require('node:child_process')",
-      "const { writeFileSync } = require('node:fs')",
-      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], { detached: true, stdio: 'ignore', env: process.env })",
-      `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
-      'child.unref()',
-    ].join(';');
-    try {
-      const result = await runBenchProcess(process.execPath, ['-e', source], {
-        cwd: directory,
-        workerScope: directory,
-        terminationGraceMs: 1_000,
-        onLifecycleToken: (value) => { token = value; },
-        onLifecycleCandidates: (_token, candidates, complete) => {
-          inventories.push({ candidates, complete });
-        },
-        processInspection: {
-          platform: 'darwin',
-          executePs: (argv) => {
-            if (argv.join(' ') === '-ax -o pid=') {
-              try {
-                escapedPid = Number(readFileSync(pidFile, 'utf8'));
-              } catch {
-                return '';
-              }
-              return readProcessIdentity(escapedPid) === undefined ? '' : String(escapedPid);
-            }
-            if (argv.includes('command=')) {
-              try {
-                escapedPid = Number(readFileSync(pidFile, 'utf8'));
-              } catch {
-                return '';
-              }
-              if (readProcessIdentity(escapedPid) === undefined) return '';
-              const command = `${escapedPid} ${escapedPid} ${started} /usr/bin/node escaped.js`;
-              return argv.includes('-E')
-                ? `${command} ULTRACODE_WORKER_TOKEN=${token} ULTRACODE_WORKER_SCOPE=${scope}`
-                : command;
-            }
-            const requested = argv[argv.indexOf('-p') + 1]?.split(',').map(Number) ?? [];
-            return requested.flatMap((pid) => readProcessIdentity(pid) === undefined
-              ? []
-              : [`${pid} ${pid} ${started}`]).join('\n');
-          },
-          signalProcess: (pid, signal) => { process.kill(pid, signal); },
-        },
-      });
-      expect(result.exitCode).toBe(0);
-      expect(escapedPid).toBeGreaterThan(1);
-      expect(await waitForProcessGone(escapedPid)).toBe(true);
-      expect(inventories.some((inventory) =>
-        inventory.complete && inventory.candidates.some((candidate) => candidate.pid === escapedPid))).toBe(true);
-    } finally {
-      if (escapedPid > 1) {
-        try {
-          process.kill(-escapedPid, 'SIGKILL');
-        } catch {
-          /* already gone */
-        }
-      }
-    }
-  });
-
   it('completes Darwin cleanup only after a normal same-group helper is absent', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return;
     const directory = mkdtempSync(join(tmpdir(), 'uc-bench-darwin-group-'));
     const pidFile = join(directory, 'helper.pid');
-    const started = 'Mon Jul 20 12:00:00 2026';
     const source = [
       "const { spawn } = require('node:child_process')",
       "const { writeFileSync } = require('node:fs')",
@@ -288,14 +214,7 @@ describe('benchmark process boundary', () => {
         cwd: directory,
         workerScope: directory,
         terminationGraceMs: 1_000,
-        processInspection: {
-          platform: 'darwin',
-          executePs: (argv) => {
-            if (argv.includes('command=')) return '';
-            const pid = Number(argv[argv.indexOf('-p') + 1]);
-            return readProcessIdentity(pid) === undefined ? '' : `${pid} ${pid} ${started}`;
-          },
-        },
+        processInspection: { platform: 'darwin' },
       });
       helperPid = Number(readFileSync(pidFile, 'utf8'));
       expect(result.exitCode).toBe(0);
