@@ -19,6 +19,7 @@ import { createExecutorForBackend } from '../engine/agentcall.js';
 import { readProcStat } from '../exec/procinfo.js';
 import { chainedTimeout } from '../exec/timers.js';
 import { killWorkerGroupsUntilGone } from '../exec/stop.js';
+import { errorMessage } from '../engine/errors.js';
 import { Semaphore, defaultConcurrency, isPositiveInt } from '../engine/semaphore.js';
 import { BudgetAccount } from '../budget/account.js';
 import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
@@ -55,7 +56,10 @@ function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger', at
   };
 }
 
-export async function runnerMain(dir: string): Promise<number> {
+export async function runnerMain(
+  dir: string,
+  cleanupWorkers: (runDir: string) => Promise<number> = killWorkerGroupsUntilGone,
+): Promise<number> {
   const source = readFileSync(join(dir, 'script.js'), 'utf8');
   const args = readRunArgs(dir);
   const config = readRunConfig(dir);
@@ -99,24 +103,31 @@ export async function runnerMain(dir: string): Promise<number> {
         type: 'workflow_log',
         message: `hard stop: runner did not unwind ${HARD_STOP_GRACE_MS}ms after ${reason} — force-exiting`,
       });
+      let cleanupFailure: string | undefined;
       try {
-        const killedWorkers = await killWorkerGroupsUntilGone(dir);
+        const killedWorkers = await cleanupWorkers(dir);
         if (killedWorkers > 0) {
           events.write({
             type: 'workflow_log',
             message: `hard stop reaped ${killedWorkers} worker record(s)`,
           });
         }
-        writeManifest(dir, {
-          ...manifest,
-          status: 'stopped',
-          endedAt: new Date().toISOString(),
-          heartbeatAt: new Date().toISOString(),
-          error: reason,
+      } catch (error) {
+        cleanupFailure = errorMessage(error);
+        events.write({
+          type: 'workflow_log',
+          message: `hard stop worker cleanup incomplete: ${cleanupFailure}`,
         });
-      } catch {
-        /* best effort — the point is to not leave a live orphan */
       }
+      writeManifest(dir, {
+        ...manifest,
+        status: 'stopped',
+        endedAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+        error: cleanupFailure === undefined
+          ? reason
+          : `${reason}; worker cleanup incomplete: ${cleanupFailure}`,
+      });
       events.close();
       process.exit(1);
     }, HARD_STOP_GRACE_MS);

@@ -21,15 +21,16 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli/main.ts",
-    "test": "vitest run",
+    "test": "vitest run --no-file-parallelism test/unit/bench-process.test.ts test/unit/bench-process-linux-recovery.test.ts test/unit/process-cleanup.integration.test.ts test/unit/process-stop-recovery.test.ts test/unit/runner.integration.test.ts test/unit/retry-resume.integration.test.ts && vitest run --exclude test/unit/bench-process.test.ts --exclude test/unit/bench-process-linux-recovery.test.ts --exclude test/unit/process-cleanup.integration.test.ts --exclude test/unit/process-stop-recovery.test.ts --exclude test/unit/runner.integration.test.ts --exclude test/unit/retry-resume.integration.test.ts",
     "test:watch": "vitest",
-    "lint": "eslint src test",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src test bench/src",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm run bench:check",
     "build:plugins": "node scripts/build-plugins.mjs",
     "build:release": "node scripts/build-release.mjs",
     "release:oss": "node scripts/release-oss.mjs",
     "release:oss:dry": "node scripts/release-oss.mjs --dry-run",
-    "version": "node scripts/sync-version.mjs && git add src/version.ts package.json package-lock.json"
+    "version": "node scripts/sync-version.mjs && git add src/version.ts package.json package-lock.json",
+    "bench:check": "tsc -p bench/tsconfig.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.0",

@@ -5,17 +5,26 @@ import { join } from 'node:path';
 import { isTerminal, readManifest } from '../store/manifest.js';
 import { getRun, isRunnerAlive, reapOrphans } from '../store/runstore.js';
 import {
-  findWorkerProcessesForTokens,
+  darwinWorkerSignalingInspection,
+  discoverWorkerProcessesForTokens,
   isSafeProcessId,
   isWorkerToken,
-  readProcessIdentity,
+  readProcessIdentitySnapshot,
+  signalTrackedWorkerProcesses,
   signalWorkerProcessTokens,
   signalWorkerProcessTokensUntilGone,
+  type ProcessInspectionOptions,
+  type TrackedProcess,
 } from './procinfo.js';
 import {
+  DARWIN_START_IDENTITY_RE,
+  MAX_WORKER_CANDIDATE_RECORD_BYTES,
   MAX_WORKER_SEQUENCES,
+  parseWorkerCandidateInventory,
   WORKER_RECORD_FILE_NAMES,
+  workerCandidateRecordPath,
   workerRecordDir,
+  type WorkerCandidateInventory,
 } from './worker-record.js';
 
 // One initial attempt, five task retries, and two schema repairs are the
@@ -114,12 +123,12 @@ function collectWorkerRecordPaths(runDir: string): string[] {
   return records;
 }
 
-function readWorkerRecord(path: string): string | undefined {
+function readWorkerRecord(path: string, maxBytes = MAX_WORKER_RECORD_BYTES): string | undefined {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const stat = fstatSync(fd);
-    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_WORKER_RECORD_BYTES) return undefined;
+    if (!stat.isFile() || stat.size <= 0 || stat.size > maxBytes) return undefined;
     const buffer = Buffer.alloc(Number(stat.size));
     const bytes = readSync(fd, buffer, 0, buffer.length, 0);
     return buffer.toString('utf8', 0, bytes);
@@ -137,15 +146,28 @@ function readWorkerRecord(path: string): string | undefined {
 }
 
 interface RecoveryRecords {
-  groupRecords: Map<string, { path: string; pid: number; starttime: string; token: string }>;
+  groupRecords: Map<string, WorkerGroupRecord>;
   legacyGroupIds: Set<number>;
-  tokenRecords: Map<string, string>;
+  tokenRecords: Map<string, WorkerTokenRecord>;
+}
+
+interface WorkerGroupRecord {
+  path: string;
+  pid: number;
+  starttime: string;
+  token: string;
+}
+
+interface WorkerTokenRecord {
+  candidateInventory?: WorkerCandidateInventory;
+  path: string;
+  token: string;
 }
 
 function loadRecoveryRecords(runDir: string): RecoveryRecords {
-  const groupRecords = new Map<string, { path: string; pid: number; starttime: string; token: string }>();
+  const groupRecords = new Map<string, WorkerGroupRecord>();
   const legacyGroupIds = new Set<number>();
-  const tokenRecords = new Map<string, string>();
+  const tokenRecords = new Map<string, WorkerTokenRecord>();
   for (const path of collectWorkerRecordPaths(runDir)) {
     const raw = readWorkerRecord(path);
     if (raw === undefined) continue;
@@ -170,7 +192,20 @@ function loadRecoveryRecords(runDir: string): RecoveryRecords {
         token: workerToken,
       });
     }
-    if (isWorkerToken(workerToken) && !tokenRecords.has(workerToken)) tokenRecords.set(workerToken, path);
+    if (isWorkerToken(workerToken) && !tokenRecords.has(workerToken)) {
+      const candidateRaw = readWorkerRecord(
+        workerCandidateRecordPath(path),
+        MAX_WORKER_CANDIDATE_RECORD_BYTES,
+      );
+      const candidateInventory = candidateRaw === undefined
+        ? undefined
+        : parseWorkerCandidateInventory(candidateRaw, workerToken);
+      tokenRecords.set(workerToken, {
+        path,
+        token: workerToken,
+        ...(candidateInventory === undefined ? {} : { candidateInventory }),
+      });
+    }
   }
   return { groupRecords, legacyGroupIds, tokenRecords };
 }
@@ -190,15 +225,21 @@ function countLiveLegacyWorkerGroups(records: RecoveryRecords): number {
   return liveGroups.size;
 }
 
-function signalRecordedWorkerGroups(runDir: string, records: RecoveryRecords): Set<string> {
+function signalRecordedWorkerGroups(
+  runDir: string,
+  records: RecoveryRecords,
+  inspection: ProcessInspectionOptions = {},
+): Set<string> {
   const { groupRecords, tokenRecords } = records;
   const actedRecords = new Set<string>();
+  const platform = inspection.platform ?? process.platform;
   const verifiedLeaders = new Map(
-    findWorkerProcessesForTokens(
+    discoverWorkerProcessesForTokens(
       tokenRecords.keys(),
       runDir,
       [...groupRecords.values()].map((record) => record.pid),
-    ).map((proc) => [`${proc.pid}:${proc.starttime}:${proc.token}`, proc]),
+      inspection,
+    ).processes.map((proc) => [`${proc.pid}:${proc.starttime}:${proc.token}`, proc]),
   );
   for (const record of groupRecords.values()) {
     const live = verifiedLeaders.get(`${record.pid}:${record.starttime}:${record.token}`);
@@ -206,22 +247,15 @@ function signalRecordedWorkerGroups(runDir: string, records: RecoveryRecords): S
     // Signal the group only when the exact leader also carries this record's
     // lifecycle token and run scope in its initial environment.
     if (!live || live.pgrp !== record.pid) continue;
-    const immediate = findWorkerProcessesForTokens([record.token], runDir, [record.pid])[0];
-    if (
-      !immediate ||
-      immediate.pid !== record.pid ||
-      immediate.pgrp !== record.pid ||
-      immediate.starttime !== record.starttime
-    ) {
-      continue;
-    }
-    const finalIdentity = readProcessIdentity(record.pid);
-    if (!finalIdentity || finalIdentity.pgrp !== record.pid || finalIdentity.starttime !== record.starttime) continue;
-    try {
-      process.kill(-record.pid, 'SIGKILL');
+    const result = signalTrackedWorkerProcesses(
+      [live],
+      'SIGKILL',
+      platform === 'darwin'
+        ? darwinWorkerSignalingInspection([record.token], runDir, inspection)
+        : inspection,
+    );
+    if (result.processes > 0) {
       actedRecords.add(record.path);
-    } catch {
-      /* group already gone */
     }
   }
   return actedRecords;
@@ -229,12 +263,12 @@ function signalRecordedWorkerGroups(runDir: string, records: RecoveryRecords): S
 
 function recordSignaledTokens(
   actedRecords: Set<string>,
-  tokenRecords: Map<string, string>,
+  tokenRecords: Map<string, WorkerTokenRecord>,
   tokens: Iterable<string>,
 ): void {
   for (const token of tokens) {
-    const path = tokenRecords.get(token);
-    if (path) actedRecords.add(path);
+    const record = tokenRecords.get(token);
+    if (record) actedRecords.add(record.path);
   }
 }
 
@@ -250,7 +284,21 @@ export function killWorkerGroups(runDir: string): number {
   // The run scope is checked in each target process's immutable initial
   // environment. Copying another run's readable token into this untrusted
   // record store therefore cannot authorize signaling that run's workers.
-  const tokenResult = signalWorkerProcessTokens(records.tokenRecords.keys(), 'SIGKILL', runDir);
+  const platform = process.platform;
+  const darwinCandidates = platform === 'darwin'
+    ? darwinRecoveryCandidates(records)
+    : undefined;
+  const tokenResult = darwinCandidates === undefined
+    ? signalWorkerProcessTokens(records.tokenRecords.keys(), 'SIGKILL', runDir)
+    : signalTrackedWorkerProcesses(
+        discoverWorkerProcessesForTokens(
+          records.tokenRecords.keys(),
+          runDir,
+          darwinCandidates.pids,
+        ).processes,
+        'SIGKILL',
+        darwinWorkerSignalingInspection(records.tokenRecords.keys(), runDir),
+      );
   recordSignaledTokens(actedRecords, records.tokenRecords, tokenResult.tokens);
   return actedRecords.size;
 }
@@ -258,27 +306,136 @@ export function killWorkerGroups(runDir: string): number {
 interface WorkerCleanupReport {
   killedRecords: number;
   liveLegacyGroups: number;
+  manualCleanup?: string;
+  settled: boolean;
 }
 
-async function cleanupWorkerGroupsUntilGone(runDir: string, graceMs = 100): Promise<WorkerCleanupReport> {
+function darwinRecoveryCandidates(records: RecoveryRecords): {
+  complete: boolean;
+  identities: TrackedProcess[];
+  pids: number[];
+  unverifiableRecords: number;
+} {
+  const identities = new Map<string, TrackedProcess>();
+  const groupsByToken = new Map<string, WorkerGroupRecord>();
+  for (const record of records.groupRecords.values()) {
+    if (DARWIN_START_IDENTITY_RE.test(record.starttime) && !groupsByToken.has(record.token)) {
+      groupsByToken.set(record.token, record);
+    }
+  }
+  let unverifiableRecords = records.legacyGroupIds.size;
+  for (const record of records.tokenRecords.values()) {
+    const group = groupsByToken.get(record.token);
+    const inventory = record.candidateInventory;
+    if (group !== undefined) {
+      identities.set(`${group.pid}:${group.starttime}:${group.pid}`, {
+        pid: group.pid,
+        pgrp: group.pid,
+        starttime: group.starttime,
+      });
+    }
+    for (const candidate of inventory?.processes ?? []) {
+      identities.set(`${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`, candidate);
+    }
+    // Candidate sidecars are useful bounded hints, but they live in the same
+    // worker-writable store as the primary record. Their `complete` bit cannot
+    // prove that a compromised worker did not omit an escaped descendant.
+    unverifiableRecords++;
+  }
+  const processes = [...identities.values()];
+  return {
+    complete: unverifiableRecords === 0,
+    identities: processes,
+    pids: [...new Set(processes.map((candidate) => candidate.pid))],
+    unverifiableRecords,
+  };
+}
+
+function candidatesAbsent(
+  candidates: readonly TrackedProcess[],
+  inspection: ProcessInspectionOptions,
+): { absent: boolean; complete: boolean } {
+  if (candidates.length === 0) return { absent: true, complete: true };
+  const snapshot = readProcessIdentitySnapshot(
+    [...new Set(candidates.map((candidate) => candidate.pid))],
+    inspection,
+  );
+  return {
+    absent: snapshot.complete && candidates.every((candidate) => {
+      const live = snapshot.identities.get(candidate.pid);
+      return live === undefined
+        || live.starttime !== candidate.starttime
+        || live.pgrp !== candidate.pgrp;
+    }),
+    complete: snapshot.complete,
+  };
+}
+
+async function cleanupWorkerGroupsUntilGone(
+  runDir: string,
+  graceMs = 100,
+  inspection: ProcessInspectionOptions = {},
+): Promise<WorkerCleanupReport> {
   const records = loadRecoveryRecords(runDir);
-  const actedRecords = signalRecordedWorkerGroups(runDir, records);
+  const platform = inspection.platform ?? process.platform;
+  const actedRecords = signalRecordedWorkerGroups(runDir, records, inspection);
+  const darwinCandidates = platform === 'darwin'
+    ? darwinRecoveryCandidates(records)
+    : undefined;
+  const tokenInspection = darwinCandidates === undefined
+    ? inspection
+    : darwinWorkerSignalingInspection(records.tokenRecords.keys(), runDir, inspection);
   const tokenResult = await signalWorkerProcessTokensUntilGone(
     records.tokenRecords.keys(),
     'SIGKILL',
     runDir,
     graceMs,
+    tokenInspection,
+    darwinCandidates?.pids,
   );
   recordSignaledTokens(actedRecords, records.tokenRecords, tokenResult.tokens);
+  const darwinAbsence = darwinCandidates === undefined
+    ? undefined
+    : candidatesAbsent(darwinCandidates.identities, inspection);
+  const liveLegacyGroups = countLiveLegacyWorkerGroups(records);
+  const settled = tokenResult.settled
+    && (darwinCandidates?.complete ?? true)
+    && (darwinAbsence?.absent ?? true)
+    && liveLegacyGroups === 0;
+  let manualCleanup: string | undefined;
+  if (darwinAbsence !== undefined && !darwinAbsence.complete) {
+    manualCleanup = 'Darwin process identity visibility was incomplete; '
+      + 'could not verify stable process absence; manual cleanup required';
+  } else if (darwinAbsence !== undefined && !darwinAbsence.absent) {
+    manualCleanup = 'a Darwin candidate identity remained live after bounded authenticated cleanup; '
+      + 'could not verify stable process absence; manual cleanup required';
+  } else if (darwinCandidates !== undefined && darwinCandidates.unverifiableRecords > 0) {
+    manualCleanup = `${darwinCandidates.unverifiableRecords} Darwin recovery record(s) are permanently unverifiable `
+      + '(legacy, token-only, malformed, incomplete, or worker-writable candidate inventory); '
+      + 'could not verify stable process absence; manual cleanup required';
+  } else if (platform === 'linux' && !settled) {
+    manualCleanup = 'the persisted Linux scan had incomplete process visibility or no trusted containment proof; '
+      + 'could not verify stable process absence; manual verification and cleanup required';
+  }
   return {
     killedRecords: actedRecords.size,
-    liveLegacyGroups: countLiveLegacyWorkerGroups(records),
+    liveLegacyGroups,
+    ...(manualCleanup === undefined ? {} : { manualCleanup }),
+    settled,
   };
 }
 
-/** Kill workers, then asynchronously confirm stable token absence. */
-export async function killWorkerGroupsUntilGone(runDir: string, graceMs = 100): Promise<number> {
-  return (await cleanupWorkerGroupsUntilGone(runDir, graceMs)).killedRecords;
+/** Kill workers and throw unless complete observations confirm stable token absence. */
+export async function killWorkerGroupsUntilGone(
+  runDir: string,
+  graceMs = 100,
+  inspection: ProcessInspectionOptions = {},
+): Promise<number> {
+  const report = await cleanupWorkerGroupsUntilGone(runDir, graceMs, inspection);
+  if (!report.settled) {
+    throw new Error(report.manualCleanup ?? 'worker cleanup did not reach verified stable process absence');
+  }
+  return report.killedRecords;
 }
 
 export interface StopResult {
@@ -289,19 +446,41 @@ export interface StopResult {
 
 function cleanupStopResult(status: string, message: string, report: WorkerCleanupReport): StopResult {
   const killed = report.killedRecords ? ` (+${report.killedRecords} worker record(s))` : '';
-  if (report.liveLegacyGroups === 0) return { ok: true, status, message: `${message}${killed}` };
-  const legacy = `${report.liveLegacyGroups} unauthenticated legacy worker group(s) still active; manual cleanup required`;
-  return { ok: false, status, message: `${message}${killed}; ${legacy}` };
+  const manual = [
+    report.manualCleanup,
+    report.liveLegacyGroups === 0
+      ? undefined
+      : `${report.liveLegacyGroups} unauthenticated legacy worker group(s) still active; manual cleanup required`,
+  ].filter((reason): reason is string => reason !== undefined);
+  if (manual.length > 0) {
+    return {
+      ok: false,
+      status,
+      message: `${message}${killed}; ${manual.join('; ')}`,
+    };
+  }
+  if (!report.settled) {
+    return {
+      ok: false,
+      status,
+      message: `${message}${killed}; worker cleanup could not verify stable process absence; retry required`,
+    };
+  }
+  return { ok: true, status, message: `${message}${killed}` };
 }
 
-export async function stopRun(root: string, runId: string): Promise<StopResult> {
+export async function stopRun(
+  root: string,
+  runId: string,
+  inspection: ProcessInspectionOptions = {},
+): Promise<StopResult> {
   const run = getRun(root, runId);
   if (!run) return { ok: false, status: 'unknown', message: `no run ${runId} under ${root}` };
   if (isTerminal(run.effectiveStatus)) {
     // A hard-stop can finalize as `stopped` immediately before process.exit(),
     // and a backend can leave setsid() descendants after any terminal outcome.
     // Stale records are therefore actionable for every terminal status.
-    const cleanup = await cleanupWorkerGroupsUntilGone(run.dir);
+    const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
     return cleanupStopResult(run.effectiveStatus, `already ${run.effectiveStatus}`, cleanup);
   }
   const pid = run.manifest.pid;
@@ -309,7 +488,7 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   // matches is a recycled PID, not our runner — signaling it would hit an
   // unrelated process. Treat that as already-dead (and reap its workers).
   if (!isRunnerAlive(run.manifest)) {
-    const cleanup = await cleanupWorkerGroupsUntilGone(run.dir);
+    const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
     reapOrphans(root);
     return cleanupStopResult('orphaned', 'runner already dead; marked orphaned', cleanup);
   }
@@ -322,7 +501,7 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   while (Date.now() < deadline) {
     const m = readManifest(run.dir);
     if (m && isTerminal(m.status)) {
-      const cleanup = await cleanupWorkerGroupsUntilGone(run.dir);
+      const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
       return cleanupStopResult(m.status, m.status, cleanup);
     }
     await sleep(200);
@@ -334,7 +513,7 @@ export async function stopRun(root: string, runId: string): Promise<StopResult> 
   }
   // The runner was unresponsive → it never killed its detached agent groups;
   // do it here so workers don't keep running/mutating files after "stopped".
-  const cleanup = await cleanupWorkerGroupsUntilGone(run.dir);
+  const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
   reapOrphans(root);
   return cleanupStopResult('stopped', 'force-killed after 7s grace', cleanup);
 }

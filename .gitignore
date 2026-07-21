@@ -10,3 +10,7 @@ dist-codex/
 dist-qoder/
 # release artifact staging (npm run build:release)
 dist-release/
+# bench harness artifacts (bench/README.md; never commit)
+bench/.cache/
+bench/results/
+bench/bench.config.json
