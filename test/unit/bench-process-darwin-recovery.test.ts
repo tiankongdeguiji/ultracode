@@ -155,9 +155,12 @@ describe('Darwin benchmark lifecycle recovery', () => {
     const signals: number[] = [];
     await expect(store.recoverPendingLifecycleProcesses(directory, 1_000, {
       platform: 'darwin',
-      executePs: (argv) => argv.includes('command=')
-        ? ''
-        : `202 202 Tue Jul 21 12:00:00 2026`,
+      executePs: (argv) => {
+        if (argv.join(' ') === '-ax -o pid=') return '202';
+        return argv.includes('command=')
+          ? ''
+          : `202 202 Tue Jul 21 12:00:00 2026`;
+      },
       signalProcess: (pid, signal) => {
         if (signal === 0) throw noSuchProcess();
         signals.push(pid);

@@ -17,7 +17,7 @@ function processLine(pid: number, pgrp: number, command: string): string {
 }
 
 describe('Darwin worker process discovery', () => {
-  it('authenticates a complete host snapshot containing a setsid descendant', () => {
+  it('authenticates a fixed host inventory containing a setsid descendant', () => {
     const scope = workerScopeValue(process.cwd());
     const commands = [
       processLine(101, 101, '/usr/bin/node worker.js'),
@@ -30,9 +30,12 @@ describe('Darwin worker process discovery', () => {
       undefined,
       {
         platform: 'darwin',
-        executePs: (argv) => argv.includes('-E')
-          ? commands.split('\n').map((line) => `${line}${environment}`).join('\n')
-          : commands,
+        executePs: (argv) => {
+          if (argv.join(' ') === '-ax -o pid=') return '101\n202\n';
+          return argv.includes('-E')
+            ? commands.split('\n').map((line) => `${line}${environment}`).join('\n')
+            : commands;
+        },
       },
     );
     expect(discovery).toEqual({
@@ -41,6 +44,25 @@ describe('Darwin worker process discovery', () => {
         { pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN },
         { pid: 202, pgrp: 202, starttime: START_IDENTITY, token: TOKEN },
       ],
+    });
+  });
+
+  it('does not compare transient pids from separate host-wide ps processes', () => {
+    const scope = workerScopeValue(process.cwd());
+    const command = processLine(101, 101, '/usr/bin/node worker.js');
+    const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
+    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), undefined, {
+      platform: 'darwin',
+      executePs: (argv) => {
+        if (argv.join(' ') === '-ax -o pid=') return '1\n101\n999\n';
+        expect(argv.includes('-ax')).toBe(false);
+        expect(argv.at(-1)).toBe('101,999');
+        return argv.includes('-E') ? `${command}${marker}` : command;
+      },
+    });
+    expect(discovery).toEqual({
+      complete: true,
+      processes: [{ pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN }],
     });
   });
 
@@ -80,7 +102,7 @@ describe('Darwin worker process discovery', () => {
     expect(failed).toEqual({ processes: [], complete: false });
   });
 
-  it('falls back from a host-wide overflow to bounded pid batches', () => {
+  it('splits an overflowing host-inventory batch', () => {
     const scope = workerScopeValue(process.cwd());
     const commands = [
       processLine(101, 101, '/usr/bin/node worker.js'),
@@ -91,10 +113,10 @@ describe('Darwin worker process discovery', () => {
       platform: 'darwin',
       executePs: (argv) => {
         if (argv.join(' ') === '-ax -o pid=') return '101\n202\n';
-        if (argv.includes('-ax')) throw new Error('stdout maxBuffer length exceeded');
-        return argv.includes('-E')
-          ? commands.split('\n').map((line) => `${line}${marker}`).join('\n')
-          : commands;
+        const selected = argv.at(-1);
+        if (selected === '101,202') throw new Error('stdout maxBuffer length exceeded');
+        const command = selected === '101' ? commands.split('\n')[0]! : commands.split('\n')[1]!;
+        return argv.includes('-E') ? `${command}${marker}` : command;
       },
     });
     expect(discovery).toEqual({
@@ -106,7 +128,7 @@ describe('Darwin worker process discovery', () => {
     });
   });
 
-  it('ignores non-actionable system pids in a fallback inventory', () => {
+  it('ignores non-actionable system pids in a host inventory', () => {
     const scope = workerScopeValue(process.cwd());
     const command = processLine(101, 101, '/usr/bin/node worker.js');
     const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
@@ -114,7 +136,6 @@ describe('Darwin worker process discovery', () => {
       platform: 'darwin',
       executePs: (argv) => {
         if (argv.join(' ') === '-ax -o pid=') return '0\n1\n101\n';
-        if (argv.includes('-ax')) throw new Error('stdout maxBuffer length exceeded');
         expect(argv.at(-1)).toBe('101');
         return argv.includes('-E') ? `${command}${marker}` : command;
       },
@@ -126,25 +147,23 @@ describe('Darwin worker process discovery', () => {
   });
 
   it('fails closed when an authenticated host inventory exceeds its bound', () => {
-    const scope = workerScopeValue(process.cwd());
-    const commands = Array.from(
+    const pids = Array.from(
       { length: MAX_DARWIN_CANDIDATE_PROCESSES + 1 },
-      (_, index) => processLine(10_000 + index, 10_000 + index, `/bin/worker-${index}`),
+      (_, index) => String(10_000 + index),
     );
-    const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
     const discovery = discoverWorkerProcessesForTokens(
       [TOKEN],
       process.cwd(),
       undefined,
       {
         platform: 'darwin',
-        executePs: (argv) => argv.includes('-E')
-          ? commands.map((line) => `${line}${marker}`).join('\n')
-          : commands.join('\n'),
+        executePs: (argv) => {
+          expect(argv.join(' ')).toBe('-ax -o pid=');
+          return pids.join('\n');
+        },
       },
     );
-    expect(discovery.complete).toBe(false);
-    expect(discovery.processes).toHaveLength(MAX_DARWIN_CANDIDATE_PROCESSES);
+    expect(discovery).toEqual({ processes: [], complete: false });
   });
 
   it('splits bounded candidate batches but keeps an unsplittable ps overflow incomplete', () => {

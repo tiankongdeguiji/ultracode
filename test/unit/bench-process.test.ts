@@ -226,6 +226,14 @@ describe('benchmark process boundary', () => {
         processInspection: {
           platform: 'darwin',
           executePs: (argv) => {
+            if (argv.join(' ') === '-ax -o pid=') {
+              try {
+                escapedPid = Number(readFileSync(pidFile, 'utf8'));
+              } catch {
+                return '';
+              }
+              return readProcessIdentity(escapedPid) === undefined ? '' : String(escapedPid);
+            }
             if (argv.includes('command=')) {
               try {
                 escapedPid = Number(readFileSync(pidFile, 'utf8'));

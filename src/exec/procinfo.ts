@@ -436,14 +436,13 @@ function isPsOverflow(error: unknown): boolean {
 }
 
 function darwinProcessQuery(
-  batch: readonly number[] | undefined,
+  batch: readonly number[],
   includeEnvironment: boolean,
   options: ProcessInspectionOptions,
 ): DarwinProcessParse & { overflow: boolean } {
   try {
     const raw = executeDarwinPs([
       '-ww',
-      ...(batch === undefined ? ['-ax'] : []),
       ...(includeEnvironment ? ['-E'] : []),
       '-o',
       'pid=',
@@ -453,11 +452,12 @@ function darwinProcessQuery(
       'lstart=',
       '-o',
       'command=',
-      ...(batch === undefined ? [] : ['-p', batch.join(',')]),
+      '-p',
+      batch.join(','),
     ], options);
     return { ...parseDarwinProcesses(raw), overflow: false };
   } catch (error) {
-    if (batch !== undefined && isDarwinNoSelection(error)) {
+    if (isDarwinNoSelection(error)) {
       return { processes: new Map(), complete: true, overflow: false };
     }
     return { processes: new Map(), complete: false, overflow: isPsOverflow(error) };
@@ -534,15 +534,15 @@ export function discoverWorkerProcessesForTokens(
     if (scopeValue === undefined) return { processes: [], complete: false };
     if (candidates !== undefined && candidates.length === 0) return { processes: [], complete: true };
     const found: TrackedWorkerProcess[] = [];
-    const batches: Array<number[] | undefined> = [];
-    if (candidates === undefined) {
-      batches.push(undefined);
-    } else {
-      for (let offset = 0; offset < candidates.length; offset += DARWIN_PS_BATCH_SIZE) {
-        batches.push(candidates.slice(offset, offset + DARWIN_PS_BATCH_SIZE));
-      }
+    const inventory = candidates === undefined
+      ? darwinProcessIds(options)
+      : { pids: candidates, complete: true };
+    if (!inventory.complete) return { processes: [], complete: false };
+    const batches: number[][] = [];
+    for (let offset = 0; offset < inventory.pids.length; offset += DARWIN_PS_BATCH_SIZE) {
+      batches.push(inventory.pids.slice(offset, offset + DARWIN_PS_BATCH_SIZE));
     }
-    let queries = 0;
+    let queries = candidates === undefined ? 1 : 0;
     let complete = true;
     while (batches.length > 0) {
       if (queries + 2 > MAX_DARWIN_PS_QUERIES) {
@@ -556,31 +556,11 @@ export function discoverWorkerProcessesForTokens(
       queries++;
       if (!commands.complete || !commandsAndEnvironment.complete) {
         if (
-          batch === undefined
-          && (commands.overflow || commandsAndEnvironment.overflow)
-          && queries < MAX_DARWIN_PS_QUERIES
-        ) {
-          const inventory = darwinProcessIds(options);
-          queries++;
-          if (!inventory.complete) {
-            complete = false;
-            continue;
-          }
-          for (let offset = inventory.pids.length; offset > 0; offset -= DARWIN_PS_BATCH_SIZE) {
-            batches.unshift(inventory.pids.slice(
-              Math.max(0, offset - DARWIN_PS_BATCH_SIZE),
-              offset,
-            ));
-          }
-          continue;
-        }
-        if (
-          batch !== undefined
-          && batch.length > 1
+          batch.length > 1
           && (commands.overflow || commandsAndEnvironment.overflow)
         ) {
           const middle = Math.ceil(batch.length / 2);
-          batches.unshift(batch.slice(middle), batch.slice(0, middle));
+          batches.unshift(batch.slice(0, middle), batch.slice(middle));
         } else {
           complete = false;
         }
