@@ -204,6 +204,7 @@ describe('escaped worker descendant cleanup', () => {
     const launcher = spawnAgentProcess(process.execPath, ['-e', launcherSource], {
       cwd: process.cwd(),
       env: {},
+      workerScope: dir,
     });
     const closed = new Promise<void>((resolve) => launcher.child.once('close', () => resolve()));
     const helperPid = await waitForPid(pidFile);
