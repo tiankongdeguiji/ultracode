@@ -1,7 +1,7 @@
 /** Opt-in local-daemon parity for frozen SWE-bench Pro HostConfig policy. */
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -11,17 +11,21 @@ import {
   evaluatorContainerPolicy,
   loadSwebenchProContainerPolicy,
   sessionContainerPolicyArgv,
+  sessionTaskIdentity,
 } from '../../bench/src/suites/swebench-pro/container-policy.js';
 import {
   reclaimSessionOwnership,
   reclamationContainerName,
   reclamationDockerRunArgv,
+  sessionDockerCreateArgv,
+  swebenchProSessionAttachment,
 } from '../../bench/src/suites/swebench-pro/runner.js';
 import {
   SWEBENCH_PRO_MODEL_RELAY_CONTRACT_SHA256,
   SWEBENCH_PRO_NETWORK_POLICY,
   inspectSwebenchProSessionAttachment,
   inspectSwebenchProTransportBoundary,
+  swebenchProCurrentEndpointIds,
 } from '../../bench/src/suites/swebench-pro/model-transport.js';
 
 const enabled = process.env.UC_LIVE_TESTS === '1' && Boolean(process.env.UC_DOCKER_PARITY_IMAGE);
@@ -29,9 +33,10 @@ const image = process.env.UC_DOCKER_PARITY_IMAGE ?? '';
 const reclamationImage = process.env.UC_DOCKER_RECLAMATION_IMAGE ?? '';
 const reclamationEnabled = process.env.UC_LIVE_TESTS === '1' && reclamationImage !== '';
 const relayImage = process.env.UC_DOCKER_RELAY_PARITY_IMAGE ?? '';
-const relayEnabled = process.env.UC_LIVE_TESTS === '1' && relayImage !== '';
+const sessionImage = process.env.UC_DOCKER_SESSION_PARITY_IMAGE ?? '';
+const relayEnabled = process.env.UC_LIVE_TESTS === '1' && relayImage !== '' && sessionImage !== '';
 const policy = loadSwebenchProContainerPolicy(createBenchPathRoots(join(process.cwd(), 'bench')));
-const resources = { cpus: 0.5, memoryBytes: 64 * 1_024 * 1_024, keepImages: false };
+const resources = { cpus: 0.5, memoryBytes: 64 * 1_024 * 1_024 };
 
 function docker(argv: readonly string[]): string {
   return execFileSync('docker', [...argv], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -44,7 +49,7 @@ describe.runIf(enabled)('live SWE-bench Pro Docker policy parity', () => {
       {
         name: `uc-pro-session-parity-${randomUUID()}`,
         argv: sessionContainerPolicyArgv(policy, resources),
-        expectedCaps: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'],
+        expectedCaps: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'],
       },
       {
         name: `uc-pro-evaluator-parity-${randomUUID()}`,
@@ -70,13 +75,6 @@ describe.runIf(enabled)('live SWE-bench Pro Docker policy parity', () => {
           NanoCpus: 500_000_000,
           Memory: resources.memoryBytes,
         });
-        if (entry.expectedCaps.includes('SETPCAP')) {
-          expect(docker([
-            'run', '--rm', ...entry.argv, '--entrypoint', 'setpriv', image,
-            '--reuid', '65534', '--regid', '65534', '--clear-groups',
-            '--bounding-set=-all', '--inh-caps=-all', '--ambient-caps=-all', '--', '/bin/true',
-          ])).toBe('');
-        }
       } finally {
         try { docker(['rm', '-f', entry.name]); } catch { /* exact test-owned name may not exist */ }
       }
@@ -156,7 +154,39 @@ describe.runIf(relayEnabled)('live SWE-bench Pro restricted model-transport topo
     let relayId = '';
     let sessionId = '';
     const runtimeNonce = 'f'.repeat(64);
+    const sessionRoot = mkdtempSync(join(tmpdir(), 'uc-pro-relay-live-'));
+    const taskDirectory = join(sessionRoot, 'task');
+    const runtimeHome = join(sessionRoot, 'runtime-home');
+    const runtimeCodex = join(sessionRoot, 'runtime-codex');
+    const envFile = join(sessionRoot, 'session.env');
+    const artifactOwner = {
+      uid: typeof process.getuid === 'function' ? process.getuid() : 0,
+      gid: typeof process.getgid === 'function' ? process.getgid() : 0,
+    };
+    const taskIdentity = sessionTaskIdentity(artifactOwner);
     try {
+      mkdirSync(join(taskDirectory, 'codex-home', 'sessions'), { recursive: true });
+      mkdirSync(join(taskDirectory, 'uc'));
+      mkdirSync(runtimeHome);
+      mkdirSync(runtimeCodex);
+      writeFileSync(join(taskDirectory, 'prompt.txt'), 'Parity test; exit without changes.\n');
+      writeFileSync(envFile, [
+        'BENCH_ARM=a',
+        'BENCH_TIMEOUT_SECS=60',
+        `BENCH_MODEL=${model}`,
+        'BENCH_EFFORT=low',
+        `BENCH_TASK_UID=${taskIdentity.uid}`,
+        `BENCH_TASK_GID=${taskIdentity.gid}`,
+        `BENCH_ARTIFACT_OWNER=${artifactOwner.uid}:${artifactOwner.gid}`,
+        `BENCH_RUNTIME_NONCE=${runtimeNonce}`,
+        'BENCH_SANITIZE=1',
+        'BENCH_REPO_DIR=/app',
+        'CODEX_HOME=/runtime/codex-home',
+        'ULTRACODE_HOME=/bench/uc',
+        'HOME=/runtime/home',
+        'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        `BENCH_MODEL_RELAY_BASE_URL=${bindings.relayBaseUrl}`,
+      ].join('\n') + '\n', { mode: 0o600 });
       docker(['image', 'inspect', relayImage]);
       docker([
         'network', 'create', '--internal', '--driver', 'bridge',
@@ -180,35 +210,44 @@ describe.runIf(relayEnabled)('live SWE-bench Pro restricted model-transport topo
         model,
         bindings,
       );
-      const imageId = JSON.parse(docker(['image', 'inspect', relayImage]))[0].Id as string;
-      sessionId = docker([
-        'run', '-d', '--no-healthcheck', '--name', sessionName, '--network', networkName,
-        '--label', 'ultracode.benchmark.schema=2',
-        '--label', 'ultracode.benchmark.suite=swebench-pro',
-        '--label', 'ultracode.benchmark.run=local-parity',
-        '--label', 'ultracode.benchmark.task=task-one',
-        '--label', 'ultracode.benchmark.arm=a',
-        '--label', 'ultracode.benchmark.purpose=session',
-        '--label', 'ultracode.benchmark.ownership=1',
-        '--label', `ultracode.benchmark.runtime=${runtimeNonce}`,
-        '--env', 'HOME=/tmp', '--env', `BENCH_MODEL_RELAY_BASE_URL=${bindings.relayBaseUrl}`,
-        '--env', `BENCH_RUNTIME_NONCE=${runtimeNonce}`,
-        '--env', 'BASH_ENV=', '--env', 'ENV=', '--env', 'LD_PRELOAD=', '--env', 'LD_AUDIT=',
-        '--entrypoint', 'sh', imageId, '-c', 'while :; do sleep 60; done',
-      ]);
-      inspectSwebenchProSessionAttachment(docker(['inspect', sessionName]), {
-        id: sessionId,
+      const imageId = JSON.parse(docker(['image', 'inspect', sessionImage]))[0].Id as string;
+      const sessionOptions = {
         name: sessionName,
         runId: 'local-parity',
         taskId: 'task-one',
-        arm: 'a',
+        arm: 'a' as const,
         runtimeNonce,
-        imageName: imageId,
+        envFile,
+        taskDirectory,
+        runtimeHome,
+        runtimeCodex,
+        restrictedNetwork: networkName,
+        artifactOwner,
         imageId,
-      }, bindings);
+        docker: resources,
+        policy,
+      };
+      sessionId = docker(sessionDockerCreateArgv(sessionOptions));
+      inspectSwebenchProSessionAttachment(
+        docker(['inspect', sessionId]),
+        swebenchProSessionAttachment(sessionId, sessionOptions, false),
+        bindings,
+      );
+      docker(['start', sessionId]);
+      inspectSwebenchProSessionAttachment(
+        docker(['inspect', sessionId]),
+        swebenchProSessionAttachment(sessionId, sessionOptions, true),
+        bindings,
+      );
+      const runningNetwork = docker(['network', 'inspect', networkName]);
       expect(inspectSwebenchProTransportBoundary(
-        docker(['network', 'inspect', networkName]),
-        docker(['inspect', relayName]),
+        runningNetwork,
+        docker(['inspect', ...swebenchProCurrentEndpointIds(
+          runningNetwork,
+          bindings,
+          new Map([[sessionName, sessionId]]),
+          new Set([sessionName]),
+        )]),
         config,
         model,
         bindings,
@@ -216,9 +255,15 @@ describe.runIf(relayEnabled)('live SWE-bench Pro restricted model-transport topo
         new Set([sessionName]),
       )).toEqual(preflight);
       docker(['stop', '--time', '1', sessionName]);
+      const stoppedNetwork = docker(['network', 'inspect', networkName]);
       expect(inspectSwebenchProTransportBoundary(
-        docker(['network', 'inspect', networkName]),
-        docker(['inspect', relayName]),
+        stoppedNetwork,
+        docker(['inspect', ...swebenchProCurrentEndpointIds(
+          stoppedNetwork,
+          bindings,
+          new Map([[sessionName, sessionId]]),
+          new Set(),
+        )]),
         config,
         model,
         bindings,
@@ -229,6 +274,7 @@ describe.runIf(relayEnabled)('live SWE-bench Pro restricted model-transport topo
       if (sessionId) try { docker(['rm', '-f', sessionId]); } catch { /* exact test-owned id may not exist */ }
       if (relayId) try { docker(['rm', '-f', relayId]); } catch { /* exact test-owned id may not exist */ }
       try { docker(['network', 'rm', networkName]); } catch { /* exact test-owned network may not exist */ }
+      rmSync(sessionRoot, { recursive: true, force: true });
     }
   });
 });

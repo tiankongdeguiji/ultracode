@@ -139,7 +139,6 @@ export async function prepareTaskImage(
     .update(`${runId}\0${resolvedDigest}\0${options.toolchainPayloadSha256}\0${instance.instanceId}`, 'utf8')
     .digest('hex');
   const overlayName = `ultracode-swebench-pro:${overlayKey.slice(0, 48)}`;
-  let built = false;
   try {
     await docker([
       'build',
@@ -153,7 +152,6 @@ export async function prepareTaskImage(
       '-t', overlayName,
       options.toolchainDirectory,
     ], IMAGE_TRANSFER_TIMEOUT_MS);
-    built = true;
     const overlay = identity(await inspect(overlayName, docker), overlayName);
     return {
       requested,
@@ -165,7 +163,6 @@ export async function prepareTaskImage(
       overlayPlatform: overlay.platform,
     };
   } catch (error) {
-    if (!built) throw error;
     try {
       await removeTaskImageTargets([overlayName], docker);
     } catch (cleanupError) {

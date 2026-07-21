@@ -89,13 +89,14 @@ describe('SWE-bench Pro task identity', () => {
     const dockerfile = readFileSync(join(process.cwd(), 'bench/suites/swebench-pro/Dockerfile'), 'utf8');
     expect(entrypoint).toContain('TASK_UID=$BENCH_TASK_UID');
     expect(entrypoint).toContain('TASK_GID=$BENCH_TASK_GID');
-    expect(entrypoint).toContain('[ "$BENCH_TASK_UID" = 0 ]');
+    expect(entrypoint).toContain('valid_nonzero_id "${BENCH_TASK_UID:-}"');
     expect(entrypoint).toContain('[ "$BENCH_TASK_UID" = "$ARTIFACT_UID" ]');
     expect(entrypoint).toContain('[ "$REPO_DIR" = /app ]');
-    expect(entrypoint).toContain('chown -R "$BENCH_ARTIFACT_OWNER" "$BENCH" "$HOME" "$CODEX_HOME"');
     expect(entrypoint).toContain(
-      'chown -R "$TASK_UID:$TASK_GID" "$REPO_DIR" "$BENCH" "$HOME" "$CODEX_HOME"',
+      'trusted_busybox chown -R "$TASK_UID:$TASK_GID"',
     );
+    expect(entrypoint).toContain('as_task "$CODEX" --version');
+    expect(entrypoint).not.toContain('/bin/bash');
     expect(entrypoint).not.toContain('BENCH_CHOWN');
     expect(dockerfile.match(/^COPY .*$/gm)?.every((line) =>
       line.includes('--chown=0:0') && line.includes('--chmod=0555'))).toBe(true);

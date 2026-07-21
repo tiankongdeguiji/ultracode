@@ -131,24 +131,13 @@ function compareOrdinal(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function byInstanceId(
-  left: Record<string, unknown>,
-  right: Record<string, unknown>,
-): number {
-  const leftId = instanceFromRow(left).instanceId;
-  const rightId = instanceFromRow(right).instanceId;
-  return compareOrdinal(leftId, rightId);
-}
-
 /** Build the only hashable dataset representation, with codepoint-sorted full rows. */
 export function canonicalDatasetDescriptor(
   rows: readonly Record<string, unknown>[],
 ): SwebenchProDatasetSnapshot {
-  const sorted = rows.map((row) => {
-    instanceFromRow(row);
-    return structuredClone(row);
-  }).sort(byInstanceId);
-  const taskIds = sorted.map((row) => instanceFromRow(row).instanceId);
+  const normalized = rows.map(instanceFromRow).sort((left, right) =>
+    compareOrdinal(left.instanceId, right.instanceId));
+  const taskIds = normalized.map((instance) => instance.instanceId);
   if (new Set(taskIds).size !== taskIds.length) {
     throw new Error('SWE-bench Pro dataset descriptor contains duplicate task IDs');
   }
@@ -158,7 +147,7 @@ export function canonicalDatasetDescriptor(
     dataset: SWE_BENCH_PRO_DATASET,
     config: SWE_BENCH_PRO_CONFIG,
     split: SWE_BENCH_PRO_SPLIT,
-    rows: sorted,
+    rows: normalized.map((instance) => instance.row),
   }) as SwebenchProDatasetSnapshot;
 }
 

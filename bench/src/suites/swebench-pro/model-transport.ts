@@ -173,6 +173,10 @@ interface DockerSessionInspection {
   NetworkSettings?: { Networks?: unknown };
 }
 
+interface DockerNetworkEndpointSnapshot {
+  Containers?: unknown;
+}
+
 export interface SwebenchProSessionContainerPolicy {
   user: string;
   entrypoint: readonly string[];
@@ -391,6 +395,47 @@ export function inspectSwebenchProTransportBoundary(
       allowedSessions,
       requiredSessionNames,
     );
+  } catch (error) {
+    throw transportAttestationFailure('transport-boundary', error);
+  }
+}
+
+/** Select only endpoints present in this network snapshot from the tracked allowlist. */
+export function swebenchProCurrentEndpointIds(
+  networkStdout: string,
+  bindings: SwebenchProTransportBindings,
+  allowedSessions: ReadonlyMap<string, string> = new Map(),
+  requiredSessionNames: ReadonlySet<string> = new Set(),
+): string[] {
+  try {
+    const relayName = relayBaseUrl(bindings.relayBaseUrl).hostname;
+    const inspection = oneDockerInspectRow<DockerNetworkEndpointSnapshot>(
+      networkStdout,
+      'SWE-bench Pro restricted network',
+    );
+    const endpoints = Object.entries(dockerObject(inspection.Containers));
+    const names = new Set<string>();
+    let relayCount = 0;
+    for (const [id, value] of endpoints) {
+      const name = dockerObject(value).Name;
+      if (!/^[a-f0-9]{64}$/.test(id) || typeof name !== 'string' || names.has(name)) {
+        throw new Error('SWE-bench Pro restricted network contains an invalid endpoint snapshot');
+      }
+      names.add(name);
+      if (name === relayName) relayCount += 1;
+      else if (allowedSessions.get(name) !== id) {
+        throw new Error('SWE-bench Pro restricted network contains an endpoint outside the tracked allowlist');
+      }
+    }
+    if (relayCount !== 1) {
+      throw new Error('SWE-bench Pro restricted network must contain exactly one model relay');
+    }
+    for (const required of requiredSessionNames) {
+      if (!names.has(required)) {
+        throw new Error(`SWE-bench Pro restricted network is missing required session ${required}`);
+      }
+    }
+    return endpoints.map(([id]) => id);
   } catch (error) {
     throw transportAttestationFailure('transport-boundary', error);
   }

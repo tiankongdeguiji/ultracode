@@ -67,7 +67,7 @@ function supportedHost(overrides: Partial<EvaluatorHost> = {}): EvaluatorHost {
 describe('SWE-bench Pro evaluator dependency assets', () => {
   it('stages every suite script referenced by the overlay Dockerfile', () => {
     const dockerfile = readFileSync(join(assetRoot, 'Dockerfile'), 'utf8');
-    const copiedScripts = [...dockerfile.matchAll(/^COPY .* ([a-z-]+\.sh)\s+\/opt\/bench\//gmu)]
+    const copiedScripts = [...dockerfile.matchAll(/^COPY .* ([a-z-]+\.(?:sh|mjs))\s+\/opt\/bench\//gmu)]
       .map((match) => match[1]!);
     expect(SWEBENCH_PRO_TOOLCHAIN_NATIVE_ASSETS).toEqual(copiedScripts.map((destination) => ({
       source: `suites/swebench-pro/${destination}`,

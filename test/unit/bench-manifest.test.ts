@@ -174,7 +174,7 @@ function proManifest(): Record<string, unknown> {
       attempts: 1,
       retries: 0,
       evaluator: { workers: 2, watchdogMs: 60_000 },
-      docker: { cpus: 4, memoryBytes: 8_000_000_000, keepImages: false },
+      docker: { cpus: 4, memoryBytes: 8_000_000_000 },
     },
   };
 }

@@ -17,6 +17,7 @@ import {
   inspectSwebenchProSessionAttachment,
   inspectSwebenchProTransportBoundary,
   loadSwebenchProTransportBindings,
+  swebenchProCurrentEndpointIds,
   swebenchProTransportPolicyLockFile,
   swebenchProTransportPolicyLockRoot,
 } from '../../bench/src/suites/swebench-pro/model-transport.js';
@@ -38,7 +39,8 @@ const TRUSTED_LOADER = '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1';
 const TRUSTED_BUSYBOX = '/opt/bench/node-musl-runtime/busybox';
 const SESSION_GATE = '/opt/bench/session-gate.sh';
 const SESSION_COMMAND = [
-  TRUSTED_BUSYBOX, 'sh', SESSION_GATE, '/bin/bash', '/opt/bench/entrypoint.sh',
+  TRUSTED_BUSYBOX, 'sh', SESSION_GATE,
+  TRUSTED_LOADER, TRUSTED_BUSYBOX, 'sh', '/opt/bench/entrypoint.sh',
 ];
 const config = {
   relayIdentity: 'relay-public-id',
@@ -147,7 +149,7 @@ function session(overrides: Record<string, unknown> = {}): string {
       PidsLimit: 1_024,
       SecurityOpt: ['no-new-privileges'],
       CapDrop: ['ALL'],
-      CapAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'],
+      CapAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'],
       NanoCpus: 1_500_000_000,
       Memory: 2_000_000,
     },
@@ -184,7 +186,7 @@ const expectedSession = {
     pidsLimit: 1_024,
     securityOpt: ['no-new-privileges'],
     capDrop: ['ALL'],
-    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'],
+    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'],
     nanoCpus: 1_500_000_000,
     memoryBytes: 2_000_000,
     mounts: [
@@ -264,6 +266,21 @@ describe('SWE-bench Pro attested model relay contract', () => {
     expect(running).toEqual(preflight);
     expect(Object.values(preflight).every((value) => /^[a-f0-9]{64}$/.test(value))).toBe(true);
     expect(JSON.stringify(preflight)).not.toMatch(/relay\.test|swebench-pro-private|api\.openai\.com/);
+  });
+
+  it('inspects only endpoints present after a tracked session stops', () => {
+    expect(swebenchProCurrentEndpointIds(
+      network(),
+      bindings,
+      new Map([['session-one', SESSION_ID]]),
+      new Set(),
+    )).toEqual([RELAY_ID]);
+    expect(() => swebenchProCurrentEndpointIds(
+      network(),
+      bindings,
+      new Map([['session-one', SESSION_ID]]),
+      new Set(['session-one']),
+    )).toThrow(/missing required session/u);
   });
 
   it('rejects a generic proxy declaration, identity drift, or any extra endpoint', () => {

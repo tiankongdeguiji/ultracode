@@ -102,6 +102,7 @@ import {
   inspectSwebenchProSessionAttachment,
   inspectSwebenchProTransportBoundary,
   loadSwebenchProTransportBindings,
+  swebenchProCurrentEndpointIds,
   swebenchProTransportPolicyLockFile,
   swebenchProTransportPolicyLockRoot,
   transportAttestationFailure,
@@ -171,8 +172,8 @@ const TRUSTED_MUSL_LOADER = '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1';
 const TRUSTED_BUSYBOX = '/opt/bench/node-musl-runtime/busybox';
 const TRUSTED_SESSION_GATE = '/opt/bench/session-gate.sh';
 const TASK_ENTRYPOINT = '/opt/bench/entrypoint.sh';
-const RECLAMATION_COMMAND = `owner=$1; shift; ${TRUSTED_BUSYBOX} chown -R "$owner" "$@"`
-  + ` && ${TRUSTED_BUSYBOX} chmod 0700 "$@"`;
+const RECLAMATION_COMMAND = `owner=$1; shift; ${TRUSTED_MUSL_LOADER} ${TRUSTED_BUSYBOX} chown -R "$owner" "$@"`
+  + ` && ${TRUSTED_MUSL_LOADER} ${TRUSTED_BUSYBOX} chmod 0700 "$@"`;
 const RECLAMATION_NAME_PREFIX = 'ucbench-reclaim-';
 const RECLAMATION_NAME_RE = /^\/ucbench-reclaim-[a-f0-9]{32}$/;
 const RECLAMATION_NAMESPACE_LIMIT = 16_384;
@@ -327,6 +328,7 @@ function currentPolicies(
 ): SwebenchProManifest['suiteConfig']['policies'] {
   const entrypoint = join(roots.benchRoot, 'suites', 'swebench-pro', 'entrypoint.sh');
   const sessionGate = join(roots.benchRoot, 'suites', 'swebench-pro', 'session-gate.sh');
+  const privilegeDropper = join(roots.benchRoot, 'suites', 'swebench-pro', 'drop-privileges.mjs');
   const gitSanitizer = join(roots.benchRoot, 'suites', 'swebench-pro', 'sanitize-git.sh');
   const gitCapture = join(roots.benchRoot, 'suites', 'swebench-pro', 'capture-git.sh');
   const containerPolicyFile = join(roots.benchRoot, 'suites', 'swebench-pro', 'container-policy.json');
@@ -338,6 +340,7 @@ function currentPolicies(
     sessionSha256: sha256CanonicalJson({
       entrypointSha256: sha256File(entrypoint),
       sessionGateSha256: sha256File(sessionGate),
+      privilegeDropperSha256: sha256File(privilegeDropper),
       gitSanitizerSha256: sha256File(gitSanitizer),
       gitCaptureSha256: sha256File(gitCapture),
       containerPolicySha256: containerPolicySha256(policy),
@@ -384,6 +387,7 @@ function swebenchProNativeAssets(roots: BenchPathRoots): SwebenchProManifest['pr
     'suites/swebench-pro/Dockerfile',
     'suites/swebench-pro/entrypoint.sh',
     'suites/swebench-pro/session-gate.sh',
+    'suites/swebench-pro/drop-privileges.mjs',
     'suites/swebench-pro/sanitize-git.sh',
     'suites/swebench-pro/capture-git.sh',
     'suites/swebench-pro/container-policy.json',
@@ -551,7 +555,7 @@ function buildManifest(
       attempts: 1,
       retries: 0,
       evaluator: { workers: config.concurrency.verifier, watchdogMs: config.timeouts.evaluatorWatchdogMs },
-      docker: { cpus: config.docker.cpus, memoryBytes: config.docker.memoryBytes, keepImages: config.docker.keepImages },
+      docker: { cpus: config.docker.cpus, memoryBytes: config.docker.memoryBytes },
     },
   };
 }
@@ -621,7 +625,6 @@ function resumeConfig(operator: SwebenchProConfig, manifest: SwebenchProManifest
     docker: {
       cpus: manifest.suiteConfig.docker.cpus,
       memoryBytes: manifest.suiteConfig.docker.memoryBytes,
-      keepImages: manifest.suiteConfig.docker.keepImages,
     },
     evaluator: {
       ...operator.evaluator,
@@ -960,15 +963,20 @@ export async function attestModelTransport(
   } catch (error) {
     throw transportAttestationFailure('restricted-network-inspect', error);
   }
-  let relayName: string;
   try {
-    relayName = new URL(bindings.relayBaseUrl).hostname;
+    void new URL(bindings.relayBaseUrl);
   } catch (error) {
     throw transportAttestationFailure('model-relay-inspect', error);
   }
   let relay: string;
   try {
-    relay = await executor(['inspect', relayName, ...allowedSessions.values()], lifecycle, timeoutMs);
+    const endpointIds = swebenchProCurrentEndpointIds(
+      network,
+      bindings,
+      allowedSessions,
+      requiredSessionNames,
+    );
+    relay = await executor(['inspect', ...endpointIds], lifecycle, timeoutMs);
   } catch (error) {
     throw transportAttestationFailure('model-relay-inspect', error);
   }
@@ -1530,10 +1538,19 @@ export interface SessionDockerCreateArgvOptions {
 }
 
 function sessionContainerCommand(): string[] {
-  return [TRUSTED_BUSYBOX, 'sh', TRUSTED_SESSION_GATE, '/bin/bash', TASK_ENTRYPOINT];
+  return [
+    TRUSTED_BUSYBOX,
+    'sh',
+    TRUSTED_SESSION_GATE,
+    TRUSTED_MUSL_LOADER,
+    TRUSTED_BUSYBOX,
+    'sh',
+    TASK_ENTRYPOINT,
+  ];
 }
 
-function sessionAttachment(
+/** Build the complete expected Docker attachment for one production session container. */
+export function swebenchProSessionAttachment(
   id: string,
   options: SessionDockerCreateArgvOptions,
   running: boolean,
@@ -1732,7 +1749,7 @@ async function runSession(
       fatalController?.throwIfAborted();
       await startAttestedSessionTransport({
         executor,
-        expected: sessionAttachment(launchedId, sessionOptions, false),
+        expected: swebenchProSessionAttachment(launchedId, sessionOptions, false),
         bindings: transportBindings,
         config,
         manifest,
@@ -2239,7 +2256,7 @@ export async function runCommand(
         context.clock.now(),
         error instanceof OwnershipUnsafeCleanupError ? 'ownership-unsafe' : 'unknown-terminal',
       );
-      throw error;
+      await rethrowAfterRuntimeCleanup(error, stores.policyLock);
     } finally {
       try {
         releaseLocks(inputLocks);
@@ -2331,17 +2348,18 @@ export async function runCommand(
       throw error;
     }
   } catch (error) {
+    let primaryError = error;
     if (initialized === null && unpublishedImages.length > 0) {
       try {
         await removeTaskImageTargets(unpublishedImages.map((image) => image.overlayName));
       } catch (cleanupError) {
-        throw ownershipUnsafeAggregate('fresh SWE-bench Pro setup image cleanup failed', [
+        primaryError = ownershipUnsafeAggregate('fresh SWE-bench Pro setup image cleanup failed', [
           error,
           cleanupError,
         ]);
       }
     }
-    throw error;
+    await rethrowAfterRuntimeCleanup(primaryError, policyLock);
   } finally {
     try { claim.release(); } catch { /* already released after publication */ }
     try {
@@ -2691,7 +2709,7 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
           ? 'artifact-unsafe'
           : 'verifier-process-failed',
     );
-    throw error;
+    await rethrowAfterRuntimeCleanup(error, stores.policyLock);
   } finally {
     try {
       await cleanupActiveSwebenchProEvaluators();
@@ -3738,7 +3756,7 @@ export async function cleanCommand(options: CleanOptions, context: CommandContex
       context.clock.now(),
       error instanceof OwnershipUnsafeCleanupError ? 'ownership-unsafe' : 'unknown-terminal',
     );
-    throw error;
+    await rethrowAfterRuntimeCleanup(error, stores.policyLock);
   } finally {
     try { stores.lease.release(); } finally { stores.policyLock.release(); }
   }
@@ -3759,6 +3777,24 @@ export async function cleanupSwebenchProRuntime(): Promise<void> {
     throw ownershipUnsafeAggregate('SWE-bench Pro runtime cleanup failed ownership checks', failures);
   }
   if (failures.length > 0) throw new AggregateError(failures, 'SWE-bench Pro runtime cleanup failed');
+}
+
+/** Preserve command failure while settling resources under its still-held host policy lock. */
+async function rethrowAfterRuntimeCleanup(
+  error: unknown,
+  policyLock: BenchLockHandle | null,
+): Promise<never> {
+  if (policyLock === null) throw error;
+  policyLock.assertHeld();
+  try {
+    await cleanupSwebenchProRuntime();
+  } catch (cleanupError) {
+    throw ownershipUnsafeAggregate('SWE-bench Pro command and terminal cleanup both failed', [
+      error,
+      cleanupError,
+    ]);
+  }
+  throw error;
 }
 
 export const defaultCommandContext = (paths: BenchPathRoots): CommandContext => ({

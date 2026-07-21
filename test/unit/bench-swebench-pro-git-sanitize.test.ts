@@ -206,9 +206,9 @@ describe('SWE-bench Pro Git sanitizer', () => {
   it('keeps the identifier-free artifact private until the session has ended and fails before launch', () => {
     const source = readFileSync(entrypoint, 'utf8');
     const sanitizeAt = source.indexOf('/opt/bench/sanitize-git.sh');
-    const launchAt = source.indexOf('timeout -k 60');
+    const launchAt = source.indexOf('as_task_busybox timeout -k 60');
     const endedAt = source.indexOf('CODEX_EXIT=$?');
-    const publishAt = source.indexOf('install -m 0644 "$GIT_AUDIT_DIR/safe.txt"');
+    const publishAt = source.indexOf('trusted_busybox cp "$GIT_AUDIT_DIR/safe.txt"');
     expect(sanitizeAt).toBeGreaterThan(0);
     expect(launchAt).toBeGreaterThan(sanitizeAt);
     expect(endedAt).toBeGreaterThan(launchAt);
@@ -218,9 +218,9 @@ describe('SWE-bench Pro Git sanitizer', () => {
     expect(source.slice(sanitizeAt, launchAt)).toContain('finish');
     expect(source.slice(sanitizeAt, launchAt)).not.toContain('git commit');
     expect(source.slice(0, launchAt)).not.toContain('$BENCH/out/git-audit.txt');
-    expect(source).toContain('if ! git status --porcelain > "$BENCH/out/pre-status.txt" 2>&1; then');
-    expect(source).toContain('if ! TRACKED_DIRTY=$(git status --porcelain --untracked-files=no');
-    expect(source).toContain('if ! git status --porcelain -z 2>/dev/null | "$NODE" -e');
+    expect(source).toContain('if ! as_task git status --porcelain > "$BENCH/out/pre-status.txt" 2>&1; then');
+    expect(source).toContain('if ! TRACKED_DIRTY=$(as_task git status --porcelain --untracked-files=no');
+    expect(source).toContain('if ! as_task git status --porcelain -z 2>/dev/null | as_task "$NODE" -e');
   });
 
   it('captures an evaluator-faithful patch in the immutable task-uid helper', () => {

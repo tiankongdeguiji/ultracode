@@ -1,6 +1,41 @@
 diff --git a/swe_bench_pro_eval.py b/swe_bench_pro_eval.py
 --- a/swe_bench_pro_eval.py
 +++ b/swe_bench_pro_eval.py
+@@ -34,6 +34,7 @@ It expects:
+ """
+
+ import argparse
++import ast
+ import concurrent.futures
+ import json
+ import os
+@@ -71,6 +72,15 @@ def load_local_script(scripts_dir, instance_id, script_name):
+     with open(script_path, 'r') as f:
+         return f.read()
+
++
++def benchmark_test_names(value, field):
++    if not isinstance(value, str):
++        raise ValueError(f"{field} must be a Python literal string")
++    parsed = ast.literal_eval(value)
++    if not isinstance(parsed, list) or any(not isinstance(name, str) for name in parsed):
++        raise ValueError(f"{field} must contain only test-name strings")
++    return parsed
++
+
+ def strip_binary_hunks(patch: str) -> str:
+     """Remove binary diff sections from a git patch."""
+@@ -94,7 +106,9 @@ def strip_binary_hunks(patch: str) -> str:
+
+ def create_entryscript(sample):
+     before_repo_set_cmd = sample["before_repo_set_cmd"].strip().split("\n")[-1]
+-    selected_test_files_to_run = ",".join(eval(sample["selected_test_files_to_run"]))
++    selected_test_files_to_run = ",".join(benchmark_test_names(
++        sample["selected_test_files_to_run"], "selected_test_files_to_run"
++    ))
+     base_commit = sample["base_commit"]
+     base_dockerfile = load_base_docker(sample["instance_id"])
+     instance_dockerfile = instance_docker(sample["instance_id"])
 @@ -277,7 +277,7 @@ def collect_outputs_local(workspace_dir, output_dir, uid, prefix):
          return None
 
@@ -88,7 +123,7 @@ diff --git a/swe_bench_pro_eval.py b/swe_bench_pro_eval.py
      parser.add_argument(
          "--num_workers",
          type=int,
-@@ -517,6 +534,18 @@ def main():
+@@ -517,6 +546,19 @@ def main():
 
      eval_fn = eval_with_docker if args.use_local_docker else eval_with_modal
 
@@ -104,10 +139,11 @@ diff --git a/swe_bench_pro_eval.py b/swe_bench_pro_eval.py
 +    from ultracode_evaluator_policy import docker_run_options
 +    docker_run_options(benchmark_container_options, args.benchmark_policy_sha256)
 +    evaluation_failures = []
++
      # Use ThreadPoolExecutor to run evaluations in parallel
      with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
          # Create a dictionary mapping futures to their patch samples for progress tracking
-@@ -530,6 +559,9 @@ def main():
+@@ -530,6 +572,9 @@ def main():
                  redo=args.redo,
                  block_network=args.block_network,
                  docker_platform=(args.docker_platform or detected_platform) if args.use_local_docker else None,
@@ -117,7 +153,7 @@ diff --git a/swe_bench_pro_eval.py b/swe_bench_pro_eval.py
              ): patch_sample
              for patch_sample in valid_patches
          }
-@@ -544,31 +569,37 @@ def main():
+@@ -544,31 +582,37 @@ def main():
                  output = future.result()
                  if output is None:
                      print(f'Evaluation for {patch_sample["instance_id"]} returned None')
@@ -134,8 +170,10 @@ diff --git a/swe_bench_pro_eval.py b/swe_bench_pro_eval.py
                      else:
                          raw_sample = raw_sample_df.loc[instance_id]
                          passed_tests = {x["name"] for x in output["tests"] if x["status"] == "PASSED"}
-                         f2p = set(eval(raw_sample["fail_to_pass"]))
-                         p2p = set(eval(raw_sample["pass_to_pass"]))
+-                        f2p = set(eval(raw_sample["fail_to_pass"]))
+-                        p2p = set(eval(raw_sample["pass_to_pass"]))
++                        f2p = set(benchmark_test_names(raw_sample["fail_to_pass"], "fail_to_pass"))
++                        p2p = set(benchmark_test_names(raw_sample["pass_to_pass"], "pass_to_pass"))
                          result = (f2p | p2p) <= passed_tests
                          eval_results[instance_id] = result
 

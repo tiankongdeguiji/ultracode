@@ -5,6 +5,7 @@
 set -eu
 
 BUSYBOX=/opt/bench/node-musl-runtime/busybox
+LOADER=/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1
 GATE=${HOME:?runtime home is required}/.model-transport-attested
 NONCE=${BENCH_RUNTIME_NONCE:-}
 
@@ -15,10 +16,10 @@ esac
 
 attempt=0
 while [ ! -f "$GATE" ] && [ "$attempt" -lt 120 ]; do
-  "$BUSYBOX" sleep 1
+  "$LOADER" "$BUSYBOX" sleep 1
   attempt=$((attempt + 1))
 done
 IFS= read -r observed < "$GATE" 2>/dev/null || observed=
 [ "$observed" = "$NONCE" ] || exit 70
-"$BUSYBOX" rm -f "$GATE"
+"$LOADER" "$BUSYBOX" rm -f "$GATE"
 exec "$@"

@@ -31,8 +31,7 @@
     },
     "docker": {
       "cpus": 8,
-      "memoryBytes": 25769803776,
-      "keepImages": false
+      "memoryBytes": 25769803776
     },
     "evaluator": {
       "repository": "https://github.com/scaleapi/SWE-bench_Pro-os",

@@ -133,7 +133,6 @@ export const swebenchProSuiteConfigSchema = z.strictObject({
   docker: z.strictObject({
     cpus: z.number().finite().positive(),
     memoryBytes: z.number().int().positive(),
-    keepImages: z.boolean(),
   }),
 });
 

@@ -50,6 +50,7 @@ const REQUIREMENTS_PROVENANCE = 'suites/swebench-pro/evaluator-requirements.prov
 export const SWEBENCH_PRO_TOOLCHAIN_NATIVE_ASSETS = [
   'entrypoint.sh',
   'session-gate.sh',
+  'drop-privileges.mjs',
   'sanitize-git.sh',
   'capture-git.sh',
 ].map((destination): ToolchainNativeAsset => ({

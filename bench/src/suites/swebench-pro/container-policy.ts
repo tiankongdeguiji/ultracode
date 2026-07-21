@@ -24,7 +24,7 @@ const boundedPolicySchema = z.strictObject({
   pidsLimit: z.literal(1_024),
   securityOpt: z.tuple([z.literal('no-new-privileges')]),
   capDrop: z.tuple([z.literal('ALL')]),
-  capAdd: z.array(z.enum(['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETGID', 'SETPCAP', 'SETUID'])),
+  capAdd: z.array(z.enum(['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETGID', 'SETUID'])),
   resources: z.literal('manifest-docker'),
 });
 
@@ -36,7 +36,6 @@ const containerPolicySchema = z.strictObject({
       z.literal('CHOWN'),
       z.literal('DAC_OVERRIDE'),
       z.literal('SETGID'),
-      z.literal('SETPCAP'),
       z.literal('SETUID'),
     ]),
   }),
@@ -59,7 +58,7 @@ export type SwebenchProContainerPolicy = z.infer<typeof containerPolicySchema>;
 
 /** Reviewed canonical JSON identity of the complete static container policy. */
 export const SWEBENCH_PRO_CONTAINER_POLICY_SHA256 =
-  'a8963e9656e5e128ac2b4dfbe7c3d3ddc0457af21ba37e3203c7345d03cc70a0';
+  'fddc752e75887966da0ea81cb18de9a5cdabcc6e27a2f21a1ea931f4a122aaa2';
 
 export interface EvaluatorContainerPolicy {
   pidsLimit: 1_024;

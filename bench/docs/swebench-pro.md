@@ -46,7 +46,9 @@ command, user, labels, mounts, capability/resource policy, runtime nonce,
 credential-free environment, relay URL, and configured network. Docker then
 starts only the pinned musl loader and BusyBox gate. The host reinspects the
 running sole-network attachment and complete relay topology before publishing
-the nonce, after which the gate may execute the task image's Bash entrypoint.
+the nonce. The gate then enters a pinned BusyBox bootstrap; task-image Git,
+Codex, and Node execute only through the pinned privilege dropper after it
+proves the task uid/gid, empty usable capability sets, and `no_new_privs`.
 
 The separately managed relay must use an immutable local image and declare its
 public identity/version, exact model hash, fixed-destination hash, and relay
@@ -275,12 +277,11 @@ the immutable run manifest. Session containers have a
 1,024-process cgroup
 bound, `no-new-privileges`, `cap-drop ALL`, those manifest-derived CPU and
 memory limits, and only
-`CHOWN`, `DAC_OVERRIDE`, `SETGID`, `SETPCAP`, and `SETUID` for an explicit uid-0
-immutable setup over base-image files that may not be root-writable. `SETPCAP`
-exists only so `setpriv` can drop the capability bounding set during the uid
-transition. Codex, detached task work, and the immutable post-task Git capture
-run as the task uid with bounding, inheritable, and ambient capability sets
-cleared.
+`CHOWN`, `DAC_OVERRIDE`, `SETGID`, and `SETUID` for an explicit uid-0 immutable
+setup over base-image files that may not be root-writable. The pinned privilege
+dropper clears supplementary groups, changes uid/gid, and verifies that
+inheritable, permitted, effective, and ambient capabilities are empty under
+`no-new-privileges` before task-image Git, Codex, or Node can execute.
 
 Root ownership reclamation runs only in a deterministic helper named from the
 validated run, task, and arm. It carries the complete common ownership labels
@@ -349,11 +350,14 @@ survivor, its exact inspection proof, stop-triggered auto-removal, absence
 check, and idempotent rerun. The live test
 does not pull an image or launch a benchmark.
 
-Setting `UC_DOCKER_RELAY_PARITY_IMAGE` to an already-local image with `sh`
-additionally creates an ephemeral internal network, labeled relay stand-in, and
-task stand-in, then inspects their actual Docker topology. It neither contacts
-a model nor any public service and does not claim the stand-in implements the
-relay behavior contract.
+Setting `UC_DOCKER_RELAY_PARITY_IMAGE` to an already-local image with `sh` and
+`UC_DOCKER_SESSION_PARITY_IMAGE` to an already-local compatible SWE-bench Pro
+overlay additionally creates an ephemeral internal network, labeled relay
+stand-in, and production-policy session. The session remains blocked at the
+trusted pre-entrypoint gate while the test inspects its stopped and running
+attachments, so it neither launches Codex nor contacts a model or public
+service. The test does not claim the relay stand-in implements the relay
+behavior contract.
 
 If the local Docker engine rejects the minimal tuple or cannot prove the
 inspected `HostConfig`, the parity test fails. Capability sets must not be

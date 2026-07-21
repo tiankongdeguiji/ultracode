@@ -13,7 +13,6 @@
       "CHOWN",
       "DAC_OVERRIDE",
       "SETGID",
-      "SETPCAP",
       "SETUID"
     ],
     "resources": "manifest-docker"

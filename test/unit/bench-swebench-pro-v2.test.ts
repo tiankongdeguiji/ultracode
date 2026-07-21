@@ -66,7 +66,7 @@ const config: SwebenchProConfig = {
   },
   timeouts: { sessionMs: 60_000, verifierMs: 60_000, evaluatorWatchdogMs: 60_000 },
   concurrency: { tasks: 1, verifier: 1 },
-  docker: { cpus: 1, memoryBytes: 1_000_000, keepImages: false },
+  docker: { cpus: 1, memoryBytes: 1_000_000 },
   evaluator: {
     repository: 'https://github.com/scaleapi/SWE-bench_Pro-os',
     revision: 'ca10a60a5fcae51e6948ffe1485d4153d421e6c5',
@@ -82,7 +82,7 @@ const containerPolicy: SwebenchProContainerPolicy = {
     pidsLimit: 1_024,
     securityOpt: ['no-new-privileges'],
     capDrop: ['ALL'],
-    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'],
+    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'],
     resources: 'manifest-docker',
   },
   evaluator: {
@@ -449,6 +449,42 @@ describe('evaluator ownership and empty predictions', () => {
       toolchainPayloadSha256: 'd'.repeat(64),
       docker,
     })).rejects.toThrow(/injected post-build inspect failure/);
+    expect(calls).toContainEqual(['image', 'rm', overlayName]);
+    expect(calls).toContainEqual(['image', 'ls', '-q', '--no-trunc', overlayName]);
+  });
+
+  it('reconciles the deterministic overlay tag when the build wrapper rejects', async () => {
+    const instance = instanceFromRow(row('task'));
+    const digest = `jefzda/sweap-images@sha256:${'a'.repeat(64)}`;
+    const baseId = `sha256:${'b'.repeat(64)}`;
+    let overlayName = '';
+    const calls: string[][] = [];
+    const docker = async (argv: readonly string[]): Promise<string> => {
+      calls.push([...argv]);
+      if (argv[0] === 'build') {
+        overlayName = argv[argv.indexOf('-t') + 1]!;
+        throw new Error('injected post-build wrapper rejection');
+      }
+      if (argv[0] === 'image' && argv[1] === 'inspect') {
+        return JSON.stringify([{
+          Id: baseId,
+          RepoDigests: [digest],
+          Os: 'linux',
+          Architecture: 'amd64',
+        }]);
+      }
+      if (argv[0] === 'image' && argv[1] === 'rm') return '';
+      if (argv[0] === 'image' && argv[1] === 'ls') return '';
+      throw new Error(`unexpected Docker argv: ${argv.join(' ')}`);
+    };
+
+    await expect(prepareTaskImage(instance, {
+      roots: createBenchPathRoots(join(process.cwd(), 'bench')),
+      runId: 'run-rejected',
+      toolchainDirectory: '/cache/toolchain',
+      toolchainPayloadSha256: 'd'.repeat(64),
+      docker,
+    })).rejects.toThrow(/injected post-build wrapper rejection/u);
     expect(calls).toContainEqual(['image', 'rm', overlayName]);
     expect(calls).toContainEqual(['image', 'ls', '-q', '--no-trunc', overlayName]);
   });

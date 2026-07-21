@@ -1,5 +1,14 @@
 /** Offline ownership cleanup tests for ambiguous Docker removal outcomes. */
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -31,7 +40,7 @@ import {
 
 const temporaryRoots: string[] = [];
 const policy = loadSwebenchProContainerPolicy(createBenchPathRoots(join(process.cwd(), 'bench')));
-const docker = { cpus: 1, memoryBytes: 1_000_000, keepImages: false };
+const docker = { cpus: 1, memoryBytes: 1_000_000 };
 
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -858,5 +867,17 @@ describe('SWE-bench Pro ownership cleanup', () => {
       code: 'ownership-unsafe',
       failures: [expect.objectContaining({ message: 'rm failed' })],
     });
+  });
+
+  it('settles every terminal command failure before releasing the host policy lock', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'bench/src/suites/swebench-pro/runner.ts'),
+      'utf8',
+    );
+    expect(source.match(/await rethrowAfterRuntimeCleanup\(/gu)).toHaveLength(4);
+    const helper = source.slice(source.indexOf('async function rethrowAfterRuntimeCleanup'));
+    expect(helper.indexOf('policyLock.assertHeld()')).toBeLessThan(
+      helper.indexOf('await cleanupSwebenchProRuntime()'),
+    );
   });
 });

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # In-container driver for one SWE-bench Pro instance x arm. Contract with
 # bench/src/suites/swebench-pro/runner.ts: the arm dir is bind-mounted at /bench; env carries
 # BENCH_ARM (a|b), BENCH_TIMEOUT_SECS, BENCH_MODEL, BENCH_EFFORT,
@@ -8,20 +8,47 @@
 # BENCH_MODEL_RELAY_BASE_URL. The repository is fixed at /app. Everything of
 # value is written under /bench before exit, and the script always exits 0 — failures are reported in
 # /bench/out/meta.json, never as a container error.
-set -uo pipefail
+set -u
+set -o pipefail
 
 BENCH=/bench
 # Images mix glibc and musl userlands; node-sel carries both builds and runtimes.
 NODE=/opt/bench/node-sel
 CODEX=/opt/bench/bin/codex
 UC_MAIN=/opt/bench/ultracode/dist/cli/main.js
+TRUSTED_RUNTIME=/opt/bench/node-musl-runtime
+TRUSTED_LOADER=$TRUSTED_RUNTIME/ld-musl-x86_64.so.1
+TRUSTED_BUSYBOX=$TRUSTED_RUNTIME/busybox
+TRUSTED_NODE=/opt/bench/node-musl/bin/node
+DROP_PRIVILEGES=/opt/bench/drop-privileges.mjs
 REPO_DIR=${BENCH_REPO_DIR:-}
 export HOME=${HOME:-/root}
 export PATH=/opt/bench/bin:$PATH
 
-mkdir -p "$BENCH/logs" "$BENCH/out"
+trusted_busybox() {
+  "$TRUSTED_LOADER" "$TRUSTED_BUSYBOX" "$@"
+}
+trusted_busybox mkdir -p "$BENCH/logs" "$BENCH/out"
 exec 2>>"$BENCH/logs/entry.log"
-log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
+log() { printf '%s %s\n' "$(trusted_busybox date -u +%FT%TZ)" "$*" >&2; }
+trusted_node() {
+  LD_LIBRARY_PATH=$TRUSTED_RUNTIME "$TRUSTED_LOADER" "$TRUSTED_NODE" "$@"
+}
+as_task() {
+  trusted_node "$DROP_PRIVILEGES" "$TASK_UID" "$TASK_GID" "$@"
+}
+as_task_busybox() {
+  as_task "$TRUSTED_LOADER" "$TRUSTED_BUSYBOX" "$@"
+}
+valid_id() {
+  case ${1:-} in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "$1" -le 2147483647 ] 2>/dev/null ;;
+  esac
+}
+valid_nonzero_id() {
+  valid_id "$1" && [ "$1" -ne 0 ]
+}
 
 # meta.json is written exactly once, via node for correct JSON encoding.
 META_FAILURE=""
@@ -33,14 +60,14 @@ WAITED_MS=0
 GIT_AUDIT_DIR=""
 cleanup_git_audit() {
   case "$GIT_AUDIT_DIR" in
-    /tmp/ucbench-git-audit.*) rm -rf "$GIT_AUDIT_DIR" ;;
+    /tmp/ucbench-git-audit.*) trusted_busybox rm -rf "$GIT_AUDIT_DIR" ;;
   esac
   GIT_AUDIT_DIR=""
 }
 write_meta() {
   M_FAILURE="$META_FAILURE" M_EXIT="$CODEX_EXIT" M_START="$START" M_END="$END" \
   M_BASE="$BASE_SHA" M_EXPECTED="${BENCH_BASE_COMMIT:-}" M_WAITED="$WAITED_MS" \
-  M_UC_HOME="${ULTRACODE_HOME:-}" M_BENCH="$BENCH" "$NODE" -e '
+  M_UC_HOME="${ULTRACODE_HOME:-}" M_BENCH="$BENCH" trusted_node -e '
     const fs = require("fs"), path = require("path");
     const e = process.env;
     const patchFile = path.join(e.M_BENCH, "out", "patch.diff");
@@ -76,25 +103,43 @@ write_meta() {
 finish() {
   cleanup_git_audit
   write_meta
-  if [[ ${BENCH_ARTIFACT_OWNER:-} =~ ^[0-9]+:[0-9]+$ ]]; then
-    chown -R "$BENCH_ARTIFACT_OWNER" "$BENCH" "$HOME" "$CODEX_HOME" 2>/dev/null
-    chmod 0700 "$BENCH" "$HOME" "$CODEX_HOME" 2>/dev/null
-  fi
-  sync
+  trusted_busybox sync
   exit 0
 }
 
 log "entrypoint arm=$BENCH_ARM timeout=${BENCH_TIMEOUT_SECS}s model=${BENCH_MODEL:-<unset>}"
-"$NODE" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
-"$CODEX" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
 [ "$REPO_DIR" = /app ] || { META_FAILURE="harness-setup-failed"; finish; }
+case ${BENCH_ARTIFACT_OWNER:-} in
+  *:*) ARTIFACT_UID=${BENCH_ARTIFACT_OWNER%%:*}; ARTIFACT_GID=${BENCH_ARTIFACT_OWNER##*:} ;;
+  *) META_FAILURE="harness-setup-failed"; finish ;;
+esac
+if ! valid_nonzero_id "${BENCH_TASK_UID:-}" \
+  || ! valid_nonzero_id "${BENCH_TASK_GID:-}" \
+  || ! valid_id "$ARTIFACT_UID" \
+  || ! valid_id "$ARTIFACT_GID"; then
+  META_FAILURE="harness-setup-failed"
+  finish
+fi
+if [ "$BENCH_TASK_UID" = "$ARTIFACT_UID" ] || [ "$BENCH_TASK_GID" = "$ARTIFACT_GID" ]; then
+  META_FAILURE="harness-setup-failed"
+  finish
+fi
+TASK_UID=$BENCH_TASK_UID
+TASK_GID=$BENCH_TASK_GID
+trusted_busybox chown -R "$TASK_UID:$TASK_GID" \
+  "$REPO_DIR" "$BENCH" "$HOME" "$CODEX_HOME" "${ULTRACODE_HOME:-$BENCH/uc}" 2>/dev/null || {
+  META_FAILURE="ownership-unsafe"
+  finish
+}
+as_task "$NODE" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
+as_task "$CODEX" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
 cd "$REPO_DIR" 2>/dev/null || { META_FAILURE="harness-setup-failed"; finish; }
 
 # --- git preflight: uid-mismatch + identity so agent-side git always works ---
-git config --global --add safe.directory '*'
-git config --global user.email bench@ultracode.local
-git config --global user.name 'ultracode bench'
-git config --global core.autocrlf false
+as_task git config --global --add safe.directory '*'
+as_task git config --global user.email bench@ultracode.local
+as_task git config --global user.name 'ultracode bench'
+as_task git config --global core.autocrlf false
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_REPLACE_REF_BASE
 unset GIT_NAMESPACE GIT_SHALLOW_FILE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
@@ -104,33 +149,18 @@ export GIT_CONFIG_KEY_0=core.fsmonitor
 export GIT_CONFIG_VALUE_0=false
 export GIT_CONFIG_KEY_1=core.hooksPath
 export GIT_CONFIG_VALUE_1=/dev/null
-BASE_SHA=$(git rev-parse HEAD 2>/dev/null) || { META_FAILURE="harness-setup-failed"; finish; }
+BASE_SHA=$(as_task git rev-parse HEAD 2>/dev/null) || { META_FAILURE="harness-setup-failed"; finish; }
 [ -n "${BENCH_BASE_COMMIT:-}" ] && [ "$BASE_SHA" != "$BENCH_BASE_COMMIT" ] && {
   log "base sha $BASE_SHA != dataset base_commit $BENCH_BASE_COMMIT"
   META_FAILURE="base-mismatch"
   finish
 }
-if ! [[ ${BENCH_TASK_UID:-} =~ ^[0-9]+$ ]] \
-  || ! [[ ${BENCH_TASK_GID:-} =~ ^[0-9]+$ ]] \
-  || [ "$BENCH_TASK_UID" = 0 ] || [ "$BENCH_TASK_GID" = 0 ] \
-  || ! [[ ${BENCH_ARTIFACT_OWNER:-} =~ ^[0-9]+:[0-9]+$ ]]; then
-  META_FAILURE="harness-setup-failed"
-  finish
-fi
-ARTIFACT_UID=${BENCH_ARTIFACT_OWNER%%:*}
-ARTIFACT_GID=${BENCH_ARTIFACT_OWNER##*:}
-if [ "$BENCH_TASK_UID" = "$ARTIFACT_UID" ] || [ "$BENCH_TASK_GID" = "$ARTIFACT_GID" ]; then
-  META_FAILURE="harness-setup-failed"
-  finish
-fi
-TASK_UID=$BENCH_TASK_UID
-TASK_GID=$BENCH_TASK_GID
-if ! git status --porcelain > "$BENCH/out/pre-status.txt" 2>&1; then
+if ! as_task git status --porcelain > "$BENCH/out/pre-status.txt" 2>&1; then
   log "image checkout status is unreadable; refusing to launch"
   META_FAILURE="invalid-instance"
   finish
 fi
-if ! TRACKED_DIRTY=$(git status --porcelain --untracked-files=no 2>/dev/null); then
+if ! TRACKED_DIRTY=$(as_task git status --porcelain --untracked-files=no 2>/dev/null); then
   log "image checkout tracked status is unreadable; refusing to launch"
   META_FAILURE="invalid-instance"
   finish
@@ -140,7 +170,7 @@ fi
   META_FAILURE="invalid-instance"
   finish
 }
-if ! git status --porcelain -z 2>/dev/null | "$NODE" -e '
+if ! as_task git status --porcelain -z 2>/dev/null | as_task "$NODE" -e '
   let buf = ""; process.stdin.on("data", (d) => (buf += d)).on("end", () => {
     const paths = [];
     const parts = buf.split("\0").filter(Boolean);
@@ -165,42 +195,35 @@ fi
   META_FAILURE="harness-setup-failed"
   finish
 }
-GIT_AUDIT_DIR=$(mktemp -d /tmp/ucbench-git-audit.XXXXXX) || {
+GIT_AUDIT_DIR=$(trusted_busybox mktemp -d /tmp/ucbench-git-audit.XXXXXX) || {
   META_FAILURE="harness-setup-failed"
   finish
 }
-chmod 700 "$GIT_AUDIT_DIR"
-if ! /opt/bench/sanitize-git.sh "$REPO_DIR" "$BASE_SHA" "$GIT_AUDIT_DIR" \
+trusted_busybox chmod 700 "$GIT_AUDIT_DIR"
+trusted_busybox chown "$TASK_UID:$TASK_GID" "$GIT_AUDIT_DIR" || {
+  META_FAILURE="ownership-unsafe"
+  finish
+}
+if ! as_task_busybox sh /opt/bench/sanitize-git.sh "$REPO_DIR" "$BASE_SHA" "$GIT_AUDIT_DIR" \
   > "$GIT_AUDIT_DIR/stdout.log" 2>> "$GIT_AUDIT_DIR/private.log"; then
   log "git history sanitization failed before session launch"
   META_FAILURE="harness-setup-failed"
   finish
 fi
-AUDIT_OWNER=0
-[ "$TASK_UID" = 0 ] && AUDIT_OWNER=65534
-chmod -R u+rwX,go-rwx "$GIT_AUDIT_DIR" \
-  && chown -R "$AUDIT_OWNER:$AUDIT_OWNER" "$GIT_AUDIT_DIR" || {
+trusted_busybox chmod -R u+rwX,go-rwx "$GIT_AUDIT_DIR" \
+  && trusted_busybox chown -R 0:0 "$GIT_AUDIT_DIR" || {
   META_FAILURE="ownership-unsafe"
   finish
 }
 log "git history sanitized and verified at base"
 
-# Root-only image setup is complete. Task-controlled processes run as the host
-# owner with no capability or privilege-escalation path, so bind-mounted
-# artifacts cannot become hostile root-owned trees.
-command -v setpriv >/dev/null 2>&1 || { META_FAILURE="toolchain-incompatible"; finish; }
-chown -R "$TASK_UID:$TASK_GID" "$REPO_DIR" "$BENCH" "$HOME" "$CODEX_HOME" "${ULTRACODE_HOME:-$BENCH/uc}" 2>/dev/null || {
-  META_FAILURE="ownership-unsafe"
-  finish
-}
-
 # --- CODEX_HOME from the credential-free arm template. config.toml is rebuilt
 # --- from the template every attempt (a stale copy from
 # --- a retried run would get keys prepended twice and break codex's parser) ---
-mkdir -p "$CODEX_HOME"
-rm -f "$CODEX_HOME/config.toml"
-cp -an "/opt/bench/codex-home-$BENCH_ARM/." "$CODEX_HOME/"
-cp -f "/opt/bench/codex-home-$BENCH_ARM/config.toml" "$CODEX_HOME/config.toml"
+trusted_busybox mkdir -p "$CODEX_HOME"
+trusted_busybox rm -f "$CODEX_HOME/config.toml"
+trusted_busybox cp -an "/opt/bench/codex-home-$BENCH_ARM/." "$CODEX_HOME/"
+trusted_busybox cp -f "/opt/bench/codex-home-$BENCH_ARM/config.toml" "$CODEX_HOME/config.toml"
 case ${BENCH_MODEL_RELAY_BASE_URL:-} in
   http://*/v1|https://*/v1) ;;
   *) META_FAILURE="harness-setup-failed"; finish ;;
@@ -210,17 +233,18 @@ if [ -n "${BENCH_MODEL:-}" ] || [ -n "${BENCH_EFFORT:-}" ]; then
     [ -n "${BENCH_MODEL:-}" ] && printf 'model = "%s"\n' "$BENCH_MODEL"
     [ -n "${BENCH_EFFORT:-}" ] && printf 'model_reasoning_effort = "%s"\n' "$BENCH_EFFORT"
     printf 'model_provider = "swebench_pro_relay"\n'
-    cat "$CODEX_HOME/config.toml"
+    trusted_busybox cat "$CODEX_HOME/config.toml"
     printf '\n[model_providers.swebench_pro_relay]\n'
     printf 'name = "SWE-bench Pro attested model relay"\n'
     printf 'base_url = "%s"\n' "$BENCH_MODEL_RELAY_BASE_URL"
     printf 'wire_api = "responses"\n'
     printf 'requires_openai_auth = false\n'
-  } > /tmp/bench-config.toml && mv /tmp/bench-config.toml "$CODEX_HOME/config.toml"
+  } > /tmp/bench-config.toml \
+    && trusted_busybox mv /tmp/bench-config.toml "$CODEX_HOME/config.toml"
 fi
 if [ "$BENCH_ARM" = b ]; then
-  mkdir -p "$HOME/.agents"
-  cp -a /opt/bench/agents-home-b/. "$HOME/.agents/"
+  trusted_busybox mkdir -p "$HOME/.agents"
+  trusted_busybox cp -a /opt/bench/agents-home-b/. "$HOME/.agents/"
   { # codex spawns MCP servers with a sanitized env — everything the engine and
     # its codex workers need must ride the config env table, not docker -e
     printf '\n[mcp_servers.ultracode.env]\n'
@@ -232,22 +256,28 @@ if [ "$BENCH_ARM" = b ]; then
   } >> "$CODEX_HOME/config.toml"
 fi
 
+# Root setup uses only pinned overlay tooling. Every task-image Git, Codex, or
+# Node process goes through the trusted dropper, which clears groups, changes
+# uid/gid, and proves every usable capability set empty under no-new-privileges.
+trusted_busybox chown -R "$TASK_UID:$TASK_GID" \
+  "$REPO_DIR" "$BENCH" "$HOME" "$CODEX_HOME" "${ULTRACODE_HOME:-$BENCH/uc}" 2>/dev/null || {
+  META_FAILURE="ownership-unsafe"
+  finish
+}
+
 # --- the session ---
-START=$(date +%s)
-timeout -k 60 "$BENCH_TIMEOUT_SECS" setpriv \
-  --reuid "$TASK_UID" --regid "$TASK_GID" --clear-groups \
-  --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \
-  "$CODEX" exec --json \
+START=$(trusted_busybox date +%s)
+as_task_busybox timeout -k 60 "$BENCH_TIMEOUT_SECS" "$CODEX" exec --json \
   --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
   --cd "$REPO_DIR" - < "$BENCH/prompt.txt" \
   > "$BENCH/logs/host.jsonl" 2> "$BENCH/logs/host.stderr.log"
 CODEX_EXIT=$?
-END=$(date +%s)
+END=$(trusted_busybox date +%s)
 log "codex exit=$CODEX_EXIT after $((END - START))s"
 
 # --- arm b: detached ultracode runs outlive codex exec; wait, then stop stragglers ---
 active_runs() {
-  UC_HOME="$ULTRACODE_HOME" "$NODE" -e '
+  UC_HOME="$ULTRACODE_HOME" as_task "$NODE" -e '
     const fs = require("fs"), path = require("path");
     const dir = path.join(process.env.UC_HOME, "runs");
     if (!fs.existsSync(dir)) process.exit(0);
@@ -260,26 +290,33 @@ active_runs() {
     }'
 }
 if [ "$BENCH_ARM" = b ]; then
-  WAIT_START=$(date +%s)
+  WAIT_START=$(trusted_busybox date +%s)
   REMAIN=$((BENCH_TIMEOUT_SECS - (END - START)))
   [ "$REMAIN" -lt 0 ] && REMAIN=0
   DEADLINE=$((WAIT_START + REMAIN))
-  while [ -n "$(active_runs)" ] && [ "$(date +%s)" -lt "$DEADLINE" ]; do sleep 10; done
+  while [ -n "$(active_runs)" ] \
+    && [ "$(trusted_busybox date +%s)" -lt "$DEADLINE" ]; do
+    trusted_busybox sleep 10
+  done
   STRAGGLERS=$(active_runs)
   if [ -n "$STRAGGLERS" ]; then
     log "stopping straggler runs: $STRAGGLERS"
-    for r in $STRAGGLERS; do "$NODE" "$UC_MAIN" stop "$r" >&2 || true; done
-    STOP_DEADLINE=$(( $(date +%s) + 120 ))
-    while [ -n "$(active_runs)" ] && [ "$(date +%s)" -lt "$STOP_DEADLINE" ]; do sleep 5; done
+    for r in $STRAGGLERS; do as_task "$NODE" "$UC_MAIN" stop "$r" >&2 || true; done
+    STOP_DEADLINE=$(( $(trusted_busybox date +%s) + 120 ))
+    while [ -n "$(active_runs)" ] \
+      && [ "$(trusted_busybox date +%s)" -lt "$STOP_DEADLINE" ]; do
+      trusted_busybox sleep 5
+    done
   fi
-  WAITED_MS=$(( ($(date +%s) - WAIT_START) * 1000 ))
+  WAITED_MS=$(( ($(trusted_busybox date +%s) - WAIT_START) * 1000 ))
 fi
-sleep 2 # settle: let final writes land before capture
+trusted_busybox sleep 2 # settle: let final writes land before capture
 
 # The detailed audit never leaves its root-only directory. Publish only the
 # identifier-free proof after Codex and detached task work have ended.
 if [ -n "$GIT_AUDIT_DIR" ]; then
-  if ! install -m 0644 "$GIT_AUDIT_DIR/safe.txt" "$BENCH/out/git-audit.txt"; then
+  if ! trusted_busybox cp "$GIT_AUDIT_DIR/safe.txt" "$BENCH/out/git-audit.txt" \
+    || ! trusted_busybox chmod 0644 "$BENCH/out/git-audit.txt"; then
     log "safe git audit publication failed"
     META_FAILURE="harness-setup-failed"
   fi
@@ -287,10 +324,9 @@ if [ -n "$GIT_AUDIT_DIR" ]; then
 fi
 
 # Patch capture is immutable harness code but operates on task-controlled Git
-# state, so it runs as the task uid with every capability set cleared.
-if ! setpriv --reuid "$TASK_UID" --regid "$TASK_GID" --clear-groups \
-  --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \
-  /opt/bench/capture-git.sh "$REPO_DIR" "$BASE_SHA" "$BENCH" "$NODE" /tmp/predirty.z; then
+# state, so the trusted dropper runs it as the task uid with zero usable caps.
+if ! as_task_busybox sh /opt/bench/capture-git.sh \
+  "$REPO_DIR" "$BASE_SHA" "$BENCH" "$NODE" /tmp/predirty.z; then
   log "post-session Git capture failed"
   META_FAILURE="harness-setup-failed"
 fi

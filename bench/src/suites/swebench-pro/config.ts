@@ -58,7 +58,6 @@ export const swebenchProConfigSchema = z.strictObject({
       'CPU limit must be an exact positive number of nanocores',
     ),
     memoryBytes: z.number().int().positive(),
-    keepImages: z.boolean(),
   }),
   evaluator: z.strictObject({
     repository: z.literal(OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY),
@@ -110,7 +109,7 @@ export const DEFAULT_SWEBENCH_PRO_CONFIG: SwebenchProConfig = {
   },
   timeouts: { sessionMs: 43_200_000, verifierMs: 21_600_000, evaluatorWatchdogMs: 5_400_000 },
   concurrency: { tasks: 4, verifier: 8 },
-  docker: { cpus: 8, memoryBytes: 24 * 1_024 * 1_024 * 1_024, keepImages: false },
+  docker: { cpus: 8, memoryBytes: 24 * 1_024 * 1_024 * 1_024 },
   evaluator: {
     repository: OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY,
     revision: OFFICIAL_SWEBENCH_PRO_EVALUATOR_REVISION,

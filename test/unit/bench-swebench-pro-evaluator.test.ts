@@ -81,7 +81,7 @@ const config: SwebenchProConfig = {
   },
   timeouts: { sessionMs: 60_000, verifierMs: 60_000, evaluatorWatchdogMs: 60_000 },
   concurrency: { tasks: 1, verifier: 3 },
-  docker: { cpus: 1.5, memoryBytes: 2_000_000, keepImages: false },
+  docker: { cpus: 1.5, memoryBytes: 2_000_000 },
   evaluator: {
     repository: 'https://github.com/scaleapi/SWE-bench_Pro-os',
     revision: 'ca10a60a5fcae51e6948ffe1485d4153d421e6c5',
@@ -97,7 +97,7 @@ const containerPolicy: SwebenchProContainerPolicy = {
     pidsLimit: 1_024,
     securityOpt: ['no-new-privileges'],
     capDrop: ['ALL'],
-    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'],
+    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'],
     resources: 'manifest-docker',
   },
   evaluator: {

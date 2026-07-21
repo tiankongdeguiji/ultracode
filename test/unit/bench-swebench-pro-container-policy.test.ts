@@ -27,7 +27,7 @@ import {
 
 const benchRoot = join(process.cwd(), 'bench');
 const policy = loadSwebenchProContainerPolicy(createBenchPathRoots(benchRoot));
-const docker = { cpus: 1.5, memoryBytes: 2_000_000, keepImages: false };
+const docker = { cpus: 1.5, memoryBytes: 2_000_000 };
 
 const config = {
   docker,
@@ -66,7 +66,6 @@ describe('SWE-bench Pro container policy', () => {
       '--cap-add', 'CHOWN',
       '--cap-add', 'DAC_OVERRIDE',
       '--cap-add', 'SETGID',
-      '--cap-add', 'SETPCAP',
       '--cap-add', 'SETUID',
       '--cpus', '1.5',
       '--memory', '2000000',
@@ -107,7 +106,6 @@ describe('SWE-bench Pro container policy', () => {
       '--cap-add', 'CHOWN',
       '--cap-add', 'DAC_OVERRIDE',
       '--cap-add', 'SETGID',
-      '--cap-add', 'SETPCAP',
       '--cap-add', 'SETUID',
       '--cpus', '1.5',
       '--memory', '2000000',
@@ -127,7 +125,8 @@ describe('SWE-bench Pro container policy', () => {
       '--entrypoint', '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1',
       `sha256:${'c'.repeat(64)}`,
       '/opt/bench/node-musl-runtime/busybox', 'sh', '/opt/bench/session-gate.sh',
-      '/bin/bash', '/opt/bench/entrypoint.sh',
+      '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1',
+      '/opt/bench/node-musl-runtime/busybox', 'sh', '/opt/bench/entrypoint.sh',
     ]);
     expect(reclamationContainerPolicyArgv(policy, docker)).toEqual([
       '--network', 'none',
@@ -182,8 +181,10 @@ describe('SWE-bench Pro container policy', () => {
       '--entrypoint', '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1',
       `sha256:${'c'.repeat(64)}`,
       '/opt/bench/node-musl-runtime/busybox', 'sh', '-c',
-      'owner=$1; shift; /opt/bench/node-musl-runtime/busybox chown -R "$owner" "$@"'
-        + ' && /opt/bench/node-musl-runtime/busybox chmod 0700 "$@"',
+      'owner=$1; shift; /opt/bench/node-musl-runtime/ld-musl-x86_64.so.1'
+        + ' /opt/bench/node-musl-runtime/busybox chown -R "$owner" "$@"'
+        + ' && /opt/bench/node-musl-runtime/ld-musl-x86_64.so.1'
+        + ' /opt/bench/node-musl-runtime/busybox chmod 0700 "$@"',
       'ultracode-reclaim', '2001:2002', '/bench', '/runtime/home', '/runtime/codex-home',
     ]);
   });
@@ -228,6 +229,13 @@ describe('SWE-bench Pro container policy', () => {
     expect(evaluatorPatch).toContain(
       'docker_run_options(benchmark_container_options, args.benchmark_policy_sha256)',
     );
+    expect(evaluatorPatch).toContain('parsed = ast.literal_eval(value)');
+    expect(evaluatorPatch).toContain('any(not isinstance(name, str) for name in parsed)');
+    const addedEvaluatorLines = evaluatorPatch
+      .split('\n')
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+      .join('\n');
+    expect(addedEvaluatorLines).not.toMatch(/\beval\(/u);
     expect(evaluatorPatch).toContain('evaluation_failures.append');
     expect(evaluatorPatch).toContain('raise RuntimeError(f"{len(evaluation_failures)} evaluator tasks failed without a verdict")');
   });
@@ -323,11 +331,18 @@ describe('SWE-bench Pro container policy', () => {
 
   it('runs post-task Git capture as the task uid with all capability sets cleared', () => {
     const entrypoint = readFileSync(join(benchRoot, 'suites/swebench-pro/entrypoint.sh'), 'utf8');
+    const dropper = readFileSync(join(benchRoot, 'suites/swebench-pro/drop-privileges.mjs'), 'utf8');
     const capture = entrypoint.indexOf('/opt/bench/capture-git.sh');
     expect(capture).toBeGreaterThan(entrypoint.indexOf('sleep 2 # settle'));
-    expect(entrypoint.slice(capture - 220, capture)).toContain('setpriv --reuid "$TASK_UID" --regid "$TASK_GID"');
-    expect(entrypoint.slice(capture - 220, capture)).toContain('--bounding-set=-all --inh-caps=-all --ambient-caps=-all');
+    expect(entrypoint.slice(capture - 220, capture)).toContain('as_task_busybox sh');
+    expect(dropper).toContain('process.setgroups([])');
+    expect(dropper).toContain('process.setgid(gid)');
+    expect(dropper).toContain('process.setuid(uid)');
+    expect(dropper).toContain("['CapInh', 'CapPrm', 'CapEff', 'CapAmb']");
+    expect(dropper).toContain("/^NoNewPrivs:\\s+1$/mu");
     expect(readFileSync(join(benchRoot, 'suites/swebench-pro/Dockerfile'), 'utf8'))
       .toContain('COPY --chown=0:0 --chmod=0555 capture-git.sh /opt/bench/capture-git.sh');
+    expect(readFileSync(join(benchRoot, 'suites/swebench-pro/Dockerfile'), 'utf8'))
+      .toContain('COPY --chown=0:0 --chmod=0555 drop-privileges.mjs /opt/bench/drop-privileges.mjs');
   });
 });
