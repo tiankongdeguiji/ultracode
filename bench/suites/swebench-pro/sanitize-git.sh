@@ -30,6 +30,8 @@ chmod 700 "$AUDIT_DIR"
 EXPECTED_GIT_DIR=$REPO_DIR/.git
 [ -d "$EXPECTED_GIT_DIR" ] && [ ! -L "$EXPECTED_GIT_DIR" ] \
   || fail 'repository does not have a standalone .git directory'
+EXPECTED_GIT_DIR=$(cd "$EXPECTED_GIT_DIR" && pwd -P) 2>> "$AUDIT_DIR/private.log" \
+  || fail 'cannot canonicalize repository metadata'
 ACTUAL_GIT_DIR=$(git -C "$REPO_DIR" rev-parse --absolute-git-dir 2>> "$AUDIT_DIR/private.log") \
   || fail 'cannot resolve repository metadata'
 [ "$ACTUAL_GIT_DIR" = "$EXPECTED_GIT_DIR" ] \

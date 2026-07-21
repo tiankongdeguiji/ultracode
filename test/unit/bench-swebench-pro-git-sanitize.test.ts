@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -53,6 +54,36 @@ function initializeRepository(directory: string): void {
 }
 
 describe('SWE-bench Pro Git sanitizer', () => {
+  it('accepts a repository whose parent path resolves through a symlink', () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-bench-pro-git-symlink-parent-'));
+    temporaryRoots.push(root);
+    const realRoot = join(root, 'real');
+    const aliasRoot = join(root, 'alias');
+    const repository = join(aliasRoot, 'repository');
+    const audit = join(root, 'root-private-audit');
+    mkdirSync(realRoot);
+    symlinkSync(realRoot, aliasRoot);
+    initializeRepository(repository);
+    mkdirSync(audit, { mode: 0o700 });
+    writeFileSync(join(repository, 'base.txt'), 'base content\n');
+    git(repository, ['add', 'base.txt']);
+    git(repository, ['commit', '--quiet', '-m', 'base']);
+    const base = git(repository, ['rev-parse', 'HEAD']);
+
+    const result = spawnSync('bash', [sanitizer, repository, base, audit], {
+      encoding: 'utf8',
+      env: cleanGitEnvironment(),
+    });
+
+    expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
+      status: 0,
+      stdout: '',
+      stderr: '',
+    });
+    expect(git(repository, ['rev-parse', 'HEAD'])).toBe(base);
+    expect(readFileSync(join(audit, 'safe.txt'), 'utf8')).toContain('status=sanitized');
+  });
+
   it('replaces packed future history and adversarial namespaces with the exact base closure', () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-bench-pro-git-'));
     temporaryRoots.push(root);
