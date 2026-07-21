@@ -3,7 +3,7 @@
 # bench/src/suites/swebench-pro/runner.ts: the arm dir is bind-mounted at /bench; env carries
 # BENCH_ARM (a|b), BENCH_TIMEOUT_SECS, BENCH_MODEL, BENCH_EFFORT,
 # BENCH_BASE_COMMIT, host-distinct nonzero BENCH_TASK_UID/BENCH_TASK_GID,
-# BENCH_ARTIFACT_OWNER (host uid:gid), BENCH_SANITIZE=1,
+# BENCH_ARTIFACT_OWNER (host uid:gid),
 # CODEX_HOME=/runtime/codex-home, ULTRACODE_HOME=/bench/uc, and the attested
 # BENCH_MODEL_RELAY_BASE_URL. The repository is fixed at /app. Everything of
 # value is written under /bench before exit, and the script always exits 0 — failures are reported in
@@ -57,13 +57,6 @@ START=0
 END=0
 BASE_SHA=""
 WAITED_MS=0
-GIT_AUDIT_DIR=""
-cleanup_git_audit() {
-  case "$GIT_AUDIT_DIR" in
-    /tmp/ucbench-git-audit.*) trusted_busybox rm -rf "$GIT_AUDIT_DIR" ;;
-  esac
-  GIT_AUDIT_DIR=""
-}
 write_meta() {
   M_FAILURE="$META_FAILURE" M_EXIT="$CODEX_EXIT" M_START="$START" M_END="$END" \
   M_BASE="$BASE_SHA" M_EXPECTED="${BENCH_BASE_COMMIT:-}" M_WAITED="$WAITED_MS" \
@@ -101,9 +94,7 @@ write_meta() {
   ' || printf '{"failure":"%s","codexExit":%s,"startedAt":0,"endedAt":0,"baseSha":"","expectedBase":"","patchBytes":0,"applyCheck":null,"ucRuns":[],"waitedForTerminalMs":0}\n' "${META_FAILURE:-harness-setup-failed}" "$CODEX_EXIT" > "$BENCH/out/meta.json"
 }
 finish() {
-  cleanup_git_audit
   write_meta
-  trusted_busybox sync
   exit 0
 }
 
@@ -126,6 +117,17 @@ if [ "$BENCH_TASK_UID" = "$ARTIFACT_UID" ] || [ "$BENCH_TASK_GID" = "$ARTIFACT_G
 fi
 TASK_UID=$BENCH_TASK_UID
 TASK_GID=$BENCH_TASK_GID
+[ -d /opt/bench/sanitized-repository ] && [ ! -L /opt/bench/sanitized-repository ] || {
+  META_FAILURE="harness-setup-failed"
+  finish
+}
+trusted_busybox rm -rf -- "$REPO_DIR" \
+  && trusted_busybox mv /opt/bench/sanitized-repository "$REPO_DIR" \
+  && trusted_busybox cp /opt/bench/predirty.z /tmp/predirty.z \
+  && trusted_busybox cp /opt/bench/pre-status.txt "$BENCH/out/pre-status.txt" || {
+  META_FAILURE="harness-setup-failed"
+  finish
+}
 trusted_busybox chown -R "$TASK_UID:$TASK_GID" \
   "$REPO_DIR" "$BENCH" "$HOME" "$CODEX_HOME" "${ULTRACODE_HOME:-$BENCH/uc}" 2>/dev/null || {
   META_FAILURE="ownership-unsafe"
@@ -135,11 +137,21 @@ as_task "$NODE" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish
 as_task "$CODEX" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
 cd "$REPO_DIR" 2>/dev/null || { META_FAILURE="harness-setup-failed"; finish; }
 
-# --- git preflight: uid-mismatch + identity so agent-side git always works ---
-as_task git config --global --add safe.directory '*'
-as_task git config --global user.email bench@ultracode.local
-as_task git config --global user.name 'ultracode bench'
-as_task git config --global core.autocrlf false
+# --- Git identity for agent-side tooling; the host already sanitized and
+# --- verified the repository with trusted executables before image build. ---
+cat > "$HOME/.gitconfig" <<'EOF'
+[safe]
+	directory = *
+[user]
+	email = bench@ultracode.local
+	name = ultracode bench
+[core]
+	autocrlf = false
+EOF
+trusted_busybox chown "$TASK_UID:$TASK_GID" "$HOME/.gitconfig" || {
+  META_FAILURE="ownership-unsafe"
+  finish
+}
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_REPLACE_REF_BASE
 unset GIT_NAMESPACE GIT_SHALLOW_FILE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
@@ -149,73 +161,18 @@ export GIT_CONFIG_KEY_0=core.fsmonitor
 export GIT_CONFIG_VALUE_0=false
 export GIT_CONFIG_KEY_1=core.hooksPath
 export GIT_CONFIG_VALUE_1=/dev/null
-BASE_SHA=$(as_task git rev-parse HEAD 2>/dev/null) || { META_FAILURE="harness-setup-failed"; finish; }
-[ -n "${BENCH_BASE_COMMIT:-}" ] && [ "$BASE_SHA" != "$BENCH_BASE_COMMIT" ] && {
-  log "base sha $BASE_SHA != dataset base_commit $BENCH_BASE_COMMIT"
-  META_FAILURE="base-mismatch"
-  finish
-}
-if ! as_task git status --porcelain > "$BENCH/out/pre-status.txt" 2>&1; then
-  log "image checkout status is unreadable; refusing to launch"
-  META_FAILURE="invalid-instance"
-  finish
-fi
-if ! TRACKED_DIRTY=$(as_task git status --porcelain --untracked-files=no 2>/dev/null); then
-  log "image checkout tracked status is unreadable; refusing to launch"
-  META_FAILURE="invalid-instance"
-  finish
-fi
-[ -n "$TRACKED_DIRTY" ] && {
-  log "image checkout has tracked changes; refusing to score a patch against a different base"
-  META_FAILURE="invalid-instance"
-  finish
-}
-if ! as_task git status --porcelain -z 2>/dev/null | as_task "$NODE" -e '
-  let buf = ""; process.stdin.on("data", (d) => (buf += d)).on("end", () => {
-    const paths = [];
-    const parts = buf.split("\0").filter(Boolean);
-    for (let i = 0; i < parts.length; i++) {
-      const p = parts[i];
-      // Untracked entries only: image runtime droppings. Tracked files the
-      // image shipped modified stay in the diff — resetting them would
-      // silently discard agent edits to those same files.
-      if (p.startsWith("?? ")) paths.push(":(literal)" + p.slice(3));
-      if (p[0] === "R" || p[0] === "C") i++; // rename/copy: next token is the origin path
-    }
-    process.stdout.write(paths.join("\0"));
-  })' > /tmp/predirty.z; then
-  log "image checkout pre-dirty paths are unreadable; refusing to launch"
-  META_FAILURE="invalid-instance"
-  finish
-fi
-
-# --- gold-fix leakage guard: privately audit, replace all Git metadata with a
-# --- fresh BASE_SHA-only database, and fail before launch on any uncertainty ---
-[ "${BENCH_SANITIZE:-}" = 1 ] || {
-  META_FAILURE="harness-setup-failed"
-  finish
-}
-GIT_AUDIT_DIR=$(trusted_busybox mktemp -d /tmp/ucbench-git-audit.XXXXXX) || {
-  META_FAILURE="harness-setup-failed"
-  finish
-}
-trusted_busybox chmod 700 "$GIT_AUDIT_DIR"
-trusted_busybox chown "$TASK_UID:$TASK_GID" "$GIT_AUDIT_DIR" || {
-  META_FAILURE="ownership-unsafe"
-  finish
-}
-if ! as_task_busybox sh /opt/bench/sanitize-git.sh "$REPO_DIR" "$BASE_SHA" "$GIT_AUDIT_DIR" \
-  > "$GIT_AUDIT_DIR/stdout.log" 2>> "$GIT_AUDIT_DIR/private.log"; then
-  log "git history sanitization failed before session launch"
+BASE_SHA=${BENCH_BASE_COMMIT:-}
+if [ "${#BASE_SHA}" -ne 40 ]; then
   META_FAILURE="harness-setup-failed"
   finish
 fi
-trusted_busybox chmod -R u+rwX,go-rwx "$GIT_AUDIT_DIR" \
-  && trusted_busybox chown -R 0:0 "$GIT_AUDIT_DIR" || {
-  META_FAILURE="ownership-unsafe"
+case "$BASE_SHA" in
+  *[!0-9a-f]*)
+  META_FAILURE="harness-setup-failed"
   finish
-}
-log "git history sanitized and verified at base"
+  ;;
+esac
+log "using host-sanitized Git history at base $BASE_SHA"
 
 # --- CODEX_HOME from the credential-free arm template. config.toml is rebuilt
 # --- from the template every attempt (a stale copy from
@@ -307,20 +264,23 @@ if [ "$BENCH_ARM" = b ]; then
       && [ "$(trusted_busybox date +%s)" -lt "$STOP_DEADLINE" ]; do
       trusted_busybox sleep 5
     done
+    REMAINING_RUNS=$(active_runs)
+    if [ -n "$REMAINING_RUNS" ]; then
+      log "straggler runs remained nonterminal after stop grace: $REMAINING_RUNS"
+      META_FAILURE="harness-setup-failed"
+      finish
+    fi
   fi
   WAITED_MS=$(( ($(trusted_busybox date +%s) - WAIT_START) * 1000 ))
 fi
 trusted_busybox sleep 2 # settle: let final writes land before capture
 
-# The detailed audit never leaves its root-only directory. Publish only the
+# The detailed host audit never enters the image. Publish only its
 # identifier-free proof after Codex and detached task work have ended.
-if [ -n "$GIT_AUDIT_DIR" ]; then
-  if ! trusted_busybox cp "$GIT_AUDIT_DIR/safe.txt" "$BENCH/out/git-audit.txt" \
-    || ! trusted_busybox chmod 0644 "$BENCH/out/git-audit.txt"; then
-    log "safe git audit publication failed"
-    META_FAILURE="harness-setup-failed"
-  fi
-  cleanup_git_audit
+if ! trusted_busybox cp /opt/bench/git-audit.txt "$BENCH/out/git-audit.txt" \
+  || ! trusted_busybox chmod 0644 "$BENCH/out/git-audit.txt"; then
+  log "safe git audit publication failed"
+  META_FAILURE="harness-setup-failed"
 fi
 
 # Patch capture is immutable harness code but operates on task-controlled Git

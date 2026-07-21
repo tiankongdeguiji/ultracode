@@ -179,7 +179,6 @@ describe.runIf(relayEnabled)('live SWE-bench Pro restricted model-transport topo
         `BENCH_TASK_GID=${taskIdentity.gid}`,
         `BENCH_ARTIFACT_OWNER=${artifactOwner.uid}:${artifactOwner.gid}`,
         `BENCH_RUNTIME_NONCE=${runtimeNonce}`,
-        'BENCH_SANITIZE=1',
         'BENCH_REPO_DIR=/app',
         'CODEX_HOME=/runtime/codex-home',
         'ULTRACODE_HOME=/bench/uc',
@@ -190,6 +189,7 @@ describe.runIf(relayEnabled)('live SWE-bench Pro restricted model-transport topo
       docker(['image', 'inspect', relayImage]);
       docker([
         'network', 'create', '--internal', '--driver', 'bridge',
+        '--ipv6=false',
         '--opt', 'com.docker.network.bridge.inhibit_ipv4=true',
         '--label', `ultracode.egress-policy=${SWEBENCH_PRO_NETWORK_POLICY.policyLabel}`,
         networkName,

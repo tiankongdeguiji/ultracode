@@ -7,6 +7,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -386,6 +387,42 @@ describe('SWE-bench Pro ownership cleanup', () => {
     expect(calls[2]).toContain('FOWNER');
     expect(existsSync(runtime)).toBe(false);
     expect(statSync(taskDirectory).mode & 0o777).toBe(0o700);
+  });
+
+  it('reclaims a runtime when the temporary root is a symlink alias', async () => {
+    const originalTmpdir = process.env.TMPDIR;
+    const aliasParent = mkdtempSync(join(tmpdir(), 'uc-bench-pro-tmp-alias-'));
+    temporaryRoots.push(aliasParent);
+    const physicalTmpdir = join(aliasParent, 'physical');
+    const aliasTmpdir = join(aliasParent, 'alias');
+    mkdirSync(physicalTmpdir);
+    symlinkSync(physicalTmpdir, aliasTmpdir, 'dir');
+    process.env.TMPDIR = aliasTmpdir;
+    try {
+      const fixture = sessionFixture();
+      const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = fixture;
+      const handleReclamation = successfulReclamation(reclamationFixture('task-a', fixture));
+      let listed = true;
+      const executor: SessionDockerExecutor = async (argv) => {
+        const reclamationResult = handleReclamation(argv);
+        if (reclamationResult !== undefined) return reclamationResult;
+        if (argv[0] === 'ps') return isReclamationQuery(argv) ? '' : listed ? id : '';
+        if (argv[0] === 'inspect') return inspect;
+        if (argv[0] === 'rm') {
+          listed = false;
+          return '';
+        }
+        throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
+      };
+      await expect(stopPersistedSessionContainer(
+        'session-name', 'pilot1', 'task-a', 'a', {}, executor,
+        { taskDirectory, image, artifactOwner, ...reclamation },
+      )).resolves.toBeUndefined();
+      expect(existsSync(runtime)).toBe(false);
+    } finally {
+      if (originalTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = originalTmpdir;
+    }
   });
 
   it('accepts an ambiguous rm failure only after the exact name is proven absent', async () => {
@@ -882,6 +919,10 @@ describe('SWE-bench Pro ownership cleanup', () => {
     ['image', (record: ReturnType<typeof reclamationFixture>['record']) => { record.Image = `sha256:${'0'.repeat(64)}`; }],
     ['command', (record: ReturnType<typeof reclamationFixture>['record']) => { record.Args = ['-c', 'true']; }],
     ['user', (record: ReturnType<typeof reclamationFixture>['record']) => { record.Config.User = '1000:1000'; }],
+    ['node options', (record: ReturnType<typeof reclamationFixture>['record']) => { record.Config.Env[5] = 'NODE_OPTIONS=--require=/task/hook.js'; }],
+    ['duplicate node options', (record: ReturnType<typeof reclamationFixture>['record']) => { record.Config.Env.push('NODE_OPTIONS=--require=/task/hook.js'); }],
+    ['ld preload', (record: ReturnType<typeof reclamationFixture>['record']) => { record.Config.Env[2] = 'LD_PRELOAD=/task/hook.so'; }],
+    ['healthcheck', (record: ReturnType<typeof reclamationFixture>['record']) => { record.Config.Healthcheck = { Test: ['CMD', '/task/hook'] }; }],
     ['capabilities', (record: ReturnType<typeof reclamationFixture>['record']) => { record.HostConfig.CapAdd = ['CHOWN']; }],
     ['auto-remove', (record: ReturnType<typeof reclamationFixture>['record']) => { record.HostConfig.AutoRemove = false; }],
     ['privileged', (record: ReturnType<typeof reclamationFixture>['record']) => { record.HostConfig.Privileged = true; }],

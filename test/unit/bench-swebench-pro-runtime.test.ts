@@ -98,8 +98,13 @@ describe('SWE-bench Pro task identity', () => {
     expect(entrypoint).toContain('as_task "$CODEX" --version');
     expect(entrypoint).not.toContain('/bin/bash');
     expect(entrypoint).not.toContain('BENCH_CHOWN');
-    expect(dockerfile.match(/^COPY .*$/gm)?.every((line) =>
-      line.includes('--chown=0:0') && line.includes('--chmod=0555'))).toBe(true);
+    expect(dockerfile.match(/^COPY .*$/gm)?.every((line) => line.includes('--chown=0:0'))).toBe(true);
+    expect(entrypoint.indexOf('trusted_busybox mv /opt/bench/sanitized-repository'))
+      .toBeLessThan(entrypoint.indexOf('as_task "$NODE" --version'));
+    expect(entrypoint).not.toContain('trusted_busybox sync');
+    expect(entrypoint).toContain('REMAINING_RUNS=$(active_runs)');
+    expect(entrypoint.indexOf('REMAINING_RUNS=$(active_runs)'))
+      .toBeLessThan(entrypoint.indexOf('/opt/bench/capture-git.sh'));
     expect(sessionTaskIdentity({ uid: 1_000, gid: 1_000 })).toEqual({ uid: 1_001, gid: 1_001 });
   });
 });

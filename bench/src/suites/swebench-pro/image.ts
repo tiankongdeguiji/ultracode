@@ -1,6 +1,20 @@
 /** Digest-pinned Pro base images and re-attested COPY-only overlays. */
 import { createHash } from 'node:crypto';
+import {
+  chmodSync,
+  copyFileSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { BenchPathRoots } from '../../shared/contracts.js';
 import { validateRunId } from '../../shared/paths.js';
 import { runBenchProcess } from '../../shared/process.js';
@@ -28,7 +42,7 @@ interface ImageInspect {
   RepoDigests?: string[];
   Os?: string;
   Architecture?: string;
-  Config?: { OnBuild?: unknown };
+  Config?: { OnBuild?: unknown; Volumes?: unknown };
 }
 
 function parseInspect(output: string, description: string): ImageInspect {
@@ -53,6 +67,173 @@ function assertNoInheritedBuildTriggers(record: ImageInspect): void {
   if (onBuild !== null && !(Array.isArray(onBuild) && onBuild.length === 0)) {
     throw new Error('base image must declare no inherited ONBUILD triggers');
   }
+  const volumes = record.Config?.Volumes;
+  if (volumes !== null && volumes !== undefined
+    && (typeof volumes !== 'object' || Array.isArray(volumes) || Object.keys(volumes).length > 0)) {
+    throw new Error('base image must declare no inherited volumes');
+  }
+}
+
+function stageTree(source: string, destination: string): void {
+  mkdirSync(destination, { recursive: true, mode: lstatSync(source).mode & 0o777 });
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    const from = join(source, entry.name);
+    const to = join(destination, entry.name);
+    if (entry.isDirectory()) stageTree(from, to);
+    else if (entry.isSymbolicLink()) symlinkSync(readlinkSync(from), to);
+    else if (entry.isFile()) {
+      try {
+        linkSync(from, to);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
+        copyFileSync(from, to);
+        chmodSync(to, lstatSync(from).mode & 0o777);
+      }
+    } else {
+      throw new Error(`unsupported prepared-toolchain entry: ${from}`);
+    }
+  }
+}
+
+interface PrepContainerInspect {
+  Id?: string;
+  Name?: string;
+  Image?: string;
+  Config?: { Labels?: Record<string, string> };
+  State?: { Running?: boolean };
+}
+
+function prepLabels(runId: string, taskId: string): Record<string, string> {
+  return {
+    'ultracode.benchmark.schema': '2',
+    'ultracode.benchmark.suite': 'swebench-pro',
+    'ultracode.benchmark.run': runId,
+    'ultracode.benchmark.task': taskId,
+    'ultracode.benchmark.purpose': 'prep',
+    'ultracode.benchmark.ownership': '1',
+  };
+}
+
+async function exactPrepContainer(
+  name: string,
+  baseLocalId: string,
+  labels: Record<string, string>,
+  docker: DockerExecutor,
+): Promise<PrepContainerInspect | null> {
+  const ids = (await docker([
+    'ps', '-aq', '--no-trunc', '--filter', `name=^/${name}$`,
+  ], IMAGE_QUERY_TIMEOUT_MS)).split('\n').map((entry) => entry.trim()).filter(Boolean);
+  if (ids.length === 0) return null;
+  if (ids.length !== 1 || !/^[a-f0-9]{64}$/.test(ids[0]!)) {
+    throw new Error('repository-prep container name is not uniquely bound');
+  }
+  const parsed = JSON.parse(await docker(['inspect', ids[0]!], IMAGE_QUERY_TIMEOUT_MS)) as unknown;
+  if (!Array.isArray(parsed) || parsed.length !== 1 || parsed[0] === null || typeof parsed[0] !== 'object') {
+    throw new Error('repository-prep container inspection is malformed');
+  }
+  const record = parsed[0] as PrepContainerInspect;
+  const observedLabels = record.Config?.Labels ?? {};
+  const labelsMatch = Object.entries(labels).every(([key, value]) => observedLabels[key] === value);
+  if (record.Id !== ids[0] || record.Name !== `/${name}` || record.Image !== baseLocalId
+    || record.State?.Running !== false
+    || !labelsMatch) {
+    throw new Error('repository-prep container does not match its exact stopped identity');
+  }
+  return record;
+}
+
+async function removePrepContainer(
+  name: string,
+  baseLocalId: string,
+  labels: Record<string, string>,
+  docker: DockerExecutor,
+): Promise<void> {
+  const record = await exactPrepContainer(name, baseLocalId, labels, docker);
+  if (record === null) return;
+  await docker(['rm', '-fv', record.Id!], IMAGE_QUERY_TIMEOUT_MS);
+  if (await exactPrepContainer(name, baseLocalId, labels, docker) !== null) {
+    throw new Error('repository-prep container absence was not proven');
+  }
+}
+
+export interface TaskBuildContextInput {
+  roots: BenchPathRoots;
+  contextDirectory: string;
+  toolchainDirectory: string;
+  runId: string;
+  instance: SwebenchProInstance;
+  resolvedDigest: string;
+  baseLocalId: string;
+  docker: DockerExecutor;
+}
+
+/** Extract without starting task code, then sanitize once with host-side trusted Git tooling. */
+export async function prepareTaskBuildContext(input: TaskBuildContextInput): Promise<void> {
+  stageTree(input.toolchainDirectory, input.contextDirectory);
+  const repository = join(input.contextDirectory, 'sanitized-repository');
+  const audit = join(input.contextDirectory, '.git-audit');
+  mkdirSync(repository, { mode: 0o700 });
+  mkdirSync(audit, { mode: 0o700 });
+  const key = createHash('sha256')
+    .update(`${input.runId}\0${input.instance.instanceId}`, 'utf8')
+    .digest('hex').slice(0, 32);
+  const name = `ucbench-prep-${key}`;
+  const labels = prepLabels(input.runId, input.instance.instanceId);
+  await removePrepContainer(name, input.baseLocalId, labels, input.docker);
+  let created = false;
+  try {
+    const id = (await input.docker([
+      'create', '--name', name, '--network', 'none', '--no-healthcheck',
+      ...Object.entries(labels).flatMap(([label, value]) => ['--label', `${label}=${value}`]),
+      '--entrypoint', '/bin/false', input.resolvedDigest,
+    ], IMAGE_QUERY_TIMEOUT_MS)).trim();
+    created = true;
+    if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('Docker returned an invalid repository-prep id');
+    const record = await exactPrepContainer(name, input.baseLocalId, labels, input.docker);
+    if (record?.Id !== id) throw new Error('repository-prep id changed after creation');
+    await input.docker(['cp', `${id}:/app/.`, repository], IMAGE_TRANSFER_TIMEOUT_MS);
+  } finally {
+    if (created || await exactPrepContainer(name, input.baseLocalId, labels, input.docker) !== null) {
+      await removePrepContainer(name, input.baseLocalId, labels, input.docker);
+    }
+  }
+  const tracked = await runBenchProcess('git', [
+    '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    '-C', repository, 'status', '--porcelain', '--untracked-files=no',
+  ], {
+    cwd: input.contextDirectory,
+    env: { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    timeoutMs: IMAGE_QUERY_TIMEOUT_MS,
+  });
+  if (tracked.stdout.trim() !== '') {
+    throw new Error('base image repository has tracked changes before host sanitization');
+  }
+  const sanitizer = join(input.roots.benchRoot, 'suites', 'swebench-pro', 'sanitize-git.sh');
+  await runBenchProcess('bash', [sanitizer, repository, input.instance.baseCommit, audit], {
+    cwd: input.contextDirectory,
+    env: { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    timeoutMs: IMAGE_TRANSFER_TIMEOUT_MS,
+    tailBytes: 8 * 1_024 * 1_024,
+  });
+  const status = await runBenchProcess('git', [
+    '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    '-C', repository, 'status', '--porcelain', '-z', '--untracked-files=all',
+  ], {
+    cwd: input.contextDirectory,
+    env: { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    timeoutMs: IMAGE_QUERY_TIMEOUT_MS,
+  });
+  const parts = status.stdout.split('\0').filter(Boolean);
+  const preDirty: string[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const entry = parts[index]!;
+    if (entry.startsWith('?? ')) preDirty.push(`:(literal)${entry.slice(3)}`);
+    if (entry[0] === 'R' || entry[0] === 'C') index += 1;
+  }
+  writeFileSync(join(input.contextDirectory, 'predirty.z'), `${preDirty.join('\0')}${preDirty.length ? '\0' : ''}`);
+  writeFileSync(join(input.contextDirectory, 'pre-status.txt'), status.stdout.replaceAll('\0', '\n'));
+  copyFileSync(join(audit, 'safe.txt'), join(input.contextDirectory, 'git-audit.txt'));
+  rmSync(audit, { recursive: true, force: true });
 }
 
 /** Select only the digest belonging to the requested repository. */
@@ -97,6 +278,7 @@ export interface PrepareTaskImageOptions {
   toolchainDirectory: string;
   toolchainPayloadSha256: string;
   docker?: DockerExecutor;
+  prepareBuildContext?: (input: TaskBuildContextInput) => Promise<void>;
 }
 
 /** Remove run-owned pre-publication image tags and prove no matching tag remains. */
@@ -148,7 +330,18 @@ export async function prepareTaskImage(
     .update(`${runId}\0${resolvedDigest}\0${options.toolchainPayloadSha256}\0${instance.instanceId}`, 'utf8')
     .digest('hex');
   const overlayName = `ultracode-swebench-pro:${overlayKey.slice(0, 48)}`;
+  const contextDirectory = mkdtempSync(join(tmpdir(), 'uc-pro-build-context-'));
   try {
+    await (options.prepareBuildContext ?? prepareTaskBuildContext)({
+      roots: options.roots,
+      contextDirectory,
+      toolchainDirectory: options.toolchainDirectory,
+      runId,
+      instance,
+      resolvedDigest,
+      baseLocalId: baseIdentity.localId,
+      docker,
+    });
     await docker([
       'build',
       '--pull=false',
@@ -160,7 +353,7 @@ export async function prepareTaskImage(
       '-f', join(options.roots.benchRoot, 'suites', 'swebench-pro', 'Dockerfile'),
       '--build-arg', `BASE_IMAGE=${resolvedDigest}`,
       '-t', overlayName,
-      options.toolchainDirectory,
+      contextDirectory,
     ], IMAGE_TRANSFER_TIMEOUT_MS);
     const overlay = identity(await inspect(overlayName, docker), overlayName);
     return {
@@ -182,6 +375,8 @@ export async function prepareTaskImage(
       ]);
     }
     throw error;
+  } finally {
+    rmSync(contextDirectory, { recursive: true, force: true });
   }
 }
 
@@ -205,33 +400,11 @@ export async function removeTaskImages(
   docker: DockerExecutor = defaultDockerExecutor,
 ): Promise<number> {
   try {
-    let removed = 0;
-    const exact = new Map(attestations.map((entry) => [entry.overlayLocalId, entry]));
-    const localImageIds = async (): Promise<Set<string>> => {
-      const ids = (await docker(['image', 'ls', '-q', '--no-trunc'], IMAGE_QUERY_TIMEOUT_MS))
-        .split('\n').map((entry) => entry.trim()).filter(Boolean);
-      if (ids.some((id) => !/^sha256:[a-f0-9]{64}$/.test(id))) {
-        throw new Error('Docker returned an invalid local image id');
-      }
-      return new Set(ids);
-    };
+    const exact = new Map(attestations.map((entry) => [entry.overlayName, entry]));
     for (const attestation of exact.values()) {
       await reattestTaskImage(attestation, docker);
-      let removalFailure: unknown;
-      try {
-        await docker(['image', 'rm', attestation.overlayLocalId], IMAGE_QUERY_TIMEOUT_MS);
-      } catch (error) {
-        removalFailure = error;
-      }
-      if ((await localImageIds()).has(attestation.overlayLocalId)) {
-        throw ownershipUnsafeAggregate('overlay image absence was not proven after removal', [
-          removalFailure,
-          new Error(`owned overlay image remains present: ${attestation.overlayLocalId}`),
-        ]);
-      }
-      removed += 1;
     }
-    return removed;
+    return await removeTaskImageTargets([...exact.keys()], docker);
   } catch (error) {
     throw ownershipUnsafe('unsafe SWE-bench Pro overlay image cleanup', error);
   }

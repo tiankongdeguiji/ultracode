@@ -38,11 +38,12 @@ The relay URL hostname must equal the relay container name and must be a Docker
 DNS endpoint name; localhost and every IP literal are rejected before Docker
 inspection. The named network
 must be a local, non-attachable, non-ingress Docker bridge created with
-`--internal --opt com.docker.network.bridge.inhibit_ipv4=true` and labeled
-`ultracode.egress-policy=codex-responses-via-attested-relay-v1`. Before manifest
+`--internal --ipv6=false --opt com.docker.network.bridge.inhibit_ipv4=true` and labeled
+`ultracode.egress-policy=codex-responses-via-attested-relay-v2`. Before manifest
 publication it must contain exactly the running relay. The required bridge
-option prevents Docker from assigning the bridge an IP, so task containers
-cannot reach services on the host through the internal-network gateway. During sessions it may
+option prevents Docker from assigning the bridge an IPv4 address, while the
+attested disabled IPv6 setting and absence of IPv6 IPAM prevent an IPv6 host
+gateway. During sessions it may
 contain only that relay and exact active run-owned task containers. Each task
 container is created stopped from its manifest-bound immutable local image ID,
 with the image healthcheck disabled and shell/dynamic-loader bootstrap
@@ -51,8 +52,18 @@ command, user, labels, mounts, capability/resource policy, runtime nonce,
 credential-free environment, relay URL, and configured network. Docker then
 starts only the pinned musl loader and BusyBox gate. The host reinspects the
 running sole-network attachment and complete relay topology before publishing
-the nonce. The gate then enters a pinned BusyBox bootstrap; task-image Git,
-Codex, and Node execute only through the pinned privilege dropper after it
+the nonce.
+
+Before the COPY-only overlay build, preparation creates but never starts a
+stopped container from the immutable task image, copies `/app` to a private
+host build context, and runs the manifest-bound sanitizer with host Git and
+host utilities. The detailed audit stays outside the image; only its
+identifier-free summary enters the overlay. This expensive base-closure repack
+runs once per selected task. Each arm starts from the same immutable sanitized
+overlay and receives an independent writable container layer. The pinned
+BusyBox bootstrap removes the original task-image `/app` view and moves that
+arm's sanitized copy into place before any task-image executable can run.
+Task-image Git, Codex, and Node execute only through the pinned privilege dropper after it
 proves the task uid/gid, empty usable capability sets, and `no_new_privs`.
 
 The separately managed relay must use an immutable local image and declare its
@@ -68,7 +79,7 @@ contract hash in these labels:
 
 The destination hash covers the canonical JSON object with `protocol`,
 `hostname`, `port`, and `pathname` parsed from `fixedDestination`. Contract
-`c4608a577487f503bfd5d26269107511607b8a4b2c7e5c9eb0e14acd77748990`
+`f98d8a4b29798cde4287df40843098ed15c0377bd940477b5a159be162ea87d4`
 accepts only JSON `POST /v1/responses` and `POST /v1/responses/compact` for the
 configured model. It requires strict request-schema and header allowlists;
 rejects provider-hosted tools, remote MCP, background mode, and external URLs,
@@ -76,7 +87,10 @@ file IDs, and vector stores; and accepts only JSON or event-stream responses
 without hosted-tool or citation outputs. It maps the two paths to the one
 configured HTTPS `/v1` destination, rejects client Authorization, CONNECT,
 absolute-form requests, other methods/paths, redirects, and generic forwarding,
-and keeps the provider credential inside the relay. The task-facing relay may
+and keeps the provider credential inside the relay. It also requires a quota
+bound to each Docker source endpoint for the lifetime of its network
+attachment: at most 16 concurrent requests, 2,048 total requests, and 16 million
+output tokens, with overflow rejected before provider forwarding. The task-facing relay may
 use HTTP on the isolated bridge or operator-configured HTTPS. Codex uses
 `wire_api = "responses"` with `requires_openai_auth = false`; nested Arm B
 workers inherit the same provider without a provider key.
@@ -100,7 +114,7 @@ Runtime network and relay names remain hash-only in persistent artifacts.
 This is an attested external relay contract, not an in-repository proxy and not
 proof of its implementation. The operator must review and deploy the relay so
 its code, request and response validators, provider credential scope, model
-restriction, hosted-retrieval rejection, fixed upstream destination, redirect
+restriction, source-identity quota enforcement, hosted-retrieval rejection, fixed upstream destination, redirect
 handling, and egress match the declared contract. The harness does not inspect
 an operator firewall and makes no claim about an undocumented firewall.
 Docker-daemon administrators, relay compromise, false relay labels, mutable
@@ -328,6 +342,11 @@ only expose results whose timing and per-task attribution already survive
 recovery. Report assembly requires the complete arm-scoped receipt from the
 same invocation as the latest verifier attempt; an older result or the other
 arm's bindings cannot satisfy that proof after a crash.
+
+`clean --run-id <run>` removes exact run-owned containers and invalidates the
+generated `report.json` and `report.md`; rerun `report` after cleaning to
+publish them again. `--images` additionally removes every manifest-owned
+overlay tag after re-attestation.
 
 Official evaluator containers have the same static process and privilege
 bounds with `cap-drop ALL`, an empty capability-add tuple, and the same

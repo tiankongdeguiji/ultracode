@@ -350,6 +350,7 @@ function currentPolicies(
       containerPolicySha256: containerPolicySha256(policy),
       setupUser: '0:0',
       taskUser: 'dynamic-host-distinct-nonzero-cleared-capability-sets',
+      repositoryPreparation: 'host-sanitized-once-per-task-overlay-copy-on-write-per-arm',
       postTaskGitCapture: 'immutable-helper-as-task-uid',
     }),
     historySha256: sha256CanonicalJson({
@@ -358,7 +359,8 @@ function currentPolicies(
       preDirty: 'untracked-excluded',
       objectDatabase: 'fresh-base-reachable-closure-only',
       refs: 'base-branch-and-head-only',
-      audit: 'root-private-until-post-session-safe-summary',
+      sanitizerExecution: 'host-before-overlay-build',
+      audit: 'host-private-detailed-safe-summary-published-post-session',
     }),
     cleanupSha256: sha256CanonicalJson({
       sessionLabels: 'schema-suite-run-task-arm-purpose-ownership-runtime',
@@ -1701,7 +1703,6 @@ async function runSession(
       `BENCH_ARTIFACT_OWNER=${artifactOwner.uid}:${artifactOwner.gid}`,
       `BENCH_RUNTIME_NONCE=${runtimeNonce}`,
       'BENCH_REPO_DIR=/app',
-      'BENCH_SANITIZE=1',
       'CODEX_HOME=/runtime/codex-home',
       'ULTRACODE_HOME=/bench/uc',
       'HOME=/runtime/home',
@@ -3005,7 +3006,7 @@ function trustedSessionRuntimeRoot(
   arm: Arm,
   expectedNonce?: string,
 ): string {
-  const relativeRuntime = relative(tmpdir(), runtime);
+  const relativeRuntime = relative(physicalPath(tmpdir()), physicalPath(runtime));
   if (!/^uc-bench-pro-runtime-[A-Za-z0-9]+$/.test(relativeRuntime) || relativeRuntime.includes(sep)) {
     throw new Error('owned session credential runtime is outside the exact temporary namespace');
   }

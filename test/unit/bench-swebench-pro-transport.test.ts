@@ -66,6 +66,7 @@ function network(containers: Record<string, { Name: string }> = {
     Scope: 'local',
     Attachable: false,
     Ingress: false,
+    EnableIPv6: false,
     Labels: { 'ultracode.egress-policy': SWEBENCH_PRO_NETWORK_POLICY.policyLabel },
     Options: { 'com.docker.network.bridge.inhibit_ipv4': 'true' },
     IPAM: { Driver: 'default' },
@@ -204,7 +205,7 @@ const expectedSession = {
 describe('SWE-bench Pro attested model relay contract', () => {
   it('freezes a Responses-only request and fixed-destination policy', () => {
     expect(SWEBENCH_PRO_MODEL_RELAY_CONTRACT_SHA256)
-      .toBe('c4608a577487f503bfd5d26269107511607b8a4b2c7e5c9eb0e14acd77748990');
+      .toBe('f98d8a4b29798cde4287df40843098ed15c0377bd940477b5a159be162ea87d4');
     expect(SWEBENCH_PRO_MODEL_RELAY_CONTRACT).toMatchObject({
       wireProtocol: 'openai-responses',
       requests: [
@@ -223,6 +224,13 @@ describe('SWE-bench Pro attested model relay contract', () => {
       },
       destinationPolicy: { genericForwarding: 'reject', redirects: 'reject' },
       credentialPolicy: { taskProviderCredential: 'forbidden', inboundAuthorization: 'reject' },
+      sourceBudgetPolicy: {
+        identity: 'docker-source-endpoint',
+        maximumConcurrentRequests: 16,
+        maximumRequests: 2_048,
+        maximumOutputTokens: 16_000_000,
+        overflow: 'reject-before-provider-forward',
+      },
       responsePolicy: {
         contentTypes: ['application/json', 'text/event-stream'],
         hostedToolAndCitationOutputs: 'reject',
@@ -305,12 +313,14 @@ describe('SWE-bench Pro attested model relay contract', () => {
       { Attachable: true },
       { Scope: 'swarm' },
       { Options: {} },
+      { EnableIPv6: true },
+      { IPAM: { Driver: 'default', Config: [{ Subnet: 'fd00::/64' }] } },
     ]) {
       const parsed = JSON.parse(network()) as Array<Record<string, unknown>>;
       Object.assign(parsed[0]!, drift);
       expect(() => inspectSwebenchProTransportBoundary(
         JSON.stringify(parsed), relay(), config, MODEL, bindings,
-      )).toThrow(/internal network|dedicated local bridge|inhibit the host bridge IP/);
+      )).toThrow(/internal network|dedicated local bridge|inhibit the host bridge IP|disable IPv6/);
     }
   });
 

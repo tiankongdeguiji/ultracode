@@ -194,7 +194,7 @@ export const swebenchProAdapter: SuiteAdapter<'swebench-pro'> = {
     report: identitySpec('write the shared report envelope', 'reportCommand'),
     status: identitySpec('show exact task/arm status', 'statusCommand'),
     clean: {
-      summary: 'clean exact run-owned containers and optional overlays',
+      summary: 'clean run-owned containers, invalidate reports, and optionally remove overlays',
       usage: '--run-id <id> [--images]',
       options: CLEAN_OPTIONS,
       parse(argv): CleanOptions {

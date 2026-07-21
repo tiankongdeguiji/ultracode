@@ -77,6 +77,11 @@ matches the configured pin. The initial pin is explicitly marked as an
 unaudited local content digest and must be independently renewed before results
 are treated as publishable benchmark evidence.
 
+Task-image repositories are extracted from stopped containers and sanitized
+once per selected task by host Git before the COPY-only overlay build. The
+original image checkout is hidden by the trusted bootstrap, and Arm A and Arm B
+modify isolated container-layer copies of the same sanitized base closure.
+
 ## Model isolation
 
 SWE-bench Pro has no direct ChatGPT/API-key mode. Task containers receive no

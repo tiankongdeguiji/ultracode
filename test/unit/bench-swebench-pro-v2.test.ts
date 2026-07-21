@@ -9,7 +9,11 @@ import {
   swebenchProOperatorConfigSchema,
   type SwebenchProConfig,
 } from '../../bench/src/suites/swebench-pro/config.js';
-import { prepareTaskImage, repositoryDigest } from '../../bench/src/suites/swebench-pro/image.js';
+import {
+  prepareTaskImage,
+  removeTaskImages,
+  repositoryDigest,
+} from '../../bench/src/suites/swebench-pro/image.js';
 import { instanceFromRow, selectInstances } from '../../bench/src/suites/swebench-pro/instances.js';
 import type { SwebenchProContainerPolicy } from '../../bench/src/suites/swebench-pro/container-policy.js';
 import { classifyOutcome } from '../../bench/src/suites/swebench-pro/state.js';
@@ -33,6 +37,7 @@ import {
 import { createBenchPathRoots } from '../../bench/src/shared/paths.js';
 
 const temporaryRoots: string[] = [];
+const skipBuildContext = async (): Promise<void> => {};
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -117,6 +122,7 @@ describe('SWE-bench Pro adapter parsing', () => {
       runId: 'pilot1', resume: true, redo: ['owner/repo::a'], taskIds: ['owner/repo'],
     });
     expect(() => swebenchProAdapter.commands.run.parse(['--run-id', 'pilot1', '--unknown'])).toThrow(/unknown option/);
+    expect(swebenchProAdapter.commands.clean.summary).toContain('invalidate reports');
   });
 
   it('rejects explicit resume count or seed drift from the immutable manifest', () => {
@@ -423,6 +429,7 @@ describe('evaluator ownership and empty predictions', () => {
       toolchainDirectory: '/cache/toolchain',
       toolchainPayloadSha256: 'd'.repeat(64),
       docker,
+      prepareBuildContext: skipBuildContext,
     })).rejects.toThrow(/ONBUILD/);
     expect(calls.every((argv) => argv[0] !== 'build')).toBe(true);
   });
@@ -472,6 +479,7 @@ describe('evaluator ownership and empty predictions', () => {
       toolchainDirectory: '/cache/toolchain',
       toolchainPayloadSha256: 'd'.repeat(64),
       docker,
+      prepareBuildContext: skipBuildContext,
     };
 
     const first = await prepareTaskImage(instance, { ...common, runId: 'run-one' });
@@ -519,9 +527,45 @@ describe('evaluator ownership and empty predictions', () => {
       toolchainDirectory: '/cache/toolchain',
       toolchainPayloadSha256: 'd'.repeat(64),
       docker,
+      prepareBuildContext: skipBuildContext,
     })).rejects.toThrow(/injected post-build inspect failure/);
     expect(calls).toContainEqual(['image', 'rm', overlayName]);
     expect(calls).toContainEqual(['image', 'ls', '-q', '--no-trunc', overlayName]);
+  });
+
+  it('removes every run-owned tag when identical overlays share one local image id', async () => {
+    const imageId = `sha256:${'c'.repeat(64)}`;
+    const baseId = `sha256:${'b'.repeat(64)}`;
+    const digest = `jefzda/sweap-images@sha256:${'a'.repeat(64)}`;
+    const names = ['ultracode-swebench-pro:' + '1'.repeat(48), 'ultracode-swebench-pro:' + '2'.repeat(48)];
+    const present = new Set(names);
+    const removed: string[] = [];
+    const docker = async (argv: readonly string[]): Promise<string> => {
+      if (argv[0] === 'image' && argv[1] === 'inspect') {
+        const reference = argv[2]!;
+        if (reference === digest) {
+          return JSON.stringify([{ Id: baseId, Os: 'linux', Architecture: 'amd64' }]);
+        }
+        if (present.has(reference)) {
+          return JSON.stringify([{ Id: imageId, Os: 'linux', Architecture: 'amd64' }]);
+        }
+        throw new Error(`missing image ${reference}`);
+      }
+      if (argv[0] === 'image' && argv[1] === 'rm') {
+        removed.push(argv[2]!);
+        present.delete(argv[2]!);
+        return '';
+      }
+      if (argv[0] === 'image' && argv[1] === 'ls') return present.has(argv.at(-1)!) ? imageId : '';
+      throw new Error(`unexpected Docker argv: ${argv.join(' ')}`);
+    };
+    const attestations = names.map((overlayName) => ({
+      requested: 'jefzda/sweap-images:task', resolvedDigest: digest,
+      baseLocalId: baseId, basePlatform: 'linux/amd64', overlayName,
+      overlayLocalId: imageId, overlayPlatform: 'linux/amd64',
+    }));
+    await expect(removeTaskImages(attestations, docker)).resolves.toBe(2);
+    expect(removed).toEqual(names);
   });
 
   it('reconciles the deterministic overlay tag when the build wrapper rejects', async () => {
@@ -556,6 +600,7 @@ describe('evaluator ownership and empty predictions', () => {
       toolchainDirectory: '/cache/toolchain',
       toolchainPayloadSha256: 'd'.repeat(64),
       docker,
+      prepareBuildContext: skipBuildContext,
     })).rejects.toThrow(/injected post-build wrapper rejection/u);
     expect(calls).toContainEqual(['image', 'rm', overlayName]);
     expect(calls).toContainEqual(['image', 'ls', '-q', '--no-trunc', overlayName]);

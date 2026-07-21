@@ -48,6 +48,14 @@ export const SWEBENCH_PRO_MODEL_RELAY_CONTRACT = Object.freeze({
     inboundAuthorization: 'reject',
     providerCredential: 'relay-only',
   },
+  sourceBudgetPolicy: {
+    identity: 'docker-source-endpoint',
+    lifetime: 'network-endpoint-attachment',
+    maximumConcurrentRequests: 16,
+    maximumRequests: 2_048,
+    maximumOutputTokens: 16_000_000,
+    overflow: 'reject-before-provider-forward',
+  },
   responsePolicy: {
     contentTypes: ['application/json', 'text/event-stream'],
     hostedToolAndCitationOutputs: 'reject',
@@ -55,7 +63,7 @@ export const SWEBENCH_PRO_MODEL_RELAY_CONTRACT = Object.freeze({
 });
 
 export const SWEBENCH_PRO_MODEL_RELAY_CONTRACT_SHA256 =
-  'c4608a577487f503bfd5d26269107511607b8a4b2c7e5c9eb0e14acd77748990';
+  'f98d8a4b29798cde4287df40843098ed15c0377bd940477b5a159be162ea87d4';
 
 if (sha256CanonicalJson(SWEBENCH_PRO_MODEL_RELAY_CONTRACT)
   !== SWEBENCH_PRO_MODEL_RELAY_CONTRACT_SHA256) {
@@ -65,11 +73,11 @@ if (sha256CanonicalJson(SWEBENCH_PRO_MODEL_RELAY_CONTRACT)
 export const SWEBENCH_PRO_NETWORK_POLICY = Object.freeze({
   schemaVersion: 1,
   dockerNetwork: 'dedicated-internal-local-bridge',
-  policyLabel: 'codex-responses-via-attested-relay-v1',
+  policyLabel: 'codex-responses-via-attested-relay-v2',
   onlyNonTaskEndpoint: 'attested-model-relay',
   taskNetworks: 1,
   taskProviderCredentials: 0,
-  hostGatewayReachability: 'bridge-ip-inhibited',
+  hostGatewayReachability: 'bridge-ipv4-inhibited-ipv6-disabled',
 });
 
 export const SWEBENCH_PRO_NETWORK_POLICY_SHA256 = sha256CanonicalJson(SWEBENCH_PRO_NETWORK_POLICY);
@@ -310,6 +318,15 @@ function inspectSwebenchProTransportBoundaryUnchecked(
   const networkOptions = dockerObject(network.inspection.Options);
   if (networkOptions['com.docker.network.bridge.inhibit_ipv4'] !== 'true') {
     throw new Error('SWE-bench Pro restricted network must inhibit the host bridge IP');
+  }
+  const ipam = dockerObject(network.inspection.IPAM);
+  const ipamConfig = Array.isArray(ipam.Config) ? ipam.Config : [];
+  if (network.inspection.EnableIPv6 !== false || ipamConfig.some((entry) => {
+    const row = dockerObject(entry);
+    return [row.Subnet, row.Gateway, row.IPRange]
+      .some((value) => typeof value === 'string' && value.includes(':'));
+  })) {
+    throw new Error('SWE-bench Pro restricted network must disable IPv6 and IPv6 IPAM');
   }
   const relayEntry = network.containers.filter(([, value]) => value.Name === endpoint.hostname);
   if (relayEntry.length !== 1) {

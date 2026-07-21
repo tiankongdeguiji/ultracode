@@ -8,6 +8,7 @@ export interface DockerNetworkInspection {
   Scope?: unknown;
   Attachable?: unknown;
   Ingress?: unknown;
+  EnableIPv6?: unknown;
   Labels?: unknown;
   Options?: unknown;
   IPAM?: unknown;

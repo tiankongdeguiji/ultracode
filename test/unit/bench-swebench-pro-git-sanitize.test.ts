@@ -2,6 +2,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -15,6 +16,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { createBenchPathRoots } from '../../bench/src/shared/paths.js';
+import { prepareTaskBuildContext } from '../../bench/src/suites/swebench-pro/image.js';
 
 const temporaryRoots: string[] = [];
 const sanitizer = join(process.cwd(), 'bench/suites/swebench-pro/sanitize-git.sh');
@@ -56,6 +59,86 @@ function initializeRepository(directory: string): void {
 }
 
 describe('SWE-bench Pro Git sanitizer', () => {
+  it('extracts without starting task code and sanitizes one host build context', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-bench-pro-host-sanitize-'));
+    temporaryRoots.push(root);
+    const source = join(root, 'source');
+    const toolchain = join(root, 'toolchain');
+    const context = join(root, 'context');
+    initializeRepository(source);
+    mkdirSync(toolchain);
+    writeFileSync(join(source, 'base.txt'), 'base content\n');
+    git(source, ['add', 'base.txt']);
+    git(source, ['commit', '--quiet', '-m', 'base']);
+    git(source, ['branch', '-M', 'main']);
+    const base = git(source, ['rev-parse', 'HEAD']);
+    git(source, ['checkout', '--quiet', '-b', 'future']);
+    writeFileSync(join(source, 'gold.txt'), 'gold history\n');
+    git(source, ['add', 'gold.txt']);
+    git(source, ['commit', '--quiet', '-m', 'future']);
+    const future = git(source, ['rev-parse', 'HEAD']);
+    git(source, ['checkout', '--quiet', 'main']);
+    writeFileSync(join(source, 'runtime.tmp'), 'pre-existing untracked file\n');
+
+    const id = 'd'.repeat(64);
+    const baseLocalId = `sha256:${'b'.repeat(64)}`;
+    let present = false;
+    let name = '';
+    let labels: Record<string, string> = {};
+    const calls: string[][] = [];
+    const docker = async (argv: readonly string[]): Promise<string> => {
+      calls.push([...argv]);
+      if (argv[0] === 'ps') return present ? id : '';
+      if (argv[0] === 'create') {
+        present = true;
+        name = argv[argv.indexOf('--name') + 1]!;
+        labels = {};
+        for (let index = 0; index < argv.length; index += 1) {
+          if (argv[index] !== '--label') continue;
+          const [key, ...value] = argv[index + 1]!.split('=');
+          labels[key!] = value.join('=');
+        }
+        return id;
+      }
+      if (argv[0] === 'inspect') {
+        return JSON.stringify([{
+          Id: id, Name: `/${name}`, Image: baseLocalId,
+          Config: { Labels: labels }, State: { Running: false },
+        }]);
+      }
+      if (argv[0] === 'cp') {
+        cpSync(source, argv[2]!, { recursive: true });
+        return '';
+      }
+      if (argv[0] === 'rm') {
+        present = false;
+        return '';
+      }
+      throw new Error(`unexpected Docker argv: ${argv.join(' ')}`);
+    };
+    await prepareTaskBuildContext({
+      roots: createBenchPathRoots(join(process.cwd(), 'bench')),
+      contextDirectory: context,
+      toolchainDirectory: toolchain,
+      runId: 'pilot1',
+      instance: { instanceId: 'task-one', baseCommit: base } as never,
+      resolvedDigest: `repo@sha256:${'a'.repeat(64)}`,
+      baseLocalId,
+      docker,
+    });
+
+    const repository = join(context, 'sanitized-repository');
+    expect(git(repository, ['rev-parse', 'HEAD'])).toBe(base);
+    expect(spawnSync('git', ['-C', repository, 'cat-file', '-e', future], {
+      env: cleanGitEnvironment(),
+    }).status).not.toBe(0);
+    expect(readFileSync(join(context, 'git-audit.txt'), 'utf8')).toContain('status=sanitized');
+    expect(readFileSync(join(context, 'predirty.z'), 'utf8')).toContain(':(literal)runtime.tmp');
+    expect(existsSync(join(context, '.git-audit'))).toBe(false);
+    expect(calls.some((argv) => argv[0] === 'start' || argv[0] === 'run')).toBe(false);
+    expect(present).toBe(false);
+  });
+
   it('accepts a repository whose parent path resolves through a symlink', () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-bench-pro-git-symlink-parent-'));
     temporaryRoots.push(root);
@@ -203,24 +286,21 @@ describe('SWE-bench Pro Git sanitizer', () => {
     expect(readdirSync(repository).filter((name) => name.startsWith('.git-sanitize.'))).toEqual([]);
   });
 
-  it('keeps the identifier-free artifact private until the session has ended and fails before launch', () => {
+  it('installs the host-sanitized repository before task code and publishes only the safe audit after it ends', () => {
     const source = readFileSync(entrypoint, 'utf8');
-    const sanitizeAt = source.indexOf('/opt/bench/sanitize-git.sh');
+    const installAt = source.indexOf('trusted_busybox mv /opt/bench/sanitized-repository');
     const launchAt = source.indexOf('as_task_busybox timeout -k 60');
     const endedAt = source.indexOf('CODEX_EXIT=$?');
-    const publishAt = source.indexOf('trusted_busybox cp "$GIT_AUDIT_DIR/safe.txt"');
-    expect(sanitizeAt).toBeGreaterThan(0);
-    expect(launchAt).toBeGreaterThan(sanitizeAt);
+    const publishAt = source.indexOf('trusted_busybox cp /opt/bench/git-audit.txt');
+    expect(installAt).toBeGreaterThan(0);
+    expect(launchAt).toBeGreaterThan(installAt);
     expect(endedAt).toBeGreaterThan(launchAt);
     expect(publishAt).toBeGreaterThan(endedAt);
-    expect(source.slice(0, sanitizeAt)).toContain('[ "${BENCH_SANITIZE:-}" = 1 ]');
-    expect(source.slice(sanitizeAt, launchAt)).toContain('META_FAILURE="harness-setup-failed"');
-    expect(source.slice(sanitizeAt, launchAt)).toContain('finish');
-    expect(source.slice(sanitizeAt, launchAt)).not.toContain('git commit');
+    expect(source).not.toContain('/opt/bench/sanitize-git.sh');
+    expect(source.slice(installAt, launchAt)).not.toMatch(/as_task git/u);
     expect(source.slice(0, launchAt)).not.toContain('$BENCH/out/git-audit.txt');
-    expect(source).toContain('if ! as_task git status --porcelain > "$BENCH/out/pre-status.txt" 2>&1; then');
-    expect(source).toContain('if ! TRACKED_DIRTY=$(as_task git status --porcelain --untracked-files=no');
-    expect(source).toContain('if ! as_task git status --porcelain -z 2>/dev/null | as_task "$NODE" -e');
+    expect(source).toContain('trusted_busybox cp /opt/bench/predirty.z /tmp/predirty.z');
+    expect(source).toContain('trusted_busybox cp /opt/bench/pre-status.txt "$BENCH/out/pre-status.txt"');
   });
 
   it('captures an evaluator-faithful patch in the immutable task-uid helper', () => {
