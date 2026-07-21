@@ -1,0 +1,129 @@
+diff --git a/swe_bench_pro_eval.py b/swe_bench_pro_eval.py
+--- a/swe_bench_pro_eval.py
++++ b/swe_bench_pro_eval.py
+@@ -277,7 +277,7 @@ def collect_outputs_local(workspace_dir, output_dir, uid, prefix):
+         return None
+
+
+-def eval_with_modal(patch, sample, output_dir, dockerhub_username, scripts_dir, prefix="", redo=False, block_network=False, docker_platform=None):
++def eval_with_modal(patch, sample, output_dir, dockerhub_username, scripts_dir, prefix="", redo=False, block_network=False, docker_platform=None, benchmark_labels=None, benchmark_container_options=None, benchmark_policy_sha256=None):
+     if modal is None:
+         raise RuntimeError("modal is not installed. Install it or run with --use_local_docker")
+     uid = sample["instance_id"]
+@@ -358,7 +358,7 @@ def eval_with_modal(patch, sample, output_dir, dockerhub_username, scripts_dir,
+                 pass
+
+
+-def eval_with_docker(patch, sample, output_dir, dockerhub_username, scripts_dir, prefix="", redo=False, block_network=False, docker_platform=None):
++def eval_with_docker(patch, sample, output_dir, dockerhub_username, scripts_dir, prefix="", redo=False, block_network=False, docker_platform=None, benchmark_labels=None, benchmark_container_options=None, benchmark_policy_sha256=None):
+     if docker is None:
+         raise RuntimeError("docker SDK is not installed. Install via 'pip install docker' or run without --use_local_docker")
+     uid = sample["instance_id"]
+@@ -399,6 +399,17 @@ def eval_with_docker(patch, sample, output_dir, dockerhub_username, scripts_dir,
+             "entrypoint": "/bin/bash",  # Override image entrypoint
+             "command": ["-c", "bash /workspace/entryscript.sh"],
+         }
++        if benchmark_labels:
++            run_kwargs["labels"] = {
++                **benchmark_labels,
++                "ultracode.benchmark.task": uid,
++                "ultracode.benchmark.purpose": "verifier",
++                "ultracode.benchmark.ownership": "1",
++            }
++        if benchmark_container_options is None:
++            raise RuntimeError("benchmark container policy is required")
++        from ultracode_evaluator_policy import docker_run_options
++        run_kwargs.update(docker_run_options(benchmark_container_options, benchmark_policy_sha256))
+         if block_network:
+             run_kwargs["network_mode"] = "none"
+         # Optional platform override (useful on Apple Silicon)
+@@ -454,6 +464,13 @@ def parse_args():
+     parser.add_argument(
+         "--redo", action="store_true", help="Redo evaluations even if output exists"
+     )
++    parser.add_argument("--benchmark_run_id", required=True)
++    parser.add_argument(
++        "--benchmark_arm", required=True, choices=["a", "b", "gold", "nullcheck"]
++    )
++    parser.add_argument("--benchmark_invocation_id", required=True)
++    parser.add_argument("--benchmark_policy_path", required=True)
++    parser.add_argument("--benchmark_policy_sha256", required=True)
+     parser.add_argument(
+         "--num_workers",
+         type=int,
+@@ -517,6 +534,18 @@ def main():
+
+     eval_fn = eval_with_docker if args.use_local_docker else eval_with_modal
+
++    benchmark_labels = {
++        "ultracode.benchmark.schema": "2",
++        "ultracode.benchmark.suite": "swebench-pro",
++        "ultracode.benchmark.run": args.benchmark_run_id,
++        "ultracode.benchmark.arm": args.benchmark_arm,
++        "ultracode.benchmark.invocation": args.benchmark_invocation_id,
++    }
++    with open(args.benchmark_policy_path) as policy_file:
++        benchmark_container_options = json.load(policy_file)
++    from ultracode_evaluator_policy import docker_run_options
++    docker_run_options(benchmark_container_options, args.benchmark_policy_sha256)
++    evaluation_failures = []
+     # Use ThreadPoolExecutor to run evaluations in parallel
+     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+         # Create a dictionary mapping futures to their patch samples for progress tracking
+@@ -530,6 +559,9 @@ def main():
+                 redo=args.redo,
+                 block_network=args.block_network,
+                 docker_platform=(args.docker_platform or detected_platform) if args.use_local_docker else None,
++                benchmark_labels=benchmark_labels,
++                benchmark_container_options=benchmark_container_options,
++                benchmark_policy_sha256=args.benchmark_policy_sha256,
+             ): patch_sample
+             for patch_sample in valid_patches
+         }
+@@ -544,31 +569,37 @@ def main():
+                 output = future.result()
+                 if output is None:
+                     print(f'Evaluation for {patch_sample["instance_id"]} returned None')
+-                    eval_results[patch_sample["instance_id"]] = False
++                    evaluation_failures.append(patch_sample["instance_id"])
++                    continue
+                 else:
+                     instance_id = patch_sample["instance_id"]
+                     if instance_id not in raw_sample_df.index:
+                         print(f'Warning: Instance {instance_id} not found in raw sample data, skipping')
+-                        eval_results[instance_id] = False
++                        evaluation_failures.append(instance_id)
++                        continue
+                     else:
+                         raw_sample = raw_sample_df.loc[instance_id]
+                         passed_tests = {x["name"] for x in output["tests"] if x["status"] == "PASSED"}
+                         f2p = set(eval(raw_sample["fail_to_pass"]))
+                         p2p = set(eval(raw_sample["pass_to_pass"]))
+                         result = (f2p | p2p) <= passed_tests
+                         eval_results[instance_id] = result
+
+-                current_accuracy = sum(eval_results.values()) / len(eval_results)
+-                pbar.set_description(f"Accuracy: {current_accuracy:.2%}")
++                if eval_results:
++                    current_accuracy = sum(eval_results.values()) / len(eval_results)
++                    pbar.set_description(f"Accuracy: {current_accuracy:.2%}")
+             except Exception as exc:
+                 print(f'Evaluation for {patch_sample["instance_id"]} generated an exception: {exc}')
+-                eval_results[patch_sample["instance_id"]] = False
++                evaluation_failures.append(patch_sample["instance_id"])
+-                # Update progress bar description with current accuracy
+-                current_accuracy = sum(eval_results.values()) / len(eval_results)
+-                pbar.set_description(f"Accuracy: {current_accuracy:.2%}")
++                if eval_results:
++                    current_accuracy = sum(eval_results.values()) / len(eval_results)
++                    pbar.set_description(f"Accuracy: {current_accuracy:.2%}")
+     with open(os.path.join(args.output_dir, "eval_results.json"), "w") as f:
+         json.dump(eval_results, f)
+-    print("Overall accuracy: ", sum(eval_results.values()) / len(eval_results))
++    accuracy = sum(eval_results.values()) / len(eval_results) if eval_results else None
++    print("Overall accuracy: ", accuracy)
++    if evaluation_failures:
++        raise RuntimeError(f"{len(evaluation_failures)} evaluator tasks failed without a verdict")
+
+
+ if __name__ == "__main__":

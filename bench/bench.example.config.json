@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 3,
+  "toolchain": {
+    "nodeVersion": "22.14.0",
+    "nodeDistribution": "npmmirror",
+    "codexBinary": "auto"
+  },
+  "swebenchPro": {
+    "model": "gpt-5.2-codex",
+    "requestedEffort": "low",
+    "arm": "both",
+    "selection": {
+      "taskIds": null,
+      "count": 20,
+      "seed": 7,
+      "stratifyBy": "repo_language"
+    },
+    "modelTransport": {
+      "relayIdentity": "operator-supplied-relay-identity",
+      "relayVersion": "operator-supplied-relay-version",
+      "fixedDestination": "https://api.openai.com/v1"
+    },
+    "timeouts": {
+      "sessionMs": 43200000,
+      "verifierMs": 21600000,
+      "evaluatorWatchdogMs": 5400000
+    },
+    "concurrency": {
+      "tasks": 4,
+      "verifier": 8
+    },
+    "docker": {
+      "cpus": 8,
+      "memoryBytes": 25769803776,
+      "keepImages": false
+    },
+    "evaluator": {
+      "repository": "https://github.com/scaleapi/SWE-bench_Pro-os",
+      "revision": "ca10a60a5fcae51e6948ffe1485d4153d421e6c5",
+      "pipIndex": "https://pypi.org/simple"
+    },
+    "sanitizeGitHistory": true
+  }
+}
