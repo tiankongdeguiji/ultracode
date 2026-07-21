@@ -59,12 +59,15 @@ export function forEachJsonLine(
     const content = line.at(-1) === 0x0d ? line.subarray(0, -1) : line;
     const trimmed = content.toString('utf8').trim();
     if (!trimmed) return;
+    let parsed: unknown;
     try {
-      visit(JSON.parse(trimmed));
-      stats.parsedLines += 1;
+      parsed = JSON.parse(trimmed) as unknown;
     } catch {
       stats.malformedLines += 1;
+      return;
     }
+    visit(parsed);
+    stats.parsedLines += 1;
   };
   try {
     for (;;) {

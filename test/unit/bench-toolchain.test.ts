@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { resolveCodexBin } from '../../bench/src/shared/toolchain.js';
+import { downloadCacheFilename, resolveCodexBin } from '../../bench/src/shared/toolchain.js';
 
 const roots: string[] = [];
 
@@ -12,6 +12,19 @@ afterEach(() => {
 });
 
 describe('Codex toolchain resolution', () => {
+  it('names same-basename downloads by their immutable digest', () => {
+    const official = downloadCacheFilename(
+      'https://nodejs.org/dist/v22.0.0/node-v22.0.0-linux-x64.tar.xz',
+      'a'.repeat(64),
+    );
+    const unofficial = downloadCacheFilename(
+      'https://unofficial-builds.nodejs.org/download/release/v22.0.0/node-v22.0.0-linux-x64.tar.xz',
+      'b'.repeat(64),
+    );
+    expect(official).not.toBe(unofficial);
+    expect(official).toBe(`${'a'.repeat(64)}-node-v22.0.0-linux-x64.tar.xz`);
+  });
+
   it('reaches the schema-valid custom diagnostic when login-shell lookup is empty', async () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-codex-resolution-'));
     roots.push(root);

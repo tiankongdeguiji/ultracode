@@ -33,6 +33,14 @@ describe('shared JSONL reader', () => {
     expect(stats.oversizeLines).toBe(1);
   });
 
+  it('propagates visitor failures instead of classifying them as malformed JSON', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'uc-jsonl-visitor-'));
+    const file = join(directory, 'rows.jsonl');
+    writeFileSync(file, '{"ok":true}\n');
+    const failure = new Error('visitor failed');
+    expect(() => forEachJsonLine(file, () => { throw failure; })).toThrow(failure);
+  });
+
   it('parses a near-limit record across many read chunks', () => {
     const directory = mkdtempSync(join(tmpdir(), 'uc-jsonl-chunks-'));
     const file = join(directory, 'rows.jsonl');

@@ -1,4 +1,5 @@
 /** Offline lifecycle-lease, run-state CAS, and verifier-receipt coverage. */
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -204,7 +205,9 @@ describe('run lifecycle control state', () => {
     const paths = createBenchPathRoots(temporary());
     const directory = createPrivateRunDirectory(paths, 'swebench-pro', 'pilot1');
     mkdirSync(join(directory, 'native', 'eval'), { recursive: true });
-    writeFileSync(join(directory, 'native', 'eval', 'eval_results.json'), '{"task-one":true}\n');
+    const nativeBytes = '{"task-one":true}\n';
+    const nativeSha256 = createHash('sha256').update(nativeBytes).digest('hex');
+    writeFileSync(join(directory, 'native', 'eval', 'eval_results.json'), nativeBytes);
     const lease = await acquireBenchLock(paths.resultsRoot, runLeaseFile(paths, 'swebench-pro', 'pilot1'));
     const store = new VerifierReceiptStore(paths, 'swebench-pro', 'pilot1', HASH, lease);
     expect(store.initialize(new Date('2026-07-20T12:00:00.000Z')).revision).toBe(0);
@@ -214,7 +217,7 @@ describe('run lifecycle control state', () => {
       role: 'native-result',
       path: 'native/eval/eval_results.json',
       nativeRecordKey: 'task-one',
-    });
+    }, nativeSha256);
     const second = {
       ...first,
       scope: { kind: 'suite-check' as const, name: 'aggregate' },
@@ -233,7 +236,7 @@ describe('run lifecycle control state', () => {
       role: 'native-result',
       path: 'run-state.json',
       nativeRecordKey: 'task-one',
-    })).toThrow(/beneath native/);
+    }, nativeSha256)).toThrow(/beneath native/);
     const receipt = await store.update(0, () => [first, second], new Date('2026-07-20T12:01:00.000Z'));
     expect(receipt.bindings).toHaveLength(2);
     expect(receipt.bindings[0]?.sha256).toBe(receipt.bindings[1]?.sha256);

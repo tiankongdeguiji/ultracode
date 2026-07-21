@@ -228,6 +228,11 @@ async function publishedArchiveChecksum(
   return parsePublishedArchiveChecksum(bytes, filename);
 }
 
+/** Namespace cached archives by their immutable published digest. */
+export function downloadCacheFilename(url: string, expectedSha256: string): string {
+  return `${sha256Schema.parse(expectedSha256)}-${basename(new URL(url).pathname)}`;
+}
+
 /** Fetch one published-checksum-bound archive into the private download cache. */
 async function downloadCached(
   url: string,
@@ -235,7 +240,7 @@ async function downloadCached(
   roots: BenchPathRoots,
 ): Promise<string> {
   const directory = ensureRealDirectoryWithin(roots.cacheRoot, join(roots.cacheRoot, 'downloads'));
-  const dest = join(directory, basename(new URL(url).pathname));
+  const dest = join(directory, downloadCacheFilename(url, expectedSha256));
   if (existsSync(dest)) {
     if (sha256File(dest) !== expectedSha256) throw new Error(`cached download checksum drifted: ${dest}`);
     return dest;

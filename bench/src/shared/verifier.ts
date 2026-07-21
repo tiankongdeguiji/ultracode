@@ -121,12 +121,13 @@ export function createVerifierBinding(
   runDirectory: string,
   input: Omit<VerifierBinding, 'invocationId' | 'sha256'> & { invocationId?: string },
   /** Hash of bytes already parsed by the caller; drift before binding is rejected. */
-  parsedBytesSha256?: string,
+  parsedBytesSha256: string,
 ): VerifierBinding {
   const path = relativePathSchema.parse(input.path);
+  const parsedSha256 = sha256Schema.parse(parsedBytesSha256);
   const file = resolveRegularFileWithinRoot(runDirectory, path, 'native verifier artifact');
   const sha256 = sha256File(file);
-  if (parsedBytesSha256 !== undefined && sha256 !== parsedBytesSha256) {
+  if (sha256 !== parsedSha256) {
     throw new Error(`native verifier artifact changed between parsing and binding: ${path}`);
   }
   return verifierBindingSchema.parse({

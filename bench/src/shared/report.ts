@@ -237,12 +237,22 @@ export function loadStoredReportEvidence<S extends BenchSuite>(
     throw new Error('stored verifier receipt is not bound to the exact manifest bytes');
   }
   const invocationIds = new Set(runState.invocations.map((invocation) => invocation.invocationId));
+  const artifactDigests = new Map<string, string>();
   for (const binding of verifierReceipt.bindings) {
     if (!invocationIds.has(binding.invocationId)) {
       throw new Error(`verifier binding references unknown invocation ${binding.invocationId}`);
     }
-    const artifact = resolveRegularFileWithinRoot(directory, binding.path, 'receipt-bound native artifact');
-    if (sha256File(artifact) !== binding.sha256) {
+    const artifact = resolveRegularFileWithinRoot(
+      directory,
+      binding.path,
+      'receipt-bound native artifact',
+    );
+    let digest = artifactDigests.get(artifact);
+    if (digest === undefined) {
+      digest = sha256File(artifact);
+      artifactDigests.set(artifact, digest);
+    }
+    if (digest !== binding.sha256) {
       throw new Error(`receipt-bound native artifact drifted: ${binding.path}`);
     }
   }
