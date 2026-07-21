@@ -18,6 +18,7 @@ const INVOCATION = '11111111-1111-4111-8111-111111111111';
 const TOKEN = 'b'.repeat(32);
 const DIRECT_START = 'darwin:Mon_Jul_20_11:59:59_2026';
 const CANDIDATE_START = 'darwin:Mon_Jul_20_12:00:00_2026';
+const SECOND_CANDIDATE_START = 'darwin:Mon_Jul_20_12:00:01_2026';
 const STARTED = 'Mon Jul 20 12:00:00 2026';
 const roots: string[] = [];
 const leases: BenchLockHandle[] = [];
@@ -164,6 +165,42 @@ describe('Darwin benchmark lifecycle recovery', () => {
     })).resolves.toBe(1);
     expect(signals).toEqual([]);
     expect(store.load().invocations[0]?.lifecycleProcesses[0]?.recovery).toBe('complete');
+  });
+
+  it('re-authenticates each persisted candidate at its individual signal boundary', async () => {
+    const { store, directory } = await lifecycleStore();
+    const candidates = [
+      { pid: 202, pgrp: 202, starttime: CANDIDATE_START },
+      { pid: 303, pgrp: 303, starttime: SECOND_CANDIDATE_START },
+    ];
+    store.lifecycleHooks(INVOCATION).onLifecycleCandidates(TOKEN, candidates, true);
+    const marked = new Set(candidates.map((candidate) => candidate.pid));
+    const byPid = new Map(candidates.map((candidate) => [candidate.pid, candidate]));
+    const signals: number[] = [];
+
+    await expect(store.recoverPendingLifecycleProcesses(directory, 0, {
+      platform: 'darwin',
+      discoverWorkerProcesses: (tokens, _scope, candidatePids) => ({
+        complete: true,
+        processes: (candidatePids ?? candidates.map((candidate) => candidate.pid))
+          .filter((pid) => marked.has(pid))
+          .map((pid) => ({ ...byPid.get(pid)!, token: tokens[0]! })),
+      }),
+      // The second PID is replaced inside the same public lstart second after
+      // the first signal; only its missing lifecycle markers distinguish it.
+      readIdentitySnapshot: () => ({
+        complete: true,
+        identities: new Map([[303, byPid.get(303)!]]),
+      }),
+      signalProcess: (pid, signal) => {
+        if (signal === 0) throw noSuchProcess();
+        signals.push(pid);
+        marked.clear();
+      },
+    })).rejects.toThrow(/could not be recovered safely/u);
+
+    expect(signals).toEqual([-202]);
+    expect(store.load().invocations[0]?.lifecycleProcesses[0]?.recovery).toBe('failed');
   });
 
   it('allows a settlement interval after SIGKILL before declaring recovery failed', async () => {

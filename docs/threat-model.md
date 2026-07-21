@@ -14,7 +14,7 @@ Fan-out concurrency is user-controlled: the default is `min(10, max(2, cores - 2
 
 The run store (`.ultracode/runs/**`) lives inside the workspace, so a prompt-injected agent that processes hostile repo content runs as the same user and *can* write there. Artifact writes are `O_NOFOLLOW` (a pre-planted symlink leaf can't redirect them; directory-component symlinks are out of scope), other backends' credentials are scrubbed from each worker's env, and recovery accepts only a bounded set of small regular process records. New records use fixed sequence/attempt paths, so worker-created directory entries cannot hide a sibling record; bounded `agents/**/pgid*` discovery remains only for compatibility. Live pre-token groups from that legacy layout are reported as requiring manual cleanup rather than signaled without authentication. A token-only record is written before spawn and atomically enriched afterward. A persisted process group is signaled only when its live leader matches the recorded OS start-time **and** carries the record's high-entropy lifecycle token plus the expected filesystem-backed run-scope digest in its initial environment. Linux reads those markers and process identity from `/proc`; macOS subtracts a separately queried untruncated argv field from the environment-expanded command, checks only recorded candidate leaders through bounded, adaptively split `/bin/ps` queries, and uses `lstart` as the process-instance identity.
 
-Linux additionally scans same-user procfs entries for token-plus-scope matches, which contains Codex/bwrap descendants that leave the original process group. This sweep is deliberately fail-closed and limited: it cannot discover a process whose `/proc/<pid>/environ` is unreadable, a descendant hidden from the runner's PID namespace, a descendant that replaced or sanitized away either lifecycle marker before leaving the PGID, or a process on a host without procfs. macOS therefore has no host-wide token sweep; normal settlement still reaps the known process group, while persisted recovery requires a live authenticated leader. Repeated settlement sweeps permanently stop targeting a numeric PGID once it is observed absent, preventing a later reused group from becoming a target.
+Linux additionally scans same-user procfs entries for token-plus-scope matches, which contains Codex/bwrap descendants that leave the original process group. This sweep is deliberately fail-closed and limited: it cannot discover a process whose `/proc/<pid>/environ` is unreadable, a descendant hidden from the runner's PID namespace, a descendant that replaced or sanitized away either lifecycle marker before leaving the PGID, or a process on a host without procfs. macOS therefore has no authoritative persisted host-wide token sweep. Live cleanup retains bounded host observations and re-authenticates each candidate immediately before signaling; after runner loss, the worker-writable candidate sidecar is only a bounded PID hint and cannot prove inventory completeness, so persisted recovery requires manual absence verification. Repeated settlement sweeps permanently stop targeting a numeric PGID once it is observed absent, preventing a later reused group from becoming a target.
 
 The synchronous uncaught-exception monitor signals only worker identities held in the runner's trusted memory; it never parses the worker-writable recovery store. Handled runner failures, hard-stop, and external stop paths can await the bounded persisted-record recovery described above.
 
@@ -24,7 +24,8 @@ These controls protect signaling decisions made from worker-writable records, bu
 
 The benchmark harness treats suite runners and task containers as native,
 potentially task-influenced producers, not as score authorities by themselves.
-Host-owned schema-v2 manifests and verifier receipts, plus schema-v3 run-state
+Host-owned suite-versioned manifests (Pro relay v3; Marathon and FeatureBench
+v2) and schema-v2 verifier receipts, plus schema-v3 run-state
 ledger heads and segments, live outside task workspaces with private modes and
 symlink-safe writes. Ledger records are bounded and hash chained; replay
 requires contiguous revisions, indexes, and segment ancestry, and reports bind
@@ -41,13 +42,34 @@ toolchains, evaluator environments, datasets, patches, images, prompt policy,
 and control-plane implementations are pinned or content-addressed and
 re-attested at the suite's launch boundary.
 
-SWE-bench Pro and SWE-Marathon repository-controlled task code shares a
-security domain with the reusable Codex credential needed for that session.
-The harness keeps credential material out of persistent result trees and
-deletes exact nonce-bound runtime homes after their containers are gone, but
-it cannot prevent malicious task code from reading or exfiltrating a live
-credential. Operators must use disposable, narrowly scoped benchmark accounts
-and independently restricted egress.
+SWE-Marathon repository-controlled task code shares a security domain with the
+reusable Codex credential needed for that session. Its harness keeps credential
+material out of persistent result trees, but cannot prevent malicious task code
+from reading or exfiltrating a live credential. Operators must use disposable,
+narrowly scoped benchmark accounts and independently restricted egress.
+
+SWE-bench Pro task sessions instead fail closed onto one dedicated internal,
+local, non-attachable Docker bridge. The only non-task endpoint is a separately
+operated immutable-image Codex Responses relay; the task has no default/WAN
+attachment, generic proxy, auth file, or provider API key. The harness attests
+the complete network endpoint IDs, the task's sole attachment, relay runtime
+identity, and labels declaring exact request paths/model/fixed destination and
+no generic forwarding or provider-hosted retrieval. An immutable nonce-bound
+gate keeps task-controlled code stopped until the post-create checks pass. A
+host policy lock shared across worktrees covers recovery,
+preflight, session lifetime, resume,
+report/evaluation state access, and cleanup. Relay and network runtime names are
+persisted only through manifest/report-bound hashes.
+
+This proves the inspected Docker topology and binds the operator's relay
+declaration; it does not prove that the relay image truthfully implements its
+labels, that the provider returns a particular information source, or that an
+undocumented operator firewall exists. The Docker daemon, host networking after
+inspection, relay implementation and credential scope, its fixed upstream
+egress, and provider are trusted operator components. A daemon administrator or
+compromised/mislabeled relay can violate the guarantee. Missing or drifted
+topology, identity, contract, destination, model, or runtime binding terminates
+the Pro run, and legacy direct-credential sessions are rejected.
 
 SWE-bench Pro bounds both Docker paths with a frozen, manifest-bound policy.
 Session containers use `no-new-privileges`, a 1,024-process limit, manifest
@@ -70,7 +92,7 @@ policy hashes. Offline tests compare exact CLI and Docker SDK projections;
 opt-in tests inspect a live daemon's resulting HostConfig using an explicitly
 operator-supplied local image. This does not make repository code trusted: it
 still controls the task workload, can consume resources within those bounds,
-and shares the live session credential domain described above.
+within the model-relay boundary described above.
 
 SWE-bench Pro acquisition similarly treats the mutable dataset service as
 untrusted input. A reviewed digest covers dataset, config, split, and complete
@@ -87,7 +109,7 @@ can discover marked descendants that escaped the original process group;
 macOS recovery is limited to the recorded candidate leaders. Unverifiable
 descendants fail recovery rather than authorizing a broader signal target.
 
-FeatureBench has a narrower network and credential boundary. Task containers
+FeatureBench has a separate network and credential-broker boundary. Task containers
 receive no reusable host credential and run only on a dedicated internal Docker
 network. The sole pre-existing endpoint must be a separately managed, running,
 immutable-image HTTPS credential broker with the configured public

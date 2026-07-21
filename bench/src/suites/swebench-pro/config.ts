@@ -4,10 +4,8 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { BenchPathRoots } from '../../shared/contracts.js';
 import {
-  assertPrivateRuntimeFile,
   loadPrivateOperatorConfig,
   toolchainConfigSchema,
-  type RuntimeBindings,
 } from '../../shared/config.js';
 import { publicLocatorSchema } from '../../shared/provenance.js';
 
@@ -29,15 +27,22 @@ const pricingEntrySchema = z.strictObject({
   outputPerMTokens: z.number().finite().nonnegative(),
 });
 
+const modelTransportSchema = z.strictObject({
+  relayIdentity: z.string().min(1).max(512),
+  relayVersion: z.string().min(1).max(256),
+  fixedDestination: publicLocatorSchema.refine((value) => {
+    const destination = new URL(value);
+    return destination.protocol === 'https:' && destination.pathname === '/v1'
+      && !value.includes('?') && !value.includes('#');
+  }, 'fixed model destination must be an HTTPS /v1 base URL'),
+});
+
 export const swebenchProConfigSchema = z.strictObject({
-  model: z.string().regex(/^[^\u0000-\u001f\u007f]*$/),
-  requestedEffort: z.string().regex(/^[^\u0000-\u001f\u007f]*$/),
+  model: z.string().max(256).regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/),
+  requestedEffort: z.string().max(64).regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
   arm: z.enum(['a', 'b', 'both']),
   selection: selectionSchema,
-  auth: z.strictObject({
-    mechanism: z.enum(['chatgpt', 'api-key']),
-    publicIdentity: z.string().min(1).max(512),
-  }),
+  modelTransport: modelTransportSchema,
   timeouts: z.strictObject({
     sessionMs: z.number().int().min(60_000),
     verifierMs: z.number().int().positive(),
@@ -64,23 +69,45 @@ export const swebenchProConfigSchema = z.strictObject({
   pricing: z.record(z.string(), pricingEntrySchema).optional(),
 });
 
-const operatorConfigSchema = z.strictObject({
-  schemaVersion: z.literal(2),
+const operatorConfigEnvelopeSchema = z.strictObject({
+  schemaVersion: z.number().int(),
+  toolchain: toolchainConfigSchema,
+  swebenchPro: z.unknown(),
+  sweMarathon: z.unknown().optional(),
+  featureBench: z.unknown().optional(),
+}).superRefine((config, context) => {
+  if (config.schemaVersion === 2) {
+    context.addIssue({
+      code: 'custom',
+      path: ['schemaVersion'],
+      message: 'SWE-bench Pro operator schema version 2 used direct provider auth and is unsupported; migrate to version 3 modelTransport',
+    });
+  } else if (config.schemaVersion !== 3) {
+    context.addIssue({ code: 'custom', path: ['schemaVersion'], message: 'SWE-bench Pro requires operator schema version 3' });
+  }
+});
+
+export const swebenchProOperatorConfigSchema = operatorConfigEnvelopeSchema.pipe(z.strictObject({
+  schemaVersion: z.literal(3),
   toolchain: toolchainConfigSchema,
   swebenchPro: swebenchProConfigSchema,
   sweMarathon: z.unknown().optional(),
   featureBench: z.unknown().optional(),
-});
+}));
 
 export type SwebenchProConfig = z.infer<typeof swebenchProConfigSchema>;
-export type SwebenchProOperatorConfig = z.infer<typeof operatorConfigSchema>;
+export type SwebenchProOperatorConfig = z.infer<typeof swebenchProOperatorConfigSchema>;
 
 export const DEFAULT_SWEBENCH_PRO_CONFIG: SwebenchProConfig = {
   model: '',
   requestedEffort: '',
   arm: 'both',
   selection: { taskIds: null, count: 20, seed: 7, stratifyBy: 'repo_language' },
-  auth: { mechanism: 'chatgpt', publicIdentity: 'operator-supplied-chatgpt-account' },
+  modelTransport: {
+    relayIdentity: 'operator-supplied-relay-identity',
+    relayVersion: 'operator-supplied-relay-version',
+    fixedDestination: 'https://api.openai.com/v1',
+  },
   timeouts: { sessionMs: 43_200_000, verifierMs: 21_600_000, evaluatorWatchdogMs: 5_400_000 },
   concurrency: { tasks: 4, verifier: 8 },
   docker: { cpus: 8, memoryBytes: 24 * 1_024 * 1_024 * 1_024, keepImages: false },
@@ -106,13 +133,13 @@ export function operatorConfigFile(roots: BenchPathRoots): string {
   return join(roots.benchRoot, 'bench.config.json');
 }
 
-/** Load only the strict v2 config; the unreleased legacy shape is rejected. */
+/** Load only the strict v3 config; the incompatible v2 transport shape is rejected. */
 export function loadSwebenchProOperatorConfig(roots: BenchPathRoots): SwebenchProOperatorConfig {
   const file = operatorConfigFile(roots);
   if (!existsSync(file)) {
     throw new Error(`private benchmark config is missing at ${file}; copy bench.example.config.json and chmod it 0600`);
   }
-  return loadPrivateOperatorConfig(file, operatorConfigSchema);
+  return loadPrivateOperatorConfig(file, swebenchProOperatorConfigSchema);
 }
 
 export function resolveSwebenchProConfig(
@@ -128,24 +155,6 @@ export function validateRunConfig(config: SwebenchProConfig): void {
   if (config.selection.taskIds !== null && config.selection.taskIds.length === 0) {
     throw new Error('SWE-bench Pro taskIds must be null or a non-empty list');
   }
-}
-
-/** Runtime credentials are supplied anew and are never serialized. */
-export function loadRuntimeBindings(config: SwebenchProConfig, env = process.env): RuntimeBindings {
-  const pipConfigFile = env.PIP_CONFIG_FILE === undefined
-    ? undefined
-    : assertPrivateRuntimeFile(env.PIP_CONFIG_FILE, 'private pip config');
-  if (config.auth.mechanism === 'chatgpt') {
-    const authFile = env.CODEX_AUTH_JSON_PATH;
-    if (!authFile) throw new Error('chatgpt auth requires CODEX_AUTH_JSON_PATH for every run invocation');
-    return {
-      authFile: assertPrivateRuntimeFile(authFile, 'Codex auth file'),
-      ...(pipConfigFile === undefined ? {} : { pipConfigFile }),
-    };
-  }
-  const apiKey = env.CODEX_API_KEY;
-  if (!apiKey || apiKey.includes('\0')) throw new Error('api-key auth requires CODEX_API_KEY for every run invocation');
-  return { apiKey, ...(pipConfigFile === undefined ? {} : { pipConfigFile }) };
 }
 
 export const suiteCacheDir = (roots: BenchPathRoots): string => join(roots.cacheRoot, 'swebench-pro');

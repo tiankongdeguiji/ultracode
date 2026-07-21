@@ -81,8 +81,9 @@ describe('SWE-bench Pro container policy', () => {
       taskDirectory: '/run/task-a',
       runtimeHome: '/runtime/home',
       runtimeCodex: '/runtime/codex-home',
+      restrictedNetwork: 'swebench-pro-private',
       artifactOwner: { uid: 2_001, gid: 2_002 },
-      image: 'ultracode-swebench-pro:image',
+      imageId: `sha256:${'c'.repeat(64)}`,
       docker,
       policy,
     })).toEqual([
@@ -99,6 +100,7 @@ describe('SWE-bench Pro container policy', () => {
       '--label', 'ultracode.benchmark.task-gid=1000',
       '--label', 'ultracode.benchmark.artifact-uid=2001',
       '--label', 'ultracode.benchmark.artifact-gid=2002',
+      '--no-healthcheck',
       '--pids-limit', '1024',
       '--security-opt', 'no-new-privileges',
       '--cap-drop', 'ALL',
@@ -109,14 +111,19 @@ describe('SWE-bench Pro container policy', () => {
       '--cap-add', 'SETUID',
       '--cpus', '1.5',
       '--memory', '2000000',
+      '--network', 'swebench-pro-private',
       '--user', '0:0',
+      '--env', 'BASH_ENV=',
+      '--env', 'ENV=',
+      '--env', 'LD_PRELOAD=',
+      '--env', 'LD_AUDIT=',
       '--env-file', '/runtime/container.env',
       '--mount', 'type=bind,src=/run/task-a,dst=/bench',
       '--mount', 'type=bind,src=/runtime/home,dst=/runtime/home',
       '--mount', 'type=bind,src=/runtime/codex-home,dst=/runtime/codex-home',
       '--mount', 'type=bind,src=/run/task-a/codex-home/sessions,dst=/runtime/codex-home/sessions',
       '--entrypoint', '/bin/bash',
-      'ultracode-swebench-pro:image',
+      `sha256:${'c'.repeat(64)}`,
       '/opt/bench/entrypoint.sh',
     ]);
     expect(reclamationContainerPolicyArgv(policy, docker)).toEqual([
@@ -292,14 +299,16 @@ describe('SWE-bench Pro container policy', () => {
     expect(() => sessionContainerPolicyArgv(policy, invalid as never)).toThrow(/manifest (CPU|memory) limit/);
   });
 
-  it('documents suite-scoped Pro prerequisites, credentials, and manifest resources', () => {
+  it('documents suite-scoped Pro prerequisites, relay isolation, and manifest resources', () => {
     const readme = readFileSync(join(benchRoot, 'README.md'), 'utf8');
     const guide = readFileSync(join(benchRoot, 'docs/swebench-pro.md'), 'utf8');
     expect(readme).toContain('it does not require `uv` or GNU `patch`');
-    expect(readme).toContain('its API-key mode uses `CODEX_API_KEY`');
-    expect(guide).toContain('current-user-owned, singly-linked');
-    expect(guide).toContain('regular ChatGPT auth file no larger than 4 MiB whose mode is exactly `0600`');
-    expect(guide).toContain('SWE-Marathon\nAPI-key mode uses `OPENAI_API_KEY` instead of `CODEX_API_KEY`');
+    expect(readme).toContain('SWE-bench Pro has no direct ChatGPT/API-key mode');
+    expect(guide).toContain('no direct `chatgpt` or `api-key` session mode');
+    expect(guide).toContain('affected task is recorded and the whole run invocation');
+    expect(guide).toContain('Legacy Pro schema version 2 described direct provider auth');
+    expect(guide).toContain('manifest-bound immutable local image ID');
+    expect(guide).toMatch(/does not inspect\s+an operator firewall/u);
     expect(guide).toContain('CPU and memory values are instead derived from\nthe immutable run manifest');
   });
 

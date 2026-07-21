@@ -12,12 +12,14 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { newRunId } from '../../src/store/layout.js';
 import { createRunDir, getRun, isPidAlive } from '../../src/store/runstore.js';
 import { readManifest, isTerminal } from '../../src/store/manifest.js';
-import { launchRunner } from '../../src/exec/daemonize.js';
+import { launchRunner, resolveRunnerEntry } from '../../src/exec/daemonize.js';
 import { readJournal } from '../../src/engine/journal.js';
 import {
+  discoverWorkerProcessesForTokens,
   findWorkerProcesses,
   readProcessIdentity,
   readProcStat,
+  WORKER_SCOPE_ENV,
   WORKER_TOKEN_ENV,
 } from '../../src/exec/procinfo.js';
 import { killWorkerGroups, stopRun } from '../../src/exec/stop.js';
@@ -119,6 +121,31 @@ function makeRun(source: string, config: Record<string, unknown> = {}) {
     config: { backend: 'mock', cwd: root, ...config },
   });
   return { root, runId, dir };
+}
+
+function launchRunnerWithRejectedCleanup(dir: string): { pid: number; exited: Promise<number> } {
+  const entry = resolveRunnerEntry();
+  const runnerUrl = new URL('../../src/cli/runner.ts', import.meta.url).href;
+  const source = [
+    `import { runnerMain } from ${JSON.stringify(runnerUrl)};`,
+    `void runnerMain(${JSON.stringify(dir)}, async () => { throw new Error('deterministic cleanup rejection'); });`,
+  ].join('\n');
+  const env = { ...process.env };
+  delete env[WORKER_TOKEN_ENV];
+  delete env[WORKER_SCOPE_ENV];
+  const child = spawn(entry[0]!, [...entry.slice(1, -1), '--input-type=module', '--eval', source], {
+    stdio: 'ignore',
+    env,
+  });
+  const exited = new Promise<number>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (signal !== null) reject(new Error(`runner exited from signal ${signal}`));
+      else resolve(code ?? -1);
+    });
+  });
+  if (!child.pid) throw new Error('failed to spawn cleanup-rejection runner');
+  return { pid: child.pid, exited };
 }
 
 describe('detached runner', () => {
@@ -246,6 +273,9 @@ describe('detached runner', () => {
       const { pid } = await launchRunner(dir);
       const status = await waitTerminal(dir, 12_000);
       expect(status).toBe('stopped');
+      expect(readManifest(dir)?.error).toBe('wall-clock cap');
+      expect(existsSync(join(dir, 'output.json'))).toBe(false);
+      expect(readFileSync(join(dir, 'events.jsonl'), 'utf8')).not.toContain('worker cleanup incomplete');
       await sleep(300);
       expect(isPidAlive(pid)).toBe(false); // the process actually exited
     } finally {
@@ -253,6 +283,92 @@ describe('detached runner', () => {
       else process.env.ULTRACODE_HARD_STOP_GRACE_MS = prev;
     }
   }, 20_000);
+
+  it('hard-stop records cleanup rejection synchronously and leaves cleanup retryable', async () => {
+    const exerciseWorkerRetry = process.platform === 'linux';
+    const binDir = exerciseWorkerRetry ? mkdtempSync(join(tmpdir(), 'uc-hard-stop-retry-bin-')) : undefined;
+    const pidsFile = binDir === undefined ? undefined : join(binDir, 'pids.json');
+    const fake = binDir === undefined || pidsFile === undefined ? undefined : writeEscapingClaude(binDir, pidsFile);
+    const prevBin = process.env.ULTRACODE_CLAUDE_BIN;
+    const prevGrace = process.env.ULTRACODE_HARD_STOP_GRACE_MS;
+    process.env.ULTRACODE_HARD_STOP_GRACE_MS = '500';
+    if (fake !== undefined) process.env.ULTRACODE_CLAUDE_BIN = fake;
+    let runDir: string | undefined;
+    let workerPid = 0;
+    let escapedPid = 0;
+    try {
+      const { root, runId, dir } = makeRun(
+        exerciseWorkerRetry ? HANG_WITH_AGENT : HANG,
+        { backend: exerciseWorkerRetry ? 'claude' : 'mock', wallClockMs: 500 },
+      );
+      runDir = dir;
+      const { pid, exited } = launchRunnerWithRejectedCleanup(dir);
+      if (pidsFile !== undefined) {
+        ({ worker: workerPid, escaped: escapedPid } = await waitForRecordedPids(pidsFile));
+      }
+
+      expect(await exited).toBe(1);
+      expect(isPidAlive(pid)).toBe(false);
+      if (exerciseWorkerRetry) {
+        expect(readProcStat(workerPid)).toBeDefined();
+        expect(readProcStat(escapedPid)).toBeDefined();
+      }
+
+      // No polling after exit: the terminal state and complete event lines must
+      // have landed through synchronous writes before process.exit(1).
+      const manifest = readManifest(dir);
+      expect(manifest).toMatchObject({
+        status: 'stopped',
+        error: 'wall-clock cap; worker cleanup incomplete: deterministic cleanup rejection',
+      });
+      expect(manifest?.endedAt).toBeDefined();
+      const workflowLogs = readFileSync(join(dir, 'events.jsonl'), 'utf8')
+        .trimEnd()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+        .filter((event) => event.type === 'workflow_log')
+        .map((event) => event.message);
+      expect(workflowLogs).toEqual([
+        'wall-clock cap 500ms exceeded — stopping run',
+        'hard stop: runner did not unwind 500ms after wall-clock cap — force-exiting',
+        'hard stop worker cleanup incomplete: deterministic cleanup rejection',
+      ]);
+      expect(existsSync(join(dir, 'output.json'))).toBe(false);
+
+      const retry = exerciseWorkerRetry
+        ? await stopRun(root, runId, {
+            platform: 'linux',
+            discoverWorkerProcesses: (tokens, scope) => discoverWorkerProcessesForTokens(
+              tokens,
+              scope,
+              [workerPid, escapedPid],
+              { platform: 'linux' },
+            ),
+          })
+        : await stopRun(root, runId);
+      expect(retry).toMatchObject({ ok: true, status: 'stopped' });
+      expect(retry.message).toContain('already stopped');
+      if (exerciseWorkerRetry) {
+        expect(retry.message).toContain('worker record(s)');
+        expect(await waitProcessGone(workerPid)).toBe(true);
+        expect(await waitProcessGone(escapedPid)).toBe(true);
+      }
+    } finally {
+      if (prevBin === undefined) delete process.env.ULTRACODE_CLAUDE_BIN;
+      else process.env.ULTRACODE_CLAUDE_BIN = prevBin;
+      if (prevGrace === undefined) delete process.env.ULTRACODE_HARD_STOP_GRACE_MS;
+      else process.env.ULTRACODE_HARD_STOP_GRACE_MS = prevGrace;
+      for (const pid of [workerPid, escapedPid]) {
+        if (pid <= 1) continue;
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      if (runDir) killWorkerGroups(runDir);
+    }
+  }, 10_000);
 
   it('hard-stop reaps an active backend descendant that escaped into a new session', async () => {
     if (process.platform !== 'linux') return;

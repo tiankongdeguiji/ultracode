@@ -119,12 +119,24 @@ export const taskProvenanceSchema = z.strictObject({
   }).nullable(),
 });
 
+export const modelTransportProvenanceSchema = z.strictObject({
+  mechanism: z.literal('attested-model-relay'),
+  contractSha256: sha256Schema,
+  relayIdentitySha256: sha256Schema,
+  relayVersionSha256: sha256Schema,
+  fixedDestinationSha256: sha256Schema,
+  modelSha256: sha256Schema,
+  relayRuntimeSha256: sha256Schema,
+  topologySha256: sha256Schema,
+});
+
 export const benchProvenanceSchema = z.strictObject({
   toolchain: toolchainProvenanceSchema,
   controlPlane: controlPlaneProvenanceSchema,
   suiteSource: sourceProvenanceSchema,
   dataset: datasetProvenanceSchema,
   environment: environmentProvenanceSchema,
+  modelTransport: modelTransportProvenanceSchema.optional(),
   nativeAssets: z.array(nativeAssetProvenanceSchema),
   tasks: z.array(taskProvenanceSchema),
 });

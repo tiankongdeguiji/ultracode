@@ -4,9 +4,9 @@
 # BENCH_ARM (a|b), BENCH_TIMEOUT_SECS, BENCH_MODEL, BENCH_EFFORT,
 # BENCH_BASE_COMMIT, host-distinct nonzero BENCH_TASK_UID/BENCH_TASK_GID,
 # BENCH_ARTIFACT_OWNER (host uid:gid), BENCH_SANITIZE=1,
-# CODEX_HOME=/bench/codex-home, ULTRACODE_HOME=/bench/uc, and optionally
-# CODEX_API_KEY. The repository is fixed at /app. Everything of value is written under /bench
-# before exit, and the script always exits 0 — failures are reported in
+# CODEX_HOME=/runtime/codex-home, ULTRACODE_HOME=/bench/uc, and the attested
+# BENCH_MODEL_RELAY_BASE_URL. The repository is fixed at /app. Everything of
+# value is written under /bench before exit, and the script always exits 0 — failures are reported in
 # /bench/out/meta.json, never as a container error.
 set -uo pipefail
 
@@ -74,7 +74,6 @@ write_meta() {
   ' || printf '{"failure":"%s","codexExit":%s,"startedAt":0,"endedAt":0,"baseSha":"","expectedBase":"","patchBytes":0,"applyCheck":null,"ucRuns":[],"waitedForTerminalMs":0}\n' "${META_FAILURE:-harness-setup-failed}" "$CODEX_EXIT" > "$BENCH/out/meta.json"
 }
 finish() {
-  rm -f "$CODEX_HOME/auth.json" # container-side scrub; the driver scrubs again
   cleanup_git_audit
   write_meta
   if [[ ${BENCH_ARTIFACT_OWNER:-} =~ ^[0-9]+:[0-9]+$ ]]; then
@@ -84,6 +83,22 @@ finish() {
   sync
   exit 0
 }
+
+# No task-controlled code runs until the host has inspected the created
+# attachment and the complete relay-only topology for this exact runtime.
+TRANSPORT_GATE="$HOME/.model-transport-attested"
+if ! [[ ${BENCH_RUNTIME_NONCE:-} =~ ^[a-f0-9]{64}$ ]]; then
+  META_FAILURE="harness-setup-failed"
+  finish
+fi
+GATE_DEADLINE=$(( $(date +%s) + 120 ))
+while [ ! -f "$TRANSPORT_GATE" ] && [ "$(date +%s)" -lt "$GATE_DEADLINE" ]; do sleep 1; done
+IFS= read -r OBSERVED_NONCE < "$TRANSPORT_GATE" 2>/dev/null || OBSERVED_NONCE=""
+if [ "$OBSERVED_NONCE" != "$BENCH_RUNTIME_NONCE" ]; then
+  META_FAILURE="harness-setup-failed"
+  finish
+fi
+rm -f "$TRANSPORT_GATE"
 
 log "entrypoint arm=$BENCH_ARM timeout=${BENCH_TIMEOUT_SECS}s model=${BENCH_MODEL:-<unset>}"
 "$NODE" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
@@ -190,18 +205,28 @@ chown -R "$TASK_UID:$TASK_GID" "$REPO_DIR" "$BENCH" "$HOME" "$CODEX_HOME" "${ULT
   finish
 }
 
-# --- CODEX_HOME from the arm template; pre-placed auth.json survives cp -n.
-# --- config.toml is rebuilt from the template every attempt (a stale copy from
+# --- CODEX_HOME from the credential-free arm template. config.toml is rebuilt
+# --- from the template every attempt (a stale copy from
 # --- a retried run would get keys prepended twice and break codex's parser) ---
 mkdir -p "$CODEX_HOME"
 rm -f "$CODEX_HOME/config.toml"
 cp -an "/opt/bench/codex-home-$BENCH_ARM/." "$CODEX_HOME/"
 cp -f "/opt/bench/codex-home-$BENCH_ARM/config.toml" "$CODEX_HOME/config.toml"
+case ${BENCH_MODEL_RELAY_BASE_URL:-} in
+  http://*/v1|https://*/v1) ;;
+  *) META_FAILURE="harness-setup-failed"; finish ;;
+esac
 if [ -n "${BENCH_MODEL:-}" ] || [ -n "${BENCH_EFFORT:-}" ]; then
   { # top-level keys must precede any [table] in the template
     [ -n "${BENCH_MODEL:-}" ] && printf 'model = "%s"\n' "$BENCH_MODEL"
     [ -n "${BENCH_EFFORT:-}" ] && printf 'model_reasoning_effort = "%s"\n' "$BENCH_EFFORT"
+    printf 'model_provider = "swebench_pro_relay"\n'
     cat "$CODEX_HOME/config.toml"
+    printf '\n[model_providers.swebench_pro_relay]\n'
+    printf 'name = "SWE-bench Pro attested model relay"\n'
+    printf 'base_url = "%s"\n' "$BENCH_MODEL_RELAY_BASE_URL"
+    printf 'wire_api = "responses"\n'
+    printf 'requires_openai_auth = false\n'
   } > /tmp/bench-config.toml && mv /tmp/bench-config.toml "$CODEX_HOME/config.toml"
 fi
 if [ "$BENCH_ARM" = b ]; then
@@ -215,7 +240,6 @@ if [ "$BENCH_ARM" = b ]; then
     printf 'ULTRACODE_CODEX_BIN = "%s"\n' "$CODEX"
     printf 'PATH = "%s"\n' "$PATH"
     printf 'HOME = "%s"\n' "$HOME"
-    [ -n "${CODEX_API_KEY:-}" ] && printf 'CODEX_API_KEY = "%s"\n' "$CODEX_API_KEY"
   } >> "$CODEX_HOME/config.toml"
 fi
 

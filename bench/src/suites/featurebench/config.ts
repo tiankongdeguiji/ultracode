@@ -56,7 +56,7 @@ export const featureBenchConfigSchema = z.strictObject({
 });
 
 const operatorConfigSchema = z.strictObject({
-  schemaVersion: z.literal(2),
+  schemaVersion: z.union([z.literal(2), z.literal(3)]),
   toolchain: toolchainConfigSchema,
   swebenchPro: z.unknown().optional(),
   sweMarathon: z.unknown().optional(),

@@ -161,7 +161,7 @@ describe('benchmark process boundary', () => {
       cwd: process.cwd(),
       tailBytes: 8,
       drainMs: 100,
-      terminationGraceMs: 0,
+      terminationGraceMs: 250,
       onLifecycleToken: (token) => lifecycle.push(`token:${token}`),
       onLifecycleStarted: (token, pid) => lifecycle.push(`started:${token}:${pid ?? 'none'}`),
       onLifecycleRecovered: (token, recovery) => lifecycle.push(`recovered:${token}:${recovery}`),

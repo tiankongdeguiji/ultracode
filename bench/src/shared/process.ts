@@ -34,7 +34,12 @@ const BASE_CHILD_ENV = [
   'DOCKER_CERT_PATH',
 ] as const;
 
-const ACTIVE_BENCH_PROCESSES = new Set<SpawnedAgent>();
+interface ActiveBenchProcess {
+  spawned: SpawnedAgent;
+  recordCompleteCleanup(): void;
+}
+
+const ACTIVE_BENCH_PROCESSES = new Set<ActiveBenchProcess>();
 const DEFAULT_TAIL_BYTES = 64 * 1_024;
 const DEFAULT_DRAIN_MS = 1_000;
 const DEFAULT_TERMINATION_GRACE_MS = 1_000;
@@ -60,7 +65,7 @@ export interface BenchProcessOptions {
   onLifecycleToken?: (token: string) => void;
   /** Enrich the pre-spawn token with the direct-child process identity. */
   onLifecycleStarted?: (token: string, pid: number | null, processStartIdentity: string | null) => void;
-  /** Persist a bounded authenticated macOS candidate inventory before cleanup signals it. */
+  /** Persist bounded macOS candidates; `complete` means live cleanup sealed the inventory. */
   onLifecycleCandidates?: (
     token: string,
     candidates: readonly TrackedProcess[],
@@ -361,7 +366,20 @@ export async function runBenchProcess(
     onWorkerCandidates: options.onLifecycleCandidates,
     processInspection: options.processInspection,
   });
-  ACTIVE_BENCH_PROCESSES.add(spawned);
+  let cleanupRecorded = false;
+  const activeProcess: ActiveBenchProcess = {
+    spawned,
+    recordCompleteCleanup: () => {
+      if (cleanupRecorded) return;
+      options.onLifecycleRecovered?.(spawned.workerToken, 'complete');
+      cleanupRecorded = true;
+    },
+  };
+  const retireCompleteCleanup = (): void => {
+    activeProcess.recordCompleteCleanup();
+    ACTIVE_BENCH_PROCESSES.delete(activeProcess);
+  };
+  ACTIVE_BENCH_PROCESSES.add(activeProcess);
   try {
     const childPid = spawned.child.pid ?? null;
     const childIdentity = childPid === null
@@ -375,11 +393,10 @@ export async function runBenchProcess(
       remaining = await spawned.cleanupEscaped(
         terminationGraceMs,
       );
-      if (remaining === 0) options.onLifecycleRecovered?.(spawned.workerToken, 'complete');
+      if (remaining === 0) retireCompleteCleanup();
     } catch {
       // The pending durable token remains available to resume recovery.
     }
-    if (remaining === 0) ACTIVE_BENCH_PROCESSES.delete(spawned);
     throw error;
   }
   const stdout = new ByteTailBuffer(tailBytes);
@@ -405,13 +422,7 @@ export async function runBenchProcess(
   let timeoutEscalation: NodeJS.Timeout | undefined;
   let timedOut = false;
   let cleanupRemaining: number | null = null;
-  let cleanupRecorded = false;
   let outputDrainFailure: Error | null = null;
-  const recordCompleteCleanup = (): void => {
-    if (cleanupRecorded) return;
-    options.onLifecycleRecovered?.(spawned.workerToken, 'complete');
-    cleanupRecorded = true;
-  };
   try {
     childStdout?.on('data', onStdoutData);
     childStderr?.on('data', onStderrData);
@@ -456,7 +467,7 @@ export async function runBenchProcess(
     cleanupRemaining = await spawned.cleanupEscaped(
       terminationGraceMs,
     );
-    if (cleanupRemaining === 0) recordCompleteCleanup();
+    if (cleanupRemaining === 0) retireCompleteCleanup();
     const elapsedMs = performance.now() - startedAt;
     const output = {
       stdout: stdout.text,
@@ -500,9 +511,8 @@ export async function runBenchProcess(
       } catch {
         cleanupRemaining = 1;
       }
-      if (cleanupRemaining === 0) recordCompleteCleanup();
+      if (cleanupRemaining === 0) retireCompleteCleanup();
     }
-    if (cleanupRemaining === 0) ACTIVE_BENCH_PROCESSES.delete(spawned);
     try {
       detachChildReadable(childStdout, stdoutForwarder, onStdoutData);
     } finally {
@@ -511,19 +521,26 @@ export async function runBenchProcess(
   }
 }
 
-/** Signal all trusted in-memory benchmark processes during root fatal cleanup. */
+/** Retire every trusted in-memory process or fail so fatal cleanup can retry. */
 export async function cleanupActiveBenchProcesses(graceMs = DEFAULT_TERMINATION_GRACE_MS): Promise<number> {
   const active = [...ACTIVE_BENCH_PROCESSES];
   if (active.length === 0) return 0;
-  active.forEach((spawned) => spawned.killTree('SIGTERM'));
+  active.forEach(({ spawned }) => spawned.killTree('SIGTERM'));
   await sleep(graceMs);
-  await Promise.all(active.map(async (spawned) => {
+  await Promise.all(active.map(async (entry) => {
+    const { spawned } = entry;
     spawned.killTree('SIGKILL');
     try {
-      if (await spawned.cleanupEscaped(graceMs) === 0) ACTIVE_BENCH_PROCESSES.delete(spawned);
+      if (await spawned.cleanupEscaped(graceMs) === 0) {
+        entry.recordCompleteCleanup();
+        ACTIVE_BENCH_PROCESSES.delete(entry);
+      }
     } catch {
       // Keep the entry actionable for a later fatal-cleanup retry.
     }
   }));
+  if (active.some((entry) => ACTIVE_BENCH_PROCESSES.has(entry))) {
+    throw new Error('active benchmark process cleanup did not reach verified stable absence');
+  }
   return active.length;
 }

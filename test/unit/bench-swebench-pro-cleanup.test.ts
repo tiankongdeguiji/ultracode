@@ -12,14 +12,20 @@ import {
   loadSwebenchProContainerPolicy,
   sessionTaskIdentity,
 } from '../../bench/src/suites/swebench-pro/container-policy.js';
+import { SwebenchProTransportAttestationError } from '../../bench/src/suites/swebench-pro/model-transport.js';
 import {
+  SwebenchProRunFatalController,
   reclaimSessionOwnership,
   reclamationContainerName,
   reclamationDockerRunArgv,
+  cleanupActiveSwebenchProContainers,
+  launchTrackedSessionContainer,
   ownedRunContainerIds,
   proveManifestReclamationNamesAbsent,
+  runCleanupOperationTimeout,
   stopPersistedSessionContainer,
   settleSessionWorkers,
+  survivorCleanupTimeout,
   type SessionDockerExecutor,
 } from '../../bench/src/suites/swebench-pro/runner.js';
 
@@ -62,8 +68,9 @@ function sessionFixture(taskId = 'task-a') {
   const taskIdentity = sessionTaskIdentity(artifactOwner);
   const inspect = JSON.stringify([{
     Id: id,
+    Name: '/session-name',
     Image: image.overlayLocalId,
-    Config: { Image: image.overlayName, Labels: {
+    Config: { Image: image.overlayLocalId, Labels: {
       'ultracode.benchmark.schema': '2',
       'ultracode.benchmark.suite': 'swebench-pro',
       'ultracode.benchmark.run': 'pilot1',
@@ -172,6 +179,117 @@ function reclamationFixture(taskId = 'task-a') {
 }
 
 describe('SWE-bench Pro ownership cleanup', () => {
+  it('adopts a paused launch that appears after the first absent cleanup query', async () => {
+    const { runtime, taskDirectory, id, inspect, image, artifactOwner, reclamation } = sessionFixture();
+    const events: string[] = [];
+    let present = false;
+    let launchReleased = false;
+    let releaseLaunch!: () => void;
+    const launchGate = new Promise<void>((resolvePromise) => { releaseLaunch = resolvePromise; });
+    let announceLaunch!: () => void;
+    const launchStarted = new Promise<void>((resolvePromise) => { announceLaunch = resolvePromise; });
+    let announceFirstAbsent!: () => void;
+    const firstAbsent = new Promise<void>((resolvePromise) => { announceFirstAbsent = resolvePromise; });
+    let releaseFinalProof!: () => void;
+    const finalProofGate = new Promise<void>((resolvePromise) => { releaseFinalProof = resolvePromise; });
+    let announceFinalProof!: () => void;
+    const finalProofStarted = new Promise<void>((resolvePromise) => { announceFinalProof = resolvePromise; });
+    let absentQueries = 0;
+    let finalProofAttempts = 0;
+    const timeouts: number[] = [];
+    const executor: SessionDockerExecutor = async (argv, _lifecycle, timeoutMs) => {
+      timeouts.push(timeoutMs!);
+      if (argv[0] === 'run' && !isReclamationQuery(argv)) {
+        events.push('launch-started');
+        announceLaunch();
+        await launchGate;
+        launchReleased = true;
+        present = true;
+        events.push('launch-appeared');
+        return id;
+      }
+      if (argv[0] === 'ps' && argv.includes(`id=${id}`)) {
+        finalProofAttempts++;
+        events.push('final-id-proof');
+        if (finalProofAttempts === 1) {
+          announceFinalProof();
+          await finalProofGate;
+          throw new Error('injected ambiguous final id query');
+        }
+        return present ? id : '';
+      }
+      if (argv[0] === 'ps') {
+        if (isReclamationQuery(argv)) return '';
+        if (!present) {
+          absentQueries++;
+          if (absentQueries === 1) {
+            events.push('initial-absent');
+            announceFirstAbsent();
+          }
+        }
+        return present ? id : '';
+      }
+      if (argv[0] === 'inspect') return inspect;
+      if (argv[0] === 'run') return '';
+      if (argv[0] === 'rm') {
+        present = false;
+        events.push('removed');
+        return '';
+      }
+      throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
+    };
+    const launching = launchTrackedSessionContainer('session-name', {
+      runtime,
+      runtimeNonce: 'a'.repeat(64),
+      runId: 'pilot1',
+      taskId: 'task-a',
+      arm: 'a',
+      taskDirectory,
+      artifactOwner,
+      image,
+      ...reclamation,
+      attemptDeadline: performance.now() + 60_000,
+      lifecycle: {},
+      executor,
+    }, () => executor(['run', 'session'], {}, 60_000));
+    await launchStarted;
+    let fatalCleanupAttempts = 0;
+    const fatalController = new SwebenchProRunFatalController(async () => {
+      fatalCleanupAttempts++;
+      await cleanupActiveSwebenchProContainers();
+    });
+    const fatal = new SwebenchProTransportAttestationError(
+      'transport-boundary',
+      new Error('injected overlapping worker failure'),
+    );
+    fatalController.abort(fatal);
+    expect(fatalController.failure).toBe(fatal);
+    const cleanup = fatalController.settleCleanup();
+    await firstAbsent;
+    releaseLaunch();
+    await expect(launching).resolves.toBe(id);
+    await finalProofStarted;
+    const adoptedCleanup = cleanupActiveSwebenchProContainers();
+    releaseFinalProof();
+    await expect(cleanup).rejects.toMatchObject({ code: 'ownership-unsafe' });
+    await expect(adoptedCleanup).rejects.toMatchObject({ code: 'ownership-unsafe' });
+    expect(fatalCleanupAttempts).toBe(1);
+    expect(existsSync(runtime)).toBe(false);
+    await expect(cleanupActiveSwebenchProContainers()).resolves.toBe(1);
+    expect(launchReleased).toBe(true);
+    expect(present).toBe(false);
+    expect(events).toEqual([
+      'launch-started',
+      'initial-absent',
+      'launch-appeared',
+      'removed',
+      'final-id-proof',
+      'final-id-proof',
+    ]);
+    expect(timeouts.every((timeoutMs) => timeoutMs > 0)).toBe(true);
+    await expect(cleanupActiveSwebenchProContainers()).resolves.toBe(0);
+  });
+
   it('reclaims artifacts and runtime homes after the owned container vanished', async () => {
     const { runtime, taskDirectory, image, artifactOwner, reclamation } = sessionFixture();
     const calls: string[][] = [];
@@ -482,25 +600,71 @@ describe('SWE-bench Pro ownership cleanup', () => {
     )).toEqual([]);
   });
 
-  it('queries every immutable reclamation name instead of trusting run labels', async () => {
+  it('bounds full-suite discovery to one reserved reclamation namespace snapshot', async () => {
+    const tasks = Array.from({ length: 731 }, (_, index) => `task-${index.toString().padStart(3, '0')}`);
+    const executions = tasks.flatMap((taskId) => [
+      { taskId, arm: 'a' },
+      { taskId, arm: 'b' },
+    ]);
     const manifest = {
       runId: 'pilot1',
-      artifacts: { executions: [
-        { taskId: 'task-a', arm: 'a' },
-        { taskId: 'task-b', arm: 'b' },
-      ] },
+      artifacts: { executions },
     } as never;
+    const ids = executions.map((_, index) =>
+      (index + 1).toString(16).padStart(64, '0'));
+    const names = new Map(ids.map((id: string, index: number) => [
+      id,
+      `/ucbench-reclaim-${(index + 1).toString(16).padStart(32, '0')}`,
+    ]));
     const queries: string[][] = [];
     await expect(proveManifestReclamationNamesAbsent(manifest, async (argv) => {
       queries.push([...argv]);
-      return '';
+      if (argv[0] === 'ps') return ids.join('\n');
+      return JSON.stringify(argv.slice(1).map((id) => ({ Id: id, Name: names.get(id) })));
     }, () => 1_000)).resolves.toBeUndefined();
-    expect(queries).toHaveLength(2);
-    expect(queries[0]).toContain(`name=^/${reclamationContainerName('pilot1', 'task-a', 'a')}$`);
-    expect(queries[1]).toContain(`name=^/${reclamationContainerName('pilot1', 'task-b', 'b')}$`);
+    expect(queries[0]).toEqual([
+      'ps', '-aq', '--no-trunc', '--filter', 'name=^/ucbench-reclaim-',
+    ]);
+    expect(queries).toHaveLength(4);
+    expect(queries.slice(1).every((argv) => argv[0] === 'inspect' && argv.length <= 513)).toBe(true);
+    const survivorTimeouts = Array.from(
+      { length: 731 },
+      () => runCleanupOperationTimeout(121_000, 1_000),
+    );
+    expect(survivorTimeouts.every((timeoutMs) => timeoutMs > 0)).toBe(true);
+    expect(new Set(survivorTimeouts)).toEqual(new Set([120_000]));
+  });
 
-    await expect(proveManifestReclamationNamesAbsent(manifest, async () => 'e'.repeat(64), () => 1_000))
-      .rejects.toThrow(/name remains occupied/);
+  it('decreases one survivor deadline and resets the full bound for the next survivor', () => {
+    let now = 1_000;
+    const first = survivorCleanupTimeout(() => now);
+    expect(first()).toBe(120_000);
+    now += 37;
+    expect(first()).toBe(119_963);
+    const second = survivorCleanupTimeout(() => now);
+    expect(second()).toBe(120_000);
+    now += 11;
+    expect(first()).toBe(119_952);
+    expect(second()).toBe(119_989);
+  });
+
+  it('rejects malformed bulk inspection and an unlabelled exact-name occupant', async () => {
+    const manifest = {
+      runId: 'pilot1',
+      artifacts: { executions: [{ taskId: 'task-a', arm: 'a' }] },
+    } as never;
+    const id = 'e'.repeat(64);
+    await expect(proveManifestReclamationNamesAbsent(manifest, async (argv) =>
+      argv[0] === 'ps' ? id : JSON.stringify([]), () => 1_000))
+      .rejects.toThrow(/did not exactly bind/);
+
+    const name = reclamationContainerName('pilot1', 'task-a', 'a');
+    await expect(proveManifestReclamationNamesAbsent(manifest, async (argv) =>
+      argv[0] === 'ps' ? id : JSON.stringify([{
+        Id: id,
+        Name: `/${name}`,
+        Config: { Labels: {} },
+      }]), () => 1_000)).rejects.toThrow(/name remains occupied/);
   });
 
   it('registers an in-flight helper for exact root fatal cleanup', async () => {
@@ -567,6 +731,32 @@ describe('SWE-bench Pro ownership cleanup', () => {
     await expect(settleSessionWorkers([failed])).rejects.toMatchObject({ code: 'ownership-unsafe' });
     expect(present).toBe(false);
     await expect(cleanupActiveReclamationHelpers()).resolves.toBe(0);
+  });
+
+  it('gives each idempotent reclamation retry a fresh bounded deadline', async () => {
+    const { options } = reclamationFixture('task-fresh-retry-deadline');
+    const launchTimeouts: number[] = [];
+    let attempts = 0;
+    const executor: SessionDockerExecutor = async (argv, _lifecycle, timeoutMs) => {
+      if (argv[0] === 'ps') return '';
+      if (argv[0] === 'run') {
+        launchTimeouts.push(timeoutMs!);
+        attempts++;
+        if (attempts === 1) throw new Error('injected first launch failure');
+        return '';
+      }
+      throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
+    };
+    await expect(reclaimSessionOwnership(
+      options,
+      {},
+      executor,
+      () => 3,
+    )).resolves.toBeUndefined();
+    expect(launchTimeouts).toHaveLength(2);
+    expect(launchTimeouts[0]).toBe(3);
+    expect(launchTimeouts[1]).toBeGreaterThan(100_000);
+    expect(launchTimeouts[1]).toBeLessThanOrEqual(120_000);
   });
 
   it.each([

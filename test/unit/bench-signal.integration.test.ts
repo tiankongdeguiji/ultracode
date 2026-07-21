@@ -35,6 +35,21 @@ interface SignalResult {
   stderr: string;
 }
 
+interface DeadlineSignalResult {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  elapsedMs: number;
+  stdout: string;
+  stderr: string;
+}
+
+interface DispatchCleanupSignalResult {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  events: string[];
+  stderr: string;
+}
+
 function processExists(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -123,7 +138,7 @@ function fixtureSource(): string {
     } };
     const cleanupActiveProcesses = process.env.TEST_FAIL_ACTIVE === '1'
       ? async () => { event('active:failed'); throw new Error('injected active cleanup failure'); }
-      : async () => { event('active:start'); await cleanupActiveBenchProcesses(20); event('active:done'); };
+      : async () => { event('active:start'); await cleanupActiveBenchProcesses(40); event('active:done'); };
     await runBenchExecutable(
       ['--suite', suite, 'run'],
       registry,
@@ -222,11 +237,155 @@ async function runSignalCase(options: SignalCase): Promise<SignalResult> {
   return result;
 }
 
+function runDeadlineSignalCase(signal: 'SIGINT' | 'SIGTERM'): DeadlineSignalResult {
+  const cliUrl = pathToFileURL(join(REPO_ROOT, 'bench/src/cli.ts')).href;
+  const script = `
+    import { runBenchExecutable } from ${JSON.stringify(cliUrl)};
+
+    const keepAlive = setInterval(() => {}, 60_000);
+    const pending = new Promise(() => {});
+    const command = {
+      parse: () => ({}),
+      run: async () => {
+        setImmediate(() => process.kill(process.pid, ${JSON.stringify(signal)}));
+        await pending;
+      },
+    };
+    const registry = { get: () => ({ commands: { run: command } }) };
+    void runBenchExecutable(
+      ['--suite', 'featurebench', 'run'],
+      registry,
+      undefined,
+      {
+        cleanupActiveProcesses: async () => {
+          clearInterval(keepAlive);
+          await pending;
+        },
+        signalCleanupTimeoutMs: 150,
+      },
+    );
+  `;
+  const startedAt = Date.now();
+  const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    env: SUBPROCESS_ENV,
+    timeout: 5_000,
+    killSignal: 'SIGKILL',
+  });
+  if (result.error) throw result.error;
+  return {
+    code: result.status,
+    signal: result.signal,
+    elapsedMs: Date.now() - startedAt,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+}
+
+function runDispatchCleanupSignalCase(signal: 'SIGINT' | 'SIGTERM'): DispatchCleanupSignalResult {
+  const cliUrl = pathToFileURL(join(REPO_ROOT, 'bench/src/cli.ts')).href;
+  const script = `
+    import { writeSync } from 'node:fs';
+    import { runBenchExecutable } from ${JSON.stringify(cliUrl)};
+
+    const pause = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+    const event = (value) => writeSync(1, value + '\\n');
+    let activeCleanupCount = 0;
+    let suiteCleanupCount = 0;
+    const adapter = {
+      cleanup: async () => {
+        suiteCleanupCount += 1;
+        const pass = suiteCleanupCount;
+        event('suite:' + pass + ':start');
+        if (pass === 1) {
+          setImmediate(() => process.kill(process.pid, ${JSON.stringify(signal)}));
+          await pause(40);
+        }
+        event('suite:' + pass + ':done');
+      },
+      commands: {
+        run: {
+          parse: () => ({}),
+          run: async () => {
+            event('run:failed');
+            throw new Error('injected command failure');
+          },
+        },
+      },
+    };
+    const cleanupActiveProcesses = async () => {
+      activeCleanupCount += 1;
+      const pass = activeCleanupCount;
+      event('active:' + pass + ':start');
+      if (pass === 1) await pause(150);
+      event('active:' + pass + ':done');
+    };
+    void runBenchExecutable(
+      ['--suite', 'featurebench', 'run'],
+      { get: () => adapter },
+      undefined,
+      { cleanupActiveProcesses, signalCleanupTimeoutMs: 1_000 },
+    );
+  `;
+  const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    env: SUBPROCESS_ENV,
+    timeout: 5_000,
+    killSignal: 'SIGKILL',
+  });
+  if (result.error) throw result.error;
+  return {
+    code: result.status,
+    signal: result.signal,
+    events: result.stdout.trim().split(/\r?\n/u).filter(Boolean),
+    stderr: result.stderr,
+  };
+}
+
 afterEach(() => {
   for (const directory of tempDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
 describe.skipIf(SUBPROCESS_BLOCKED)('benchmark signal coordinator', () => {
+  it.each([
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+  ] as const)('keeps the fatal cleanup deadline alive before re-sending %s', (signal, status) => {
+    const result = runDeadlineSignalCase(signal);
+    expect(result.code).toBeNull();
+    expect(result.signal).toBe(signal);
+    const observedStatus = result.code ?? 128 + osConstants.signals[result.signal!];
+    expect(observedStatus).toBe(status);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(100);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('');
+  });
+
+  it.each([
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+  ] as const)('adopts dispatch-owned cleanup before re-sending %s', (signal, status) => {
+    const result = runDispatchCleanupSignalCase(signal);
+    expect(result.code).toBeNull();
+    expect(result.signal).toBe(signal);
+    const observedStatus = result.code ?? 128 + osConstants.signals[result.signal!];
+    expect(observedStatus).toBe(status);
+    expect(result.events).toEqual([
+      'run:failed',
+      'suite:1:start',
+      'active:1:start',
+      'suite:1:done',
+      'active:1:done',
+      'active:2:start',
+      'active:2:done',
+      'suite:2:start',
+      'suite:2:done',
+    ]);
+    expect(result.stderr).toBe('');
+  });
+
   it.each([
     ['featurebench', 'SIGINT', 130],
     ['swe-marathon', 'SIGTERM', 143],

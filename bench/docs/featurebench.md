@@ -98,8 +98,17 @@ non-null inference root with native `--resume`; null-only history retries the
 complete immutable task set fresh only while `native/` has no timestamp root.
 Any timestamp root absent from inference state is ambiguous and rejected. Redo
 runs a new timestamped native inference while preserving that first baseline,
-then evaluates a complete prediction set consolidated from every state-bound
-inference root in append order.
+then evaluates a complete prediction set whose selected tasks must come from
+the new root and whose untouched tasks come only from immutable, receipt-bound
+prediction snapshots accepted by an earlier successful evaluation. A redo
+invalidation removes task evidence only for its selected tasks and removes the
+run aggregate. If inference or evaluation preparation fails before the
+evaluator child launches, no verifier attempt is recorded and accepted task
+evidence for untouched tasks remains eligible for task-level reporting.
+Each consolidated snapshot has an invocation-unique filename inside the
+current timestamp root. This keeps accepted inputs immutable while preserving
+the upstream evaluator's contract that reports are emitted beside its
+predictions file.
 
 Every run uses the common suite-qualified layout (with `suite` equal to
 `featurebench`):
@@ -115,8 +124,12 @@ bench/results/<suite>/<runId>/
     <YYYY-MM-DD__HH-MM-SS>/
       run_metadata.json
       output.jsonl
+      consolidated-output-<invocation-id>.jsonl
       eval_outputs/<task>/attempt-1/report.json
       report.json
+    invocations/<invocation-id>/
+      fb-eval.json
+      prior-eval/...
 ```
 
 The upstream timestamp directory is discovered only after `fb infer` creates
@@ -128,6 +141,12 @@ The verifier receipt binds the timestamped `run_metadata.json`, prediction
 JSONL, each task report, each official completion marker, the exact `fb eval`
 input and invocation record, and the run-level `attempt_1` aggregate. Missing,
 malformed, symlinked, escaped, or later-mutated evidence remains unverified.
+Task disposition requires the complete receipt chain for that task and its
+evaluation invocation, but does not require the run aggregate. The aggregate
+headline is published only when its invocation has a complete, same-root
+receipt for every immutable task. Accepted snapshots and report evidence are
+re-hashed before reuse, so changed prediction inputs, evaluation invocations,
+metadata, rollout output, or reports fail closed.
 
 ## Score semantics
 

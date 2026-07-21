@@ -24,9 +24,9 @@ required later to fetch pinned sources, dependencies, toolchains, and images.
 
 Copy `bench/bench.example.config.json` to the ignored, operator-owned
 `bench/bench.config.json`, set its mode to `0600`, and fill in the requested
-models, efforts, task sets, and public authentication identities. Runtime
-credentials and endpoint names are supplied through the environment and never
-belong in either config file.
+models, efforts, task sets, and public transport/authentication identities.
+Runtime credentials and endpoint names are supplied through the environment
+and never belong in either config file.
 
 ## Unified CLI
 
@@ -62,7 +62,9 @@ bench/results/<suite>/<runId>/
   native/
 ```
 
-The manifest is strict schema version 2 and immutable. Resume re-attests the
+Manifests are strict and immutable: relay-backed SWE-bench Pro uses schema
+version 3, while the unchanged SWE-Marathon and FeatureBench contracts remain
+version 2. Legacy Pro v2 direct-auth manifests are rejected. Resume re-attests the
 prepared inputs and control-plane policy hashes, then accepts only that manifest
 identity. Native output is authoritative only when its exact path, SHA-256,
 scope, invocation, role, and native record key are stored in the host-owned
@@ -113,6 +115,8 @@ inventory digest live in `suites/featurebench/dataset-pin.json`.
 # SWE-bench Pro
 npm run bench -- --suite swebench-pro fetch
 npm run bench -- --suite swebench-pro prep
+SWEBENCH_PRO_MODEL_RELAY_URL=http://pro-relay:8080/v1 \
+SWEBENCH_PRO_RESTRICTED_NETWORK=swebench-pro-private \
 npm run bench -- --suite swebench-pro run --run-id pro-pilot \
   --model <model> --effort <effort> --arm both --count 20 --seed 7
 npm run bench -- --suite swebench-pro eval --run-id pro-pilot --resume
@@ -133,9 +137,10 @@ npm run bench -- --suite featurebench run --run-id feature-b1 \
 npm run bench -- --suite featurebench report --run-id feature-b1
 ```
 
-Preparation and native execution can use network access and spend substantial
-resources. Unit tests and the default CI suite are offline; live benchmark runs
-are always manual.
+Preparation, verification, and relay operation can use network access and spend
+substantial resources. Pro task sessions have only their dedicated internal
+relay network. Unit tests and the default CI suite are offline; live benchmark
+runs are always manual.
 
 ## Arms and prompt policy
 
@@ -148,22 +153,29 @@ its native layout provides a task-by-arm execution namespace.
 
 ## Authentication and isolation
 
-Authentication is resolved only at launch, using an allowlisted child
-environment. Manifests store the mechanism and hashes of operator-provided
-public identities, never API keys, auth-file paths or contents, broker URLs, or
-runtime Docker names.
+Authentication and transport bindings are resolved only at launch. Manifests
+and reports store mechanisms and hashes of public identities, versions,
+destinations, policies, immutable runtime identities, and topology, never API
+keys, auth-file paths or contents, relay/broker URLs, or Docker runtime names.
 
-- SWE-bench Pro ChatGPT mode requires `CODEX_AUTH_JSON_PATH` to name a
-  current-user-owned, singly-linked regular ChatGPT auth file no larger than
-  4 MiB with mode `0600`;
-  its API-key mode uses `CODEX_API_KEY`.
+- SWE-bench Pro has no direct ChatGPT/API-key mode. Every task container must
+  use a custom Codex Responses provider on a dedicated internal Docker network.
+  Its only non-task endpoint is the separately operated immutable-image model
+  relay attested by `SWEBENCH_PRO_MODEL_RELAY_URL` and
+  `SWEBENCH_PRO_RESTRICTED_NETWORK`. The task gets no reusable provider
+  credential and has no default/WAN or generic-proxy attachment. A host-wide
+  policy lock covers run recovery, preflight, sessions, resume, and cleanup.
 - SWE-Marathon ChatGPT mode uses the same `CODEX_AUTH_JSON_PATH` file contract,
-  but its API-key mode deliberately uses `OPENAI_API_KEY`, not
-  `CODEX_API_KEY`.
+  while its API-key mode uses `OPENAI_API_KEY`.
 - FeatureBench task containers receive no reusable credential. They attach to
   a dedicated internal Docker network whose only pre-existing endpoint is a
   separately managed, labeled HTTPS credential broker. A host-wide policy lock
   covers network preflight, native execution, official evaluation, and cleanup.
+
+The Pro harness attests the relay's declared strict request/model/destination
+contract and Docker identity; the operator remains responsible for making the
+relay implementation and its upstream egress match that declaration. It does
+not claim to attest an undocumented host or provider firewall.
 
 All native containers receive the complete `ultracode.benchmark.*` ownership
 label tuple. Cleanup discovers by that tuple, reinspects the full identity, and

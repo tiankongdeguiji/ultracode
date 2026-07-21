@@ -72,7 +72,7 @@ Choose the configured authentication mechanism on every run:
 
 - `chatgpt`: set `CODEX_AUTH_JSON_PATH` to a current-user-owned, singly-linked
   regular file no larger than 4 MiB with mode `0600`.
-- `api-key`: set `OPENAI_API_KEY` (not SWE-bench Pro's `CODEX_API_KEY`).
+- `api-key`: set `OPENAI_API_KEY`.
 
 Credentials are copied or forwarded only into an ephemeral `0700` runtime home
 and never enter argv, manifests, reports, or the persistent run directory.

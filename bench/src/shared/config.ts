@@ -13,7 +13,7 @@ export const toolchainConfigSchema = z.strictObject({
 });
 
 export const sharedBenchConfigSchema = z.strictObject({
-  schemaVersion: z.literal(2),
+  schemaVersion: z.union([z.literal(2), z.literal(3)]),
   toolchain: toolchainConfigSchema,
   cacheRoot: z.string().min(1).optional(),
 });

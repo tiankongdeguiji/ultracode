@@ -4,7 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { swebenchProAdapter } from '../../bench/src/suites/swebench-pro/adapter.js';
-import { resolveSwebenchProConfig, type SwebenchProConfig } from '../../bench/src/suites/swebench-pro/config.js';
+import {
+  resolveSwebenchProConfig,
+  swebenchProOperatorConfigSchema,
+  type SwebenchProConfig,
+} from '../../bench/src/suites/swebench-pro/config.js';
 import { repositoryDigest } from '../../bench/src/suites/swebench-pro/image.js';
 import { instanceFromRow, selectInstances } from '../../bench/src/suites/swebench-pro/instances.js';
 import type { SwebenchProContainerPolicy } from '../../bench/src/suites/swebench-pro/container-policy.js';
@@ -12,7 +16,10 @@ import { classifyOutcome } from '../../bench/src/suites/swebench-pro/state.js';
 import {
   hasCompleteProVerifierReceipt,
   cleanupProRuntimeHomes,
+  isRunFatalTransportFailure,
   ownedRunContainerIds,
+  reclamationContainerName,
+  reclamationNamespaceSnapshot,
   retainVerifierBindingsAfterRedo,
 } from '../../bench/src/suites/swebench-pro/runner.js';
 import {
@@ -54,7 +61,9 @@ const config: SwebenchProConfig = {
   requestedEffort: 'high',
   arm: 'both',
   selection: { taskIds: null, count: 1, seed: 7, stratifyBy: 'repo_language' },
-  auth: { mechanism: 'api-key', publicIdentity: 'test' },
+  modelTransport: {
+    relayIdentity: 'relay-test', relayVersion: 'v1', fixedDestination: 'https://api.openai.com/v1',
+  },
   timeouts: { sessionMs: 60_000, verifierMs: 60_000, evaluatorWatchdogMs: 60_000 },
   concurrency: { tasks: 1, verifier: 1 },
   docker: { cpus: 1, memoryBytes: 1_000_000, keepImages: false },
@@ -134,6 +143,48 @@ describe('SWE-bench Pro adapter parsing', () => {
       toolchain: { nodeVersion: '22.0.0', nodeDistribution: 'nodejs', codexBinary: '/bin/false' },
       swebenchPro: config,
     }, { sanitizeGitHistory: false } as never)).toThrow();
+  });
+
+  it('rejects legacy direct provider credentials instead of falling back to unrestricted sessions', () => {
+    const legacy = structuredClone(config) as unknown as Record<string, unknown>;
+    delete legacy.modelTransport;
+    legacy.auth = { mechanism: 'api-key', publicIdentity: 'legacy' };
+    expect(() => swebenchProOperatorConfigSchema.parse({
+      schemaVersion: 2,
+      toolchain: { nodeVersion: '22.0.0', nodeDistribution: 'nodejs', codexBinary: '/bin/false' },
+      swebenchPro: legacy,
+    })).toThrow(/version 2 used direct provider auth.*migrate to version 3 modelTransport/);
+    expect(swebenchProOperatorConfigSchema.parse({
+      schemaVersion: 3,
+      toolchain: { nodeVersion: '22.0.0', nodeDistribution: 'nodejs', codexBinary: '/bin/false' },
+      swebenchPro: config,
+    }).schemaVersion).toBe(3);
+  });
+
+  it.each([
+    ['model', 'x" #'],
+    ['model', 'x\\y'],
+    ['model', 'x#comment'],
+    ['requestedEffort', 'high"'],
+    ['requestedEffort', 'high\\low'],
+    ['requestedEffort', 'high#comment'],
+  ] as const)('rejects TOML-unsafe %s values at the public config boundary', (field, value) => {
+    expect(() => resolveSwebenchProConfig({
+      schemaVersion: 3,
+      toolchain: { nodeVersion: '22.0.0', nodeDistribution: 'nodejs', codexBinary: '/bin/false' },
+      swebenchPro: { ...config, [field]: value },
+    })).toThrow();
+  });
+
+  it('requires an exact query-free HTTPS model destination base', () => {
+    expect(() => resolveSwebenchProConfig({
+      schemaVersion: 2,
+      toolchain: { nodeVersion: '22.0.0', nodeDistribution: 'nodejs', codexBinary: '/bin/false' },
+      swebenchPro: {
+        ...config,
+        modelTransport: { ...config.modelTransport, fixedDestination: 'https://api.openai.com/v1?' },
+      },
+    })).toThrow(/fixed model destination/);
   });
 
   it('rejects operator-selected evaluator repositories and revisions', () => {
@@ -268,6 +319,9 @@ describe('complete row freezing and strict native evidence', () => {
       waitedForTerminalMs: 0,
       failure: null,
     }, null).failure).toBe('agent-timeout');
+    expect(isRunFatalTransportFailure('broker-failed')).toBe(true);
+    expect(isRunFatalTransportFailure('network-policy-failed')).toBe(true);
+    expect(isRunFatalTransportFailure('native-runner-failed')).toBe(false);
   });
 });
 
@@ -453,7 +507,7 @@ describe('evaluator ownership and empty predictions', () => {
     expect(existsSync(runtime)).toBe(false);
   });
 
-  it('retains an exact runtime while its deterministic helper name is occupied', async () => {
+  it('takes a fresh final snapshot and retains runtime if its exact helper name appears', async () => {
     const runtime = mkdtempSync(join(tmpdir(), 'uc-bench-pro-runtime-'));
     temporaryRoots.push(runtime);
     mkdirSync(join(runtime, 'codex-home'), { mode: 0o700 });
@@ -470,8 +524,20 @@ describe('evaluator ownership and empty predictions', () => {
       runId: 'pilot1',
       artifacts: { executions: [{ taskId: 'task-a', arm: 'a' }] },
     } as never;
-    await expect(cleanupProRuntimeHomes(manifest, async () => 'd'.repeat(64)))
+    const id = 'd'.repeat(64);
+    const name = reclamationContainerName('pilot1', 'task-a', 'a');
+    let snapshots = 0;
+    const executor = async (argv: readonly string[]) => {
+      if (argv[0] === 'ps') {
+        snapshots += 1;
+        return snapshots === 1 ? '' : id;
+      }
+      return JSON.stringify([{ Id: id, Name: `/${name}`, Config: { Labels: {} } }]);
+    };
+    await expect(reclamationNamespaceSnapshot(executor, () => 1_000)).resolves.toEqual(new Map());
+    await expect(cleanupProRuntimeHomes(manifest, executor))
       .rejects.toThrow(/name remains occupied/);
+    expect(snapshots).toBe(2);
     expect(existsSync(runtime)).toBe(true);
   });
 });

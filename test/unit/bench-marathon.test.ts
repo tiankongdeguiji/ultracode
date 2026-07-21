@@ -126,9 +126,9 @@ describe('SWE-Marathon configuration and preparation', () => {
     const readme = readFileSync(resolve('bench/README.md'), 'utf8');
     const guide = readFileSync(resolve('bench/docs/swe-marathon.md'), 'utf8');
     expect(readme).toContain('plus `uv` and GNU `patch`');
-    expect(readme).toContain('uses `OPENAI_API_KEY`, not\n  `CODEX_API_KEY`');
+    expect(readme).toContain('API-key mode uses `OPENAI_API_KEY`');
     expect(guide).toContain('preflights both before\nnetwork access, cache staging');
-    expect(guide).toContain('set `OPENAI_API_KEY` (not SWE-bench Pro\'s `CODEX_API_KEY`)');
+    expect(guide).toContain('set `OPENAI_API_KEY`');
     expect(guide).toContain('singly-linked\n  regular file no larger than 4 MiB');
     const proPreparation = readFileSync(resolve('bench/src/suites/swebench-pro/toolchain.ts'), 'utf8');
     expect(proPreparation).not.toMatch(/(?:command|runBenchProcess)\(['"]uv['"]/u);

@@ -1,12 +1,18 @@
 /**
- * The only persisted benchmark experiment manifest. Version 2 is a strict
- * suite-discriminated union; there are no legacy readers or layout fallbacks.
+ * The only persisted benchmark experiment manifest. Pro relay runs use v3;
+ * the unchanged Marathon and FeatureBench contracts remain strict v2.
  */
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { z } from 'zod';
 import type { BenchPathRoots, BenchSuite } from './contracts.js';
-import { benchProvenanceSchema, canonicalJson, sha256CanonicalJson, sha256Schema } from './provenance.js';
+import {
+  benchProvenanceSchema,
+  canonicalJson,
+  modelTransportProvenanceSchema,
+  sha256CanonicalJson,
+  sha256Schema,
+} from './provenance.js';
 import {
   artifactKey,
   isPortableComponent,
@@ -107,7 +113,7 @@ export const swebenchProSuiteConfigSchema = z.strictObject({
     taskId: taskIdSchema,
     arms: z.array(armSchema).min(1).max(2),
   })).min(1),
-  auth: authSnapshotSchema,
+  modelTransport: modelTransportProvenanceSchema,
   policies: proPolicySchema,
   attempts: z.literal(1),
   retries: z.literal(0),
@@ -169,7 +175,6 @@ export const featureBenchSuiteConfigSchema = z.strictObject({
 });
 
 const commonShape = {
-  schemaVersion: z.literal(2),
   kind: z.literal('ultracode-benchmark-run'),
   runId: runIdSchema,
   createdAt: isoTimestampSchema,
@@ -183,18 +188,21 @@ const commonShape = {
 
 const swebenchProManifestSchema = z.strictObject({
   ...commonShape,
+  schemaVersion: z.literal(3),
   suite: z.literal('swebench-pro'),
   suiteConfig: swebenchProSuiteConfigSchema,
 });
 
 const sweMarathonManifestSchema = z.strictObject({
   ...commonShape,
+  schemaVersion: z.literal(2),
   suite: z.literal('swe-marathon'),
   suiteConfig: sweMarathonSuiteConfigSchema,
 });
 
 const featureBenchManifestSchema = z.strictObject({
   ...commonShape,
+  schemaVersion: z.literal(2),
   suite: z.literal('featurebench'),
   suiteConfig: featureBenchSuiteConfigSchema,
 });
@@ -279,6 +287,14 @@ function refineManifest(manifest: RawManifest, context: z.RefinementCtx): void {
 
   if (manifest.suite === 'swebench-pro') {
     const config = manifest.suiteConfig;
+    if (manifest.provenance.modelTransport === undefined
+      || canonicalJson(config.modelTransport) !== canonicalJson(manifest.provenance.modelTransport)) {
+      addIssue(context, ['provenance', 'modelTransport'], 'Pro model transport provenance must equal its frozen suite policy');
+    }
+    const modelSha256 = createHash('sha256').update(manifest.experiment.model, 'utf8').digest('hex');
+    if (config.modelTransport.modelSha256 !== modelSha256) {
+      addIssue(context, ['suiteConfig', 'modelTransport', 'modelSha256'], 'Pro model transport must bind the requested model');
+    }
     const instanceIds = config.instances.map((instance) => instance.taskId);
     const orderIds = config.armOrder.map((entry) => entry.taskId);
     if (canonicalJson(instanceIds) !== canonicalJson(taskIds)) {
@@ -321,14 +337,22 @@ function refineManifest(manifest: RawManifest, context: z.RefinementCtx): void {
       addIssue(context, ['suiteConfig', 'policies', 'adapterSha256'], 'adapter policy hash must equal provenance');
     }
   } else if (manifest.suite === 'swe-marathon') {
+    if (manifest.provenance.modelTransport !== undefined) {
+      addIssue(context, ['provenance', 'modelTransport'], 'SWE-Marathon does not accept Pro model transport provenance');
+    }
     if (manifest.limits.hostVerifierTimeoutMs !== null) {
       addIssue(context, ['limits', 'hostVerifierTimeoutMs'], 'SWE-Marathon uses only native verifier deadlines');
     }
     if (manifest.suiteConfig.policies.adapterSha256 !== manifest.provenance.controlPlane.adapterPolicySha256) {
       addIssue(context, ['suiteConfig', 'policies', 'adapterSha256'], 'adapter policy hash must equal provenance');
     }
-  } else if (manifest.suiteConfig.policies.adapterSha256 !== manifest.provenance.controlPlane.adapterPolicySha256) {
-    addIssue(context, ['suiteConfig', 'policies', 'adapterSha256'], 'adapter policy hash must equal provenance');
+  } else {
+    if (manifest.provenance.modelTransport !== undefined) {
+      addIssue(context, ['provenance', 'modelTransport'], 'FeatureBench does not accept Pro model transport provenance');
+    }
+    if (manifest.suiteConfig.policies.adapterSha256 !== manifest.provenance.controlPlane.adapterPolicySha256) {
+      addIssue(context, ['suiteConfig', 'policies', 'adapterSha256'], 'adapter policy hash must equal provenance');
+    }
   }
 
   const expectedExecutions = expectedExecutionArms(manifest);
@@ -368,6 +392,12 @@ export type PricingSnapshot = z.infer<typeof pricingSnapshotSchema>;
 export type RunArtifacts = z.infer<typeof runArtifactsSchema>;
 
 export function parseBenchRunManifest(value: unknown): BenchRunManifest {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const candidate = value as Record<string, unknown>;
+    if (candidate.suite === 'swebench-pro' && candidate.schemaVersion === 2) {
+      throw new Error('SWE-bench Pro manifest schema version 2 predates attested relay transport and is unsupported; create a new version 3 run');
+    }
+  }
   return benchRunManifestSchema.parse(value);
 }
 
@@ -418,11 +448,12 @@ export function assertManifestResumeEquality(existing: unknown, requested: unkno
 }
 
 export const MANIFEST_POLICY_SHA256 = sha256CanonicalJson({
-  schemaVersion: 2,
+  schemaVersions: { swebenchPro: 3, sweMarathon: 2, featureBench: 2 },
   kind: 'ultracode-benchmark-run',
   strictDiscriminatedUnion: true,
   resumeProjection: 'all-except-created-at',
   credentials: 'forbidden',
+  modelTransport: 'suite-bound-attested-relay-provenance',
   artifacts: 'suite-task-arm-exact',
   marathonVerifierTimeout: 'native-only-host-null',
 });

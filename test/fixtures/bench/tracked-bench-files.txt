@@ -3,6 +3,7 @@ bench/src/registry.ts
 bench/src/shared/checkout.ts
 bench/src/shared/config.ts
 bench/src/shared/contracts.ts
+bench/src/shared/docker-isolation.ts
 bench/src/shared/failure.ts
 bench/src/shared/jsonl.ts
 bench/src/shared/locks.ts
@@ -40,6 +41,7 @@ bench/src/suites/swebench-pro/config.ts
 bench/src/suites/swebench-pro/container-policy.ts
 bench/src/suites/swebench-pro/image.ts
 bench/src/suites/swebench-pro/instances.ts
+bench/src/suites/swebench-pro/model-transport.ts
 bench/src/suites/swebench-pro/prompt.ts
 bench/src/suites/swebench-pro/runner.ts
 bench/src/suites/swebench-pro/state.ts

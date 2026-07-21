@@ -258,6 +258,91 @@ describe('benchmark signal cleanup bounds', () => {
     expect(events).toEqual(['active', 'suite', 'active', 'suite', 'resend']);
   });
 
+  it('adopts a dispatch-owned suite cleanup before it settles behind active cleanup', async () => {
+    const events: string[] = [];
+    let releaseFirstSuite!: () => void;
+    const firstSuite = new Promise<void>((resolvePromise) => { releaseFirstSuite = resolvePromise; });
+    let firstSuiteStarted!: () => void;
+    const suiteStarted = new Promise<void>((resolvePromise) => { firstSuiteStarted = resolvePromise; });
+    let releaseFirstActiveCleanup!: () => void;
+    const firstActiveCleanup = new Promise<void>((resolvePromise) => {
+      releaseFirstActiveCleanup = resolvePromise;
+    });
+    let firstActiveCleanupStarted!: () => void;
+    const activeCleanupStarted = new Promise<void>((resolvePromise) => {
+      firstActiveCleanupStarted = resolvePromise;
+    });
+    let suiteCleanupCount = 0;
+    let activeCleanupCount = 0;
+    const adapter = {
+      cleanup: async () => {
+        suiteCleanupCount += 1;
+        const pass = suiteCleanupCount;
+        events.push(`suite:${pass}:start`);
+        if (pass === 1) {
+          firstSuiteStarted();
+          process.emit('SIGTERM');
+          await firstSuite;
+        }
+        events.push(`suite:${pass}:done`);
+      },
+      commands: {
+        run: {
+          parse: () => ({}),
+          run: async () => {
+            events.push('run');
+            throw new Error('command failed');
+          },
+        },
+      },
+    };
+    const running = runBenchExecutable(
+      ['--suite', 'featurebench', 'run'],
+      { get: () => adapter } as unknown as SuiteRegistry,
+      {
+        stdout: { write: () => true },
+        stderr: { write: () => true },
+        paths: { benchRoot: '/bench', cacheRoot: '/bench/.cache', resultsRoot: '/bench/results' },
+        clock: { now: () => new Date(0), monotonicMs: () => 0 },
+      } as unknown as CommandContext,
+      {
+        cleanupActiveProcesses: async () => {
+          activeCleanupCount += 1;
+          const pass = activeCleanupCount;
+          events.push(`active:${pass}:start`);
+          if (pass === 1) {
+            firstActiveCleanupStarted();
+            await firstActiveCleanup;
+          }
+          events.push(`active:${pass}:done`);
+        },
+        signalCleanupTimeoutMs: 1_000,
+        resendSignal: (signal) => { events.push(`resend:${signal}`); },
+      },
+    );
+
+    await Promise.all([suiteStarted, activeCleanupStarted]);
+    releaseFirstSuite();
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    releaseFirstActiveCleanup();
+    await running;
+
+    expect(suiteCleanupCount).toBe(2);
+    expect(activeCleanupCount).toBe(2);
+    expect(events).toEqual([
+      'run',
+      'suite:1:start',
+      'active:1:start',
+      'suite:1:done',
+      'active:1:done',
+      'active:2:start',
+      'active:2:done',
+      'suite:2:start',
+      'suite:2:done',
+      'resend:SIGTERM',
+    ]);
+  });
+
   it('re-delivers the first signal after the cleanup deadline when a suite hook never settles', async () => {
     const resent: NodeJS.Signals[] = [];
     let releaseCommand!: () => void;

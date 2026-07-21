@@ -56,7 +56,7 @@ import {
   type BenchProcessOptions,
 } from '../../shared/process.js';
 import { ARM_B_PREFIX_PATH, armBPrefixBytes } from '../../shared/prompt.js';
-import { canonicalJson, sha256CanonicalJson, sha256File } from '../../shared/provenance.js';
+import { canonicalJson, sha256Buffer, sha256CanonicalJson, sha256File } from '../../shared/provenance.js';
 import {
   REPORT_POLICY_SHA256,
   buildBenchReport,
@@ -66,6 +66,7 @@ import {
   type TaskReportInput,
 } from '../../shared/report.js';
 import { BenchRunStateStore, type BenchRunState } from '../../shared/run-state.js';
+import { oneDockerInspectRow } from '../../shared/docker-isolation.js';
 import {
   UNVERIFIED_NATIVE_RESULT,
   VerifierReceiptStore,
@@ -211,7 +212,7 @@ export const FEATUREBENCH_ADAPTER_POLICY_SHA256 = sha256CanonicalJson({
   network: FEATUREBENCH_NETWORK_POLICY,
   ownership: 'ultracode-benchmark-label-namespace',
   verifier: 'task-pass-rate-plus-run-attempt-1-aggregate',
-  timestamps: 'bound-in-run-state-and-receipt',
+  timestamps: 'accepted-invocation-snapshots-bound-in-run-state-and-receipt',
 });
 
 export interface FeatureBenchCommand {
@@ -279,6 +280,7 @@ function currentControlPlaneHashes(roots: BenchPathRoots): FeatureBenchManifest[
       'src/cli.ts',
       'src/shared/config.ts',
       'src/shared/contracts.ts',
+      'src/shared/docker-isolation.ts',
       'src/shared/locks.ts',
       'src/shared/manifest.ts',
       'src/shared/metrics.ts',
@@ -507,15 +509,6 @@ interface DockerContainerInspect {
   NetworkSettings?: { Networks?: unknown };
 }
 
-function oneRow<T>(stdout: string, description: string): T {
-  let rows: unknown;
-  try { rows = JSON.parse(stdout) as unknown; } catch {
-    throw new Error(`Docker returned malformed ${description} inspection`);
-  }
-  if (!Array.isArray(rows) || rows.length !== 1) throw new Error(`Docker returned ambiguous ${description} inspection`);
-  return rows[0] as T;
-}
-
 /** Validate the broker-only internal-network boundary without persisting runtime names. */
 export function inspectFeatureBenchTrustBoundary(
   networkStdout: string,
@@ -523,7 +516,7 @@ export function inspectFeatureBenchTrustBoundary(
   config: FeatureBenchConfig,
   bindings: FeatureBenchRuntimeBindings,
 ): Pick<RuntimeAttestation, 'endpointPolicySha256' | 'brokerRuntimeSha256'> {
-  const network = oneRow<DockerNetworkInspect>(networkStdout, 'FeatureBench network');
+  const network = oneDockerInspectRow<DockerNetworkInspect>(networkStdout, 'FeatureBench network');
   const labels = network.Labels !== null && typeof network.Labels === 'object' && !Array.isArray(network.Labels)
     ? network.Labels as Record<string, unknown>
     : {};
@@ -537,7 +530,7 @@ export function inspectFeatureBenchTrustBoundary(
       && !Array.isArray(value) && (value as Record<string, unknown>).Name === brokerHost)) {
     throw new Error('restricted FeatureBench network must be internal and contain exactly the named credential broker');
   }
-  const broker = oneRow<DockerContainerInspect>(brokerStdout, 'FeatureBench broker');
+  const broker = oneDockerInspectRow<DockerContainerInspect>(brokerStdout, 'FeatureBench broker');
   const brokerLabels = broker.Config?.Labels !== null && typeof broker.Config?.Labels === 'object'
     && !Array.isArray(broker.Config.Labels) ? broker.Config.Labels as Record<string, unknown> : {};
   const brokerNetworks = broker.NetworkSettings?.Networks !== null
@@ -605,7 +598,7 @@ interface DockerImageInspect {
 }
 
 function assertImageInspection(stdout: string, expected: FeatureBenchTaskInput): void {
-  const image = oneRow<DockerImageInspect>(stdout, `FeatureBench image ${expected.taskId}`);
+  const image = oneDockerInspectRow<DockerImageInspect>(stdout, `FeatureBench image ${expected.taskId}`);
   const digests = Array.isArray(image.RepoDigests) ? image.RepoDigests : [];
   if (image.Id !== expected.imageLocalId || `${String(image.Os)}/${String(image.Architecture)}` !== expected.imagePlatform
     || !digests.includes(expected.imageResolvedDigest)) {
@@ -679,7 +672,7 @@ export async function cleanupFeatureBenchContainers(
 
   const verified = new Set<string>();
   for (const candidate of candidates) {
-    const inspected = oneRow<DockerContainerInspect>((await executor('docker', ['inspect', candidate], {
+    const inspected = oneDockerInspectRow<DockerContainerInspect>((await executor('docker', ['inspect', candidate], {
       env: allowlistedEnvironment(process.env),
       timeoutMs: FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS,
     })).stdout, 'owned FeatureBench container');
@@ -1099,34 +1092,153 @@ function predictionTaskId(value: unknown): string | null {
     : null;
 }
 
-/** Assemble one complete verifier input from state-bound inference roots in append order. */
+function currentInferencePredictions(
+  directory: string,
+  currentRoot: string,
+  requiredTaskIds: ReadonlySet<string>,
+): Map<string, unknown> {
+  const path = `${currentRoot}/output.jsonl`;
+  if (!existsSync(join(directory, ...path.split('/')))) {
+    throw new Error(`FeatureBench current inference output is missing: ${path}`);
+  }
+  const predictions = new Map<string, unknown>();
+  const raw = readRegularFileWithinRoot(directory, path).toString('utf8');
+  const lines = raw.split(/\r?\n/u);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!line) continue;
+    let value: unknown;
+    try { value = JSON.parse(line) as unknown; } catch {
+      throw new Error(`FeatureBench current inference output is malformed at line ${index + 1}: ${path}`);
+    }
+    const taskId = predictionTaskId(value);
+    if (taskId === null || typeof (value as Record<string, unknown>).model_patch !== 'string') {
+      throw new Error(`FeatureBench current inference output is malformed at line ${index + 1}: ${path}`);
+    }
+    if (!requiredTaskIds.has(taskId)) {
+      throw new Error(`FeatureBench current inference output has wrong task id at line ${index + 1}: ${taskId}`);
+    }
+    if (predictions.has(taskId)) {
+      throw new Error(`FeatureBench current inference output has duplicate task id: ${taskId}`);
+    }
+    predictions.set(taskId, value);
+  }
+  const missing = [...requiredTaskIds].filter((taskId) => !predictions.has(taskId));
+  if (missing.length > 0) {
+    throw new Error(`FeatureBench current inference output is partial; missing ${missing.join(', ')}`);
+  }
+  return predictions;
+}
+
+function consolidatedPredictionsPath(nativeRoot: string, invocationId: string): string {
+  const components = nativeRoot.split('/');
+  if (components.length !== 2 || components[0] !== 'native' || !TIMESTAMP_RE.test(components[1]!)) {
+    throw new Error(`FeatureBench prediction input root is not an exact timestamped directory: ${nativeRoot}`);
+  }
+  return validateRelativeArtifactPath(`${nativeRoot}/consolidated-output-${invocationId}.jsonl`);
+}
+
+function successfulFeatureBenchVerifierRoot(
+  state: BenchRunState,
+  invocationId: string,
+  taskIds: readonly string[],
+): string | null {
+  const taskMembership = new Set(taskIds);
+  const attempts = state.attempts.filter((attempt) =>
+    attempt.invocationId === invocationId && attempt.phase === 'verifier');
+  if (attempts.length !== taskMembership.size
+    || attempts.some((attempt) => !taskMembership.has(attempt.taskId)
+      || attempt.status !== 'succeeded'
+      || attempt.failures.length > 0
+      || attempt.nativePath === null)
+    || new Set(attempts.map((attempt) => attempt.taskId)).size !== taskMembership.size) return null;
+  const roots = new Set(attempts.map((attempt) => attempt.nativePath!));
+  if (roots.size !== 1) return null;
+  const root = [...roots][0]!;
+  const components = root.split('/');
+  return components.length === 2 && components[0] === 'native' && TIMESTAMP_RE.test(components[1]!)
+    ? root
+    : null;
+}
+
+/** Assemble verifier input while requiring redone tasks to come from the current root. */
 export function consolidateFeatureBenchPredictions(
   directory: string,
   state: BenchRunState,
+  bindings: readonly VerifierBinding[],
   currentRoot: string,
+  invocationId: string,
   taskIds: readonly string[],
+  redoTaskIds: ReadonlySet<string> = new Set(),
 ): string {
-  const roots = [...new Set([
-    ...state.attempts.filter((attempt) => attempt.phase === 'inference' && attempt.nativePath !== null)
-      .map((attempt) => attempt.nativePath!),
-    currentRoot,
-  ])];
+  const taskMembership = new Set(taskIds);
+  const invalidRedo = [...redoTaskIds].filter((taskId) => !taskMembership.has(taskId));
+  if (invalidRedo.length > 0) {
+    throw new Error(`FeatureBench redo target is outside the immutable task set: ${invalidRedo.join(', ')}`);
+  }
   const latest = new Map<string, unknown>();
-  for (const root of roots) {
-    const path = `${root}/output.jsonl`;
-    if (!existsSync(join(directory, ...path.split('/')))) continue;
-    const raw = readRegularFileWithinRoot(directory, path).toString('utf8');
+  for (const invocation of state.invocations) {
+    const acceptedRoot = successfulFeatureBenchVerifierRoot(
+      state,
+      invocation.invocationId,
+      taskIds,
+    );
+    if (acceptedRoot === null) continue;
+    const acceptedPath = consolidatedPredictionsPath(acceptedRoot, invocation.invocationId);
+    const marker = bindings.find((binding) => binding.invocationId === invocation.invocationId
+      && binding.role === 'completion-marker'
+      && binding.scope.kind === 'suite-check'
+      && binding.scope.name === 'featurebench-accepted-predictions'
+      && binding.path === acceptedPath
+      && binding.nativeRecordKey === 'accepted-predictions-jsonl');
+    const input = bindings.find((binding) => binding.invocationId === invocation.invocationId
+      && binding.role === 'verifier-input'
+      && binding.path === acceptedPath
+      && binding.nativeRecordKey === 'predictions-jsonl'
+      && marker !== undefined
+      && binding.path === marker.path
+      && binding.sha256 === marker.sha256);
+    const invocationBinding = bindings.find((binding) => binding.invocationId === invocation.invocationId
+      && binding.role === 'verifier-invocation'
+      && binding.path === `native/invocations/${invocation.invocationId}/fb-eval.json`
+      && binding.nativeRecordKey === 'fb-eval-v2');
+    if (input === undefined || invocationBinding === undefined) continue;
+    const path = input.path;
+    const bytes = readRegularFileWithinRoot(directory, path);
+    if (sha256Buffer(bytes) !== input.sha256) {
+      throw new Error(`accepted FeatureBench verifier input changed after receipt binding: ${path}`);
+    }
+    const invocationBytes = readRegularFileWithinRoot(directory, invocationBinding.path);
+    if (sha256Buffer(invocationBytes) !== invocationBinding.sha256) {
+      throw new Error(`accepted FeatureBench verifier invocation changed after receipt binding: ${invocationBinding.path}`);
+    }
+    const raw = bytes.toString('utf8');
+    const snapshot = new Map<string, unknown>();
     for (const line of raw.split(/\r?\n/u)) {
       if (!line) continue;
       let value: unknown;
-      try { value = JSON.parse(line) as unknown; } catch { continue; }
+      try { value = JSON.parse(line) as unknown; } catch {
+        throw new Error(`accepted FeatureBench verifier input is malformed: ${path}`);
+      }
       const taskId = predictionTaskId(value);
-      if (taskId !== null && taskIds.includes(taskId)) latest.set(taskId, value);
+      if (taskId === null || !taskMembership.has(taskId) || snapshot.has(taskId)) {
+        throw new Error(`accepted FeatureBench verifier input has invalid task membership: ${path}`);
+      }
+      snapshot.set(taskId, value);
     }
+    if (taskIds.some((taskId) => !snapshot.has(taskId))) {
+      throw new Error(`accepted FeatureBench verifier input is partial: ${path}`);
+    }
+    for (const [taskId, prediction] of snapshot) latest.set(taskId, prediction);
+  }
+  if (redoTaskIds.size > 0 || latest.size === 0) {
+    const requiredCurrentTasks = redoTaskIds.size > 0 ? redoTaskIds : taskMembership;
+    const currentPredictions = currentInferencePredictions(directory, currentRoot, requiredCurrentTasks);
+    for (const [taskId, prediction] of currentPredictions) latest.set(taskId, prediction);
   }
   const missing = taskIds.filter((taskId) => !latest.has(taskId));
   if (missing.length > 0) throw new Error(`cannot build complete FeatureBench verifier input; missing ${missing.join(', ')}`);
-  const path = `${currentRoot}/consolidated-output.jsonl`;
+  const path = consolidatedPredictionsPath(currentRoot, invocationId);
   writePrivateFileAtomic(directory, join(directory, ...path.split('/')),
     `${taskIds.map((taskId) => JSON.stringify(latest.get(taskId))).join('\n')}\n`);
   return path;
@@ -1199,6 +1311,14 @@ async function updateReceipt(
   ]);
 }
 
+async function replaceReceiptBindings(
+  store: VerifierReceiptStore,
+  bindings: readonly VerifierBinding[],
+): Promise<void> {
+  const current = store.load();
+  await store.update(current.revision, () => bindings);
+}
+
 async function invalidateEvaluationReceipt(
   store: VerifierReceiptStore,
   manifest: FeatureBenchManifest,
@@ -1212,17 +1332,22 @@ async function invalidateEvaluationReceipt(
   }));
 }
 
-/** Preserve prior native verifier bytes while clearing fixed paths before rerun. */
-export function archiveFeatureBenchEvaluation(
+interface FeatureBenchEvaluationMove {
+  source: string;
+  destination: string;
+}
+
+function archiveFeatureBenchEvaluationMoves(
   directory: string,
   nativeRoot: string,
   taskIds: readonly string[],
   invocationId: string,
-): void {
+): readonly FeatureBenchEvaluationMove[] {
   const paths = [
     `${nativeRoot}/report.json`,
     ...taskIds.map((taskId) => `${nativeRoot}/eval_outputs/${taskId}/attempt-1/report.json`),
   ];
+  const moves: FeatureBenchEvaluationMove[] = [];
   for (const path of paths) {
     const candidate = join(directory, ...path.split('/'));
     try { lstatSync(candidate); } catch (error) {
@@ -1239,8 +1364,71 @@ export function archiveFeatureBenchEvaluation(
     } catch (error) {
       if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
     }
-    renameSync(source, destination);
+    moves.push({ source, destination });
   }
+  const completed: Array<{ source: string; destination: string }> = [];
+  try {
+    for (const move of moves) {
+      renameSync(move.source, move.destination);
+      completed.push(move);
+    }
+  } catch (error) {
+    for (const move of completed.reverse()) renameSync(move.destination, move.source);
+    throw error;
+  }
+  return moves;
+}
+
+/** Preserve prior native verifier bytes while clearing fixed paths before rerun. */
+export function archiveFeatureBenchEvaluation(
+  directory: string,
+  nativeRoot: string,
+  taskIds: readonly string[],
+  invocationId: string,
+): void {
+  archiveFeatureBenchEvaluationMoves(directory, nativeRoot, taskIds, invocationId);
+}
+
+function restoreFeatureBenchEvaluationArchive(
+  directory: string,
+  moves: readonly FeatureBenchEvaluationMove[],
+): void {
+  const restores = [...moves].reverse().map((move) => {
+    const destinationPath = relative(directory, move.destination).split(sep).join('/');
+    const destination = resolveRegularFileWithinRoot(
+      directory,
+      validateRelativeArtifactPath(destinationPath),
+      'pre-launch FeatureBench evaluation archive',
+    );
+    try {
+      lstatSync(move.source);
+      throw new Error(`FeatureBench evaluation restore target already exists: ${move.source}`);
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
+    }
+    return { source: move.source, destination };
+  });
+  const completed: typeof restores = [];
+  try {
+    for (const restore of restores) {
+      renameSync(restore.destination, restore.source);
+      completed.push(restore);
+    }
+  } catch (error) {
+    for (const restore of completed.reverse()) renameSync(restore.source, restore.destination);
+    throw error;
+  }
+}
+
+function acceptedPredictionsBinding(
+  input: VerifierBinding,
+): VerifierBinding {
+  return {
+    ...input,
+    scope: { kind: 'suite-check', name: 'featurebench-accepted-predictions' },
+    role: 'completion-marker',
+    nativeRecordKey: 'accepted-predictions-jsonl',
+  };
 }
 
 function verifierInvocationBinding(
@@ -1285,6 +1473,20 @@ function classifyProcessFailure(error: unknown, phase: 'inference' | 'verifier')
   if (/artifact|symlink|multiply-linked/iu.test(message)) return 'artifact-unsafe';
   if (/toolchain/iu.test(message)) return 'toolchain-incompatible';
   return phase === 'verifier' ? 'verifier-process-failed' : 'native-runner-failed';
+}
+
+/** Reject every failed inference before verifier preparation mutates evidence. */
+export function assertFeatureBenchInferenceReady(
+  nativeRoot: string | null,
+  inferenceFailure: FailureCode | null,
+): asserts nativeRoot is string {
+  if (nativeRoot === null) throw new Error('FeatureBench inference produced no timestamped native directory');
+  if (inferenceFailure !== null) throw new Error(`FeatureBench inference failed: ${inferenceFailure}`);
+}
+
+/** A lifecycle callback proves evaluator launch only when spawn assigned a child PID. */
+export function featureBenchEvaluatorLaunched(pid: number | null): pid is number {
+  return pid !== null;
 }
 
 async function executeNativeRun(
@@ -1420,40 +1622,60 @@ async function executeNativeRunWithHome(
   );
 
   let verifierFailure: FailureCode | null = inferenceFailure === null ? null : 'verifier-output-missing';
+  let evaluatorStarted = false;
+  let receiptBeforeEvaluation: readonly VerifierBinding[] | null = null;
+  let evaluationArchive: readonly FeatureBenchEvaluationMove[] = [];
   const verifierStarted = context.clock.now();
   const verifierMs = performance.now();
   try {
-    if (nativeRoot === null) throw new Error('FeatureBench inference produced no timestamped native directory');
-    if (inferenceFailure === 'artifact-unsafe') throw new Error('FeatureBench inference artifact tree is unsafe');
+    assertFeatureBenchInferenceReady(nativeRoot, inferenceFailure);
     const predictions = consolidateFeatureBenchPredictions(
       directory,
       stores.state.load(),
+      stores.receipt.load().bindings,
       nativeRoot,
+      invocationId,
       manifest.experiment.taskIds,
+      redo,
     );
     const evalPlan = planFeatureBenchEval(prepared, manifest, join(directory, ...predictions.split('/')), configPath);
-    await updateReceipt(stores.receipt, [
-      createVerifierBinding(directory, {
-        invocationId,
-        scope: { kind: 'suite-check', name: `featurebench-eval-input-${manifest.experiment.arm}` },
-        role: 'verifier-input',
-        path: validateRelativeArtifactPath(predictions),
-        nativeRecordKey: 'predictions-jsonl',
-      }),
-      verifierInvocationBinding(directory, invocationId, manifest, predictions),
-    ]);
     const attestation = await attestRuntime(context.paths, manifest.runId, config, runtime, prepared, executor);
     assertProvenance(context.paths, manifest, prepared, attestation);
+    receiptBeforeEvaluation = stores.receipt.load().bindings;
+    const inputBinding = createVerifierBinding(directory, {
+      invocationId,
+      scope: { kind: 'suite-check', name: `featurebench-eval-input-${manifest.experiment.arm}` },
+      role: 'verifier-input',
+      path: validateRelativeArtifactPath(predictions),
+      nativeRecordKey: 'predictions-jsonl',
+    });
+    await updateReceipt(stores.receipt, [
+      inputBinding,
+      verifierInvocationBinding(directory, invocationId, manifest, predictions),
+    ]);
+    evaluationArchive = archiveFeatureBenchEvaluationMoves(
+      directory,
+      nativeRoot,
+      manifest.experiment.taskIds,
+      invocationId,
+    );
     await invalidateEvaluationReceipt(stores.receipt, manifest);
-    archiveFeatureBenchEvaluation(directory, nativeRoot, manifest.experiment.taskIds, invocationId);
+    const evaluationLifecycle = {
+      ...lifecycle,
+      onLifecycleStarted(token: string, pid: number | null, processStartIdentity: string | null): void {
+        if (featureBenchEvaluatorLaunched(pid)) evaluatorStarted = true;
+        lifecycle.onLifecycleStarted(token, pid, processStartIdentity);
+      },
+    };
     await executor(evalPlan.command, evalPlan.argv, {
       cwd: evalPlan.cwd,
       env: childEnvironment(prepared, manifest, runtime, runtimeHome),
       stream: true,
       timeoutMs: manifest.suiteConfig.evaluation.timeoutMs,
       workerScope: directory,
-      ...lifecycle,
+      ...evaluationLifecycle,
     });
+    evaluatorStarted = true;
     reclaimAndAssertArtifactTree(join(directory, ...nativeRoot.split('/')));
     verifierFailure = null;
     const evidence = indexFeatureBenchEvidence(
@@ -1465,12 +1687,28 @@ async function executeNativeRunWithHome(
       inferTasks,
     );
     await updateReceipt(stores.receipt, evidence.bindings);
-    if (evidence.aggregate === null) verifierFailure = 'verifier-output-malformed';
+    if (evidence.aggregate === null) {
+      verifierFailure = 'verifier-output-malformed';
+    } else {
+      await updateReceipt(stores.receipt, [acceptedPredictionsBinding(inputBinding)]);
+    }
   } catch (error) {
-    verifierFailure = classifyProcessFailure(error, 'verifier');
+    let failure = error;
+    if (!evaluatorStarted && receiptBeforeEvaluation !== null) {
+      try {
+        restoreFeatureBenchEvaluationArchive(directory, evaluationArchive);
+        await replaceReceiptBindings(stores.receipt, receiptBeforeEvaluation);
+      } catch (rollbackError) {
+        failure = new AggregateError(
+          [error, rollbackError],
+          'FeatureBench pre-launch evaluation rollback failed',
+        );
+      }
+    }
+    verifierFailure = classifyProcessFailure(failure, 'verifier');
   } finally {
     try {
-      if (nativeRoot !== null) {
+      if (nativeRoot !== null && evaluatorStarted) {
         const evidence = indexFeatureBenchEvidence(
           directory,
           nativeRoot,
@@ -1484,19 +1722,21 @@ async function executeNativeRunWithHome(
     } catch { verifierFailure ??= 'verifier-output-malformed'; }
     try { await cleanupFeatureBenchContainers(manifest.runId, manifest.experiment.arm as Arm, manifest.experiment.taskIds, executor); }
     catch { verifierFailure = 'ownership-unsafe'; }
-    const verifierEnded = context.clock.now();
-    await recordFeatureBenchBatchAttempts(
-      stores.state,
-      invocationId,
-      manifest.experiment.taskIds,
-      manifest.experiment.arm as Arm,
-      'verifier',
-      verifierStarted,
-      verifierEnded,
-      Math.max(0, performance.now() - verifierMs),
-      nativeRoot,
-      verifierFailure,
-    );
+    if (evaluatorStarted) {
+      const verifierEnded = context.clock.now();
+      await recordFeatureBenchBatchAttempts(
+        stores.state,
+        invocationId,
+        manifest.experiment.taskIds,
+        manifest.experiment.arm as Arm,
+        'verifier',
+        verifierStarted,
+        verifierEnded,
+        Math.max(0, performance.now() - verifierMs),
+        nativeRoot,
+        verifierFailure,
+      );
+    }
   }
   if (inferenceFailure !== null) throw new Error(`FeatureBench inference failed: ${inferenceFailure}`);
   if (verifierFailure !== null) throw new Error(`FeatureBench verifier failed: ${verifierFailure}`);
@@ -1529,8 +1769,9 @@ export async function invalidateFeatureBenchRedo(
   }
   const current = receipt.load();
   await receipt.update(current.revision, (bindings) => bindings.filter((binding) => {
-    if (binding.scope.kind === 'task-arm' && targets.has(binding.scope.taskId)) return false;
-    return binding.role !== 'aggregate-report' && binding.role !== 'verifier-input' && binding.role !== 'verifier-invocation';
+    if (binding.scope.kind === 'task-arm' && binding.scope.arm === manifest.experiment.arm
+      && targets.has(binding.scope.taskId)) return false;
+    return binding.role !== 'aggregate-report';
   }));
   rmSync(reportJsonFile(roots, 'featurebench', manifest.runId), { force: true });
   rmSync(reportMarkdownFile(roots, 'featurebench', manifest.runId), { force: true });
@@ -1699,6 +1940,85 @@ function artifactIdentity(artifact: { path: string; sha256: string; nativeRecord
   return `${artifact.path}\0${artifact.sha256}\0${artifact.nativeRecordKey}`;
 }
 
+function taskReportRoot(path: string, taskId: string): string | null {
+  const suffix = `/eval_outputs/${taskId}/attempt-1/report.json`;
+  if (!path.endsWith(suffix)) return null;
+  const root = path.slice(0, -suffix.length);
+  const components = root.split('/');
+  return components.length === 2 && components[0] === 'native' && TIMESTAMP_RE.test(components[1]!)
+    ? root
+    : null;
+}
+
+function aggregateReportRoot(path: string): string | null {
+  const suffix = '/report.json';
+  if (!path.endsWith(suffix)) return null;
+  const root = path.slice(0, -suffix.length);
+  const components = root.split('/');
+  return components.length === 2 && components[0] === 'native' && TIMESTAMP_RE.test(components[1]!)
+    ? root
+    : null;
+}
+
+function completeTaskReceiptRoot(
+  bindings: readonly VerifierBinding[],
+  invocationId: string,
+  taskId: string,
+  arm: Arm,
+): string | null {
+  const invocation = bindings.filter((binding) => binding.invocationId === invocationId);
+  const taskReports = invocation.filter((binding) => binding.role === 'task-report'
+    && binding.scope.kind === 'task-arm'
+    && binding.scope.taskId === taskId
+    && binding.scope.arm === arm
+    && binding.nativeRecordKey === `${taskId}.pass_rate`);
+  for (const taskReport of taskReports) {
+    const root = taskReportRoot(taskReport.path, taskId);
+    if (root === null) continue;
+    const invocationRoot = `native/invocations/${invocationId}`;
+    const predictionsPath = consolidatedPredictionsPath(root, invocationId);
+    const complete = invocation.some((binding) => binding.role === 'completion-marker'
+      && binding.scope.kind === 'task-arm'
+      && binding.scope.taskId === taskId
+      && binding.scope.arm === arm
+      && binding.path === taskReport.path
+      && binding.sha256 === taskReport.sha256
+      && binding.nativeRecordKey === `${taskId}.featurebench_eval_completed`)
+      && invocation.some((binding) => binding.role === 'verifier-input'
+        && binding.scope.kind === 'suite-check'
+        && binding.scope.name === `featurebench-eval-input-${arm}`
+        && binding.path === predictionsPath
+        && binding.nativeRecordKey === 'predictions-jsonl')
+      && invocation.some((binding) => binding.role === 'verifier-invocation'
+        && binding.scope.kind === 'suite-check'
+        && binding.scope.name === `featurebench-eval-invocation-${arm}`
+        && binding.path === `${invocationRoot}/fb-eval.json`
+        && binding.nativeRecordKey === 'fb-eval-v2')
+      && invocation.some((binding) => binding.role === 'run-metadata'
+        && binding.scope.kind === 'suite-check'
+        && binding.scope.name === `featurebench-run-metadata-${arm}`
+        && binding.path === `${root}/run_metadata.json`
+        && binding.nativeRecordKey === 'task_ids')
+      && invocation.some((binding) => binding.role === 'rollout-output'
+        && binding.scope.kind === 'suite-check'
+        && binding.scope.name === `featurebench-predictions-${arm}`
+        && binding.path === `${root}/output.jsonl`
+        && binding.nativeRecordKey === 'output-jsonl');
+    if (complete) return root;
+  }
+  return null;
+}
+
+/** Require accepted upstream and native evidence for one task, independent of the run aggregate. */
+export function hasCompleteFeatureBenchTaskReceipt(
+  bindings: readonly VerifierBinding[],
+  invocationId: string,
+  taskId: string,
+  arm: Arm,
+): boolean {
+  return completeTaskReceiptRoot(bindings, invocationId, taskId, arm) !== null;
+}
+
 /** Index each latest-first verifier root once for one report assembly. */
 export function createFeatureBenchEvidenceResolver(
   directory: string,
@@ -1707,6 +2027,13 @@ export function createFeatureBenchEvidenceResolver(
   bindings: readonly VerifierBinding[],
   indexEvidence: FeatureBenchEvidenceIndexer = indexFeatureBenchEvidence,
 ): FeatureBenchEvidenceResolver {
+  const currentBindings = bindings.filter((binding) => {
+    try {
+      return sha256Buffer(readRegularFileWithinRoot(directory, binding.path)) === binding.sha256;
+    } catch {
+      return false;
+    }
+  });
   const roots = [...state.attempts].reverse()
     .filter((attempt) => attempt.phase === 'verifier' && attempt.nativePath !== null)
     .map((attempt) => attempt.nativePath!);
@@ -1717,32 +2044,29 @@ export function createFeatureBenchEvidenceResolver(
     manifest.experiment.arm as Arm,
     randomUUID(),
   ));
-  const taskBindings = new Map<string, Set<string>>();
-  const aggregateBindings = new Set<string>();
-  for (const binding of bindings) {
-    if (binding.nativeRecordKey === null) continue;
-    const identity = artifactIdentity({
-      path: binding.path,
-      sha256: binding.sha256,
-      nativeRecordKey: binding.nativeRecordKey,
-    });
-    if (binding.role === 'task-report' && binding.scope.kind === 'task-arm'
-      && binding.scope.arm === manifest.experiment.arm) {
-      const values = taskBindings.get(binding.scope.taskId) ?? new Set<string>();
-      values.add(identity);
-      taskBindings.set(binding.scope.taskId, values);
-    } else if (binding.role === 'aggregate-report') {
-      aggregateBindings.add(identity);
-    }
-  }
-  const isTaskBound = (taskId: string, result: NativeVerifierResult): boolean => {
+  const isTaskBound = (
+    taskId: string,
+    result: NativeVerifierResult,
+    invocationId?: string,
+  ): boolean => {
     const artifact = result.artifact;
-    return result.verification === 'verified' && artifact !== null && artifact.nativeRecordKey !== null
-      && taskBindings.get(taskId)?.has(artifactIdentity({
-        path: artifact.path,
-        sha256: artifact.sha256,
-        nativeRecordKey: artifact.nativeRecordKey,
-      })) === true;
+    if (result.verification !== 'verified' || artifact === null || artifact.nativeRecordKey === null) return false;
+    const root = taskReportRoot(artifact.path, taskId);
+    if (root === null) return false;
+    return bindings.some((binding) => binding.role === 'task-report'
+      && binding.scope.kind === 'task-arm'
+      && binding.scope.taskId === taskId
+      && binding.scope.arm === manifest.experiment.arm
+      && (invocationId === undefined || binding.invocationId === invocationId)
+      && binding.path === artifact.path
+      && binding.sha256 === artifact.sha256
+      && binding.nativeRecordKey === artifact.nativeRecordKey
+      && completeTaskReceiptRoot(
+        currentBindings,
+        binding.invocationId,
+        taskId,
+        manifest.experiment.arm as Arm,
+      ) === root);
   };
   const taskResults = new Map<string, NativeVerifierResult>();
   for (const taskId of manifest.experiment.taskIds) {
@@ -1758,9 +2082,34 @@ export function createFeatureBenchEvidenceResolver(
   let aggregate: FeatureBenchAggregate | null = null;
   for (const evidence of indexed) {
     const candidate = evidence.aggregate;
-    if (candidate === null || !aggregateBindings.has(artifactIdentity(candidate.artifact))) continue;
-    if (!manifest.experiment.taskIds.every((taskId) =>
-      isTaskBound(taskId, evidence.taskResults.get(taskId) ?? UNVERIFIED_NATIVE_RESULT))) continue;
+    if (candidate === null) continue;
+    const root = aggregateReportRoot(candidate.artifact.path);
+    if (root === null) continue;
+    const aggregateBinding = bindings.find((binding) => binding.role === 'aggregate-report'
+      && binding.nativeRecordKey !== null
+      && artifactIdentity({
+        path: binding.path,
+        sha256: binding.sha256,
+        nativeRecordKey: binding.nativeRecordKey,
+      }) === artifactIdentity(candidate.artifact)
+      && hasCompleteFeatureBenchReceipt(
+        currentBindings,
+        binding.invocationId,
+        manifest.experiment.taskIds,
+        manifest.experiment.arm as Arm,
+      ));
+    if (aggregateBinding === undefined || !manifest.experiment.taskIds.every((taskId) =>
+      completeTaskReceiptRoot(
+        currentBindings,
+        aggregateBinding.invocationId,
+        taskId,
+        manifest.experiment.arm as Arm,
+      ) === root
+      && isTaskBound(
+        taskId,
+        evidence.taskResults.get(taskId) ?? UNVERIFIED_NATIVE_RESULT,
+        aggregateBinding.invocationId,
+      ))) continue;
     aggregate = candidate;
     break;
   }
@@ -1774,7 +2123,7 @@ function boundNativeResult(
   return resolver.taskResults.get(taskId) ?? UNVERIFIED_NATIVE_RESULT;
 }
 
-/** Require the full upstream inference/evaluation evidence set for one invocation. */
+/** Require the all-task receipt only when publishing the upstream run aggregate. */
 export function hasCompleteFeatureBenchReceipt(
   bindings: readonly VerifierBinding[],
   invocationId: string,
@@ -1782,34 +2131,41 @@ export function hasCompleteFeatureBenchReceipt(
   arm: Arm,
 ): boolean {
   const invocation = bindings.filter((binding) => binding.invocationId === invocationId);
-  const roles = new Set(invocation.map((binding) => binding.role));
-  if (!['verifier-input', 'verifier-invocation', 'run-metadata', 'rollout-output', 'aggregate-report']
-    .every((role) => roles.has(role as VerifierBinding['role']))) return false;
-  return taskIds.every((taskId) => invocation.some((binding) => binding.role === 'task-report'
-    && binding.scope.kind === 'task-arm' && binding.scope.taskId === taskId && binding.scope.arm === arm)
-    && invocation.some((binding) => binding.role === 'completion-marker'
-      && binding.scope.kind === 'task-arm' && binding.scope.taskId === taskId && binding.scope.arm === arm));
+  const aggregate = invocation.find((binding) => binding.role === 'aggregate-report'
+    && binding.scope.kind === 'suite-check'
+    && binding.scope.name === `featurebench-attempt-1-${arm}`
+    && binding.nativeRecordKey === 'attempt_1');
+  if (aggregate === undefined) return false;
+  const root = aggregateReportRoot(aggregate.path);
+  return root !== null && taskIds.every((taskId) =>
+    completeTaskReceiptRoot(bindings, invocationId, taskId, arm) === root);
 }
 
-function taskInputs(
+export function featureBenchTaskInputs(
   manifest: FeatureBenchManifest,
   state: BenchRunState,
   bindings: readonly VerifierBinding[],
   resolver: FeatureBenchEvidenceResolver,
 ): TaskReportInput[] {
   return manifest.artifacts.executions.map((execution) => {
-    const attempts = state.attempts.filter((attempt) => attempt.taskId === execution.taskId && attempt.arm === execution.arm);
-    const latestInference = attempts.filter((attempt) => attempt.phase === 'inference').at(-1);
-    const latestVerifier = attempts.filter((attempt) => attempt.phase === 'verifier').at(-1);
+    const attempts = state.attempts.filter((attempt) =>
+      attempt.taskId === execution.taskId && attempt.arm === execution.arm);
+    let lastInvalidation = -1;
+    attempts.forEach((attempt, index) => {
+      if (attempt.phase === 'cleanup' && attempt.annotations.includes('redo-invalidated')) lastInvalidation = index;
+    });
+    const currentAttempts = attempts.slice(lastInvalidation + 1);
+    const latestInference = currentAttempts.filter((attempt) => attempt.phase === 'inference').at(-1);
+    const latestVerifier = currentAttempts.filter((attempt) => attempt.phase === 'verifier').at(-1);
     const nativeVerifier = boundNativeResult(resolver, execution.taskId);
     const latestAttempts = [latestInference, latestVerifier].filter((attempt) => attempt !== undefined);
     const failures = new Set<FailureCode>(latestAttempts.flatMap((attempt) => attempt.failures));
     if (latestVerifier !== undefined && latestVerifier.status !== 'running'
-      && !hasCompleteFeatureBenchReceipt(
+      && !hasCompleteFeatureBenchTaskReceipt(
         bindings,
         latestVerifier.invocationId,
-        manifest.experiment.taskIds,
-        manifest.experiment.arm as Arm,
+        execution.taskId,
+        execution.arm,
       )) failures.add('receipt-incomplete');
     if (latestAttempts.length > 0 && latestAttempts.every((attempt) => attempt.status !== 'running')
       && nativeVerifier.verification === 'unverified' && failures.size === 0) {
@@ -1896,7 +2252,12 @@ export async function reportCommand(options: ReportOptions, context: CommandCont
       return buildBenchReport({
         ...evidence,
         metrics,
-        taskResults: taskInputs(evidence.manifest, evidence.runState, evidence.verifierReceipt.bindings, resolver),
+        taskResults: featureBenchTaskInputs(
+          evidence.manifest,
+          evidence.runState,
+          evidence.verifierReceipt.bindings,
+          resolver,
+        ),
         currentPolicyHashes: currentControlPlaneHashes(context.paths),
         analysisHook: featureBenchAnalysisHook,
         nativeAnalysisInput: resolver.aggregate,

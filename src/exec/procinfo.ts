@@ -40,13 +40,29 @@ export interface ProcessInspectionOptions {
   readLinuxProcessIdentity?: (pid: number) => ProcStat | undefined;
   /** Linux environment seam; errors retain their normal unreadable meaning. */
   readLinuxProcessEnvironment?: (pid: number) => string;
+  /** Linux procfs owner seam; ownership never proves lifecycle-token absence. */
+  readLinuxProcessOwner?: (pid: number) => number | undefined;
+  /** Effective-UID seam; Linux permission checks use `geteuid`, not the real UID. */
+  readLinuxEffectiveUid?: () => number | undefined;
+  /** Linux procfs mountinfo seam; restricted or unprovable visibility fails closed. */
+  readLinuxProcMountInfo?: () => string;
+  /** Exact pre-spawn Linux identities that cannot carry the new worker token. */
+  excludedLinuxProcessIdentities?: ReadonlySet<string>;
   /** POSIX signal seam, including signal 0 probes. */
   signalProcess?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  /** Monotonic-millisecond seam for deterministic process-settlement deadlines. */
+  observationNow?: () => number;
+  /** Bounded polling seam for deterministic process-settlement tests. */
+  observationWait?: (delayMs: number) => Promise<void>;
 }
 
 export interface ProcStat {
+  /** Linux process state (field 3); omitted by non-Linux and synthetic seams. */
+  state?: string;
   /** Process-group id (field 5). A detached worker is its own group leader, so pgrp === pid. */
   pgrp: number;
+  /** Linux session id (field 6); omitted by non-Linux and synthetic seams. */
+  session?: number;
   /** Kernel start-time in clock ticks since boot (field 22) — unique per process instance. */
   starttime: string;
 }
@@ -78,10 +94,17 @@ export function readProcStat(pid: number): ProcStat | undefined {
   const close = raw.lastIndexOf(')');
   if (close === -1) return undefined;
   const rest = raw.slice(close + 1).trim().split(/\s+/);
+  const state = rest[0];
   const pgrp = Number(rest[2]);
+  const session = Number(rest[3]);
   const starttime = rest[19];
-  if (!isSafeProcessGroupId(pgrp) || starttime === undefined) return undefined;
-  return { pgrp, starttime };
+  if (
+    state === undefined
+    || !isSafeProcessGroupId(pgrp)
+    || !isSafeProcessGroupId(session)
+    || starttime === undefined
+  ) return undefined;
+  return { state, pgrp, session, starttime };
 }
 
 /** One bounded identity read plus whether absence claims are authoritative. */
@@ -98,6 +121,109 @@ function linuxProcessIdentity(pid: number, options: ProcessInspectionOptions): P
   return options.readLinuxProcessIdentity === undefined
     ? readProcStat(pid)
     : options.readLinuxProcessIdentity(pid);
+}
+
+function linuxIdentityKey(pid: number, identity: ProcStat): string {
+  return `${pid}:${identity.starttime}:${identity.pgrp}`;
+}
+
+function sameLinuxIdentity(left: ProcStat, right: ProcStat): boolean {
+  return left.starttime === right.starttime && left.pgrp === right.pgrp;
+}
+
+function hasExactPreSpawnLeader(
+  pid: number,
+  options: ProcessInspectionOptions,
+): boolean {
+  const excluded = options.excludedLinuxProcessIdentities;
+  if (excluded === undefined || !isSafeProcessId(pid)) return false;
+  let leader: ProcStat | undefined;
+  try { leader = linuxProcessIdentity(pid, options); } catch { leader = undefined; }
+  return leader !== undefined && excluded.has(linuxIdentityKey(pid, leader));
+}
+
+function isExcludedUnreadableLinuxProcess(
+  pid: number,
+  identity: ProcStat,
+  options: ProcessInspectionOptions,
+): boolean {
+  if (options.excludedLinuxProcessIdentities?.has(linuxIdentityKey(pid, identity))) return true;
+  return hasExactPreSpawnLeader(identity.pgrp, options)
+    || (identity.session !== undefined && hasExactPreSpawnLeader(identity.session, options));
+}
+
+function procMountAllowsFullEnumeration(
+  raw: string,
+  effectiveUid: number | undefined,
+): boolean {
+  let found = false;
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue;
+    const fields = line.trim().split(/\s+/u);
+    const separator = fields.indexOf('-');
+    if (fields[4] !== '/proc') continue;
+    if (
+      separator < 6
+      || fields.length !== separator + 4
+      || fields[3] !== '/'
+      || fields[separator + 1] !== 'proc'
+    ) return false;
+    found = true;
+    const options = [
+      ...(fields[5] ?? '').split(','),
+      ...(fields[separator + 3] ?? '').split(','),
+    ];
+    for (const option of options) {
+      if (option === 'hidepid' || option.startsWith('hidepid=')) {
+        const value = option.slice('hidepid='.length);
+        if (effectiveUid !== 0 && value !== '0' && value !== 'off') return false;
+      }
+    }
+  }
+  return found;
+}
+
+function linuxProcessEnumerationIsAuthoritative(
+  effectiveUid: number | undefined,
+  options: ProcessInspectionOptions,
+): boolean {
+  if (
+    options.readLinuxProcMountInfo === undefined
+    && process.platform !== 'linux'
+    && options.listLinuxProcessIds !== undefined
+  ) return true;
+  let mountInfo: string;
+  try {
+    mountInfo = options.readLinuxProcMountInfo?.()
+      ?? readFileSync('/proc/self/mountinfo', 'utf8');
+  } catch {
+    return false;
+  }
+  return procMountAllowsFullEnumeration(mountInfo, effectiveUid);
+}
+
+/** Snapshot readable Linux identities before spawn so unrelated peers cannot
+ * make a later token-absence proof incomplete. PID reuse changes the key. */
+export function snapshotLinuxProcessIdentities(
+  options: ProcessInspectionOptions = {},
+): ReadonlySet<string> {
+  if (inspectionPlatform(options) !== 'linux') return new Set();
+  let entries: readonly string[];
+  try {
+    entries = options.listLinuxProcessIds?.() ?? readdirSync('/proc');
+  } catch {
+    return new Set();
+  }
+  const identities = new Set<string>();
+  for (const entry of entries) {
+    if (!/^\d+$/u.test(entry)) continue;
+    const pid = Number(entry);
+    if (!isSafeProcessId(pid)) continue;
+    let identity: ProcStat | undefined;
+    try { identity = linuxProcessIdentity(pid, options); } catch { identity = undefined; }
+    if (identity !== undefined) identities.add(linuxIdentityKey(pid, identity));
+  }
+  return identities;
 }
 
 /** Classify one process or process-group signal-0 probe without collapsing permission errors into absence. */
@@ -521,6 +647,17 @@ export function discoverWorkerProcessesForTokens(
   const scopeMarker = scopeValue === undefined ? undefined : `${WORKER_SCOPE_ENV}=${scopeValue}`;
   const found: TrackedWorkerProcess[] = [];
   let complete = true;
+  if (candidates === undefined) {
+    let effectiveUid: number | undefined;
+    try {
+      effectiveUid = options.readLinuxEffectiveUid === undefined
+        ? (typeof process.geteuid === 'function' ? process.geteuid() : undefined)
+        : options.readLinuxEffectiveUid();
+    } catch {
+      effectiveUid = undefined;
+    }
+    complete = linuxProcessEnumerationIsAuthoritative(effectiveUid, options);
+  }
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
@@ -535,6 +672,22 @@ export function discoverWorkerProcessesForTokens(
       if (signal0Status(pid, options) !== 'absent') complete = false;
       continue;
     }
+    if (before.state === 'Z' || before.pgrp === 0) {
+      let afterExemption: ProcStat | undefined;
+      try {
+        afterExemption = linuxProcessIdentity(pid, options);
+      } catch {
+        afterExemption = undefined;
+      }
+      if (afterExemption === undefined) {
+        if (signal0Status(pid, options) !== 'absent') complete = false;
+      } else if (!sameLinuxIdentity(before, afterExemption)) {
+        complete = false;
+      }
+      // Zombies cannot execute or fork, and Linux kernel workers use process
+      // group zero and cannot inherit a userspace environment marker.
+      continue;
+    }
     let environ: string;
     try {
       environ = options.readLinuxProcessEnvironment?.(pid)
@@ -546,14 +699,34 @@ export function discoverWorkerProcessesForTokens(
       } catch {
         afterFailure = undefined;
       }
-      if (afterFailure !== undefined || signal0Status(pid, options) !== 'absent') complete = false;
+      if (afterFailure === undefined) {
+        if (signal0Status(pid, options) !== 'absent') complete = false;
+        continue;
+      }
+      if (!sameLinuxIdentity(before, afterFailure)) {
+        complete = false;
+        continue;
+      }
+      // A readable environment always gets authenticated first. These exact
+      // pre-spawn relationships prove unrelatedness only when environ cannot
+      // be inspected and the candidate identity remained stable around the read.
+      if (!isExcludedUnreadableLinuxProcess(pid, afterFailure, options)) {
+        complete = false;
+        continue;
+      }
+      let finalIdentity: ProcStat | undefined;
+      try {
+        finalIdentity = linuxProcessIdentity(pid, options);
+      } catch {
+        finalIdentity = undefined;
+      }
+      if (finalIdentity === undefined) {
+        if (signal0Status(pid, options) !== 'absent') complete = false;
+      } else if (!sameLinuxIdentity(afterFailure, finalIdentity)) {
+        complete = false;
+      }
       continue;
     }
-    const environment = environ.split('\0');
-    if (scopeMarker !== undefined && !environment.includes(scopeMarker)) continue;
-    const tokenEntry = environment.find((entry) => entry.startsWith(tokenPrefix));
-    const token = tokenEntry?.slice(tokenPrefix.length);
-    if (token === undefined || !accepted.has(token)) continue;
     let after: ProcStat | undefined;
     try {
       after = linuxProcessIdentity(pid, options);
@@ -564,10 +737,17 @@ export function discoverWorkerProcessesForTokens(
       if (signal0Status(pid, options) !== 'absent') complete = false;
       continue;
     }
-    if (after.starttime !== before.starttime || after.pgrp !== before.pgrp) {
+    if (!sameLinuxIdentity(before, after)) {
       complete = false;
       continue;
     }
+    const environment = environ.split('\0');
+    if (scopeMarker !== undefined && !environment.includes(scopeMarker)) continue;
+    const token = environment
+      .filter((entry) => entry.startsWith(tokenPrefix))
+      .map((entry) => entry.slice(tokenPrefix.length))
+      .find((value) => accepted.has(value));
+    if (token === undefined) continue;
     found.push({ pid, token, ...after });
   }
   return { processes: found, complete };
@@ -593,6 +773,59 @@ export interface WorkerSignalResult {
   processes: number;
   tokens: Set<string>;
   identities: Set<string>;
+}
+
+/** Aggregate signaling plus whether complete observations proved stable absence. */
+export interface WorkerSettlementResult extends WorkerSignalResult {
+  settled: boolean;
+}
+
+/** Re-authenticate Darwin lifecycle markers at each individual signal boundary. */
+export function darwinWorkerSignalingInspection(
+  tokens: Iterable<string>,
+  scope: string | undefined,
+  options: ProcessInspectionOptions = {},
+): ProcessInspectionOptions {
+  const accepted = [...new Set([...tokens].filter(isWorkerToken))];
+  const forwardSignal = options.signalProcess ?? ((pid: number, signal: NodeJS.Signals | 0) => {
+    process.kill(pid, signal);
+  });
+  return {
+    ...options,
+    // Darwin's second-granularity lstart can match a same-second PID/PGID
+    // replacement. Token and scope are therefore re-read for every target.
+    readIdentitySnapshot: (pids) => {
+      const authenticated = discoverWorkerProcessesForTokens(
+        accepted,
+        scope,
+        pids,
+        options,
+      );
+      return {
+        identities: new Map(authenticated.processes.map((candidate) => [
+          candidate.pid,
+          { pgrp: candidate.pgrp, starttime: candidate.starttime },
+        ])),
+        complete: authenticated.complete,
+      };
+    },
+    signalProcess: (target, signal) => {
+      const pid = Math.abs(target);
+      const authenticated = discoverWorkerProcessesForTokens(
+        accepted,
+        scope,
+        [pid],
+        options,
+      ).processes.some((candidate) =>
+        candidate.pid === pid && (target > 0 || candidate.pgrp === pid));
+      if (!authenticated) {
+        throw Object.assign(new Error('Darwin worker identity is no longer authenticated'), {
+          code: 'ESRCH',
+        });
+      }
+      forwardSignal(target, signal);
+    },
+  };
 }
 
 /** Signal an authenticated snapshot after one final platform-capable identity check. */
@@ -660,32 +893,46 @@ export function signalWorkerProcessTokens(
   return signalTrackedWorkerProcesses(findWorkerProcessesForTokens(accepted, scope, undefined, options), signal, options);
 }
 
-/** Asynchronously re-scan until the token set is stably absent or grace ends. */
+/** Re-scan until complete observations prove stable absence or grace ends unsettled. */
 export async function signalWorkerProcessTokensUntilGone(
   tokens: Iterable<string>,
   signal: NodeJS.Signals,
   scope?: string,
   graceMs = 100,
   options: ProcessInspectionOptions = {},
-): Promise<WorkerSignalResult> {
+  candidatePids?: Iterable<number>,
+): Promise<WorkerSettlementResult> {
   const accepted = new Set([...tokens].filter(isWorkerToken));
   const aggregate: WorkerSignalResult = { processes: 0, tokens: new Set(), identities: new Set() };
-  if (accepted.size === 0) return aggregate;
-  const deadline = Date.now() + Math.max(0, graceMs);
+  if (accepted.size === 0) return { ...aggregate, settled: true };
+  const candidates = candidatePids === undefined ? undefined : [...candidatePids];
+  const now = options.observationNow ?? (() => performance.now());
+  const wait = options.observationWait ?? sleep;
+  const deadline = now() + Math.max(0, graceMs);
   let delayMs = 5;
   let emptyPasses = 0;
+  let finalProofUsed = false;
   for (;;) {
-    const found = findWorkerProcessesForTokens(accepted, scope, undefined, options);
-    emptyPasses = found.length === 0 ? emptyPasses + 1 : 0;
-    const batch = found.filter(
+    const discovery = discoverWorkerProcessesForTokens(accepted, scope, candidates, options);
+    emptyPasses = discovery.complete && discovery.processes.length === 0 ? emptyPasses + 1 : 0;
+    const batch = discovery.processes.filter(
       (proc) => !aggregate.identities.has(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`),
     );
     const result = signalTrackedWorkerProcesses(batch, signal, options);
     aggregate.processes += result.processes;
     for (const token of result.tokens) aggregate.tokens.add(token);
     for (const identity of result.identities) aggregate.identities.add(identity);
-    if (emptyPasses >= 2 || Date.now() >= deadline) return aggregate;
-    await sleep(Math.min(delayMs, Math.max(0, deadline - Date.now())));
+    if (emptyPasses >= 2) return { ...aggregate, settled: true };
+    const observedAt = now();
+    if (observedAt >= deadline) {
+      if (graceMs > 0 && !finalProofUsed && emptyPasses === 1) {
+        finalProofUsed = true;
+        await wait(1);
+        continue;
+      }
+      return { ...aggregate, settled: false };
+    }
+    await wait(Math.min(delayMs, Math.max(1, deadline - observedAt)));
     delayMs = Math.min(delayMs * 2, 25);
   }
 }

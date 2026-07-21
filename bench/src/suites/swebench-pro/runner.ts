@@ -1,16 +1,11 @@
-/** SWE-bench Pro lifecycle on the shared v2 manifest, state, receipt, and report services. */
+/** SWE-bench Pro lifecycle on the shared manifest, state, receipt, and report services. */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
-  closeSync,
-  constants,
   existsSync,
-  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
   readdirSync,
-  readSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -56,6 +51,7 @@ import {
   writePrivateJsonAtomic,
 } from '../../shared/paths.js';
 import {
+  BenchProcessError,
   runBenchProcess,
   type BenchProcessOptions,
 } from '../../shared/process.js';
@@ -78,7 +74,6 @@ import {
 import {
   OFFICIAL_SWEBENCH_PRO_EVALUATOR_REPOSITORY,
   OFFICIAL_SWEBENCH_PRO_EVALUATOR_REVISION,
-  loadRuntimeBindings,
   loadSwebenchProOperatorConfig,
   resolveSwebenchProConfig,
   swebenchProPreparedDir,
@@ -101,6 +96,18 @@ import {
   sessionTaskIdentity,
   type SwebenchProContainerPolicy,
 } from './container-policy.js';
+import {
+  SwebenchProTransportAttestationError,
+  inspectSwebenchProSessionAttachment,
+  inspectSwebenchProTransportBoundary,
+  loadSwebenchProTransportBindings,
+  swebenchProTransportPolicyLockFile,
+  swebenchProTransportPolicyLockRoot,
+  transportAttestationFailure,
+  type SwebenchProSessionAttachment,
+  type SwebenchProTransportAttestation,
+  type SwebenchProTransportBindings,
+} from './model-transport.js';
 import {
   ArtifactUnsafeError,
   OwnershipUnsafeCleanupError,
@@ -156,27 +163,30 @@ import {
 } from './verifier.js';
 import { ARM_B_PREFIX_PATH } from '../../shared/prompt.js';
 
-const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const SESSION_BACKSTOP_EXTRA_MS = 15 * 60_000;
 const SESSION_CLEANUP_RESERVE_MS = 2 * 60_000;
 const RECLAMATION_ATTEMPTS = 2;
 const RECLAMATION_COMMAND = '/bin/chown -R -- "$1" "${@:2}" && /bin/chmod 0700 "${@:2}"';
+const RECLAMATION_NAME_PREFIX = 'ucbench-reclaim-';
+const RECLAMATION_NAME_RE = /^\/ucbench-reclaim-[a-f0-9]{32}$/;
+const RECLAMATION_NAMESPACE_LIMIT = 16_384;
+const RECLAMATION_INSPECT_BATCH_SIZE = 512;
 const TERMINAL_PHASES = new Set(['session-done', 'patched', 'evaluated']);
 const TOOLCHAIN_CACHE_LOCK = '.locks/toolchain.lock';
 const SUITE_CACHE_LOCK = '.locks/swebench-pro.lock';
 const SESSION_RUNTIME_MARKER = 'ownership.json';
 
 export const SWEBENCH_PRO_ADAPTER_POLICY_SHA256 = sha256CanonicalJson({
-  schemaVersion: 2,
+  schemaVersion: 3,
   runLayout: 'suite-run/native/tasks/artifact-key/arm',
   fresh: 'claim-exclusive-directory',
   resume: 'manifest-exists-complete-immutable-projection',
   redo: 'task-arm-exact-helper-absence-before-invalidation',
   verifier: 'strict-partial-native-booleans',
-  credentials: 'runtime-only-outside-results',
+  modelTransport: 'credential-free-task-on-internal-network-via-attested-strict-relay-run-fatal-drift',
   dataset: 'audited-canonical-descriptor-v1',
-  cleanup: 'typed-command-fatal-after-settlement-retry',
-  containers: 'host-distinct-task-identity-owned-reclamation-lifecycle-exact-evaluator-ownership',
+  cleanup: 'typed-command-fatal-launch-settlement-exact-name-id-proof-retry-fresh-per-resource-deadlines',
+  containers: 'immutable-id-no-healthcheck-sanitized-bootstrap-owned-reclamation-lifecycle-exact-evaluator-ownership',
 });
 
 export interface RunOptions {
@@ -266,6 +276,7 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SwebenchProManifest['
       'src/cli.ts',
       'src/shared/config.ts',
       'src/shared/contracts.ts',
+      'src/shared/docker-isolation.ts',
       'src/shared/locks.ts',
       'src/shared/options.ts',
       'src/shared/paths.ts',
@@ -285,6 +296,7 @@ function currentControlPlaneHashes(roots: BenchPathRoots): SwebenchProManifest['
       'src/suites/swebench-pro/container-policy.ts',
       'src/suites/swebench-pro/image.ts',
       'src/suites/swebench-pro/instances.ts',
+      'src/suites/swebench-pro/model-transport.ts',
       'src/suites/swebench-pro/prompt.ts',
       'src/suites/swebench-pro/runner.ts',
       'src/suites/swebench-pro/state.ts',
@@ -421,6 +433,7 @@ function buildManifest(
   images: ReadonlyMap<string, DockerImageAttestation>,
   prepared: ReturnType<typeof loadPreparedSwebenchProInputs>,
   datasetSha256: string,
+  transport: SwebenchProTransportAttestation,
   createdAt: Date,
 ): SwebenchProManifest {
   const taskIds = instances.map((instance) => instance.instanceId);
@@ -439,7 +452,7 @@ function buildManifest(
   );
   const nativeAssets = swebenchProNativeAssets(roots);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     kind: 'ultracode-benchmark-run',
     suite: 'swebench-pro',
     runId: validateRunId(runId),
@@ -470,6 +483,7 @@ function buildManifest(
         pythonVersion: prepared.pythonVersion,
         environmentSha256: prepared.evaluatorEnvironmentSha256,
       },
+      modelTransport: { mechanism: 'attested-model-relay', ...transport },
       nativeAssets,
       tasks: instances.map((instance) => {
         const image = images.get(instance.instanceId);
@@ -517,10 +531,7 @@ function buildManifest(
         rowSha256: sha256CanonicalJson(instance.row),
       })),
       armOrder: orders,
-      auth: {
-        mechanism: config.auth.mechanism,
-        publicIdentitySha256: createHash('sha256').update(config.auth.publicIdentity, 'utf8').digest('hex'),
-      },
+      modelTransport: { mechanism: 'attested-model-relay', ...transport },
       policies,
       attempts: 1,
       retries: 0,
@@ -531,7 +542,7 @@ function buildManifest(
 }
 
 function overrideConfig(config: SwebenchProConfig, options: RunOptions): SwebenchProConfig {
-  return resolveSwebenchProConfig({ schemaVersion: 2, toolchain: {
+  return resolveSwebenchProConfig({ schemaVersion: 3, toolchain: {
     nodeVersion: '0.0.0', nodeDistribution: 'nodejs', codexBinary: 'unused',
   }, swebenchPro: config }, {
     ...(options.model === undefined ? {} : { model: options.model }),
@@ -584,7 +595,7 @@ function resumeConfig(operator: SwebenchProConfig, manifest: SwebenchProManifest
       seed: manifest.suiteConfig.selection.seed ?? 0,
       stratifyBy: manifest.suiteConfig.selection.stratifyBy ?? 'repo_language',
     },
-    auth: { ...operator.auth, mechanism: manifest.suiteConfig.auth.mechanism },
+    modelTransport: { ...operator.modelTransport },
     timeouts: {
       ...operator.timeouts,
       sessionMs: manifest.limits.hostTaskTimeoutMs!,
@@ -610,10 +621,6 @@ function resumeConfig(operator: SwebenchProConfig, manifest: SwebenchProManifest
       },
     },
   };
-  const identity = createHash('sha256').update(config.auth.publicIdentity, 'utf8').digest('hex');
-  if (identity !== manifest.suiteConfig.auth.publicIdentitySha256) {
-    throw new Error('runtime credential public identity does not match the immutable manifest');
-  }
   return config;
 }
 
@@ -640,8 +647,7 @@ function assertPreparedProvenance(
       prepared.evaluatorPolicyHelperSha256,
       prepared.containerPolicyFileSha256,
       currentControlPlane.adapterPolicySha256,
-    )) !== canonicalJson(manifest.suiteConfig.policies)
-    || config.auth.mechanism !== manifest.suiteConfig.auth.mechanism) {
+    )) !== canonicalJson(manifest.suiteConfig.policies)) {
     throw new Error('SWE-bench Pro execution provenance drifted after manifest creation');
   }
 }
@@ -680,12 +686,26 @@ async function loadRunStores(
   roots: BenchPathRoots,
   runId: string,
   recoverStaleLock: boolean,
-): Promise<{ manifest: SwebenchProManifest; lease: BenchLockHandle; state: BenchRunStateStore; receipt: VerifierReceiptStore }> {
-  const lease = await acquireBenchLock(roots.resultsRoot, runLeaseFile(roots, 'swebench-pro', runId), {
+): Promise<{
+  manifest: SwebenchProManifest;
+  policyLock: BenchLockHandle;
+  lease: BenchLockHandle;
+  state: BenchRunStateStore;
+  receipt: VerifierReceiptStore;
+}> {
+  const policyLock = await acquireBenchLock(swebenchProTransportPolicyLockRoot(), swebenchProTransportPolicyLockFile(roots), {
     recoverStale: recoverStaleLock,
-    createParent: false,
   });
+  let lease: BenchLockHandle | null = null;
   try {
+    if (policyLock.path !== swebenchProTransportPolicyLockFile(roots)) {
+      throw new Error('SWE-bench Pro recovery requires the exact model-transport policy lock');
+    }
+    policyLock.assertHeld();
+    lease = await acquireBenchLock(roots.resultsRoot, runLeaseFile(roots, 'swebench-pro', runId), {
+      recoverStale: recoverStaleLock,
+      createParent: false,
+    });
     const manifest = loadBenchRunManifest(roots, 'swebench-pro', runId) as SwebenchProManifest;
     const manifestSha256 = sha256File(manifestFile(roots, 'swebench-pro', runId));
     const state = new BenchRunStateStore(roots, 'swebench-pro', runId, manifestSha256, lease);
@@ -704,12 +724,14 @@ async function loadRunStores(
     }
     return {
       manifest,
+      policyLock,
       lease,
       state,
       receipt: new VerifierReceiptStore(roots, 'swebench-pro', runId, manifestSha256, lease),
     };
   } catch (error) {
-    lease.release();
+    lease?.release();
+    policyLock.release();
     throw error;
   }
 }
@@ -757,36 +779,10 @@ function executionDirectory(runDirectory: string, nativeRoot: string): string {
   return join(runDirectory, ...nativeRoot.split('/'));
 }
 
-function credentialBytes(path: string): Buffer {
-  const fd = openSync(path, constants.O_RDONLY | NOFOLLOW);
-  try {
-    const info = fstatSync(fd);
-    const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
-    if (!info.isFile() || info.nlink !== 1 || info.size > 4 * 1_024 * 1_024) throw new Error('auth file is unsafe');
-    if (uid !== undefined && info.uid !== uid) throw new Error('auth file must be owned by the current user');
-    if ((info.mode & 0o777) !== 0o600) throw new Error('auth file must have mode 0600');
-    const bytes = Buffer.alloc(info.size);
-    let offset = 0;
-    while (offset < bytes.length) {
-      const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
-      if (count === 0) throw new Error('auth file changed while it was being read');
-      offset += count;
-    }
-    const after = fstatSync(fd);
-    if (after.dev !== info.dev || after.ino !== info.ino || after.size !== info.size
-      || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs || after.nlink !== 1) {
-      throw new Error('auth file changed while it was being read');
-    }
-    return bytes;
-  } finally {
-    closeSync(fd);
-  }
-}
-
 type ProcessLifecycle = Pick<BenchProcessOptions,
   'workerScope' | 'onLifecycleToken' | 'onLifecycleStarted' | 'onLifecycleCandidates' | 'onLifecycleRecovered'>;
 
-interface ActiveSessionContainer {
+export interface SessionContainerLaunchContext {
   runtime: string;
   runtimeNonce: string;
   runId: string;
@@ -800,14 +796,97 @@ interface ActiveSessionContainer {
   attemptDeadline: number;
   lifecycle: ProcessLifecycle;
   executor: SessionDockerExecutor;
+}
+
+interface ActiveSessionContainer extends SessionContainerLaunchContext {
+  containerId?: string;
+  launchSettlement: Promise<void>;
+  settleLaunch: () => void;
   cleanupPromise?: Promise<void>;
 }
 
 const activeContainers = new Map<string, ActiveSessionContainer>();
+let transportAttestationTail = Promise.resolve();
 
-function trackContainer(name: string, container: ActiveSessionContainer): void {
+/** Shared fatal signal that stops accepting work and starts exact active-session cleanup. */
+export class SwebenchProRunFatalController {
+  private readonly abortController = new AbortController();
+  private readonly fatalSignal: Promise<SwebenchProTransportAttestationError>;
+  private resolveFatal!: (error: SwebenchProTransportAttestationError) => void;
+  private fatalError: SwebenchProTransportAttestationError | null = null;
+  private cleanupPromise: Promise<unknown> | null = null;
+
+  constructor(
+    private readonly cleanup: () => Promise<unknown> = cleanupActiveSessionResources,
+  ) {
+    this.fatalSignal = new Promise((resolvePromise) => { this.resolveFatal = resolvePromise; });
+  }
+
+  get signal(): AbortSignal {
+    return this.abortController.signal;
+  }
+
+  get failure(): SwebenchProTransportAttestationError | null {
+    return this.fatalError;
+  }
+
+  abort(error: SwebenchProTransportAttestationError): void {
+    if (this.fatalError !== null) return;
+    this.fatalError = error;
+    this.abortController.abort(error);
+    this.resolveFatal(error);
+    this.cleanupPromise = Promise.resolve().then(this.cleanup);
+    void this.cleanupPromise.catch(() => {});
+  }
+
+  throwIfAborted(): void {
+    if (this.fatalError !== null) throw this.fatalError;
+  }
+
+  async race<T>(operation: Promise<T>): Promise<T> {
+    this.throwIfAborted();
+    return Promise.race([
+      operation,
+      this.fatalSignal.then((error) => { throw error; }),
+    ]);
+  }
+
+  async settleCleanup(): Promise<void> {
+    await this.cleanupPromise;
+  }
+}
+
+async function withTransportAttestationLock<T>(
+  operation: () => Promise<T>,
+  fatalController?: SwebenchProRunFatalController,
+): Promise<T> {
+  let release!: () => void;
+  const previous = transportAttestationTail;
+  transportAttestationTail = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+  await previous;
+  try {
+    fatalController?.throwIfAborted();
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+function activeSessionEndpoints(): Map<string, string> {
+  return new Map([...activeContainers.entries()].flatMap(([name, container]) =>
+    container.containerId === undefined ? [] : [[name, container.containerId]]));
+}
+
+function trackContainer(
+  name: string,
+  context: SessionContainerLaunchContext,
+): ActiveSessionContainer {
   if (activeContainers.has(name)) throw new Error(`session container is already tracked: ${name}`);
+  let settleLaunch!: () => void;
+  const launchSettlement = new Promise<void>((resolvePromise) => { settleLaunch = resolvePromise; });
+  const container: ActiveSessionContainer = { ...context, launchSettlement, settleLaunch };
   activeContainers.set(name, container);
+  return container;
 }
 
 export type SessionDockerExecutor = (
@@ -828,6 +907,97 @@ export const defaultSessionDockerExecutor: SessionDockerExecutor = async (
     ...lifecycle,
   })).stdout;
 };
+
+/** Register before launch and expose one settlement shared by normal and fatal cleanup. */
+export function launchTrackedSessionContainer(
+  name: string,
+  context: SessionContainerLaunchContext,
+  launch: () => Promise<string>,
+): Promise<string> {
+  const container = trackContainer(name, context);
+  const launched = Promise.resolve().then(launch).then((stdout) => {
+    const containerId = stdout.trim();
+    if (!/^[a-f0-9]{64}$/.test(containerId)) {
+      throw transportAttestationFailure(
+        'session-inspect',
+        new Error('Docker returned an invalid session container id'),
+      );
+    }
+    container.containerId = containerId;
+    return containerId;
+  });
+  void launched.then(container.settleLaunch, container.settleLaunch);
+  return launched;
+}
+
+export async function attestModelTransport(
+  config: SwebenchProConfig,
+  bindings: SwebenchProTransportBindings,
+  executor: SessionDockerExecutor = defaultSessionDockerExecutor,
+  lifecycle: ProcessLifecycle = {},
+  timeoutMs?: number,
+  allowedSessions: ReadonlyMap<string, string> = new Map(),
+  requiredSessionNames: ReadonlySet<string> = new Set(),
+): Promise<SwebenchProTransportAttestation> {
+  let network: string;
+  try {
+    network = await executor(['network', 'inspect', bindings.restrictedNetwork], lifecycle, timeoutMs);
+  } catch (error) {
+    throw transportAttestationFailure('restricted-network-inspect', error);
+  }
+  let relayName: string;
+  try {
+    relayName = new URL(bindings.relayBaseUrl).hostname;
+  } catch (error) {
+    throw transportAttestationFailure('model-relay-inspect', error);
+  }
+  let relay: string;
+  try {
+    relay = await executor(['inspect', relayName], lifecycle, timeoutMs);
+  } catch (error) {
+    throw transportAttestationFailure('model-relay-inspect', error);
+  }
+  return inspectSwebenchProTransportBoundary(
+    network,
+    relay,
+    config.modelTransport,
+    config.model,
+    bindings,
+    allowedSessions,
+    requiredSessionNames,
+  );
+}
+
+/** Inspect and bind one launched task attachment to the typed transport proof. */
+export async function attestSessionTransportAttachment(
+  executor: SessionDockerExecutor,
+  expected: SwebenchProSessionAttachment,
+  bindings: SwebenchProTransportBindings,
+  lifecycle: ProcessLifecycle = {},
+  timeoutMs?: number,
+): Promise<void> {
+  let inspection: string;
+  try {
+    inspection = await executor(['inspect', expected.id], lifecycle, timeoutMs);
+  } catch (error) {
+    throw transportAttestationFailure('session-inspect', error);
+  }
+  inspectSwebenchProSessionAttachment(inspection, expected, bindings);
+}
+
+export function assertModelTransportProvenance(
+  manifest: SwebenchProManifest,
+  attestation: SwebenchProTransportAttestation,
+): void {
+  const frozen = { mechanism: 'attested-model-relay', ...attestation };
+  if (canonicalJson(frozen) !== canonicalJson(manifest.provenance.modelTransport)
+    || canonicalJson(frozen) !== canonicalJson(manifest.suiteConfig.modelTransport)) {
+    throw transportAttestationFailure(
+      'manifest-transport',
+      new Error('SWE-bench Pro model transport identity, topology, or strict relay policy drifted'),
+    );
+  }
+}
 
 export interface SessionArtifactOwner {
   uid: number;
@@ -855,6 +1025,22 @@ export function remainingSessionOperationTimeout(
   const remaining = Math.ceil(deadline - now - reserveMs);
   if (remaining <= 0) throw new Error('session Docker deadline is exhausted');
   return remaining;
+}
+
+/** Give one verified survivor a monotonic deadline shared by all of its operations. */
+export function runCleanupOperationTimeout(
+  deadline = performance.now() + SESSION_CLEANUP_RESERVE_MS,
+  now = performance.now(),
+): number {
+  return remainingSessionOperationTimeout(deadline, 0, now);
+}
+
+/** Create a decreasing timeout source with a fresh bounded deadline for one survivor. */
+export function survivorCleanupTimeout(
+  clock: () => number = () => performance.now(),
+): () => number {
+  const deadline = clock() + SESSION_CLEANUP_RESERVE_MS;
+  return () => runCleanupOperationTimeout(deadline, clock());
 }
 
 /** Race Docker wait against the driver backstop without retaining a timer on either settlement path. */
@@ -889,6 +1075,50 @@ export function reclamationContainerName(runId: string, taskId: string, arm: Arm
   return `ucbench-reclaim-${digest}`;
 }
 
+async function listExactSessionContainerName(
+  name: string,
+  lifecycle: ProcessLifecycle,
+  executor: SessionDockerExecutor,
+  timeoutMs: number,
+): Promise<string[]> {
+  const listed = (await executor([
+    'ps', '-aq', '--no-trunc', '--filter', `name=^/${name}$`,
+  ], lifecycle, timeoutMs)).split('\n').map((entry) => entry.trim()).filter(Boolean);
+  if (listed.length > 1 || listed.some((id) => !/^[a-f0-9]{64}$/.test(id))) {
+    throw new Error(`session container name is not uniquely bound to a valid id: ${name}`);
+  }
+  return listed;
+}
+
+async function proveTrackedSessionContainerAbsent(
+  name: string,
+  container: ActiveSessionContainer,
+  timeout: () => number,
+): Promise<void> {
+  try {
+    const byName = await listExactSessionContainerName(
+      name,
+      container.lifecycle,
+      container.executor,
+      timeout(),
+    );
+    const byId = container.containerId === undefined
+      ? []
+      : (await container.executor([
+        'ps', '-aq', '--no-trunc', '--filter', `id=${container.containerId}`,
+      ], container.lifecycle, timeout())).split('\n').map((entry) => entry.trim()).filter(Boolean);
+    if (container.containerId !== undefined
+      && byId.some((id) => !/^[a-f0-9]{64}$/.test(id) || id !== container.containerId)) {
+      throw new Error(`session container id query did not exactly bind ${container.containerId}`);
+    }
+    if (byName.length > 0 || byId.length > 0) {
+      throw new Error(`tracked session container remains present: ${name}`);
+    }
+  } catch (error) {
+    throw ownershipUnsafe(`tracked session container absence was not proven for ${container.taskId}/${container.arm}`, error);
+  }
+}
+
 export async function stopPersistedSessionContainer(
   name: string,
   runId: string,
@@ -904,6 +1134,7 @@ export async function stopPersistedSessionContainer(
     docker?: SwebenchProConfig['docker'];
     policy?: SwebenchProContainerPolicy;
     runtimeDirectory?: string;
+    expectedContainerId?: string;
   } = {},
 ): Promise<void> {
   const cleanupDeadline = Math.min(
@@ -914,14 +1145,8 @@ export async function stopPersistedSessionContainer(
   const taskIdentity = sessionTaskIdentity(artifactOwner);
   const image = options.image;
   const timeout = (): number => remainingSessionOperationTimeout(cleanupDeadline);
-  const listExactName = async (): Promise<string[]> => {
-    const listed = (await executor(['ps', '-aq', '--filter', `name=^/${name}$`], lifecycle, timeout()))
-      .split('\n').map((entry) => entry.trim()).filter(Boolean);
-    if (listed.length > 1 || listed.some((id) => !/^[a-f0-9]{12,64}$/.test(id))) {
-      throw new Error(`session container name is not uniquely bound to a valid id: ${name}`);
-    }
-    return listed;
-  };
+  const listExactName = async (): Promise<string[]> =>
+    listExactSessionContainerName(name, lifecycle, executor, timeout());
   try {
     const listed = await listExactName();
     if (listed.length === 0) {
@@ -973,7 +1198,9 @@ export async function stopPersistedSessionContainer(
     if (
       typeof inspectedId !== 'string'
       || !/^[a-f0-9]{64}$/.test(inspectedId)
-      || !inspectedId.startsWith(listed[0]!)
+      || inspectedId !== listed[0]
+      || parsed[0]?.Name !== `/${name}`
+      || (options.expectedContainerId !== undefined && inspectedId !== options.expectedContainerId)
       || labels['ultracode.benchmark.schema'] !== '2'
       || labels['ultracode.benchmark.suite'] !== 'swebench-pro'
       || labels['ultracode.benchmark.run'] !== runId
@@ -986,7 +1213,7 @@ export async function stopPersistedSessionContainer(
       || labels['ultracode.benchmark.artifact-uid'] !== String(artifactOwner.uid)
       || labels['ultracode.benchmark.artifact-gid'] !== String(artifactOwner.gid)
       || image === undefined
-      || parsed[0]?.Config?.Image !== image.overlayName
+      || parsed[0]?.Config?.Image !== image.overlayLocalId
       || parsed[0]?.Image !== image.overlayLocalId
       || typeof runtimeNonce !== 'string'
       || !/^[a-f0-9]{64}$/.test(runtimeNonce)
@@ -1058,10 +1285,30 @@ export async function stopPersistedSessionContainer(
   }
 }
 
-async function cleanupTrackedContainer(name: string): Promise<void> {
+async function cleanupTrackedContainer(name: string, freshDeadline = false): Promise<void> {
   const container = activeContainers.get(name);
   if (container === undefined) return;
   container.cleanupPromise ??= (async () => {
+    const cleanupDeadline = freshDeadline
+      ? performance.now() + SESSION_CLEANUP_RESERVE_MS
+      : Math.min(container.attemptDeadline, performance.now() + SESSION_CLEANUP_RESERVE_MS);
+    const timeout = (): number => remainingSessionOperationTimeout(cleanupDeadline);
+    await listExactSessionContainerName(name, container.lifecycle, container.executor, timeout());
+    if (await waitForSessionExit(container.launchSettlement, timeout()) === 'backstop') {
+      throw ownershipUnsafe(`session container launch did not settle during cleanup for ${container.taskId}/${container.arm}`);
+    }
+    const settledIds = await listExactSessionContainerName(
+      name,
+      container.lifecycle,
+      container.executor,
+      timeout(),
+    );
+    if (settledIds.length === 1) {
+      if (container.containerId !== undefined && container.containerId !== settledIds[0]) {
+        throw ownershipUnsafe(`session launch id does not match its exact tracked name for ${container.taskId}/${container.arm}`);
+      }
+      container.containerId = settledIds[0];
+    }
     await stopPersistedSessionContainer(
       name,
       container.runId,
@@ -1070,15 +1317,17 @@ async function cleanupTrackedContainer(name: string): Promise<void> {
       container.lifecycle,
       container.executor,
       {
-        attemptDeadline: container.attemptDeadline,
+        attemptDeadline: cleanupDeadline,
         taskDirectory: container.taskDirectory,
         artifactOwner: container.artifactOwner,
         image: container.image,
         docker: container.docker,
         policy: container.policy,
-        runtimeDirectory: container.runtime,
+        runtimeDirectory: existsSync(container.runtime) ? container.runtime : undefined,
+        expectedContainerId: container.containerId,
       },
     );
+    await proveTrackedSessionContainerAbsent(name, container, timeout);
     if (existsSync(container.runtime)) removeSessionRuntime(
       container.runtime,
       container.runId,
@@ -1086,7 +1335,7 @@ async function cleanupTrackedContainer(name: string): Promise<void> {
       container.arm,
       container.runtimeNonce,
     );
-    activeContainers.delete(name);
+    if (activeContainers.get(name) === container) activeContainers.delete(name);
   })();
   const cleanup = container.cleanupPromise;
   try {
@@ -1100,7 +1349,7 @@ async function cleanupTrackedContainer(name: string): Promise<void> {
 
 export async function cleanupActiveSwebenchProContainers(): Promise<number> {
   const entries = [...activeContainers.entries()];
-  const settled = await Promise.allSettled(entries.map(([name]) => cleanupTrackedContainer(name)));
+  const settled = await Promise.allSettled(entries.map(([name]) => cleanupTrackedContainer(name, true)));
   const failures = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
   if (failures.length > 0) {
     throw ownershipUnsafeAggregate('active SWE-bench Pro container cleanup failed', failures);
@@ -1198,8 +1447,9 @@ export interface SessionDockerRunArgvOptions {
   taskDirectory: string;
   runtimeHome: string;
   runtimeCodex: string;
+  restrictedNetwork: string;
   artifactOwner: SessionArtifactOwner;
-  image: string;
+  imageId: string;
   docker: SwebenchProConfig['docker'];
   policy: SwebenchProContainerPolicy;
 }
@@ -1215,15 +1465,21 @@ export function sessionDockerRunArgv(options: SessionDockerRunArgvOptions): stri
   ].flatMap(([key, value]) => ['--label', `ultracode.benchmark.${key}=${value}`]);
   return [
     'run', '-d', '--name', options.name, ...labels,
+    '--no-healthcheck',
     ...sessionContainerPolicyArgv(options.policy, options.docker),
+    '--network', options.restrictedNetwork,
     '--user', '0:0',
+    '--env', 'BASH_ENV=',
+    '--env', 'ENV=',
+    '--env', 'LD_PRELOAD=',
+    '--env', 'LD_AUDIT=',
     '--env-file', options.envFile,
     '--mount', `type=bind,src=${options.taskDirectory},dst=/bench`,
     '--mount', `type=bind,src=${options.runtimeHome},dst=/runtime/home`,
     '--mount', `type=bind,src=${options.runtimeCodex},dst=/runtime/codex-home`,
     '--mount', `type=bind,src=${join(options.taskDirectory, 'codex-home', 'sessions')},dst=/runtime/codex-home/sessions`,
     '--entrypoint', '/bin/bash',
-    options.image,
+    options.imageId,
     '/opt/bench/entrypoint.sh',
   ];
 }
@@ -1236,9 +1492,10 @@ async function runSession(
   arm: Arm,
   taskDirectory: string,
   image: DockerImageAttestation,
-  runtimeBindings: ReturnType<typeof loadRuntimeBindings>,
+  transportBindings: SwebenchProTransportBindings,
   processLifecycle: ProcessLifecycle,
   executor: SessionDockerExecutor = defaultSessionDockerExecutor,
+  fatalController?: SwebenchProRunFatalController,
 ): Promise<SessionResult> {
   const startedAt = Date.now();
   const attemptDeadline = performance.now()
@@ -1251,7 +1508,9 @@ async function runSession(
   );
   const imageExecutor: DockerExecutor = (argv) => executor(argv, processLifecycle, activeTimeout());
   const policy = loadSwebenchProContainerPolicy(roots);
+  fatalController?.throwIfAborted();
   await reattestTaskImage(image, imageExecutor);
+  fatalController?.throwIfAborted();
   const name = containerName(manifest.runId, instance.instanceId, arm);
   await stopPersistedSessionContainer(
     name,
@@ -1269,6 +1528,7 @@ async function runSession(
       policy,
     },
   );
+  fatalController?.throwIfAborted();
   resetArtifactDirectory(runDirFromTask(taskDirectory), taskDirectory);
   for (const directory of [
     'codex-home', 'codex-home/sessions', 'uc', 'logs', 'out',
@@ -1291,9 +1551,6 @@ async function runSession(
       arm,
       runtimeNonce,
     });
-    if (runtimeBindings.authFile) {
-      writeFileSync(join(runtimeCodex, 'auth.json'), credentialBytes(runtimeBindings.authFile), { mode: 0o600 });
-    }
     const envLines = [
       `BENCH_ARM=${arm}`,
       `BENCH_TIMEOUT_SECS=${Math.ceil(config.timeouts.sessionMs / 1_000)}`,
@@ -1303,12 +1560,14 @@ async function runSession(
       `BENCH_TASK_UID=${taskIdentity.uid}`,
       `BENCH_TASK_GID=${taskIdentity.gid}`,
       `BENCH_ARTIFACT_OWNER=${artifactOwner.uid}:${artifactOwner.gid}`,
+      `BENCH_RUNTIME_NONCE=${runtimeNonce}`,
       'BENCH_REPO_DIR=/app',
       'BENCH_SANITIZE=1',
       'CODEX_HOME=/runtime/codex-home',
       'ULTRACODE_HOME=/bench/uc',
       'HOME=/runtime/home',
-      ...(runtimeBindings.apiKey ? [`CODEX_API_KEY=${runtimeBindings.apiKey}`] : []),
+      'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      `BENCH_MODEL_RELAY_BASE_URL=${transportBindings.relayBaseUrl}`,
     ];
     writeFileSync(envFile, `${envLines.join('\n')}\n`, { mode: 0o600 });
   } catch (error) {
@@ -1325,44 +1584,96 @@ async function runSession(
     taskDirectory,
     runtimeHome,
     runtimeCodex,
+    restrictedNetwork: transportBindings.restrictedNetwork,
     artifactOwner,
-    image: image.overlayName,
+    imageId: image.overlayLocalId,
     docker: config.docker,
     policy,
   });
   let endedAt = startedAt;
   let backstop = false;
   try {
-    trackContainer(name, {
-      runtime,
-      runtimeNonce,
-      runId: manifest.runId,
-      taskId: instance.instanceId,
-      arm,
-      taskDirectory,
-      artifactOwner,
-      image,
-      docker: config.docker,
-      policy,
-      attemptDeadline,
-      lifecycle: processLifecycle,
-      executor,
-    });
-    const launchedId = (await executor(args, processLifecycle, activeTimeout())).trim();
-    if (!/^[a-f0-9]{64}$/.test(launchedId)) throw new Error('Docker returned an invalid session container id');
+    await withTransportAttestationLock(async () => {
+      const launchedId = await launchTrackedSessionContainer(name, {
+        runtime,
+        runtimeNonce,
+        runId: manifest.runId,
+        taskId: instance.instanceId,
+        arm,
+        taskDirectory,
+        artifactOwner,
+        image,
+        docker: config.docker,
+        policy,
+        attemptDeadline,
+        lifecycle: processLifecycle,
+        executor,
+      }, () => executor(args, processLifecycle, activeTimeout()));
+      fatalController?.throwIfAborted();
+      await attestSessionTransportAttachment(
+        executor,
+        {
+          id: launchedId,
+          name,
+          runId: manifest.runId,
+          taskId: instance.instanceId,
+          arm,
+          runtimeNonce,
+          imageName: image.overlayLocalId,
+          imageId: image.overlayLocalId,
+        },
+        transportBindings,
+        processLifecycle,
+        activeTimeout(),
+      );
+      const transport = await attestModelTransport(
+        config,
+        transportBindings,
+        executor,
+        processLifecycle,
+        activeTimeout(),
+        activeSessionEndpoints(),
+        new Set([name]),
+      );
+      assertModelTransportProvenance(manifest, transport);
+      writePrivateFileAtomic(
+        runtimeHome,
+        join(runtimeHome, '.model-transport-attested'),
+        `${runtimeNonce}\n`,
+      );
+    }, fatalController);
     unlinkSync(envFile);
     const waited = executor(
       ['wait', name],
       processLifecycle,
       remainingSessionOperationTimeout(attemptDeadline),
     );
-    const first = await waitForSessionExit(waited, activeTimeout());
+    const waiting = waitForSessionExit(waited, activeTimeout());
+    const first = fatalController === undefined
+      ? await waiting
+      : await fatalController.race(waiting);
     endedAt = Date.now();
     if (first === 'backstop') {
       backstop = true;
       await cleanupTrackedContainer(name);
       await waited.catch(() => '');
+    } else {
+      await withTransportAttestationLock(async () => assertModelTransportProvenance(
+        manifest,
+        await attestModelTransport(
+          config,
+          transportBindings,
+          executor,
+          processLifecycle,
+          activeTimeout(),
+          activeSessionEndpoints(),
+          new Set(),
+        ),
+      ), fatalController);
     }
+  } catch (error) {
+    if (error instanceof SwebenchProTransportAttestationError) fatalController?.abort(error);
+    throw error;
   } finally {
     await cleanupTrackedContainer(name);
   }
@@ -1397,19 +1708,56 @@ async function runSession(
 function runDirFromTask(taskDirectory: string): string {
   const marker = `${sep}native${sep}tasks${sep}`;
   const index = taskDirectory.indexOf(marker);
-  if (index < 0) throw new Error('task directory is outside the v2 native layout');
+  if (index < 0) throw new Error('task directory is outside the native task layout');
   return taskDirectory.slice(0, index);
 }
 
-function sessionFailure(error: unknown): FailureCode {
+function errorCauses(error: unknown): unknown[] {
+  const causes: unknown[] = [];
+  const seen = new Set<unknown>();
+  const pending = [error];
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (current === null || current === undefined || seen.has(current)) continue;
+    causes.push(current);
+    seen.add(current);
+    if (typeof current !== 'object') continue;
+    const record = current as Record<string, unknown>;
+    if ('cause' in record) pending.push(record.cause);
+    for (const key of ['errors', 'failures'] as const) {
+      if (Array.isArray(record[key])) pending.push(...record[key]);
+    }
+  }
+  return causes;
+}
+
+export function sessionFailure(error: unknown): FailureCode {
+  const causes = errorCauses(error);
+  const descendantFailure = causes.find((cause) =>
+    cause instanceof BenchProcessError && /descendant cleanup failed/u.test(cause.message));
+  if (descendantFailure !== undefined) return 'descendant-cleanup-failed';
   if (error instanceof ArtifactUnsafeError) return 'artifact-unsafe';
   const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof SwebenchProTransportAttestationError) {
+    return error.stage === 'model-relay-inspect' || /model relay identity|model relay.*invalid/iu.test(message)
+      ? 'broker-failed'
+      : 'network-policy-failed';
+  }
+  if (/model relay identity|model relay.*invalid/iu.test(message)) return 'broker-failed';
+  if (/model transport|restricted network|restricted-network|task endpoint|relay policy|topology/iu.test(message)) {
+    return 'network-policy-failed';
+  }
   if (/auth file|credential|CODEX_(?:AUTH|API)/i.test(message)) return 'auth-failed';
   if (/image identity drifted/i.test(message)) return 'image-identity-drift';
   if (/toolchain/i.test(message)) return 'toolchain-incompatible';
   if (/owner|ownership/i.test(message)) return 'ownership-unsafe';
   if (/artifact|symlink|multiply-linked|non-file/i.test(message)) return 'artifact-unsafe';
   return 'native-runner-failed';
+}
+
+/** Model-transport drift invalidates the run, not only the current task. */
+export function isRunFatalTransportFailure(failure: FailureCode): boolean {
+  return failure === 'broker-failed' || failure === 'network-policy-failed';
 }
 
 function parseRedo(values: readonly string[], manifest: SwebenchProManifest): Set<string> {
@@ -1602,14 +1950,19 @@ async function executeSessions(
       Date.parse(invocation.startedAt),
     ])),
   );
+  const transportBindings = loadSwebenchProTransportBindings();
+  assertModelTransportProvenance(
+    manifest,
+    await attestModelTransport(config, transportBindings, sessionDocker),
+  );
   const byId = new Map(manifestInstances(manifest).map((instance) => [instance.instanceId, instance]));
   const images = imageAttestations(manifest);
-  const runtimeBindings = loadRuntimeBindings(config);
   let cursor = 0;
   let ownershipFailure = false;
+  const fatalController = new SwebenchProRunFatalController();
   const workers = Array.from({ length: config.concurrency.tasks }, async () => {
     for (;;) {
-      if (ownershipFailure) return;
+      if (ownershipFailure || fatalController.signal.aborted) return;
       const execution = manifest.artifacts.executions[cursor++];
       if (!execution) return;
       const taskDirectory = executionDirectory(directory, execution.nativeRoot);
@@ -1628,11 +1981,14 @@ async function executeSessions(
           execution.arm,
           taskDirectory,
           image,
-          runtimeBindings,
+          transportBindings,
           state.lifecycleHooks(invocationId),
           sessionDocker,
+          fatalController,
         );
+        fatalController.throwIfAborted();
         await recordCompletedAttempt(state, invocationId, execution, result.status, result.meta);
+        fatalController.throwIfAborted();
         output(context, `${execution.taskId} ${execution.arm}: ${result.status.phase}${result.status.failure ? ` (${result.status.failure})` : ''}`);
       } catch (error) {
         if (error instanceof OwnershipUnsafeCleanupError) {
@@ -1658,10 +2014,32 @@ async function executeSessions(
         }
         await recordCompletedAttempt(state, invocationId, execution, status, null);
         output(context, `${execution.taskId} ${execution.arm}: pending (${failure})`);
+        if (error instanceof SwebenchProTransportAttestationError
+          || isRunFatalTransportFailure(failure)) {
+          fatalController.abort(error instanceof SwebenchProTransportAttestationError
+            ? error
+            : transportAttestationFailure('transport-boundary', error));
+          return;
+        }
       }
     }
   });
-  await settleSessionWorkers(workers);
+  let workerFailure: unknown;
+  try {
+    await settleSessionWorkers(workers);
+  } catch (error) {
+    workerFailure = error;
+  }
+  let fatalCleanupFailure: unknown;
+  try {
+    await fatalController.settleCleanup();
+  } catch (error) {
+    fatalCleanupFailure = error;
+  }
+  if (workerFailure instanceof OwnershipUnsafeCleanupError) throw workerFailure;
+  if (fatalCleanupFailure !== undefined) throw fatalCleanupFailure;
+  if (fatalController.failure !== null) throw fatalController.failure;
+  if (workerFailure !== undefined) throw workerFailure;
 }
 
 export async function fetchCommand(options: CacheOptions, context: CommandContext): Promise<void> {
@@ -1708,7 +2086,7 @@ export async function runCommand(
       assertExplicitResumeOptions(options, stores.manifest);
       const config = resumeConfig(baseConfig, stores.manifest);
       validateRunConfig(config);
-      loadRuntimeBindings(config);
+      const transportBindings = loadSwebenchProTransportBindings();
       inputLocks = await acquirePreparedInputLocks(context.paths, options.recoverStaleLock);
       const prepared = loadPreparedSwebenchProInputs(
         swebenchProPreparedDir(context.paths, stores.manifest.suiteConfig.preparedInputSha256),
@@ -1717,6 +2095,10 @@ export async function runCommand(
       );
       assertPreparedProvenance(stores.manifest, config, prepared, context.paths);
       for (const image of imageAttestations(stores.manifest).values()) await reattestTaskImage(image);
+      assertModelTransportProvenance(
+        stores.manifest,
+        await attestModelTransport(config, transportBindings, dependencies.sessionDocker),
+      );
       invocationId = await beginInvocation(stores.state, 'run', context.clock.now());
       const redo = parseRedo(options.redo, stores.manifest);
       await invalidateRedo(
@@ -1762,7 +2144,7 @@ export async function runCommand(
       try {
         releaseLocks(inputLocks);
       } finally {
-        stores.lease.release();
+        try { stores.lease.release(); } finally { stores.policyLock.release(); }
       }
     }
     return;
@@ -1774,6 +2156,7 @@ export async function runCommand(
     { recoverStale: options.recoverStaleLock },
   );
   let initialized: Awaited<ReturnType<typeof initializeRun>> | null = null;
+  let policyLock: BenchLockHandle | null = null;
   let inputLocks: BenchLockHandle[] = [];
   try {
     const freshDirectory = runDir(context.paths, 'swebench-pro', options.runId);
@@ -1786,7 +2169,12 @@ export async function runCommand(
     }
     const config = overrideConfig(baseConfig, options);
     validateRunConfig(config);
-    loadRuntimeBindings(config);
+    const transportBindings = loadSwebenchProTransportBindings();
+    policyLock = await acquireBenchLock(
+      swebenchProTransportPolicyLockRoot(),
+      swebenchProTransportPolicyLockFile(context.paths),
+      { recoverStale: options.recoverStaleLock },
+    );
     inputLocks = await acquirePreparedInputLocks(context.paths, options.recoverStaleLock);
     const prepared = loadCurrentPreparedSwebenchProInputs(context.paths, config);
     const snapshot = loadDatasetSnapshot(context.paths);
@@ -1800,6 +2188,7 @@ export async function runCommand(
         toolchainPayloadSha256: prepared.toolchain.provenance.payloadSha256,
       }));
     }
+    const transport = await attestModelTransport(config, transportBindings, dependencies.sessionDocker);
     const manifest = buildManifest(
       context.paths,
       options.runId,
@@ -1808,6 +2197,7 @@ export async function runCommand(
       images,
       prepared,
       datasetSha256,
+      transport,
       context.clock.now(),
     );
     initialized = await initializeRun(context.paths, manifest, options.recoverStaleLock, claim);
@@ -1841,7 +2231,7 @@ export async function runCommand(
     try {
       releaseLocks(inputLocks);
     } finally {
-      initialized?.lease.release();
+      try { initialized?.lease.release(); } finally { policyLock?.release(); }
     }
   }
 }
@@ -1946,6 +2336,7 @@ export function evaluatorTaskAttribution(options: {
   invocationId: string;
   attemptId: string;
   ordinal: number;
+  timingGroupId?: string;
 }): EvaluatorTaskAttribution | null {
   if (!options.submitted.has(options.execution.taskId)) return null;
   const nativePresent = Object.hasOwn(options.result.verdicts, options.execution.taskId);
@@ -1959,6 +2350,7 @@ export function evaluatorTaskAttribution(options: {
     attempt: {
       attemptId: options.attemptId,
       invocationId: options.invocationId,
+      ...(options.timingGroupId === undefined ? {} : { timingGroupId: options.timingGroupId }),
       taskId: options.execution.taskId,
       arm: options.execution.arm,
       ordinal: options.ordinal,
@@ -1976,6 +2368,112 @@ export function evaluatorTaskAttribution(options: {
       annotations: [],
     },
   };
+}
+
+/** Write task statuses first, then commit all eligible evaluator attempts as one arm revision. */
+export async function recordEvaluatorArmAttributions(options: {
+  state: BenchRunStateStore;
+  executions: readonly SwebenchProManifest['artifacts']['executions'][number][];
+  runDirectory: string;
+  arm: Arm;
+  result: EvaluatorRunResult;
+  submitted: ReadonlySet<string>;
+  invocationId: string;
+  attemptId?: () => string;
+}): Promise<number> {
+  const eligible = options.executions.flatMap((execution) => {
+    if (execution.arm !== options.arm || !options.submitted.has(execution.taskId)) return [];
+    const statusDirectory = executionDirectory(options.runDirectory, execution.nativeRoot);
+    if (!existsSync(statusDirectory)) return [];
+    const status = readTaskStatus(statusDirectory);
+    writeTaskStatus(statusDirectory, { ...status, phase: 'evaluated' });
+    return [execution];
+  });
+  if (eligible.length === 0) return 0;
+  const attemptId = options.attemptId ?? randomUUID;
+  const timingGroupId = randomUUID();
+  await options.state.updateCurrent((state) => {
+    const ordinals = new Map<string, number>();
+    for (const attempt of state.attempts) {
+      const key = `${attempt.taskId}\0${attempt.arm}`;
+      ordinals.set(key, (ordinals.get(key) ?? 0) + 1);
+    }
+    const additions = eligible.map((execution) => {
+      const key = `${execution.taskId}\0${execution.arm}`;
+      const ordinal = (ordinals.get(key) ?? 0) + 1;
+      ordinals.set(key, ordinal);
+      const attribution = evaluatorTaskAttribution({
+        result: options.result,
+        execution,
+        submitted: options.submitted,
+        invocationId: options.invocationId,
+        attemptId: attemptId(),
+        ordinal,
+        timingGroupId,
+      });
+      if (attribution === null) throw new Error('eligible evaluator attribution was unexpectedly filtered');
+      return attribution.attempt;
+    });
+    return { ...state, attempts: [...state.attempts, ...additions] };
+  });
+  return eligible.length;
+}
+
+/** Persist verifier attempts and timing before publishing any accepted receipt bindings. */
+export async function publishEvaluatorModeResult(options: {
+  state: BenchRunStateStore;
+  receipt: Pick<VerifierReceiptStore, 'load' | 'update'>;
+  executions: readonly SwebenchProManifest['artifacts']['executions'][number][];
+  runDirectory: string;
+  prefix: string;
+  arm: Arm | null;
+  result: EvaluatorRunResult;
+  submitted: ReadonlySet<string>;
+  invocationId: string;
+  attemptId?: () => string;
+}): Promise<number> {
+  if (options.arm !== null) {
+    const submittedExecutions = options.executions.filter((execution) =>
+      execution.arm === options.arm && options.submitted.has(execution.taskId));
+    const attributable = new Set(submittedExecutions.map((execution) => execution.taskId));
+    const unattributed = [...options.submitted].filter((taskId) => !attributable.has(taskId));
+    const missingStatuses = submittedExecutions.filter((execution) =>
+      !existsSync(executionDirectory(options.runDirectory, execution.nativeRoot)));
+    const unexpectedVerdicts = Object.keys(options.result.verdicts).filter((taskId) =>
+      !attributable.has(taskId));
+    if (unattributed.length > 0 || missingStatuses.length > 0 || unexpectedVerdicts.length > 0) {
+      throw new Error('SWE-bench Pro evaluator receipt lacks complete task attribution state');
+    }
+  }
+  const additions = evaluatorReceiptBindings({
+    runDirectory: options.runDirectory,
+    invocationId: options.invocationId,
+    prefix: options.prefix,
+    arm: options.arm,
+    result: options.result,
+  });
+  const recorded = options.arm === null ? 0 : await recordEvaluatorArmAttributions({
+    state: options.state,
+    executions: options.executions,
+    runDirectory: options.runDirectory,
+    arm: options.arm,
+    result: options.result,
+    submitted: options.submitted,
+    invocationId: options.invocationId,
+    ...(options.attemptId === undefined ? {} : { attemptId: options.attemptId }),
+  });
+  const receipt = options.receipt.load();
+  await options.receipt.update(receipt.revision, (bindings) => [
+    ...bindings.filter((binding) => {
+      if (options.arm === null) {
+        return !(binding.scope.kind === 'suite-check' && binding.scope.name.startsWith(options.prefix));
+      }
+      return !(binding.scope.kind === 'task-arm' && binding.scope.arm === options.arm)
+        && !(binding.scope.kind === 'suite-check' && binding.scope.name.startsWith(options.prefix));
+    }),
+    ...additions,
+  ]);
+  return recorded;
 }
 
 export async function evalCommand(options: EvalOptions, context: CommandContext): Promise<void> {
@@ -2035,46 +2533,17 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
           ...stores.state.lifecycleHooks(invocationId),
         },
       });
-      const additions = evaluatorReceiptBindings({
+      await publishEvaluatorModeResult({
+        state: stores.state,
+        receipt: stores.receipt,
+        executions: stores.manifest.artifacts.executions,
         runDirectory,
-        invocationId,
         prefix: mode.prefix,
         arm: mode.arm,
         result,
+        submitted: new Set(mode.predictions.map((prediction) => prediction.instance_id)),
+        invocationId,
       });
-      const receipt = stores.receipt.load();
-      await stores.receipt.update(receipt.revision, (bindings) => [
-        ...bindings.filter((binding) => {
-          if (mode.arm === null) return !(binding.scope.kind === 'suite-check' && binding.scope.name.startsWith(mode.prefix));
-          return !(binding.scope.kind === 'task-arm' && binding.scope.arm === mode.arm)
-            && !(binding.scope.kind === 'suite-check' && binding.scope.name.startsWith(mode.prefix));
-        }),
-        ...additions,
-      ]);
-      if (mode.arm !== null) {
-        const submitted = new Set(mode.predictions.map((prediction) => prediction.instance_id));
-        for (const execution of stores.manifest.artifacts.executions.filter((entry) => entry.arm === mode.arm)) {
-          const currentState = stores.state.load();
-          const attribution = evaluatorTaskAttribution({
-            result,
-            execution,
-            submitted,
-            invocationId,
-            attemptId: randomUUID(),
-            ordinal: currentState.attempts.filter((entry) =>
-              entry.taskId === execution.taskId && entry.arm === execution.arm).length + 1,
-          });
-          if (attribution === null) continue;
-          const statusDirectory = executionDirectory(runDirectory, execution.nativeRoot);
-          if (!existsSync(statusDirectory)) continue;
-          const status = readTaskStatus(statusDirectory);
-          writeTaskStatus(statusDirectory, { ...status, phase: attribution.phase });
-          await stores.state.updateCurrent((state) => ({
-            ...state,
-            attempts: [...state.attempts, attribution.attempt],
-          }));
-        }
-      }
       output(context, `${mode.prefix}: ${Object.values(result.verdicts).filter(Boolean).length}/${mode.predictions.length} verified resolved; ${mode.predictions.length - Object.keys(result.verdicts).length} unverified`);
     }
     await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
@@ -2098,7 +2567,7 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
       try {
         releaseLocks(inputLocks);
       } finally {
-        stores.lease.release();
+        try { stores.lease.release(); } finally { stores.policyLock.release(); }
       }
     }
   }
@@ -2133,15 +2602,26 @@ function nativeResult(
 export function hasCompleteProVerifierReceipt(
   bindings: readonly VerifierBinding[],
   invocationId: string,
+  arm?: Arm,
 ): boolean {
-  const roles = new Set(bindings
-    .filter((binding) => binding.invocationId === invocationId)
-    .map((binding) => binding.role));
+  const invocationBindings = bindings.filter((binding) => binding.invocationId === invocationId);
+  if (arm !== undefined) {
+    const prefix = arm === 'a' ? 'armA' : 'armB';
+    return [
+      ['raw-samples', `${prefix}-inputs`],
+      ['predictions', `${prefix}-inputs`],
+      ['verifier-invocation', `${prefix}-invocation`],
+      ['native-config', `${prefix}-policy`],
+    ].every(([role, name]) => invocationBindings.some((binding) =>
+      binding.role === role && binding.scope.kind === 'suite-check' && binding.scope.name === name));
+  }
+  const roles = new Set(invocationBindings.map((binding) => binding.role));
   return ['raw-samples', 'predictions', 'verifier-invocation', 'native-config']
     .every((role) => roles.has(role as VerifierBinding['role']));
 }
 
-function taskReportInputs(
+/** Bind report evidence only to the latest task-scoped verifier attempt and its arm receipt. */
+export function taskReportInputs(
   manifest: SwebenchProManifest,
   state: BenchRunState,
   receiptBindings: readonly VerifierBinding[],
@@ -2159,16 +2639,17 @@ function taskReportInputs(
     });
     const currentAttempts = scopedAttempts.slice(lastInvalidation + 1);
     const latestAttempt = currentAttempts.at(-1);
-    const binding = [...receiptBindings].reverse().find((entry) => entry.role === 'native-result'
-      && entry.scope.kind === 'task-arm' && entry.scope.taskId === execution.taskId && entry.scope.arm === execution.arm);
     const failures = new Set<FailureCode>();
     if (status?.failure) failures.add(status.failure);
     const latestSession = [...currentAttempts].reverse().find((entry) => entry.phase === 'session');
     const latestVerifier = [...currentAttempts].reverse().find((entry) => entry.phase === 'verifier');
+    const binding = [...receiptBindings].reverse().find((entry) => entry.role === 'native-result'
+      && entry.invocationId === latestVerifier?.invocationId
+      && entry.scope.kind === 'task-arm' && entry.scope.taskId === execution.taskId && entry.scope.arm === execution.arm);
     latestSession?.failures.forEach((failure) => failures.add(failure));
     latestVerifier?.failures.forEach((failure) => failures.add(failure));
     if (latestVerifier !== undefined && latestVerifier.status !== 'running'
-      && !hasCompleteProVerifierReceipt(receiptBindings, latestVerifier.invocationId)) {
+      && !hasCompleteProVerifierReceipt(receiptBindings, latestVerifier.invocationId, execution.arm)) {
       failures.add('receipt-incomplete');
     }
     return {
@@ -2176,7 +2657,10 @@ function taskReportInputs(
       arm: execution.arm,
       nativeVerifier: nativeResult(runDirectory, binding),
       failures: [...failures].map((code) => failureObservationSchema.parse({
-        code, scope, phase: code.startsWith('verifier-') || code === 'unattributed-verifier-absence' ? 'verifier' : 'session',
+        code,
+        scope,
+        phase: code.startsWith('verifier-') || code === 'unattributed-verifier-absence'
+          || code === 'receipt-incomplete' ? 'verifier' : 'session',
         terminal: true, evidence: code === 'agent-timeout' ? 'native' : 'driver',
       })),
       annotations: (status?.annotations ?? []).map((code) => annotationSchema.parse({ code, scope })),
@@ -2223,7 +2707,7 @@ export async function reportCommand(options: RunIdentityOptions, context: Comman
     }
     throw error;
   } finally {
-    stores.lease.release();
+    try { stores.lease.release(); } finally { stores.policyLock.release(); }
   }
 }
 
@@ -2241,7 +2725,7 @@ export async function statusCommand(options: RunIdentityOptions, context: Comman
       output(context, `${execution.taskId} ${execution.arm}: ${status.phase}${failure ? ` (${failure})` : ''}`);
     }
   } finally {
-    stores.lease.release();
+    try { stores.lease.release(); } finally { stores.policyLock.release(); }
   }
 }
 
@@ -2600,15 +3084,13 @@ export async function reclaimSessionOwnership(
     const active: ActiveReclamationHelper = {
       name: spec.name,
       cleanup: async () => {
-        const cleanupDeadline = performance.now() + SESSION_CLEANUP_RESERVE_MS;
-        const cleanupTimeout = (): number => remainingSessionOperationTimeout(cleanupDeadline);
         await reconcileReclamationHelper(
           spec,
           spec,
           options.policy,
           lifecycle,
           executor,
-          cleanupTimeout,
+          survivorCleanupTimeout(),
         );
       },
     };
@@ -2616,15 +3098,16 @@ export async function reclaimSessionOwnership(
     try {
       const argv = reclamationDockerRunArgv({ ...spec, policy: options.policy });
       for (let attempt = 0; attempt < RECLAMATION_ATTEMPTS; attempt += 1) {
+        const attemptTimeout = attempt === 0 ? timeout : survivorCleanupTimeout();
         absenceProven = false;
         let launchFailure: unknown;
         try {
-          await executor(argv, lifecycle, timeout());
+          await executor(argv, lifecycle, attemptTimeout());
         } catch (error) {
           launchFailure = error;
         }
         try {
-          await reconcileReclamationHelper(spec, spec, options.policy, lifecycle, executor, timeout);
+          await reconcileReclamationHelper(spec, spec, options.policy, lifecycle, executor, attemptTimeout);
           absenceProven = true;
         } catch (error) {
           throw ownershipUnsafeAggregate('reclamation helper outcome could not be reconciled', [
@@ -2678,18 +3161,69 @@ function removeSessionRuntime(
   rmSync(runtime, { recursive: true });
 }
 
+/** Capture one bounded, strictly inspected view of the reserved reclamation-name namespace. */
+export async function reclamationNamespaceSnapshot(
+  executor: DockerExecutor,
+  timeout: () => number,
+): Promise<ReadonlyMap<string, ReclamationContainerInspect>> {
+  const ids = (await executor([
+    'ps', '-aq', '--no-trunc', '--filter', `name=^/${RECLAMATION_NAME_PREFIX}`,
+  ], timeout())).split('\n').map((entry) => entry.trim()).filter(Boolean);
+  if (ids.length > RECLAMATION_NAMESPACE_LIMIT
+    || ids.some((id) => !/^[a-f0-9]{64}$/.test(id))
+    || new Set(ids).size !== ids.length) {
+    throw new Error('Docker returned an invalid or oversized reclamation namespace snapshot');
+  }
+  const records: ReclamationContainerInspect[] = [];
+  for (let offset = 0; offset < ids.length; offset += RECLAMATION_INSPECT_BATCH_SIZE) {
+    const batch = ids.slice(offset, offset + RECLAMATION_INSPECT_BATCH_SIZE);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await executor(['inspect', ...batch], timeout())) as unknown;
+    } catch (error) {
+      throw new Error('Docker returned malformed reclamation namespace inspection', { cause: error });
+    }
+    if (!Array.isArray(parsed) || parsed.length !== batch.length) {
+      throw new Error('Docker reclamation namespace inspection did not exactly bind the requested ids');
+    }
+    const requested = new Set(batch);
+    const observed = new Set<string>();
+    for (const value of parsed) {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('Docker reclamation namespace inspection returned a non-object record');
+      }
+      const record = value as ReclamationContainerInspect;
+      if (typeof record.Id !== 'string' || !requested.has(record.Id) || observed.has(record.Id)
+        || typeof record.Name !== 'string'
+        || !RECLAMATION_NAME_RE.test(record.Name)) {
+        throw new Error('Docker reclamation namespace inspection did not exactly bind id and name');
+      }
+      observed.add(record.Id);
+      records.push(record);
+    }
+    if (observed.size !== requested.size) {
+      throw new Error('Docker reclamation namespace inspection omitted a requested id');
+    }
+  }
+  const byName = new Map<string, ReclamationContainerInspect>();
+  for (const record of records) {
+    const name = record.Name!.slice(1);
+    if (byName.has(name)) throw new Error(`Docker reclamation namespace name is ambiguous: ${name}`);
+    byName.set(name, record);
+  }
+  return byName;
+}
+
 /** Prove every immutable task/arm reclamation name absent before filesystem cleanup. */
 export async function proveManifestReclamationNamesAbsent(
   manifest: SwebenchProManifest,
   executor: DockerExecutor,
   timeout: () => number,
 ): Promise<void> {
+  const snapshot = await reclamationNamespaceSnapshot(executor, timeout);
   for (const execution of manifest.artifacts.executions) {
     const name = reclamationContainerName(manifest.runId, execution.taskId, execution.arm);
-    const listed = (await executor([
-      'ps', '-aq', '--no-trunc', '--filter', `name=^/${name}$`,
-    ], timeout())).split('\n').map((entry) => entry.trim()).filter(Boolean);
-    if (listed.length > 0) {
+    if (snapshot.has(name)) {
       throw new Error(`reclamation helper name remains occupied before runtime cleanup: ${name}`);
     }
   }
@@ -2701,7 +3235,6 @@ export async function cleanupProRuntimeHomes(
   executor: DockerExecutor = defaultDockerExecutor,
   timeout: () => number = () => 30_000,
 ): Promise<number> {
-  await proveManifestReclamationNamesAbsent(manifest, executor, timeout);
   const executions = new Set(manifest.artifacts.executions.map((execution) =>
     `${execution.taskId}\0${execution.arm}`));
   const candidates = readdirSync(tmpdir(), { withFileTypes: true })
@@ -2745,6 +3278,7 @@ export async function cleanupProRuntimeHomes(
   if (new Set(candidates.map((candidate) => candidate.runtimeNonce)).size !== candidates.length) {
     throw new Error('SWE-bench Pro session runtime nonce is not unique');
   }
+  await proveManifestReclamationNamesAbsent(manifest, executor, timeout);
   for (const candidate of candidates) {
     trustedSessionRuntimeRoot(
       candidate.runtime,
@@ -2855,9 +3389,9 @@ async function cleanRunContainers(
 ): Promise<number> {
   try {
     const runId = manifest.runId;
-    const cleanupDeadline = performance.now() + SESSION_CLEANUP_RESERVE_MS;
-    const timeout = (): number => remainingSessionOperationTimeout(cleanupDeadline);
-    const listRunIds = async (): Promise<string[]> => {
+    const listRunIds = async (
+      timeout: () => number = survivorCleanupTimeout(),
+    ): Promise<string[]> => {
       const ids = (await executor(
         ['ps', '-aq', '--no-trunc', '--filter', `label=ultracode.benchmark.run=${runId}`],
         timeout(),
@@ -2868,10 +3402,11 @@ async function cleanRunContainers(
       }
       return ids;
     };
-    const ids = await listRunIds();
+    const discoveryTimeout = survivorCleanupTimeout();
+    const ids = await listRunIds(discoveryTimeout);
     const parsed = ids.length === 0
       ? []
-      : JSON.parse(await executor(['inspect', ...ids], timeout())) as ContainerInspect[];
+      : JSON.parse(await executor(['inspect', ...ids], discoveryTimeout())) as ContainerInspect[];
     if (parsed.length !== ids.length || parsed.some((record) => typeof record.Id !== 'string'
       || !/^[a-f0-9]{64}$/.test(record.Id)
       || ids.filter((id) => record.Id === id).length !== 1)) {
@@ -2894,6 +3429,8 @@ async function cleanRunContainers(
     const policy = loadSwebenchProContainerPolicy(roots);
     const sessionExecutor: SessionDockerExecutor = (argv, _lifecycle, timeoutMs) =>
       executor(argv, timeoutMs);
+    const reclamationByName = await reclamationNamespaceSnapshot(executor, survivorCleanupTimeout());
+    const occupiedReclamationSpecs: ReclamationContainerSpec[] = [];
     for (const execution of manifest.artifacts.executions) {
       const taskDirectory = taskDirectories.get(`${execution.taskId}\0${execution.arm}`);
       const image = taskImages.get(execution.taskId);
@@ -2910,17 +3447,14 @@ async function cleanRunContainers(
         image,
         docker: manifest.suiteConfig.docker,
       };
-      const current = await inspectExactReclamationName(
-        base,
-        null,
-        policy,
-        {},
-        sessionExecutor,
-        timeout,
-      );
-      if (current !== null) {
-        await reclaimSessionOwnership({ ...current.spec, policy }, {}, sessionExecutor, timeout);
-      }
+      const record = reclamationByName.get(base.name);
+      if (record === undefined) continue;
+      const observed = compatibleReclamationSpec(record, base);
+      assertExactReclamationHelper(record, record.Id!, observed, policy);
+      occupiedReclamationSpecs.push(observed);
+    }
+    for (const observed of occupiedReclamationSpecs) {
+      await reclaimSessionOwnership({ ...observed, policy }, {}, sessionExecutor, survivorCleanupTimeout());
     }
     const owned = ownedRunContainerIds(
       parsed,
@@ -2968,7 +3502,7 @@ async function cleanRunContainers(
           {},
           sessionExecutor,
           {
-            attemptDeadline: cleanupDeadline,
+            attemptDeadline: performance.now() + SESSION_CLEANUP_RESERVE_MS,
             taskDirectory,
             artifactOwner,
             image,
@@ -2993,29 +3527,31 @@ async function cleanRunContainers(
           image,
           docker: manifest.suiteConfig.docker,
         };
+        const survivorTimeout = survivorCleanupTimeout();
         const current = await inspectExactReclamationName(
           base,
           null,
           policy,
           {},
           sessionExecutor,
-          timeout,
+          survivorTimeout,
         );
         if (current !== null) {
           await reclaimSessionOwnership({
             ...current.spec,
             policy,
-          }, {}, sessionExecutor, timeout);
+          }, {}, sessionExecutor, survivorTimeout);
         }
         continue;
       }
+      const survivorTimeout = survivorCleanupTimeout();
       let removalFailure: unknown;
       try {
-        await executor(['rm', '-f', id], timeout());
+        await executor(['rm', '-f', id], survivorTimeout());
       } catch (error) {
         removalFailure = error;
       }
-      const remaining = await listRunIds();
+      const remaining = await listRunIds(survivorTimeout);
       if (remaining.includes(id)) {
         throw ownershipUnsafeAggregate('run-owned container absence was not proven after removal', [
           removalFailure,
@@ -3027,7 +3563,7 @@ async function cleanRunContainers(
     if (remaining.length > 0) {
       throw new Error(`run-owned containers remain after cleanup: ${remaining.join(', ')}`);
     }
-    await cleanupProRuntimeHomes(manifest, executor, timeout);
+    await cleanupProRuntimeHomes(manifest, executor, survivorCleanupTimeout());
     return owned.length;
   } catch (error) {
     throw ownershipUnsafe('unsafe SWE-bench Pro run-owned cleanup', error);
@@ -3067,7 +3603,7 @@ export async function cleanCommand(options: CleanOptions, context: CommandContex
     );
     throw error;
   } finally {
-    stores.lease.release();
+    try { stores.lease.release(); } finally { stores.policyLock.release(); }
   }
 }
 

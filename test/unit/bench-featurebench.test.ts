@@ -1,5 +1,6 @@
 /** Offline FeatureBench pins, trust boundary, native commands, and evidence. */
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   cpSync,
@@ -15,12 +16,14 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { taskDisposition } from '../../bench/src/shared/failure.js';
 import { acquireBenchLock } from '../../bench/src/shared/locks.js';
 import type { FeatureBenchManifest } from '../../bench/src/shared/manifest.js';
 import { createBenchPathRoots, writePrivateJsonAtomic } from '../../bench/src/shared/paths.js';
 import { sha256Tree } from '../../bench/src/shared/provenance.js';
 import type { TaskResult } from '../../bench/src/shared/report.js';
 import type { BenchRunState, BenchRunStateStore } from '../../bench/src/shared/run-state.js';
+import type { VerifierBinding } from '../../bench/src/shared/verifier.js';
 import { featureBenchAdapter } from '../../bench/src/suites/featurebench/adapter.js';
 import {
   FEATUREBENCH_DATASET,
@@ -47,13 +50,17 @@ import {
 } from '../../bench/src/suites/featurebench/prepare.js';
 import {
   archiveFeatureBenchEvaluation,
+  assertFeatureBenchInferenceReady,
   cleanupFeatureBenchContainers,
   cleanupFeatureBenchRuntimeHomes,
   consolidateFeatureBenchPredictions,
   createFeatureBenchEvidenceResolver,
+  featureBenchEvaluatorLaunched,
   featureBenchAnalysisHook,
+  featureBenchTaskInputs,
   featureBenchPolicyLockFile,
   hasCompleteFeatureBenchReceipt,
+  hasCompleteFeatureBenchTaskReceipt,
   invalidateFeatureBenchRedo,
   inspectFeatureBenchTrustBoundary,
   planFeatureBenchEval,
@@ -202,14 +209,113 @@ function predictionRoot(
   const directory = join(runDirectory, ...root.split('/'));
   mkdirSync(directory, { recursive: true });
   writeFileSync(join(directory, 'output.jsonl'), `${Object.entries(predictions).map(([taskId, prediction]) =>
-    JSON.stringify({ instance_id: taskId, prediction })).join('\n')}\n`);
+    JSON.stringify({ instance_id: taskId, model_patch: prediction })).join('\n')}\n`);
   return root;
 }
 
 function consolidatedPredictions(runDirectory: string, path: string): Map<string, unknown> {
   return new Map(readFileSync(join(runDirectory, ...path.split('/')), 'utf8').trim().split(/\r?\n/u)
-    .map((line) => JSON.parse(line) as { instance_id: string; prediction: unknown })
-    .map((prediction) => [prediction.instance_id, prediction.prediction]));
+    .map((line) => JSON.parse(line) as { instance_id: string; model_patch: unknown })
+    .map((prediction) => [prediction.instance_id, prediction.model_patch]));
+}
+
+function acceptedPredictionSnapshot(
+  runDirectory: string,
+  invocationId: string,
+  predictions: Readonly<Record<string, unknown>>,
+): { bindings: VerifierBinding[]; state: BenchRunState } {
+  const nativeRoot = `native/${TIMESTAMP}`;
+  const path = `${nativeRoot}/consolidated-output-${invocationId}.jsonl`;
+  const file = join(runDirectory, ...path.split('/'));
+  mkdirSync(dirname(file), { recursive: true });
+  for (const directory of [
+    join(runDirectory, 'native'),
+    dirname(file),
+  ]) chmodSync(directory, 0o700);
+  const contents = `${Object.entries(predictions).map(([taskId, prediction]) =>
+    JSON.stringify({ instance_id: taskId, model_patch: prediction })).join('\n')}\n`;
+  writeFileSync(file, contents);
+  const sha256 = createHash('sha256').update(contents).digest('hex');
+  const invocationPath = `native/invocations/${invocationId}/fb-eval.json`;
+  const invocationFile = join(runDirectory, ...invocationPath.split('/'));
+  mkdirSync(dirname(invocationFile), { recursive: true });
+  const invocationContents = `${JSON.stringify({ command: 'eval', predictions: path })}\n`;
+  writeFileSync(invocationFile, invocationContents);
+  const common = { invocationId, path, sha256 };
+  return {
+    bindings: [
+      {
+        ...common,
+        scope: { kind: 'suite-check', name: 'featurebench-eval-input-b' },
+        role: 'verifier-input',
+        nativeRecordKey: 'predictions-jsonl',
+      },
+      {
+        ...common,
+        scope: { kind: 'suite-check', name: 'featurebench-accepted-predictions' },
+        role: 'completion-marker',
+        nativeRecordKey: 'accepted-predictions-jsonl',
+      },
+      {
+        invocationId,
+        path: invocationPath,
+        sha256: createHash('sha256').update(invocationContents).digest('hex'),
+        scope: { kind: 'suite-check', name: 'featurebench-eval-invocation-b' },
+        role: 'verifier-invocation',
+        nativeRecordKey: 'fb-eval-v2',
+      },
+    ],
+    state: {
+      invocations: [{ invocationId }],
+      attempts: Object.keys(predictions).map((taskId) => ({
+        invocationId,
+        taskId,
+        phase: 'verifier',
+        status: 'succeeded',
+        failures: [],
+        nativePath: nativeRoot,
+      })),
+    } as BenchRunState,
+  };
+}
+
+function completeEvaluationBindings(
+  runDirectory: string,
+  bindings: readonly VerifierBinding[],
+): VerifierBinding[] {
+  const template = bindings.find((binding) => binding.role === 'run-metadata');
+  if (template === undefined) throw new Error('test evidence is missing run metadata');
+  const invocationRoot = `native/invocations/${template.invocationId}`;
+  const nativeRoot = dirname(template.path);
+  mkdirSync(join(runDirectory, ...invocationRoot.split('/')), { recursive: true });
+  const artifacts = [
+    {
+      path: `${nativeRoot}/consolidated-output-${template.invocationId}.jsonl`,
+      contents: '{"instance_id":"accepted"}\n',
+      scope: { kind: 'suite-check' as const, name: 'featurebench-eval-input-b' },
+      role: 'verifier-input' as const,
+      nativeRecordKey: 'predictions-jsonl',
+    },
+    {
+      path: `${invocationRoot}/fb-eval.json`,
+      contents: '{"command":"eval"}\n',
+      scope: { kind: 'suite-check' as const, name: 'featurebench-eval-invocation-b' },
+      role: 'verifier-invocation' as const,
+      nativeRecordKey: 'fb-eval-v2',
+    },
+  ];
+  for (const artifact of artifacts) writeFileSync(
+    join(runDirectory, ...artifact.path.split('/')),
+    artifact.contents,
+  );
+  return [
+    ...bindings,
+    ...artifacts.map(({ contents, ...artifact }) => ({
+      invocationId: template.invocationId,
+      ...artifact,
+      sha256: createHash('sha256').update(contents).digest('hex'),
+    })),
+  ];
 }
 
 describe('FeatureBench immutable inputs and host policy', () => {
@@ -802,27 +908,281 @@ describe('FeatureBench resume and redo assembly', () => {
     expect(readFileSync(markdownReport, 'utf8')).toBe('existing report');
   });
 
+  it('keeps untouched accepted tasks included when an alpha-only redo fails before evaluation', async () => {
+    const selectedTaskIds = ['task-alpha', 'task-beta', 'task-gamma'];
+    const runId = 'feature-target-redo';
+    const acceptedInvocation = '00000000-0000-4000-8000-000000000031';
+    const redoInvocation = '00000000-0000-4000-8000-000000000032';
+    const roots = createBenchPathRoots(temporary());
+    const runDirectory = join(roots.resultsRoot, 'featurebench', runId);
+    const nativeRoot = `native/${TIMESTAMP}`;
+    const nativeDirectory = join(runDirectory, ...nativeRoot.split('/'));
+    mkdirSync(dirname(nativeDirectory), { recursive: true });
+    cpSync(FIXTURE, nativeDirectory, { recursive: true });
+    rmSync(join(nativeDirectory, 'README.md'));
+    writeFileSync(join(nativeDirectory, 'run_metadata.json'), JSON.stringify({ task_ids: selectedTaskIds }));
+    writeFileSync(join(nativeDirectory, 'output.jsonl'), `${selectedTaskIds.map((taskId) =>
+      JSON.stringify({ instance_id: taskId, model_patch: '' })).join('\n')}\n`);
+    const aggregateFile = join(nativeDirectory, 'report.json');
+    const aggregate = JSON.parse(readFileSync(aggregateFile, 'utf8')) as {
+      attempt_1: Record<string, unknown> & { submitted_ids: string[]; completed_ids: string[] };
+    };
+    Object.assign(aggregate.attempt_1, {
+      total_instances: 3,
+      submitted_instances: 3,
+      completed_instances: 3,
+      resolved_instances: 3,
+      unresolved_instances: 0,
+      resolved_rate: 1,
+      pass_rate: 1,
+      submitted_ids: aggregate.attempt_1.submitted_ids.slice(0, 3),
+      completed_ids: aggregate.attempt_1.completed_ids.slice(0, 3),
+    });
+    writeFileSync(aggregateFile, JSON.stringify(aggregate));
+    const indexed = indexFeatureBenchEvidence(
+      runDirectory,
+      nativeRoot,
+      selectedTaskIds,
+      'b',
+      acceptedInvocation,
+    );
+    let receiptBindings = completeEvaluationBindings(runDirectory, indexed.bindings);
+    let receiptRevision = 0;
+    const receipt = {
+      load() { return { revision: receiptRevision, bindings: receiptBindings }; },
+      async update(
+        expectedRevision: number,
+        mutate: (bindings: readonly VerifierBinding[]) => readonly VerifierBinding[],
+      ) {
+        expect(expectedRevision).toBe(receiptRevision);
+        receiptBindings = [...mutate(receiptBindings)];
+        receiptRevision += 1;
+      },
+    } as never;
+    const acceptedAt = '2026-07-19T13:00:41.000Z';
+    const acceptedAttempt = (taskId: string, phase: 'inference' | 'verifier') => ({
+      attemptId: `${phase === 'inference' ? '10000000' : '20000000'}-0000-4000-8000-${taskId.endsWith('alpha')
+        ? '000000000001' : taskId.endsWith('beta') ? '000000000002' : '000000000003'}`,
+      invocationId: acceptedInvocation,
+      taskId,
+      arm: 'b' as const,
+      ordinal: 1,
+      phase,
+      startedAt: acceptedAt,
+      endedAt: acceptedAt,
+      elapsedMs: 0,
+      nativePath: nativeRoot,
+      exitCode: 0,
+      signal: null,
+      status: 'succeeded' as const,
+      failures: [],
+      annotations: [],
+    });
+    let state = {
+      attempts: selectedTaskIds.flatMap((taskId) => [
+        acceptedAttempt(taskId, 'inference'),
+        acceptedAttempt(taskId, 'verifier'),
+      ]),
+    } as BenchRunState;
+    const stateStore = {
+      async updateCurrent(update: (current: BenchRunState) => BenchRunState) {
+        state = update(state);
+        return state;
+      },
+    } as unknown as BenchRunStateStore;
+    const redoManifest = {
+      ...manifest(),
+      runId,
+      experiment: { ...manifest().experiment, taskIds: selectedTaskIds },
+      artifacts: {
+        executions: selectedTaskIds.map((taskId) => ({ taskId, arm: 'b', nativeRoot })),
+      },
+    } as FeatureBenchManifest;
+    const acceptedBytes = new Map([...new Set(receiptBindings.map((binding) =>
+      join(runDirectory, ...binding.path.split('/'))))]
+      .map((path) => [path, readFileSync(path, 'utf8')]));
+
+    await invalidateFeatureBenchRedo(
+      roots,
+      redoManifest,
+      new Set(['task-alpha']),
+      nativeRoot,
+      receipt,
+      stateStore,
+      redoInvocation,
+      new Date('2026-07-20T00:00:00.000Z'),
+    );
+    await recordFeatureBenchBatchAttempts(
+      stateStore,
+      redoInvocation,
+      ['task-alpha'],
+      'b',
+      'inference',
+      new Date('2026-07-20T00:00:01.000Z'),
+      new Date('2026-07-20T00:00:02.000Z'),
+      1_000,
+      'native/2026-07-20__00-00-01',
+      'native-runner-failed',
+    );
+
+    expect(state.attempts.filter((attempt) =>
+      attempt.invocationId === redoInvocation && attempt.phase === 'verifier')).toEqual([]);
+    expect(receiptBindings.some((binding) => binding.role === 'aggregate-report')).toBe(false);
+    expect(receiptBindings.some((binding) => binding.scope.kind === 'task-arm'
+      && binding.scope.taskId === 'task-alpha')).toBe(false);
+    expect(receiptBindings.some((binding) => binding.scope.kind === 'task-arm'
+      && binding.scope.taskId === 'task-beta')).toBe(true);
+    for (const [path, bytes] of acceptedBytes) expect(readFileSync(path, 'utf8')).toBe(bytes);
+
+    const resolver = createFeatureBenchEvidenceResolver(
+      runDirectory,
+      redoManifest,
+      state,
+      receiptBindings,
+    );
+    const inputs = featureBenchTaskInputs(redoManifest, state, receiptBindings, resolver);
+    expect(new Map(inputs.map((input) => [
+      input.taskId,
+      taskDisposition(input.nativeVerifier, input.failures, input.attemptRunning),
+    ]))).toEqual(new Map([
+      ['task-alpha', 'infrastructure-excluded'],
+      ['task-beta', 'included-native'],
+      ['task-gamma', 'included-native'],
+    ]));
+    expect(resolver.aggregate).toBeNull();
+  });
+
+  it('requires every redo target from the new root while sourcing only untouched tasks from history', () => {
+    const runDirectory = temporary();
+    const accepted = acceptedPredictionSnapshot(runDirectory, '00000000-0000-4000-8000-000000000021', {
+      'task-alpha': 'original-alpha',
+      'task-beta': 'original-beta',
+      'task-gamma': 'original-gamma',
+    });
+    const current = predictionRoot(runDirectory, '2026-07-19__13-00-42', {
+      'task-alpha': 'redo-alpha',
+      'task-beta': 'redo-beta',
+    });
+    const path = consolidateFeatureBenchPredictions(
+      runDirectory,
+      accepted.state,
+      accepted.bindings,
+      current,
+      '00000000-0000-4000-8000-000000000022',
+      ['task-alpha', 'task-beta', 'task-gamma'],
+      new Set(['task-alpha', 'task-beta']),
+    );
+    expect(dirname(path)).toBe(current);
+    expect(consolidatedPredictions(runDirectory, path)).toEqual(new Map([
+      ['task-alpha', 'redo-alpha'],
+      ['task-beta', 'redo-beta'],
+      ['task-gamma', 'original-gamma'],
+    ]));
+  });
+
+  it.each([
+    { name: 'missing file', contents: null, error: /current inference output is missing/ },
+    {
+      name: 'absent rows',
+      contents: '',
+      error: /current inference output is partial; missing task-alpha, task-beta/,
+    },
+    { name: 'malformed row', contents: 'not-json\n', error: /current inference output is malformed at line 1/ },
+    {
+      name: 'wrong task id',
+      contents: [
+        { instance_id: 'task-alpha', model_patch: 'redo-alpha' },
+        { instance_id: 'task-beta', model_patch: 'redo-beta' },
+        { instance_id: 'task-gamma', model_patch: 'wrong-root' },
+      ].map((value) => JSON.stringify(value)).join('\n'),
+      error: /current inference output has wrong task id at line 3: task-gamma/,
+    },
+    {
+      name: 'partial multi-target output',
+      contents: `${JSON.stringify({ instance_id: 'task-alpha', model_patch: 'redo-alpha' })}\n`,
+      error: /current inference output is partial; missing task-beta/,
+    },
+    {
+      name: 'prediction without a patch',
+      contents: `${JSON.stringify({ instance_id: 'task-alpha' })}\n`,
+      error: /current inference output is malformed at line 1/,
+    },
+  ])('rejects $name before publishing verifier input or invoking the evaluator', async ({ contents, error }) => {
+    const runDirectory = temporary();
+    const original = predictionRoot(runDirectory, '2026-07-19__13-00-41', {
+      'task-alpha': 'original-alpha',
+      'task-beta': 'original-beta',
+      'task-gamma': 'original-gamma',
+    });
+    const current = 'native/2026-07-19__13-00-42';
+    const currentDirectory = join(runDirectory, ...current.split('/'));
+    mkdirSync(currentDirectory, { recursive: true });
+    if (contents !== null) writeFileSync(join(currentDirectory, 'output.jsonl'), contents);
+    const state = {
+      invocations: [],
+      attempts: [original, current].map((nativePath) => ({ phase: 'inference', nativePath })),
+    } as BenchRunState;
+    let verifierReceiptPublications = 0;
+    let evaluatorInvocations = 0;
+    const evaluate = async (): Promise<void> => {
+      consolidateFeatureBenchPredictions(
+        runDirectory,
+        state,
+        [],
+        current,
+        '00000000-0000-4000-8000-000000000023',
+        ['task-alpha', 'task-beta', 'task-gamma'],
+        new Set(['task-alpha', 'task-beta']),
+      );
+      verifierReceiptPublications += 1;
+      evaluatorInvocations += 1;
+    };
+
+    await expect(evaluate()).rejects.toThrow(error);
+    expect(verifierReceiptPublications).toBe(0);
+    expect(evaluatorInvocations).toBe(0);
+    expect(existsSync(join(currentDirectory,
+      'consolidated-output-00000000-0000-4000-8000-000000000023.jsonl'))).toBe(false);
+  });
+
+  it.each([
+    'native-runner-failed',
+    'driver-watchdog',
+    'descendant-cleanup-failed',
+  ] as const)('blocks verifier preparation after %s even when inference wrote complete output', (failure) => {
+    const runDirectory = temporary();
+    const current = predictionRoot(runDirectory, '2026-07-19__13-00-45', {
+      'task-alpha': 'alpha', 'task-beta': 'beta', 'task-gamma': 'gamma',
+    });
+    let verifierPreparations = 0;
+    expect(() => {
+      assertFeatureBenchInferenceReady(current, failure);
+      verifierPreparations += 1;
+    }).toThrow(`FeatureBench inference failed: ${failure}`);
+    expect(verifierPreparations).toBe(0);
+  });
+
+  it('does not treat a pid-less spawn callback as evaluator launch', () => {
+    expect(featureBenchEvaluatorLaunched(null)).toBe(false);
+    expect(featureBenchEvaluatorLaunched(12_345)).toBe(true);
+  });
+
   it('keeps redo predictions on a subsequent ordinary resume', () => {
     const runDirectory = temporary();
     const original = predictionRoot(runDirectory, '2026-07-19__13-00-41', {
       'task-alpha': 'original-alpha',
       'task-beta': 'original-beta',
     });
-    const redo = predictionRoot(runDirectory, '2026-07-19__13-00-42', {
-      'task-alpha': 'redo-alpha',
+    const accepted = acceptedPredictionSnapshot(runDirectory, '00000000-0000-4000-8000-000000000024', {
+      'task-alpha': 'redo-alpha', 'task-beta': 'original-beta',
     });
-    const state = {
-      attempts: [
-        { phase: 'inference', nativePath: original },
-        { phase: 'inference', nativePath: redo },
-        { phase: 'inference', nativePath: original },
-      ],
-    } as BenchRunState;
 
     const path = consolidateFeatureBenchPredictions(
       runDirectory,
-      state,
+      accepted.state,
+      accepted.bindings,
       original,
+      '00000000-0000-4000-8000-000000000025',
       ['task-alpha', 'task-beta'],
     );
     expect(consolidatedPredictions(runDirectory, path)).toEqual(new Map([
@@ -831,33 +1191,33 @@ describe('FeatureBench resume and redo assembly', () => {
     ]));
   });
 
-  it('uses the newest persisted prediction across multiple redo roots', () => {
+  it('sources history only from the newest accepted invocation snapshot', () => {
     const runDirectory = temporary();
-    const original = predictionRoot(runDirectory, '2026-07-19__13-00-41', {
-      'task-alpha': 'original-alpha',
-      'task-beta': 'original-beta',
-      'task-gamma': 'original-gamma',
+    const first = acceptedPredictionSnapshot(runDirectory, '00000000-0000-4000-8000-000000000026', {
+      'task-alpha': 'original-alpha', 'task-beta': 'original-beta', 'task-gamma': 'original-gamma',
     });
-    const firstRedo = predictionRoot(runDirectory, '2026-07-19__13-00-42', {
-      'task-alpha': 'first-redo-alpha',
+    const latest = acceptedPredictionSnapshot(runDirectory, '00000000-0000-4000-8000-000000000027', {
+      'task-alpha': 'latest-redo-alpha', 'task-beta': 'second-redo-beta', 'task-gamma': 'original-gamma',
     });
-    const secondRedo = predictionRoot(runDirectory, '2026-07-19__13-00-43', {
-      'task-beta': 'second-redo-beta',
-    });
-    const latestRedo = predictionRoot(runDirectory, '2026-07-19__13-00-44', {
-      'task-alpha': 'latest-redo-alpha',
+    const rejected = predictionRoot(runDirectory, '2026-07-19__13-00-44', {
+      'task-alpha': 'rejected-alpha', 'task-delta': 'rejected-delta',
     });
     const state = {
-      attempts: [original, firstRedo, secondRedo, latestRedo].map((nativePath) => ({
-        phase: 'inference',
-        nativePath,
-      })),
+      invocations: [...first.state.invocations, ...latest.state.invocations],
+      attempts: [
+        ...first.state.attempts,
+        { invocationId: '00000000-0000-4000-8000-000000000028', phase: 'inference', nativePath: rejected,
+          status: 'failed', failures: ['native-runner-failed'] },
+        ...latest.state.attempts,
+      ],
     } as BenchRunState;
 
     const path = consolidateFeatureBenchPredictions(
       runDirectory,
       state,
-      latestRedo,
+      [...first.bindings, ...latest.bindings],
+      rejected,
+      '00000000-0000-4000-8000-000000000029',
       ['task-alpha', 'task-beta', 'task-gamma'],
     );
     expect(consolidatedPredictions(runDirectory, path)).toEqual(new Map([
@@ -865,6 +1225,78 @@ describe('FeatureBench resume and redo assembly', () => {
       ['task-beta', 'second-redo-beta'],
       ['task-gamma', 'original-gamma'],
     ]));
+  });
+
+  it('rejects an accepted prediction snapshot outside its verifier timestamp root', () => {
+    const runDirectory = temporary();
+    const accepted = acceptedPredictionSnapshot(runDirectory, '00000000-0000-4000-8000-000000000033', {
+      'task-alpha': 'original-alpha', 'task-beta': 'original-beta',
+    });
+    const input = accepted.bindings.find((binding) => binding.role === 'verifier-input')!;
+    const wrongRoot = 'native/2026-07-19__13-00-43';
+    const wrongPath = `${wrongRoot}/consolidated-output-${input.invocationId}.jsonl`;
+    mkdirSync(join(runDirectory, ...wrongRoot.split('/')), { recursive: true });
+    renameSync(
+      join(runDirectory, ...input.path.split('/')),
+      join(runDirectory, ...wrongPath.split('/')),
+    );
+    const bindings = accepted.bindings.map((binding) =>
+      binding.path === input.path ? { ...binding, path: wrongPath } : binding);
+    const current = predictionRoot(runDirectory, '2026-07-19__13-00-42', {
+      'task-alpha': 'redo-alpha',
+    });
+
+    expect(() => consolidateFeatureBenchPredictions(
+      runDirectory,
+      accepted.state,
+      bindings,
+      current,
+      '00000000-0000-4000-8000-000000000034',
+      ['task-alpha', 'task-beta'],
+      new Set(['task-alpha']),
+    )).toThrow(/cannot build complete FeatureBench verifier input; missing task-beta/);
+  });
+
+  it.each([
+    { name: 'prediction input', role: 'verifier-input' },
+    { name: 'evaluation invocation', role: 'verifier-invocation' },
+  ] as const)('rejects a later-mutated accepted $name', ({ role }) => {
+    const runDirectory = temporary();
+    const accepted = acceptedPredictionSnapshot(runDirectory, '00000000-0000-4000-8000-000000000035', {
+      'task-alpha': 'original-alpha', 'task-beta': 'original-beta',
+    });
+    const binding = accepted.bindings.find((candidate) => candidate.role === role)!;
+    writeFileSync(join(runDirectory, ...binding.path.split('/')), 'mutated\n');
+
+    expect(() => consolidateFeatureBenchPredictions(
+      runDirectory,
+      accepted.state,
+      accepted.bindings,
+      `native/${TIMESTAMP}`,
+      '00000000-0000-4000-8000-000000000036',
+      ['task-alpha', 'task-beta'],
+    )).toThrow(/accepted FeatureBench verifier (?:input|invocation) changed after receipt binding/);
+  });
+
+  it('does not accept a snapshot backed by only one successful task attempt', () => {
+    const runDirectory = temporary();
+    const accepted = acceptedPredictionSnapshot(runDirectory, '00000000-0000-4000-8000-000000000037', {
+      'task-alpha': 'original-alpha', 'task-beta': 'original-beta',
+    });
+    accepted.state.attempts.splice(1);
+    const current = predictionRoot(runDirectory, '2026-07-19__13-00-42', {
+      'task-alpha': 'redo-alpha',
+    });
+
+    expect(() => consolidateFeatureBenchPredictions(
+      runDirectory,
+      accepted.state,
+      accepted.bindings,
+      current,
+      '00000000-0000-4000-8000-000000000038',
+      ['task-alpha', 'task-beta'],
+      new Set(['task-alpha']),
+    )).toThrow(/cannot build complete FeatureBench verifier input; missing task-beta/);
   });
 
   it('shares one timing group per redo and resume batch process', async () => {
@@ -956,25 +1388,89 @@ describe('FeatureBench official verifier evidence', () => {
     expect(evidence.aggregate).toMatchObject({
       passRate: 0.951, resolvedRate: 0.8, completedTasks: 5, requestedTasks: 5,
     });
-    const template = evidence.bindings[0]!;
-    const complete = [...evidence.bindings, ...['verifier-input', 'verifier-invocation'].map((role) => ({
-      ...template,
-      role,
-      scope: { kind: 'suite-check', name: role },
-      nativeRecordKey: role,
-    }))];
+    const complete = completeEvaluationBindings(runDirectory, evidence.bindings);
+    expect(hasCompleteFeatureBenchTaskReceipt(
+      complete,
+      '00000000-0000-4000-8000-000000000001',
+      'task-alpha',
+      'b',
+    )).toBe(true);
+    const withoutAggregate = complete.filter((binding) => binding.role !== 'aggregate-report');
+    expect(hasCompleteFeatureBenchTaskReceipt(
+      withoutAggregate,
+      '00000000-0000-4000-8000-000000000001',
+      'task-alpha',
+      'b',
+    )).toBe(true);
     expect(hasCompleteFeatureBenchReceipt(
-      complete as never,
+      withoutAggregate,
+      '00000000-0000-4000-8000-000000000001',
+      TASK_IDS,
+      'b',
+    )).toBe(false);
+    expect(hasCompleteFeatureBenchReceipt(
+      complete,
       '00000000-0000-4000-8000-000000000001',
       TASK_IDS,
       'b',
     )).toBe(true);
     expect(hasCompleteFeatureBenchReceipt(
-      complete.filter((binding) => binding.role !== 'completion-marker') as never,
+      complete.filter((binding) => binding.role !== 'completion-marker'),
       '00000000-0000-4000-8000-000000000001',
       TASK_IDS,
       'b',
     )).toBe(false);
+    expect(hasCompleteFeatureBenchTaskReceipt(
+      complete.map((binding) => binding.role === 'run-metadata'
+        ? { ...binding, path: 'native/2026-07-19__13-00-42/run_metadata.json' }
+        : binding),
+      '00000000-0000-4000-8000-000000000001',
+      'task-alpha',
+      'b',
+    )).toBe(false);
+    expect(hasCompleteFeatureBenchTaskReceipt(
+      complete.map((binding) => binding.role === 'verifier-input'
+        ? {
+            ...binding,
+            path: `native/2026-07-19__13-00-42/consolidated-output-${binding.invocationId}.jsonl`,
+          }
+        : binding),
+      '00000000-0000-4000-8000-000000000001',
+      'task-alpha',
+      'b',
+    )).toBe(false);
+  });
+
+  it.each([
+    { name: 'run metadata', role: 'run-metadata' },
+    { name: 'rollout output', role: 'rollout-output' },
+    { name: 'evaluation input', role: 'verifier-input' },
+    { name: 'evaluation invocation', role: 'verifier-invocation' },
+  ] as const)('rejects task and aggregate evidence after $name bytes drift', ({ role }) => {
+    const runDirectory = nativeFixture();
+    const invocationId = '00000000-0000-4000-8000-000000000006';
+    const bindings = completeEvaluationBindings(runDirectory, indexFeatureBenchEvidence(
+      runDirectory,
+      `native/${TIMESTAMP}`,
+      TASK_IDS,
+      'b',
+      invocationId,
+    ).bindings);
+    const binding = bindings.find((candidate) => candidate.role === role)!;
+    writeFileSync(join(runDirectory, ...binding.path.split('/')), 'mutated\n');
+    const state = {
+      attempts: TASK_IDS.map((taskId) => ({
+        invocationId,
+        taskId,
+        phase: 'verifier',
+        nativePath: `native/${TIMESTAMP}`,
+      })),
+    } as BenchRunState;
+
+    const resolver = createFeatureBenchEvidenceResolver(runDirectory, manifest(), state, bindings);
+    expect(TASK_IDS.map((taskId) => resolver.taskResults.get(taskId)?.verification))
+      .toEqual(TASK_IDS.map(() => 'unverified'));
+    expect(resolver.aggregate).toBeNull();
   });
 
   it('keeps valid per-task evidence but rejects an inconsistent run aggregate', () => {
@@ -999,13 +1495,13 @@ describe('FeatureBench official verifier evidence', () => {
       join(runDirectory, 'native', latestTimestamp),
       { recursive: true },
     );
-    const older = indexFeatureBenchEvidence(
+    const older = completeEvaluationBindings(runDirectory, indexFeatureBenchEvidence(
       runDirectory, `native/${TIMESTAMP}`, TASK_IDS, 'b', '00000000-0000-4000-8000-000000000020',
-    );
-    const latest = indexFeatureBenchEvidence(
+    ).bindings);
+    const latest = completeEvaluationBindings(runDirectory, indexFeatureBenchEvidence(
       runDirectory, `native/${latestTimestamp}`, TASK_IDS, 'b', '00000000-0000-4000-8000-000000000021',
-    );
-    const latestWithoutAlpha = latest.bindings.filter((binding) =>
+    ).bindings);
+    const latestWithoutAlpha = latest.filter((binding) =>
       binding.scope.kind !== 'task-arm' || binding.scope.taskId !== 'task-alpha');
     const state = {
       attempts: [
@@ -1027,7 +1523,7 @@ describe('FeatureBench official verifier evidence', () => {
       runDirectory,
       manifest(),
       state,
-      [...older.bindings, ...latestWithoutAlpha],
+      [...older, ...latestWithoutAlpha],
       indexer,
     );
     expect(indexedRoots).toEqual([`native/${latestTimestamp}`, `native/${TIMESTAMP}`]);
@@ -1041,7 +1537,7 @@ describe('FeatureBench official verifier evidence', () => {
       runDirectory,
       manifest(),
       state,
-      [...older.bindings, ...latestWithoutAlpha],
+      [...older, ...latestWithoutAlpha],
       indexer,
     );
     expect(indexedRoots).toHaveLength(4);
@@ -1077,6 +1573,43 @@ describe('FeatureBench official verifier evidence', () => {
       'task-alpha',
       'attempt-1',
       'report.json',
+    ))).toBe(false);
+  });
+
+  it('leaves prior verifier evidence in place when archival preflight fails', () => {
+    const runDirectory = nativeFixture();
+    const invocationId = '00000000-0000-4000-8000-000000000005';
+    const blocker = join(
+      runDirectory,
+      'native',
+      'invocations',
+      invocationId,
+      'prior-eval',
+      'eval_outputs',
+      'task-alpha',
+      'attempt-1',
+      'report.json',
+    );
+    mkdirSync(dirname(blocker), { recursive: true });
+    let privateDirectory = join(runDirectory, 'native');
+    chmodSync(privateDirectory, 0o700);
+    for (const component of [
+      'invocations', invocationId, 'prior-eval', 'eval_outputs', 'task-alpha', 'attempt-1',
+    ]) {
+      privateDirectory = join(privateDirectory, component);
+      chmodSync(privateDirectory, 0o700);
+    }
+    writeFileSync(blocker, 'occupied');
+
+    expect(() => archiveFeatureBenchEvaluation(
+      runDirectory, `native/${TIMESTAMP}`, TASK_IDS, invocationId,
+    )).toThrow(/archive target already exists/);
+    expect(existsSync(join(runDirectory, 'native', TIMESTAMP, 'report.json'))).toBe(true);
+    expect(existsSync(join(
+      runDirectory, 'native', TIMESTAMP, 'eval_outputs', 'task-alpha', 'attempt-1', 'report.json',
+    ))).toBe(true);
+    expect(existsSync(join(
+      runDirectory, 'native', 'invocations', invocationId, 'prior-eval', 'report.json',
     ))).toBe(false);
   });
 

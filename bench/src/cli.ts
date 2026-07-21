@@ -14,6 +14,11 @@ export type BenchCliRoute =
 
 type AsyncCleanup = () => Promise<unknown>;
 
+interface SingleFlightCleanup {
+  run: AsyncCleanup;
+  pending(): Promise<unknown> | null;
+}
+
 export interface BenchExecutableDependencies {
   /** Root process-registry cleanup, replaceable only by offline boundary tests. */
   cleanupActiveProcesses?: AsyncCleanup;
@@ -130,22 +135,27 @@ function commandHelp(suite: BenchSuite, command: string, registry: SuiteRegistry
   return `${lines.join('\n')}\n`;
 }
 
-function singleFlightAsync(cleanup: AsyncCleanup): AsyncCleanup {
+function singleFlightAsync(cleanup: AsyncCleanup): SingleFlightCleanup {
   let pending: Promise<unknown> | null = null;
-  return () => {
-    pending ??= Promise.resolve().then(cleanup).finally(() => { pending = null; });
-    return pending;
+  return {
+    run: () => {
+      pending ??= Promise.resolve().then(cleanup).finally(() => { pending = null; });
+      return pending;
+    },
+    pending: () => pending,
   };
 }
 
 function installSignalCoordinator(
   cleanupActiveProcesses: AsyncCleanup,
-  selectedSuiteCleanup: () => AsyncCleanup | undefined,
+  selectedSuiteCleanup: () => SingleFlightCleanup | undefined,
   timeoutMs: number,
   resendSignal: (signal: NodeJS.Signals) => void,
 ): BenchSignalCoordinator {
   if (activeSignalCoordinator !== null) return activeSignalCoordinator;
   let signalCleanup: Promise<void> | null = null;
+  let finishBoundedCleanup: (() => void) | null = null;
+  let forcedResend = false;
   let installed = true;
   const remove = (): void => {
     if (!installed) return;
@@ -160,25 +170,41 @@ function installSignalCoordinator(
   };
   const handle = (signal: NodeJS.Signals): void => {
     if (signalCleanup !== null) {
+      forcedResend = true;
+      finishBoundedCleanup?.();
       resend(signal);
       return;
     }
     const suiteCleanup = selectedSuiteCleanup();
+    const adoptedSuiteCleanup = suiteCleanup?.pending() ?? null;
     const cleanup = async (): Promise<void> => {
       await Promise.allSettled([cleanupActiveProcesses()]);
-      await Promise.allSettled([suiteCleanup?.() ?? Promise.resolve()]);
+      await Promise.allSettled([adoptedSuiteCleanup ?? suiteCleanup?.run() ?? Promise.resolve()]);
       await Promise.allSettled([cleanupActiveProcesses()]);
-      await Promise.allSettled([suiteCleanup?.() ?? Promise.resolve()]);
+      await Promise.allSettled([suiteCleanup?.run() ?? Promise.resolve()]);
     };
+    let resolveBoundedCleanup!: () => void;
     const boundedCleanup = new Promise<void>((resolvePromise) => {
-      const timer = setTimeout(resolvePromise, timeoutMs);
-      timer.unref();
-      void cleanup().finally(() => {
-        clearTimeout(timer);
-        resolvePromise();
-      });
+      resolveBoundedCleanup = resolvePromise;
     });
-    signalCleanup = boundedCleanup.then(() => { resend(signal); });
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let boundedCleanupFinished = false;
+    const finish = (): void => {
+      if (boundedCleanupFinished) return;
+      boundedCleanupFinished = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      finishBoundedCleanup = null;
+      resolveBoundedCleanup();
+    };
+    finishBoundedCleanup = finish;
+    signalCleanup = boundedCleanup.then(() => {
+      if (!forcedResend) resend(signal);
+    });
+    timer = setTimeout(finish, timeoutMs);
+    void cleanup().finally(finish);
   };
   const onSigint = (): void => handle('SIGINT');
   const onSigterm = (): void => handle('SIGTERM');
@@ -200,6 +226,7 @@ async function dispatchBenchCliRoute(
   registry: SuiteRegistry,
   context: CommandContext,
   cleanup?: AsyncCleanup,
+  cleanupOwnedElsewhere: () => boolean = () => false,
 ): Promise<void> {
   if (route.kind === 'root-help') {
     context.stdout.write(`${BENCH_USAGE}\n`);
@@ -221,7 +248,7 @@ async function dispatchBenchCliRoute(
   try {
     await spec.run(options, context);
   } catch (error) {
-    if (cleanup !== undefined) {
+    if (cleanup !== undefined && !cleanupOwnedElsewhere()) {
       try {
         await cleanup();
       } catch (cleanupError) {
@@ -265,16 +292,16 @@ export async function runBenchExecutable(
   },
   dependencies: BenchExecutableDependencies = {},
 ): Promise<void> {
-  const cleanupActiveProcesses = singleFlightAsync(
+  const activeProcessCleanup = singleFlightAsync(
     dependencies.cleanupActiveProcesses ?? cleanupActiveBenchProcesses,
   );
-  let selectedSuiteCleanup: AsyncCleanup | undefined;
+  let selectedSuiteCleanup: SingleFlightCleanup | undefined;
   const signalCleanupTimeoutMs = dependencies.signalCleanupTimeoutMs ?? 30_000;
   if (!Number.isSafeInteger(signalCleanupTimeoutMs) || signalCleanupTimeoutMs <= 0) {
     throw new Error('signal cleanup timeout must be a positive safe integer');
   }
   const coordinator = installSignalCoordinator(
-    cleanupActiveProcesses,
+    activeProcessCleanup.run,
     () => selectedSuiteCleanup,
     signalCleanupTimeoutMs,
     dependencies.resendSignal ?? ((signal) => { process.kill(process.pid, signal); }),
@@ -283,13 +310,19 @@ export async function runBenchExecutable(
     const route = parseBenchCliRoute(argv, registry);
     const cleanup = 'suite' in route ? registry.get(route.suite).cleanup : undefined;
     selectedSuiteCleanup = cleanup === undefined ? undefined : singleFlightAsync(cleanup);
-    await dispatchBenchCliRoute(route, registry, context, selectedSuiteCleanup);
+    await dispatchBenchCliRoute(
+      route,
+      registry,
+      context,
+      selectedSuiteCleanup?.run,
+      coordinator.signalReceived,
+    );
   } catch (error) {
     if (coordinator.signalReceived()) {
       await coordinator.waitForSignalCleanup();
       return;
     }
-    try { await cleanupActiveProcesses(); } catch { /* terminal diagnostic remains singular */ }
+    try { await activeProcessCleanup.run(); } catch { /* terminal diagnostic remains singular */ }
     const message = sanitizeDiagnostic(error instanceof Error ? error.message : String(error));
     context.stderr.write(`bench: ${message.replace(/[\r\n]+/g, ' ').trim() || 'benchmark command failed'}\n`);
     process.exitCode = 1;

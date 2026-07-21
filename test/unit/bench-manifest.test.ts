@@ -1,4 +1,5 @@
-/** Strict v2 discriminated manifest and resume-equality coverage. */
+/** Strict suite-versioned manifest and resume-equality coverage. */
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +8,7 @@ import {
   assertManifestResumeEquality,
   loadBenchRunManifest,
   parseBenchRunManifest,
+  serializeBenchRunManifest,
   writeBenchRunManifest,
 } from '../../bench/src/shared/manifest.js';
 import {
@@ -27,6 +29,16 @@ const REVISION = 'b'.repeat(40);
 const TASK = 'task-one';
 const KEY = artifactKey(TASK);
 const roots: string[] = [];
+const MODEL_TRANSPORT = {
+  mechanism: 'attested-model-relay',
+  contractSha256: HASH,
+  relayIdentitySha256: HASH,
+  relayVersionSha256: HASH,
+  fixedDestinationSha256: HASH,
+  modelSha256: createHash('sha256').update('gpt-test', 'utf8').digest('hex'),
+  relayRuntimeSha256: HASH,
+  topologySha256: HASH,
+};
 
 const temporary = (): string => {
   const root = mkdtempSync(join(tmpdir(), 'uc-bench-manifest-'));
@@ -119,6 +131,8 @@ function common(): Record<string, unknown> {
 function proManifest(): Record<string, unknown> {
   const row = { instance_id: TASK, base_commit: REVISION };
   const base = common();
+  base.schemaVersion = 3;
+  (base.provenance as { tasks: unknown[]; modelTransport?: unknown }).modelTransport = MODEL_TRANSPORT;
   (base.provenance as { tasks: unknown[] }).tasks = [{
     taskId: TASK,
     sourceSha256: sha256CanonicalJson(row),
@@ -149,7 +163,7 @@ function proManifest(): Record<string, unknown> {
       selection: { mode: 'explicit', seed: null, count: 1, stratifyBy: null, requestedTaskIds: [TASK] },
       instances: [{ taskId: TASK, row, rowSha256: sha256CanonicalJson(row) }],
       armOrder: [{ taskId: TASK, arms: ['b', 'a'] }],
-      auth: { mechanism: 'chatgpt', publicIdentitySha256: HASH },
+      modelTransport: MODEL_TRANSPORT,
       policies: {
         sessionSha256: HASH,
         historySha256: HASH,
@@ -227,13 +241,24 @@ function featureManifest(): Record<string, unknown> {
   };
 }
 
-describe('strict v2 manifest validation', () => {
+describe('strict suite-versioned manifest validation', () => {
   it('accepts all three suite discriminants with one common envelope', () => {
     expect(parseBenchRunManifest(proManifest()).suite).toBe('swebench-pro');
     const marathon = parseBenchRunManifest(marathonManifest());
     expect(marathon.suite).toBe('swe-marathon');
     expect(marathon.limits.hostVerifierTimeoutMs).toBeNull();
     expect(parseBenchRunManifest(featureManifest()).suite).toBe('featurebench');
+  });
+
+  it('rejects legacy Pro v2 with an explicit transition diagnostic and round-trips v3', () => {
+    const current = proManifest();
+    const legacy = structuredClone(current);
+    legacy.schemaVersion = 2;
+    const suiteConfig = legacy.suiteConfig as Record<string, unknown>;
+    delete suiteConfig.modelTransport;
+    suiteConfig.auth = { mechanism: 'chatgpt', publicIdentitySha256: HASH };
+    expect(() => parseBenchRunManifest(legacy)).toThrow(/version 2 predates attested relay transport.*version 3/);
+    expect(parseBenchRunManifest(JSON.parse(serializeBenchRunManifest(current))).schemaVersion).toBe(3);
   });
 
   it('rejects legacy versions, unknown nested keys, invalid arm policy, and row drift', () => {
@@ -311,6 +336,14 @@ describe('manifest resume equality and storage', () => {
     const suiteDrift = structuredClone(later);
     (suiteDrift.suiteConfig as { workflowWaitMs: number }).workflowWaitMs = 10_000;
     expect(() => assertManifestResumeEquality(frozen, suiteDrift)).toThrow(/resume inputs/);
+
+    const pro = proManifest();
+    const transportDrift = structuredClone(pro);
+    ((transportDrift.suiteConfig as { modelTransport: { topologySha256: string } })
+      .modelTransport).topologySha256 = 'c'.repeat(64);
+    ((transportDrift.provenance as { modelTransport: { topologySha256: string } })
+      .modelTransport).topologySha256 = 'c'.repeat(64);
+    expect(() => assertManifestResumeEquality(pro, transportDrift)).toThrow(/resume inputs/);
   });
 
   it('writes and loads only manifest.json under an exact suite/run identity', () => {

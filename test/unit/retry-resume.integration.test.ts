@@ -304,7 +304,11 @@ describe('task-retry resume', () => {
       { lines: [], exit: 1, delayMs: 3_500 }, // resume: zero events, dies on its own late in the budget
       { lines: [], exit: 0, hang: true }, // fresh fallback: hangs → must be killed at the REMAINING budget
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 6_000 }), SIGNAL);
+    const outcome = await new AgentCallExecutor(adapter, {
+      processInspection: {
+        discoverWorkerProcesses: () => ({ processes: [], complete: true }),
+      },
+    }).execute(spec({ retries: 1, timeoutMs: 6_000 }), SIGNAL);
     expect(outcome.ok).toBe(false);
     // Deterministic shape assertion, no wall-clock race: the fallback's kill
     // message carries ITS timer value — a remainder (6000 − ~3500 − overhead)
@@ -321,7 +325,11 @@ describe('task-retry resume', () => {
       { lines: [{ session: 's1' }], exit: 1 }, // fails fast, retryably
       { lines: [], exit: 1, delayMs: 1_000 }, // resume: zero events, leaves <1s of the 1.5s budget
     ]);
-    const outcome = await new AgentCallExecutor(adapter).execute(spec({ retries: 1, timeoutMs: 1_500 }), SIGNAL);
+    const outcome = await new AgentCallExecutor(adapter, {
+      processInspection: {
+        discoverWorkerProcesses: () => ({ processes: [], complete: true }),
+      },
+    }).execute(spec({ retries: 1, timeoutMs: 1_500 }), SIGNAL);
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toBe('attempt timed out after 1500ms'); // synthesized: names the FULL budget
     expect(adapter.resumeCalls).toHaveLength(1);

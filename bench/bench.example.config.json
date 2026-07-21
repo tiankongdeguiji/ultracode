@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "toolchain": {
     "nodeVersion": "22.14.0",
     "nodeDistribution": "npmmirror",
@@ -15,9 +15,10 @@
       "seed": 7,
       "stratifyBy": "repo_language"
     },
-    "auth": {
-      "mechanism": "chatgpt",
-      "publicIdentity": "operator-supplied-chatgpt-account"
+    "modelTransport": {
+      "relayIdentity": "operator-supplied-relay-identity",
+      "relayVersion": "operator-supplied-relay-version",
+      "fixedDestination": "https://api.openai.com/v1"
     },
     "timeouts": {
       "sessionMs": 43200000,

@@ -1,6 +1,6 @@
 # SWE-bench Pro provenance and containment
 
-## Prerequisites and authentication
+## Prerequisites and model transport
 
 SWE-bench Pro uses the shared Node 20+, Git, Docker, and configured Codex
 toolchain prerequisites. Its evaluator preparation additionally requires
@@ -10,18 +10,101 @@ arm64 on glibc 2.28-or-newer Linux, macOS 10.9-or-newer on x64, and macOS
 architectures, pip versions, musl, and older OS floors fail preflight before a
 dependency index or other preparation network path is reached. The suite does
 not use or require `uv` or GNU `patch`; those tools belong to other suites.
-Preparation and native runs can access the network and remain manual.
+Preparation and official evaluation remain manual networked operations. Task
+sessions do not receive ordinary outbound access.
 
-Select one runtime mechanism in the private operator config and supply it again
-for every run invocation:
+SWE-bench Pro intentionally has no direct `chatgpt` or `api-key` session mode.
+Relay-backed Pro operator configuration and run manifests use schema version 3.
+Legacy Pro schema version 2 described direct provider auth and is rejected with
+an explicit transition diagnostic; it cannot be resumed or migrated in place.
+Create a new v3 run after replacing `auth` with `modelTransport`. The public
+model grammar is `[A-Za-z0-9][A-Za-z0-9._:/-]*`; effort uses
+`[A-Za-z][A-Za-z0-9_-]*`. Other strings are rejected before TOML generation.
+The private operator config must instead define `modelTransport.relayIdentity`,
+`relayVersion`, and an exact public HTTPS `/v1` `fixedDestination`. Every fresh
+run and resume must also supply these runtime-only bindings:
 
-- `chatgpt`: set `CODEX_AUTH_JSON_PATH` to a current-user-owned, singly-linked
-  regular ChatGPT auth file no larger than 4 MiB whose mode is exactly `0600`.
-- `api-key`: set `CODEX_API_KEY` to a non-empty key.
+```bash
+SWEBENCH_PRO_MODEL_RELAY_URL=http://pro-relay:8080/v1 \
+SWEBENCH_PRO_RESTRICTED_NETWORK=swebench-pro-private \
+npm run bench -- --suite swebench-pro run --run-id <run> ...
+```
 
-These variables are specific to SWE-bench Pro. In particular, SWE-Marathon
-API-key mode uses `OPENAI_API_KEY` instead of `CODEX_API_KEY`. Credentials and
-auth paths are runtime-only and are not stored in manifests or reports.
+The relay URL hostname must equal the relay container name and must be a Docker
+DNS endpoint name; localhost and every IP literal are rejected before Docker
+inspection. The named network
+must be a local, non-attachable, non-ingress Docker bridge created with
+`--internal` and labeled
+`ultracode.egress-policy=codex-responses-via-attested-relay-v1`. Before manifest
+publication it must contain exactly the running relay. During sessions it may
+contain only that relay and exact active run-owned task containers. Each task
+container is launched by its manifest-bound immutable local image ID, with the
+image healthcheck disabled and shell/dynamic-loader bootstrap variables cleared.
+It is created with only that network; post-create inspection rejects a
+default/WAN attachment, an injected generic proxy, or any provider credential
+environment variable. The inspection also binds the exact per-attempt runtime
+nonce in both its ownership label and environment, and binds the exact attested
+relay base URL before the host publishes that nonce to the entrypoint gate.
+
+The separately managed relay must use an immutable local image and declare its
+public identity/version, exact model hash, fixed-destination hash, and relay
+contract hash in these labels:
+
+- `ultracode.model-relay=true`
+- `ultracode.model-relay.identity=<modelTransport.relayIdentity>`
+- `ultracode.model-relay.version=<modelTransport.relayVersion>`
+- `ultracode.model-relay.contract-sha256=<contract hash below>`
+- `ultracode.model-relay.destination-sha256=<canonical fixed-destination hash>`
+- `ultracode.model-relay.model-sha256=<UTF-8 model-name hash>`
+
+The destination hash covers the canonical JSON object with `protocol`,
+`hostname`, `port`, and `pathname` parsed from `fixedDestination`. Contract
+`c4608a577487f503bfd5d26269107511607b8a4b2c7e5c9eb0e14acd77748990`
+accepts only JSON `POST /v1/responses` and `POST /v1/responses/compact` for the
+configured model. It requires strict request-schema and header allowlists;
+rejects provider-hosted tools, remote MCP, background mode, and external URLs,
+file IDs, and vector stores; and accepts only JSON or event-stream responses
+without hosted-tool or citation outputs. It maps the two paths to the one
+configured HTTPS `/v1` destination, rejects client Authorization, CONNECT,
+absolute-form requests, other methods/paths, redirects, and generic forwarding,
+and keeps the provider credential inside the relay. The task-facing relay may
+use HTTP on the isolated bridge or operator-configured HTTPS. Codex uses
+`wire_api = "responses"` with `requires_openai_auth = false`; nested Arm B
+workers inherit the same provider without a provider key.
+
+The harness inspects the network, exact endpoint IDs, task attachment, relay
+image/command/mounts/networks, and declared labels before publication, on
+resume, after each session is created, and after each normally completed
+session. After normal exit, the stopped task may be absent from the network;
+the relay remains required and every unexpected endpoint remains fatal. The
+immutable entrypoint waits on a
+nonce-bound host gate, so no task-controlled process starts before the
+post-create attachment and topology checks succeed. Stable hashes enter both
+`suiteConfig.modelTransport` and `provenance.modelTransport`; reports copy the
+latter and bind the complete suite config by hash. A user-private host policy
+lock below `/tmp/ultracode-bench-<uid>/` serializes Pro recovery, execution,
+evaluation/report state access, and cleanup across worktrees. Its production
+identity does not follow `TMPDIR`, `TMP`, or `TEMP`; tests use an explicit
+absolute isolated coordination root instead.
+Runtime network and relay names remain hash-only in persistent artifacts.
+
+This is an attested external relay contract, not an in-repository proxy and not
+proof of its implementation. The operator must review and deploy the relay so
+its code, request and response validators, provider credential scope, model
+restriction, hosted-retrieval rejection, fixed upstream destination, redirect
+handling, and egress match the declared contract. The harness does not inspect
+an operator firewall and makes no claim about an undocumented firewall.
+Docker-daemon administrators, relay compromise, false relay labels, mutable
+host networking after inspection, and provider behavior remain outside the
+task-container boundary. If the relay, labels, network, or runtime bindings are
+absent or drift, the affected task is recorded and the whole run invocation
+fails closed; there is no unrestricted credential fallback. Docker rejection,
+malformed or ambiguous inspection output, attachment mismatch, topology
+mismatch, and manifest-attestation mismatch all become one typed fatal
+transport error with the failed proof stage retained. A shared fatal signal
+immediately stops new launches, rejects every overlapping session wait, starts
+exact active-container/helper cleanup, and records those overlapping task
+results as invalid instead of accepting patches produced across the drift.
 
 The evaluator source is not operator-selectable. Configuration accepts only
 `https://github.com/scaleapi/SWE-bench_Pro-os` at revision
@@ -211,7 +294,23 @@ reinspected, removed, and proven absent before reclamation is rerun idempotently
 unprovable same-name container is retained and terminates the command as
 `ownership-unsafe`. Session cleanup, run-wide cleanup, root fatal cleanup,
 artifact reset, and runtime-home deletion cannot complete until exact helper
-absence is proven.
+absence is proven. Each proven survivor receives one monotonic cleanup deadline;
+successive Docker operations consume a decreasing remainder. The next survivor
+and every mandatory idempotent or retained-resource retry receive a new bounded
+deadline. Cleanup ambiguity retains the `ownership-unsafe` taxonomy, while a
+supervised Docker command whose descendants cannot be removed remains
+`descendant-cleanup-failed` even when an attestation wrapper preserves its
+run-fatal transport role.
+
+For scored arm evaluation, native task statuses and the complete shared-timing
+verifier-attempt batch are durably committed before any accepted verifier
+receipt bindings are published. A crash during that state commit therefore
+leaves the receipt unchanged; a crash after the commit but before receipt
+publication leaves the evaluator result unaccepted. Receipt publication can
+only expose results whose timing and per-task attribution already survive
+recovery. Report assembly requires the complete arm-scoped receipt from the
+same invocation as the latest verifier attempt; an older result or the other
+arm's bindings cannot satisfy that proof after a crash.
 
 Official evaluator containers have the same static process and privilege
 bounds with `cap-drop ALL`, an empty capability-add tuple, and the same
@@ -225,7 +324,8 @@ native booleans for attribution. Policy files, translators, Git helpers,
 patches, and their hashes are native manifest assets and prepared-input
 provenance.
 
-Offline unit tests assert exact session and reclamation argv, lifecycle
+Offline unit tests assert the exact relay contract, topology/identity failures,
+credential-free session attachment, session and reclamation argv, lifecycle
 reconciliation, and evaluator Docker SDK options.
 Live daemon parity is intentionally opt-in and never pulls an image:
 
@@ -239,6 +339,12 @@ overlay additionally exercises a genuinely running `--rm` reclamation-helper
 survivor, its exact inspection proof, stop-triggered auto-removal, absence
 check, and idempotent rerun. The live test
 does not pull an image or launch a benchmark.
+
+Setting `UC_DOCKER_RELAY_PARITY_IMAGE` to an already-local image with `sh`
+additionally creates an ephemeral internal network, labeled relay stand-in, and
+task stand-in, then inspects their actual Docker topology. It neither contacts
+a model nor any public service and does not claim the stand-in implements the
+relay behavior contract.
 
 If the local Docker engine rejects the minimal tuple or cannot prove the
 inspected `HostConfig`, the parity test fails. Capability sets must not be

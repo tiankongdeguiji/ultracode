@@ -7,13 +7,13 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
+  darwinWorkerSignalingInspection,
   discoverWorkerProcessesForTokens,
-  findWorkerProcessesForTokens,
   MAX_DARWIN_CANDIDATE_PROCESSES,
   readProcessIdentitySnapshot,
+  snapshotLinuxProcessIdentities,
   signalTrackedWorkerProcesses,
   signal0Status,
-  signalWorkerProcessTokens,
   signalWorkerProcesses,
   type ProcessInspectionOptions,
   type TrackedProcess,
@@ -24,25 +24,20 @@ import {
 } from './procinfo.js';
 
 interface ActiveWorker {
-  scope: string | undefined;
-  signalGroup(signal: NodeJS.Signals): boolean;
-  token: string;
+  signal(signal: NodeJS.Signals): number;
 }
 
 const ACTIVE_WORKERS = new Map<string, ActiveWorker>();
 
 /** Signal trusted in-memory worker identities without reading recovery files. */
 export function killActiveWorkers(signal: NodeJS.Signals = 'SIGKILL'): number {
-  const tokensByScope = new Map<string | undefined, string[]>();
   let signaled = 0;
   for (const worker of ACTIVE_WORKERS.values()) {
-    if (worker.signalGroup(signal)) signaled++;
-    const tokens = tokensByScope.get(worker.scope) ?? [];
-    tokens.push(worker.token);
-    tokensByScope.set(worker.scope, tokens);
-  }
-  for (const [scope, tokens] of tokensByScope) {
-    signaled += signalWorkerProcessTokens(tokens, signal, scope).processes;
+    try {
+      signaled += worker.signal(signal);
+    } catch {
+      // A compromised record path must not prevent containment of siblings.
+    }
   }
   return signaled;
 }
@@ -52,7 +47,7 @@ export interface SpawnedAgent {
   /** High-entropy marker inherited by descendants even if they leave our PGID. */
   workerToken: string;
   killTree(signal?: NodeJS.Signals): void;
-  /** Reap same-group and token-bearing descendants after the direct child closes. */
+  /** Reap descendants, returning nonzero unless complete observations prove stable absence. */
   cleanupEscaped(graceMs?: number): Promise<number>;
 }
 
@@ -68,7 +63,7 @@ export interface SpawnAgentOptions {
   onWorkerCandidates?: (
     token: string,
     candidates: readonly TrackedProcess[],
-    complete: boolean,
+    settled: boolean,
   ) => void;
   /** Explicit platform/process seam for deterministic supervision tests. */
   processInspection?: ProcessInspectionOptions;
@@ -76,6 +71,10 @@ export interface SpawnAgentOptions {
 
 export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentOptions): SpawnedAgent {
   const workerToken = randomBytes(16).toString('hex');
+  const platform = opts.processInspection?.platform ?? process.platform;
+  const preexistingLinuxIdentities = platform === 'linux'
+    ? snapshotLinuxProcessIdentities(opts.processInspection)
+    : undefined;
   opts.onWorkerToken?.(workerToken);
   const env: NodeJS.ProcessEnv = { ...opts.env, [WORKER_TOKEN_ENV]: workerToken };
   if (opts.workerScope !== undefined) env[WORKER_SCOPE_ENV] = workerScopeValue(opts.workerScope);
@@ -97,7 +96,12 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
   }
 
   const pid = child.pid;
-  const platform = opts.processInspection?.platform ?? process.platform;
+  const tokenInspection = platform === 'linux'
+    ? {
+        ...opts.processInspection,
+        excludedLinuxProcessIdentities: preexistingLinuxIdentities,
+      }
+    : opts.processInspection;
   const processGroupStatus = (): 'alive' | 'absent' | 'unknown' => {
     if (!pid) return 'absent';
     return signal0Status(-pid, opts.processInspection);
@@ -127,74 +131,83 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     }
   };
 
-  if (pid) {
-    ACTIVE_WORKERS.set(workerToken, {
-      scope: opts.workerScope,
-      signalGroup,
-      token: workerToken,
-    });
-  }
-
-  const killTree = (signal: NodeJS.Signals = 'SIGTERM'): void => {
-    signalGroup(signal);
-    // Codex's Linux sandbox calls setsid()/bwrap --new-session, so descendants
-    // can leave the worker PGID. The inherited token is the containment
-    // boundary for those escaped sessions.
-    if (platform === 'darwin') {
-      signalWorkerProcesses(workerToken, signal, opts.workerScope, opts.processInspection);
-    } else {
-      signalWorkerProcesses(workerToken, signal, opts.workerScope);
-    }
-  };
-
   const retainedDarwinCandidates = new Map<string, TrackedWorkerProcess>();
-  let darwinInventoryComplete = false;
+  let darwinDiscoveryComplete = false;
   let darwinCandidateOverflow = false;
   let persistedDarwinInventory = '';
+  const identityKey = (proc: TrackedProcess): string => `${proc.pid}:${proc.starttime}:${proc.pgrp}`;
+  const persistDarwinCandidates = (settled: boolean): void => {
+    const candidates = [...retainedDarwinCandidates.values()]
+      .map(({ pid: candidatePid, pgrp, starttime }) => ({ pid: candidatePid, pgrp, starttime }))
+      .sort((left, right) => left.pid - right.pid);
+    const fingerprint = `${Number(settled)}:${candidates.map(identityKey).join(',')}`;
+    if (fingerprint === persistedDarwinInventory) return;
+    opts.onWorkerCandidates?.(workerToken, candidates, settled);
+    persistedDarwinInventory = fingerprint;
+  };
+  const discoverDarwinCandidates = (): boolean => {
+    const discovery = discoverWorkerProcessesForTokens(
+      [workerToken],
+      opts.workerScope,
+      undefined,
+      opts.processInspection,
+    );
+    for (const candidate of discovery.processes) {
+      const key = identityKey(candidate);
+      if (retainedDarwinCandidates.has(key)) continue;
+      if (retainedDarwinCandidates.size >= MAX_DARWIN_CANDIDATE_PROCESSES) {
+        darwinCandidateOverflow = true;
+        continue;
+      }
+      retainedDarwinCandidates.set(key, candidate);
+    }
+    darwinDiscoveryComplete = discovery.complete && !darwinCandidateOverflow;
+    // A complete point-in-time scan is not a closed inventory while the
+    // worker can still fork. Seal only after stable live cleanup below.
+    persistDarwinCandidates(false);
+    return darwinDiscoveryComplete;
+  };
+  const darwinSignalInspection = darwinWorkerSignalingInspection(
+    [workerToken],
+    opts.workerScope,
+    opts.processInspection,
+  );
+  const signalRetainedDarwinCandidates = (signal: NodeJS.Signals): number =>
+    signalTrackedWorkerProcesses(
+      retainedDarwinCandidates.values(),
+      signal,
+      darwinSignalInspection,
+    ).processes;
+  const signalLiveWorker = (signal: NodeJS.Signals): number => {
+    if (platform === 'darwin') {
+      // Persist the bounded identity hint before either signal can remove it.
+      discoverDarwinCandidates();
+      return Number(signalGroup(signal)) + signalRetainedDarwinCandidates(signal);
+    }
+    return Number(signalGroup(signal))
+      + signalWorkerProcesses(workerToken, signal, opts.workerScope, tokenInspection);
+  };
+
+  if (pid) ACTIVE_WORKERS.set(workerToken, { signal: signalLiveWorker });
+
+  const killTree = (signal: NodeJS.Signals = 'SIGTERM'): void => {
+    // Sandboxes may call setsid(), so lifecycle markers remain the containment
+    // boundary after descendants leave the original process group.
+    signalLiveWorker(signal);
+  };
 
   const cleanupEscaped = async (graceMs = 500): Promise<number> => {
     retireGroupIfGone();
     if (platform === 'darwin') {
       const retained = retainedDarwinCandidates;
-      const identityKey = (proc: TrackedProcess): string => `${proc.pid}:${proc.starttime}:${proc.pgrp}`;
-      const persistCandidates = (complete: boolean): void => {
-        const candidates = [...retained.values()]
-          .map(({ token: _token, ...proc }) => proc)
-          .sort((left, right) => left.pid - right.pid);
-        const fingerprint = `${Number(complete)}:${candidates.map(identityKey).join(',')}`;
-        if (fingerprint === persistedDarwinInventory) return;
-        opts.onWorkerCandidates?.(workerToken, candidates, complete);
-        persistedDarwinInventory = fingerprint;
-      };
-      const discoverCandidates = (): boolean => {
-        const discovery = discoverWorkerProcessesForTokens(
-          [workerToken],
-          opts.workerScope,
-          undefined,
-          opts.processInspection,
-        );
-        for (const candidate of discovery.processes) {
-          const key = identityKey(candidate);
-          if (retained.has(key)) continue;
-          if (retained.size >= MAX_DARWIN_CANDIDATE_PROCESSES) {
-            darwinCandidateOverflow = true;
-            continue;
-          }
-          retained.set(key, candidate);
-        }
-        darwinInventoryComplete = discovery.complete
-          && !darwinCandidateOverflow;
-        persistCandidates(darwinInventoryComplete);
-        return darwinInventoryComplete;
-      };
       let emptyPasses = 0;
       const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
         let delayMs = 25;
         for (;;) {
+          const discoveredCompletely = discoverDarwinCandidates();
           signalGroup(signal);
-          const discoveredCompletely = discoverCandidates();
           const candidates = [...retained.values()];
-          signalTrackedWorkerProcesses(candidates, signal, opts.processInspection);
+          signalRetainedDarwinCandidates(signal);
           const live = readProcessIdentitySnapshot(
             candidates.map((candidate) => candidate.pid),
             opts.processInspection,
@@ -209,7 +222,10 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
           emptyPasses = discoveredCompletely && candidatesAbsent && groupTargetRetired
             ? emptyPasses + 1
             : 0;
-          if (emptyPasses >= 2) return true;
+          if (emptyPasses >= 2) {
+            persistDarwinCandidates(true);
+            return true;
+          }
           if (Date.now() >= deadline) return false;
           await sleep(delayMs);
           delayMs = Math.min(delayMs * 2, 100);
@@ -234,37 +250,59 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
       }).length;
       return liveCandidates
         + Number(!groupTargetRetired)
-        + Number(!darwinInventoryComplete || !finalIdentities.complete)
+        + Number(!darwinDiscoveryComplete || !finalIdentities.complete)
         + 1;
     }
-    const tokenProcesses = () => findWorkerProcessesForTokens([workerToken], opts.workerScope);
+    const observeTokenProcesses = () => discoverWorkerProcessesForTokens(
+      [workerToken],
+      opts.workerScope,
+      undefined,
+      tokenInspection,
+    );
+    const now = opts.processInspection?.observationNow ?? (() => performance.now());
+    const wait = opts.processInspection?.observationWait ?? sleep;
     const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
       let delayMs = 25;
       let emptyPasses = 0;
+      let finalProofUsed = false;
       for (;;) {
         signalGroup(signal);
-        const tracked = tokenProcesses();
-        signalTrackedWorkerProcesses(tracked, signal);
+        const discovery = observeTokenProcesses();
+        signalTrackedWorkerProcesses(discovery.processes, signal, opts.processInspection);
         retireGroupIfGone();
-        emptyPasses = tracked.length === 0 ? emptyPasses + 1 : 0;
+        emptyPasses = discovery.complete && discovery.processes.length === 0
+          ? emptyPasses + 1
+          : 0;
         // One procfs directory snapshot can miss a PID forked after readdir.
         // Require stable absence across two backoff polls before settling.
         if (groupTargetRetired && emptyPasses >= 2) return true;
-        if (Date.now() >= deadline) return false;
-        await sleep(delayMs);
+        const observedAt = now();
+        if (observedAt >= deadline) {
+          if (graceMs > 0 && !finalProofUsed && groupTargetRetired && emptyPasses === 1) {
+            finalProofUsed = true;
+            await wait(1);
+            continue;
+          }
+          return false;
+        }
+        await wait(Math.min(delayMs, Math.max(1, deadline - observedAt)));
         delayMs = Math.min(delayMs * 2, 100);
       }
     };
-    if (await sweepUntil('SIGTERM', Date.now() + graceMs)) {
+    if (await sweepUntil('SIGTERM', now() + graceMs)) {
       ACTIVE_WORKERS.delete(workerToken);
       return 0;
     }
-    if (await sweepUntil('SIGKILL', Date.now() + graceMs)) {
+    if (await sweepUntil('SIGKILL', now() + graceMs)) {
       ACTIVE_WORKERS.delete(workerToken);
       return 0;
     }
     retireGroupIfGone();
-    return tokenProcesses().length + Number(!groupTargetRetired);
+    const finalDiscovery = observeTokenProcesses();
+    return finalDiscovery.processes.length
+      + Number(!groupTargetRetired)
+      + Number(!finalDiscovery.complete)
+      + 1;
   };
 
   return { child, workerToken, killTree, cleanupEscaped };

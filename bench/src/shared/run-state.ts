@@ -2,6 +2,7 @@
 import { existsSync } from 'node:fs';
 import { z } from 'zod';
 import {
+  darwinWorkerSignalingInspection,
   discoverWorkerProcessesForTokens,
   MAX_DARWIN_CANDIDATE_PROCESSES,
   readProcessIdentitySnapshot,
@@ -601,6 +602,11 @@ export class BenchRunStateStore {
       }
 
       const validTokens = [...candidatesByToken.keys()];
+      const signalingInspection = darwinWorkerSignalingInspection(
+        validTokens,
+        workerScope,
+        inspection,
+      );
       const emptyPasses = new Map(validTokens.map((token) => [token, 0]));
       let deadline = Date.now() + Math.max(0, graceMs);
       let signal: NodeJS.Signals = 'SIGTERM';
@@ -648,7 +654,7 @@ export class BenchRunStateStore {
         }
 
         const allCandidates = [...candidatesByToken.values()].flatMap((candidates) => [...candidates.values()]);
-        signalTrackedWorkerProcesses(allCandidates, signal, inspection);
+        signalTrackedWorkerProcesses(allCandidates, signal, signalingInspection);
         const identities = readProcessIdentitySnapshot(
           allCandidates.map((candidate) => candidate.pid),
           inspection,
