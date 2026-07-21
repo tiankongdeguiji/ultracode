@@ -2,6 +2,7 @@
 import { sha256CanonicalJson } from './provenance.js';
 
 export interface DockerNetworkInspection {
+  Name?: unknown;
   Internal?: unknown;
   Driver?: unknown;
   Scope?: unknown;
@@ -11,6 +12,13 @@ export interface DockerNetworkInspection {
   Options?: unknown;
   IPAM?: unknown;
   Containers?: unknown;
+}
+
+export interface DockerContainerInspection {
+  Id?: unknown;
+  Name?: unknown;
+  HostConfig?: unknown;
+  NetworkSettings?: unknown;
 }
 
 /** Parse exactly one Docker inspect record and reject malformed ambiguity. */
@@ -37,6 +45,7 @@ export function dockerObject(value: unknown): Record<string, unknown> {
 
 export interface InternalNetworkContract {
   description: string;
+  networkName: string;
   policyLabel: string;
   expectedEndpointNames: ReadonlySet<string>;
   requiredEndpointNames?: ReadonlySet<string>;
@@ -52,6 +61,7 @@ export interface InternalNetworkAttestation {
 /** Validate one internal network and its complete endpoint-name allowlist. */
 export function inspectInternalDockerNetwork(
   stdout: string,
+  containerStdout: string,
   contract: InternalNetworkContract,
 ): InternalNetworkAttestation {
   const inspection = oneDockerInspectRow<DockerNetworkInspection>(stdout, contract.description);
@@ -63,7 +73,9 @@ export function inspectInternalDockerNetwork(
     return [id, dockerObject(value)] as [string, Record<string, unknown>];
   });
   const names = containers.map(([, endpoint]) => endpoint.Name);
-  if (inspection.Internal !== true || labels['ultracode.egress-policy'] !== contract.policyLabel) {
+  if (inspection.Name !== contract.networkName
+    || inspection.Internal !== true
+    || labels['ultracode.egress-policy'] !== contract.policyLabel) {
     throw new Error(`${contract.description} is not the required labeled internal network`);
   }
   if (contract.dedicatedLocalBridge === true
@@ -80,6 +92,35 @@ export function inspectInternalDockerNetwork(
   for (const required of contract.requiredEndpointNames ?? []) {
     if (!names.includes(required)) throw new Error(`${contract.description} is missing required endpoint ${required}`);
   }
+  let containerRows: unknown;
+  try { containerRows = JSON.parse(containerStdout) as unknown; } catch {
+    throw new Error(`Docker returned malformed ${contract.description} container inspection`);
+  }
+  if (!Array.isArray(containerRows) || containerRows.length !== containers.length) {
+    throw new Error(`${contract.description} container inspection does not match its endpoint set`);
+  }
+  const expectedIds = new Set(containers.map(([id]) => id));
+  const inspectedIds = new Set<string>();
+  for (const row of containerRows as DockerContainerInspection[]) {
+    const id = row.Id;
+    if (typeof id !== 'string' || !expectedIds.has(id) || inspectedIds.has(id)) {
+      throw new Error(`${contract.description} contains an unbound container inspection`);
+    }
+    inspectedIds.add(id);
+    const endpoint = containers.find(([candidate]) => candidate === id)![1];
+    const name = typeof row.Name === 'string' ? row.Name.replace(/^\//u, '') : null;
+    if (name !== endpoint.Name) {
+      throw new Error(`${contract.description} container name does not match its endpoint`);
+    }
+    const hostConfig = dockerObject(row.HostConfig);
+    const networkSettings = dockerObject(row.NetworkSettings);
+    const networks = dockerObject(networkSettings.Networks);
+    if (hostConfig.NetworkMode !== contract.networkName
+      || Object.keys(networks).length !== 1
+      || !Object.hasOwn(networks, contract.networkName)) {
+      throw new Error(`${contract.description} container has an unattested network attachment`);
+    }
+  }
   return {
     inspection,
     containers,
@@ -92,6 +133,7 @@ export function inspectInternalDockerNetwork(
       options: inspection.Options ?? null,
       ipam: inspection.IPAM ?? null,
       policyLabel: labels['ultracode.egress-policy'] ?? null,
+      containers: containers.map(([id]) => ({ id, network: contract.networkName })),
     }),
   };
 }

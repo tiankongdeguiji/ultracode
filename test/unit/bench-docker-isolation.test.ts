@@ -9,6 +9,7 @@ const RUNNER_ID = 'a'.repeat(64);
 const PROXY_ID = 'b'.repeat(64);
 const contract = {
   description: 'benchmark network',
+  networkName: 'ucbench-internal',
   policyLabel: 'offline',
   expectedEndpointNames: new Set(['runner', 'proxy']),
   requiredEndpointNames: new Set(['runner']),
@@ -18,6 +19,7 @@ const contract = {
 function validInspection(): DockerNetworkInspection {
   return {
     Internal: true,
+    Name: contract.networkName,
     Driver: 'bridge',
     Scope: 'local',
     Attachable: false,
@@ -33,7 +35,13 @@ function validInspection(): DockerNetworkInspection {
 }
 
 function inspect(inspection: DockerNetworkInspection) {
-  return inspectInternalDockerNetwork(JSON.stringify([inspection]), contract);
+  const containers = Object.entries(inspection.Containers ?? {}).map(([id, endpoint]) => ({
+    Id: id,
+    Name: `/${(endpoint as { Name: string }).Name}`,
+    HostConfig: { NetworkMode: contract.networkName },
+    NetworkSettings: { Networks: { [contract.networkName]: {} } },
+  }));
+  return inspectInternalDockerNetwork(JSON.stringify([inspection]), JSON.stringify(containers), contract);
 }
 
 describe('Docker network isolation attestation', () => {
@@ -70,5 +78,32 @@ describe('Docker network isolation attestation', () => {
     const malformed = validInspection();
     malformed.Containers = { short: { Name: 'runner' } };
     expect(() => inspect(malformed)).toThrow(/invalid endpoint identity/u);
+  });
+
+  it('rejects unbound container identities and extra network attachments', () => {
+    const inspection = validInspection();
+    const rows = [{
+      Id: RUNNER_ID,
+      Name: '/runner',
+      HostConfig: { NetworkMode: contract.networkName },
+      NetworkSettings: { Networks: { [contract.networkName]: {}, bridge: {} } },
+    }, {
+      Id: PROXY_ID,
+      Name: '/proxy',
+      HostConfig: { NetworkMode: contract.networkName },
+      NetworkSettings: { Networks: { [contract.networkName]: {} } },
+    }];
+    expect(() => inspectInternalDockerNetwork(
+      JSON.stringify([inspection]),
+      JSON.stringify(rows),
+      contract,
+    )).toThrow(/unattested network attachment/u);
+    rows[0]!.NetworkSettings = { Networks: { [contract.networkName]: {} } };
+    rows[0]!.Id = 'c'.repeat(64);
+    expect(() => inspectInternalDockerNetwork(
+      JSON.stringify([inspection]),
+      JSON.stringify(rows),
+      contract,
+    )).toThrow(/unbound container inspection/u);
   });
 });

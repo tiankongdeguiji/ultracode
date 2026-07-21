@@ -39,7 +39,13 @@ import type { BenchPathRoots } from './contracts.js';
 import type { ToolchainConfig } from './config.js';
 import { ensureRealDirectoryWithin, readRegularFileWithinRoot } from './paths.js';
 import { runBenchProcess } from './process.js';
-import { sha256Buffer, sha256File, sha256Tree, type ToolchainProvenance } from './provenance.js';
+import {
+  sha256Buffer,
+  sha256CanonicalJson,
+  sha256File,
+  sha256Tree,
+  type ToolchainProvenance,
+} from './provenance.js';
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const toolchainContentManifestSchema = z.strictObject({
@@ -64,6 +70,11 @@ const toolchainContentManifestSchema = z.strictObject({
 });
 
 type ToolchainContentManifest = z.infer<typeof toolchainContentManifestSchema>;
+
+/** Bind every attested metadata field together with the payload digest. */
+export function toolchainCacheKey(manifest: unknown): string {
+  return sha256CanonicalJson(toolchainContentManifestSchema.parse(manifest));
+}
 
 export interface PreparedToolchain {
   directory: string;
@@ -328,6 +339,19 @@ function readStableExecutable(path: string): Buffer {
   }
 }
 
+/** Require the standalone Linux-x64 ELF format used inside benchmark containers. */
+export function validateLinuxX64CodexExecutable(bytes: Uint8Array): void {
+  const buffer = Buffer.from(bytes);
+  if (buffer.length < 20
+    || buffer[0] !== 0x7f
+    || buffer.subarray(1, 4).toString('ascii') !== 'ELF'
+    || buffer[4] !== 2
+    || buffer[5] !== 1
+    || buffer.readUInt16LE(18) !== 62) {
+    throw new Error('Codex binary must be a standalone Linux-x64 ELF executable');
+  }
+}
+
 /** Copy and authenticate one cache archive through an already-open source inode. */
 export function stageVerifiedArchive(source: string, destination: string, expectedSha256: string): string {
   const nofollow = constants.O_NOFOLLOW ?? 0;
@@ -446,6 +470,7 @@ async function populateSharedToolchain(
   const codexSrc = await resolveCodexBin(config.codexBinary, roots.benchRoot);
   const codexBin = join(dir, 'codex');
   const codexBytes = readStableExecutable(codexSrc);
+  validateLinuxX64CodexExecutable(codexBytes);
   writeFileSync(codexBin, codexBytes, { flag: 'wx', mode: 0o755 });
   const codexVersion = await toolchainCommand(codexBin, ['--version'], dir);
   const codexSha256 = createHash('sha256').update(codexBytes).digest('hex');
@@ -520,7 +545,7 @@ async function populateSharedToolchain(
     ultracodeTreeSha256: sha256Tree(join(dir, 'ultracode')),
   };
   writeFileSync(join(dir, 'content-manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
-  const target = join(toolchains, payloadSha256);
+  const target = join(toolchains, toolchainCacheKey(manifest));
   if (existsSync(target)) {
     rmSync(dir, { recursive: true, force: true });
   } else {
@@ -560,7 +585,8 @@ export function loadPreparedToolchain(directory: string): PreparedToolchain {
     'content-manifest.json',
     1_024 * 1_024,
   ).toString('utf8')) as unknown);
-  if (payloadSha256 !== manifest.payloadSha256 || resolve(directory) !== resolve(directory, '..', payloadSha256)) {
+  if (payloadSha256 !== manifest.payloadSha256
+    || resolve(directory) !== resolve(directory, '..', toolchainCacheKey(manifest))) {
     throw new Error('prepared toolchain payload identity drifted');
   }
   if (sha256File(join(directory, 'codex')) !== manifest.codexSha256

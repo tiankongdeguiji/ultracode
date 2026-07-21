@@ -152,9 +152,9 @@ describe('benchmark process boundary', () => {
     const sanitized = sanitizeDiagnostic(
       'OPENAI_API_KEY=top-secret CODEX_AUTH_JSON_PATH=/private/codex/auth.json '
         + 'FEATUREBENCH_CREDENTIAL_BROKER_URL=https://broker.internal/v1 '
-        + 'https://user:password@example.test/v1\u0001',
+        + 'https://user:password@example.test/v1\u0001\roverwrite',
     );
-    expect(sanitized).not.toMatch(/top-secret|private\/codex|broker\.internal|user:password|\u0001/);
+    expect(sanitized).not.toMatch(/top-secret|private\/codex|broker\.internal|user:password|[\u0001\r]/u);
     expect(sanitized).toContain('OPENAI_API_KEY=[REDACTED]');
     expect(sanitized).toContain('https://[REDACTED]@example.test/v1?');
   });

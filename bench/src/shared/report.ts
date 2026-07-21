@@ -361,7 +361,9 @@ function bindNativeAnalysisInput(
   }
 }
 
-/** Build the common envelope solely from frozen state and receipt-bound evidence. */
+/** Build the common envelope from frozen/receipt-bound identity evidence.
+ * Caller-supplied metrics, failures, annotations, policy hashes, and analysis
+ * hooks must already be loaded and normalized by the trusted control plane. */
 export function buildBenchReport<S extends BenchSuite>(options: BuildBenchReportOptions<S>): BenchReport {
   const { manifest, runState, verifierReceipt, metrics } = options;
   if (runState.suite !== manifest.suite || runState.runId !== manifest.runId

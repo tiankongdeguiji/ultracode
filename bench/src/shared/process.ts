@@ -90,10 +90,10 @@ export function allowlistedEnvironment(
   return env;
 }
 
-/** Remove terminal control characters and common credential assignments from diagnostics. */
+/** Remove terminal controls except tabs/newlines and redact common credential assignments. */
 export function sanitizeDiagnostic(value: string): string {
   return value
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '?')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '?')
     .replace(/((?:CODEX_AUTH_JSON_PATH|PIP_CONFIG_FILE|FEATUREBENCH_CREDENTIAL_BROKER_URL)\s*[=:]\s*)\S+/gi, '$1[REDACTED]')
     .replace(/([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*[=:]\s*)\S+/gi, '$1[REDACTED]')
     .replace(/(?:^|(?<=[\s'"=]))(?:\/[A-Za-z0-9._-]+)+\/auth\.json\b/g, '[REDACTED_AUTH_PATH]')

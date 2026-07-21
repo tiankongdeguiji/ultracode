@@ -18,6 +18,8 @@ import {
   downloadCacheFilename,
   resolveCodexBin,
   stageVerifiedArchive,
+  toolchainCacheKey,
+  validateLinuxX64CodexExecutable,
 } from '../../bench/src/shared/toolchain.js';
 
 const roots: string[] = [];
@@ -27,6 +29,46 @@ afterEach(() => {
 });
 
 describe('Codex toolchain resolution', () => {
+  it('accepts only standalone Linux-x64 Codex bytes', () => {
+    const elf = Buffer.alloc(20);
+    elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]);
+    elf.writeUInt16LE(62, 18);
+    expect(() => validateLinuxX64CodexExecutable(elf)).not.toThrow();
+    expect(() => validateLinuxX64CodexExecutable(Buffer.from('#!/usr/bin/env node\n'))).toThrow(
+      /Linux-x64 ELF/u,
+    );
+    elf.writeUInt16LE(183, 18);
+    expect(() => validateLinuxX64CodexExecutable(elf)).toThrow(/Linux-x64 ELF/u);
+  });
+
+  it('binds provenance metadata into the published cache identity', () => {
+    const hash = 'a'.repeat(64);
+    const manifest = {
+      schemaVersion: 2,
+      kind: 'ultracode-benchmark-toolchain',
+      payloadSha256: hash,
+      nodeVersion: '22.0.0',
+      nodeDistribution: 'nodejs',
+      nodeArchiveSha256: hash,
+      nodeChecksumManifestSha256: hash,
+      nodeTreeSha256: hash,
+      nodeMuslArchiveSha256: hash,
+      nodeMuslChecksumManifestSha256: hash,
+      nodeMuslTreeSha256: hash,
+      nodeMuslRuntime: `node@sha256:${hash}`,
+      codexVersion: 'codex 1.0.0',
+      codexSha256: hash,
+      ultracodeVersion: '0.2.1',
+      ultracodeRevision: 'b'.repeat(40),
+      ultracodeReleaseSha256: hash,
+      ultracodeTreeSha256: hash,
+    };
+    expect(toolchainCacheKey(manifest)).not.toBe(toolchainCacheKey({
+      ...manifest,
+      codexVersion: 'codex forged',
+    }));
+  });
+
   it('stages only checksum-bound bytes from an open cache inode', () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-toolchain-archive-'));
     roots.push(root);

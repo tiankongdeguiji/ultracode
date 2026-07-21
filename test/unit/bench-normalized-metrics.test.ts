@@ -367,7 +367,7 @@ describe('normalized aggregation invariants', () => {
   it('keeps the known subtotal but makes pricing partial for missing billable usage', () => {
     const runDirectory = root();
     const known = put(runDirectory, 'native/rollout-known.jsonl', jsonl(
-      { type: 'turn_context', payload: { model: 'gpt-test' } },
+      { type: 'turn_context', payload: { effort: 'high', model: 'gpt-test' } },
       tokenCount({ input_tokens: 1_000, cached_input_tokens: 400, output_tokens: 100 }),
     ));
     const missing = put(runDirectory, 'native/rollout-missing.jsonl', jsonl(
@@ -419,7 +419,7 @@ describe('normalized aggregation invariants', () => {
   it('keeps pricing partial when potentially billable indexed usage cannot be established', () => {
     const runDirectory = root();
     const known = put(runDirectory, 'native/rollout-known.jsonl', jsonl(
-      { type: 'turn_context', payload: { model: 'gpt-test' } },
+      { type: 'turn_context', payload: { effort: 'high', model: 'gpt-test' } },
       tokenCount({ input_tokens: 1_000, cached_input_tokens: 400, output_tokens: 100 }),
     ));
     const unknownMissing = put(runDirectory, 'native/rollout-unknown.jsonl', jsonl(
@@ -439,6 +439,11 @@ describe('normalized aggregation invariants', () => {
     ]);
     expect(unreadableBillable.sessions.total).toBe(1);
     expect(unreadableBillable.failures.map(({ code }) => code)).toEqual(['artifact-unsafe']);
+    expect(unreadableBillable.effectiveEffort).toMatchObject({
+      verification: 'unverified',
+      unknownSessions: 1,
+      matchesRequested: null,
+    });
     expect(unreadableBillable.pricing).toEqual({
       currency: 'USD', verification: 'partial', billableCost: 0.74,
     });
@@ -455,6 +460,33 @@ describe('normalized aggregation invariants', () => {
     expect(missingUnknown.pricing).toEqual({
       currency: 'USD', verification: 'partial', billableCost: 0.74,
     });
+  });
+
+  it('rejects fractional and overflowing normalized token counts', () => {
+    const runDirectory = root();
+    const fractional = put(runDirectory, 'native/rollout-fractional.jsonl', jsonl(
+      tokenCount({ input_tokens: 1.5, cached_input_tokens: 0, output_tokens: 1 }),
+    ));
+    const fractionalMetrics = normalize(runDirectory, {
+      ...emptyMetricsArtifactIndex(),
+      rollouts: [artifact(fractional)],
+    });
+    expect(fractionalMetrics.sessions.items[0]?.usage.rawTokenCount).toBe(0);
+    expect(fractionalMetrics.sessions.items[0]?.annotations.map(({ code }) => code)).toContain(
+      'rollout-usage-missing',
+    );
+
+    const maximum = Number.MAX_SAFE_INTEGER;
+    const first = put(runDirectory, 'native/rollout-max-one.jsonl', jsonl(
+      tokenCount({ input_tokens: maximum, cached_input_tokens: 0, output_tokens: 0 }),
+    ));
+    const second = put(runDirectory, 'native/rollout-max-two.jsonl', jsonl(
+      tokenCount({ input_tokens: maximum, cached_input_tokens: 0, output_tokens: 0 }),
+    ));
+    expect(() => normalize(runDirectory, {
+      ...emptyMetricsArtifactIndex(),
+      rollouts: [artifact(first), artifact(second, { scope: { taskId: 'task-two', arm: 'b' } })],
+    })).toThrow(/exceeds the normalized numeric range/u);
   });
 
   it('keeps valid zero usage and non-billable sessions neutral for model-verified pricing', () => {

@@ -195,8 +195,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function nonnegativeFinite(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+function nonnegativeSafeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function isBoundedMetric(value: number): boolean {
+  return Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
 }
 
 function emptyUsage(weight: number): TokenUsage {
@@ -214,14 +218,17 @@ function emptyUsage(weight: number): TokenUsage {
 
 function cumulativeUsage(value: unknown, weight: number): ParsedCumulative | null {
   if (!isRecord(value)) return null;
-  const inputTokens = nonnegativeFinite(value.input_tokens);
-  const observedCached = nonnegativeFinite(value.cached_input_tokens);
-  const outputTokens = nonnegativeFinite(value.output_tokens);
+  const inputTokens = nonnegativeSafeInteger(value.input_tokens);
+  const observedCached = nonnegativeSafeInteger(value.cached_input_tokens);
+  const outputTokens = nonnegativeSafeInteger(value.output_tokens);
   if (inputTokens === null || observedCached === null || outputTokens === null) return null;
   const cachedInputTokens = Math.min(inputTokens, observedCached);
-  const observedReasoning = nonnegativeFinite(value.reasoning_output_tokens) ?? 0;
+  const observedReasoning = nonnegativeSafeInteger(value.reasoning_output_tokens) ?? 0;
   const reasoningOutputTokens = Math.min(outputTokens, observedReasoning);
   const nonCachedInputTokens = inputTokens - cachedInputTokens;
+  const rawTokenCount = inputTokens + outputTokens;
+  const discountedTokenEquivalent = nonCachedInputTokens + outputTokens + cachedInputTokens * weight;
+  if (!Number.isSafeInteger(rawTokenCount) || !isBoundedMetric(discountedTokenEquivalent)) return null;
   return {
     usage: {
       inputTokens,
@@ -229,10 +236,9 @@ function cumulativeUsage(value: unknown, weight: number): ParsedCumulative | nul
       nonCachedInputTokens,
       outputTokens,
       reasoningOutputTokens,
-      rawTokenCount: inputTokens + outputTokens,
+      rawTokenCount,
       cachedInputWeight: weight,
-      discountedTokenEquivalent:
-        nonCachedInputTokens + outputTokens + cachedInputTokens * weight,
+      discountedTokenEquivalent,
     },
     cachedClamped: cachedInputTokens !== observedCached,
     reasoningClamped: reasoningOutputTokens !== observedReasoning,
@@ -246,16 +252,24 @@ function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
   const inputTokens = left.inputTokens + right.inputTokens;
   const cachedInputTokens = left.cachedInputTokens + right.cachedInputTokens;
   const outputTokens = left.outputTokens + right.outputTokens;
+  const reasoningOutputTokens = left.reasoningOutputTokens + right.reasoningOutputTokens;
+  const rawTokenCount = inputTokens + outputTokens;
+  const discountedTokenEquivalent =
+    inputTokens - cachedInputTokens + outputTokens + cachedInputTokens * left.cachedInputWeight;
+  if (![inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens, rawTokenCount]
+    .every(Number.isSafeInteger)
+    || !isBoundedMetric(discountedTokenEquivalent)) {
+    throw new Error('aggregated token usage exceeds the normalized numeric range');
+  }
   return {
     inputTokens,
     cachedInputTokens,
     nonCachedInputTokens: inputTokens - cachedInputTokens,
     outputTokens,
-    reasoningOutputTokens: left.reasoningOutputTokens + right.reasoningOutputTokens,
-    rawTokenCount: inputTokens + outputTokens,
+    reasoningOutputTokens,
+    rawTokenCount,
     cachedInputWeight: left.cachedInputWeight,
-    discountedTokenEquivalent:
-      inputTokens - cachedInputTokens + outputTokens + cachedInputTokens * left.cachedInputWeight,
+    discountedTokenEquivalent,
   };
 }
 
@@ -336,9 +350,12 @@ function parseCodexRolloutWithEvidence(
     const parsed = cumulativeUsage(info.total_token_usage, policy.cachedInputWeight);
     if (parsed !== null) finalCumulative = parsed;
     if (isRecord(info.last_token_usage)) {
-      const prompt = nonnegativeFinite(info.last_token_usage.input_tokens);
-      const output = nonnegativeFinite(info.last_token_usage.output_tokens);
-      if (prompt !== null && output !== null) contextHighWaterMark = Math.max(contextHighWaterMark, prompt + output);
+      const prompt = nonnegativeSafeInteger(info.last_token_usage.input_tokens);
+      const output = nonnegativeSafeInteger(info.last_token_usage.output_tokens);
+      const contextTokens = prompt === null || output === null ? null : prompt + output;
+      if (contextTokens !== null && Number.isSafeInteger(contextTokens)) {
+        contextHighWaterMark = Math.max(contextHighWaterMark, contextTokens);
+      }
       if (
         prompt !== null
         && previousPromptTokens !== null
@@ -349,7 +366,7 @@ function parseCodexRolloutWithEvidence(
       }
       if (prompt !== null) previousPromptTokens = prompt;
     }
-    const observedWindow = nonnegativeFinite(info.model_context_window);
+    const observedWindow = nonnegativeSafeInteger(info.model_context_window);
     if (observedWindow !== null && observedWindow > 0) contextWindow = observedWindow;
   });
   if (!stats.opened) throw new Error(`Codex rollout could not be opened: ${relativePath}`);
@@ -635,9 +652,11 @@ function timingMetrics(state: BenchRunState | null, observations: readonly Timin
 }
 
 function billableCost(usage: TokenUsage, pricing: PricingSnapshot): number {
-  return usage.nonCachedInputTokens / 1_000_000 * pricing.uncachedInputPerMTokens
+  const cost = usage.nonCachedInputTokens / 1_000_000 * pricing.uncachedInputPerMTokens
     + usage.cachedInputTokens / 1_000_000 * pricing.cachedInputPerMTokens
     + usage.outputTokens / 1_000_000 * pricing.outputPerMTokens;
+  if (!isBoundedMetric(cost)) throw new Error('billable cost exceeds the normalized numeric range');
+  return cost;
 }
 
 function priceableBillableUsage(
@@ -693,6 +712,7 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
   const parsedSessions: ParsedRollout[] = [];
   const sessions: NormalizedSessionMetrics[] = [];
   let pricingUsageIncomplete = false;
+  let unparsedRollouts = 0;
   for (const artifact of index.rollouts) {
     try {
       const parsed = parseCodexRolloutWithEvidence(options.runDirectory, artifact, policy);
@@ -703,6 +723,7 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
         pricingUsageIncomplete = true;
       }
     } catch {
+      unparsedRollouts += 1;
       if (artifact.billingClass === 'billable' || artifact.billingClass === 'unknown') {
         pricingUsageIncomplete = true;
       }
@@ -747,7 +768,7 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
   );
 
   const effortValues: Record<string, number> = {};
-  let unknownEffort = 0;
+  let unknownEffort = unparsedRollouts;
   for (const parsed of parsedSessions) {
     const { session, observedEfforts, effortEvidenceComplete } = parsed;
     const distinctEfforts = new Set(observedEfforts);

@@ -1,7 +1,7 @@
 /**
  * Append-only benchmark run-state storage. A small atomic head commits one
- * hash-chained prefix while bounded JSONL segments make replay independent of
- * total history size.
+ * hash-chained prefix while bounded JSONL segments cap individual file size.
+ * Replay remains linear in the committed history until checkpoints are added.
  */
 import { createHash, type Hash } from 'node:crypto';
 import {
