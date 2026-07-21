@@ -4,7 +4,7 @@ import { parseWorkflowScript } from '../engine/meta.js';
 import { validateArgsAgainstInputSchema } from '../engine/run.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir, getRun, readRunArgs, readRunConfig, reapOrphans } from '../store/runstore.js';
-import { isTerminal } from '../store/manifest.js';
+import { isResumableStatus, isTerminal } from '../store/manifest.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { attachForeground, printOutput } from './lifecycle.js';
@@ -50,6 +50,12 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
   }
   if (!isTerminal(prior.effectiveStatus)) {
     process.stderr.write(`ultracode: run ${runId} is still ${prior.effectiveStatus} — stop it first\n`);
+    return 1;
+  }
+  if (!isResumableStatus(prior.effectiveStatus)) {
+    process.stderr.write(
+      `ultracode: run ${runId} has incomplete worker cleanup — run 'ultracode stop ${runId}' first\n`,
+    );
     return 1;
   }
 

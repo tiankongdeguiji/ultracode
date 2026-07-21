@@ -406,6 +406,9 @@ export async function panelLoop(dir: string, opts: PanelLoopOptions): Promise<{ 
         if (!opts.quiet) {
           if (mode.kind === 'plain') {
             if (status === 'orphaned') stream.write('✗ runner died without finalizing (orphaned). See runner.log\n');
+            if (status === 'cleanup-failed') {
+              stream.write('✗ worker cleanup is unverified — run ultracode stop before resume\n');
+            }
             if (sandboxHint) stream.write(`⚠ ${sandboxHint}\n`);
           } else {
             if (sandboxHint) notices.push(`· ⚠ ${sandboxHint}`);

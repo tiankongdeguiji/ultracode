@@ -716,7 +716,7 @@ export function headerLines(state: PanelState, opts: FrameOptions, paint: Paint)
   const statusColor =
     opts.runStatus === 'completed'
       ? '32'
-      : opts.runStatus === 'failed' || opts.runStatus === 'orphaned'
+      : opts.runStatus === 'failed' || opts.runStatus === 'orphaned' || opts.runStatus === 'cleanup-failed'
         ? '31'
         : statusText === 'stopping…' || opts.runStatus === 'stopped'
           ? '33'
@@ -727,6 +727,8 @@ export function headerLines(state: PanelState, opts: FrameOptions, paint: Paint)
   ];
   if (opts.runStatus === 'orphaned') {
     lines.push(paint('31', '✗ runner died without finalizing (orphaned) — see runner.log'));
+  } else if (opts.runStatus === 'cleanup-failed') {
+    lines.push(paint('31', '✗ worker cleanup is unverified — run ultracode stop before resume'));
   }
   return lines;
 }

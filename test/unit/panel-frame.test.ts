@@ -129,6 +129,10 @@ describe('panel frame', () => {
   it('orphaned runs get a warning line; stop_requested renders stopping…', () => {
     const orphaned = renderFrame(richState(), { ...FRAME_OPTS, runStatus: 'orphaned' });
     expect(orphaned.split('\n')[1]).toBe('✗ runner died without finalizing (orphaned) — see runner.log');
+    const cleanupFailed = renderFrame(richState(), { ...FRAME_OPTS, runStatus: 'cleanup-failed' });
+    expect(cleanupFailed.split('\n')[1]).toBe(
+      '✗ worker cleanup is unverified — run ultracode stop before resume',
+    );
     const s = richState();
     foldEvent(s, ev('stop_requested', {}));
     expect(renderFrame(s, FRAME_OPTS).split('\n')[0]).toContain('stopping…');

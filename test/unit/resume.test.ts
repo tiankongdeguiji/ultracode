@@ -15,7 +15,7 @@ import {
 import { MockExecutor } from '../../src/backends/mock.js';
 import { newRunId } from '../../src/store/layout.js';
 import { createRunDir, readRunConfig } from '../../src/store/runstore.js';
-import { readManifest, isTerminal } from '../../src/store/manifest.js';
+import { readManifest, isTerminal, writeManifest } from '../../src/store/manifest.js';
 import { launchRunner } from '../../src/exec/daemonize.js';
 
 const CWD = '/fixed-root';
@@ -166,6 +166,35 @@ return r`;
 });
 
 describe('runner-level resume (detached processes)', () => {
+  it('rejects CLI and execution-API resume until incomplete cleanup is verified', async () => {
+    const { resumeCommand } = await import('../../src/cli/resume.js');
+    const { startDetachedRun } = await import('../../src/exec/start.js');
+    const root = mkdtempSync(join(tmpdir(), 'uc-resume-cleanup-'));
+    const runId = newRunId();
+    const dir = createRunDir(root, {
+      runId,
+      name: 'cleanup',
+      source: `export const meta = { name: 'cleanup', description: 'd' }\nreturn null`,
+      args: null,
+      config: { backend: 'mock', cwd: root },
+    });
+    const manifest = readManifest(dir)!;
+    writeManifest(dir, {
+      ...manifest,
+      status: 'cleanup-failed',
+      endedAt: new Date().toISOString(),
+      error: 'worker cleanup incomplete',
+    });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(resumeCommand(runId, { home: root, detach: true })).resolves.toBe(1);
+      await expect(startDetachedRun({ resumeFromRunId: runId, home: root }))
+        .rejects.toThrow(/before verified worker cleanup/u);
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it('full cycle: run → resume → cached journal records in the new run', async () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-resume-'));
     const source = `export const meta = { name: 'rr', description: 'd' }

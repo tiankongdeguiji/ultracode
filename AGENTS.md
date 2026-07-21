@@ -17,6 +17,10 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 - `dist/` and the `dist-codex/`/`dist-qoder/` bundles are gitignored build outputs — never commit them. `npm run build:plugins` assembles bundles from canonical sources (`skill/`, `workflows/`, `hostpacks/<host>/`); `test/unit/dist.test.ts` rebuilds them before asserting, so they never go stale.
 - Bump only via `npm version <patch|minor|major|x.y.z> --no-git-tag-version`: npm updates `package.json` + both `package-lock.json` version fields, and the `version` hook regenerates `src/version.ts`. `package.json` is the single source of truth; `dist.test.ts` guards every mirror (the `VERSION` constant, both lock fields, bundle manifests) against it. Never hand-edit a mirror; repair a hand-edited `package.json` with `npm version <that-version> --allow-same-version --no-git-tag-version` (the `--no-git-tag-version` is required — the hand-edit leaves the tree dirty, which npm's default clean-tree check would otherwise reject). For a tagged release, drop `--no-git-tag-version` and pass `-m 'chore: bump version to %s'`. The bump needs npm scripts enabled to run the hook — if your `.npmrc` sets `ignore-scripts=true`, add `--ignore-scripts=false` or the mirrors silently go stale (`dist.test.ts` still catches the drift in CI).
 
+## Benchmark Foundation
+
+- Shared multi-suite contracts live under `bench/src/shared/`; suite adapters and public CLI wiring are added separately. Use `npm run bench:check`; never commit `bench/.cache/`, `bench/results/`, or `bench/bench.config.json`.
+
 ## Testing
 
 - Vitest. Full: `npm test`; single file `npx vitest run test/unit/<x>.test.ts`; single case append `-t "name"`. Keep the suite offline and deterministic (no network / real backends, 20s timeout): drive behavior through the mock backend (`src/backends/mock.ts`; `MOCK:ok|echo|fail|fail-then-ok|delay|tools|badjson`) and assert on run output and `executor.stats`.
@@ -25,7 +29,7 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 
 ## CI Gate
 
-- Before pushing, pass the gate locally: `npm run typecheck && npm run lint && npm test` (CI runs exactly this on ubuntu + macos). `typecheck` covers `src/` only — `test/` is not typechecked, so verify test-side types by hand.
+- Before pushing, pass the gate locally: `npm run typecheck && npm run lint && npm test` (CI runs exactly this on ubuntu + macos). `typecheck` covers `src/` and `bench/src/shared/`; tests are not typechecked, so verify test-side types by hand.
 - No formatter — match style by hand: single quotes, semicolons, trailing commas, 2-space indent, numeric separators (`20_000`), `_`-prefix intentionally-unused args (ESLint enforces).
 
 ## Commits & PRs

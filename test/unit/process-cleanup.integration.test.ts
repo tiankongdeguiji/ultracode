@@ -82,6 +82,48 @@ class EscapingAdapter implements BackendAdapter {
   }
 }
 
+class ImmediateAdapter implements BackendAdapter {
+  readonly id = 'mock' as const;
+  readonly structuredOutput = 'emulated' as const;
+
+  probe() {
+    return Promise.resolve({ available: true });
+  }
+
+  buildSpawn(_req: AgentRequest): SpawnPlan {
+    return { bin: process.execPath, argv: ['-e', "process.stdout.write('done\\n')"], env: {} };
+  }
+
+  buildResume(_sessionId: string, _prompt: string, _req: AgentRequest): SpawnPlan | null {
+    return null;
+  }
+
+  createParser() {
+    return {
+      push: (line: string): AgentEvent[] => line === 'done'
+        ? [{ kind: 'result', isError: false }, { kind: 'message', text: 'ok' }]
+        : [],
+      end: (): AgentEvent[] => [],
+    };
+  }
+
+  classifyExit(code: number | null, _signal: NodeJS.Signals | null, events: AgentEvent[]): ExitClass {
+    return code === 0 && events.some((event) => event.kind === 'result')
+      ? { ok: true, retryable: false, message: 'ok' }
+      : { ok: false, errorKind: 'infra', retryable: false, message: `exit ${code}` };
+  }
+
+  extractUsage() {
+    return ZERO_USAGE;
+  }
+}
+
+class FailedAdapter extends ImmediateAdapter {
+  override buildSpawn(_req: AgentRequest): SpawnPlan {
+    return { bin: process.execPath, argv: ['-e', 'process.exit(7)'], env: {} };
+  }
+}
+
 async function waitForPid(file: string): Promise<number> {
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
@@ -204,6 +246,7 @@ describe('escaped worker descendant cleanup', () => {
     const launcher = spawnAgentProcess(process.execPath, ['-e', launcherSource], {
       cwd: process.cwd(),
       env: {},
+      workerScope: dir,
     });
     const closed = new Promise<void>((resolve) => launcher.child.once('close', () => resolve()));
     const helperPid = await waitForPid(pidFile);
@@ -296,6 +339,62 @@ describe('escaped worker descendant cleanup', () => {
         /* already gone */
       }
     }
+  });
+
+  it('turns a successful child exit into an infrastructure failure when cleanup cannot prove containment', async () => {
+    let observedAt = 0;
+    const outcome = await new AgentCallExecutor(new ImmediateAdapter(), {
+      processInspection: {
+        platform: 'linux',
+        discoverWorkerProcesses: () => ({ processes: [], complete: false }),
+        observationNow: () => {
+          observedAt += 1_000;
+          return observedAt;
+        },
+        observationWait: async () => {},
+      },
+    }).execute({
+      seq: 0,
+      prompt: 'finish without a complete process inventory',
+      label: 'cleanup-proof',
+      backend: 'mock',
+      cwd: process.cwd(),
+      retries: 0,
+    }, SIGNAL);
+    expect(outcome).toMatchObject({
+      ok: false,
+      errorKind: 'infra',
+      error: 'descendant cleanup failed after bounded retries',
+    });
+  });
+
+  it('promotes unresolved cleanup for a failed child and does not start another attempt', async () => {
+    let observedAt = 0;
+    const outcome = await new AgentCallExecutor(new FailedAdapter(), {
+      processInspection: {
+        platform: 'linux',
+        listLinuxProcessIds: () => [],
+        discoverWorkerProcesses: () => ({ processes: [], complete: false }),
+        observationNow: () => {
+          observedAt += 1_000;
+          return observedAt;
+        },
+        observationWait: async () => {},
+      },
+    }).execute({
+      seq: 0,
+      prompt: 'fail with incomplete cleanup',
+      label: 'cleanup-failed-child',
+      backend: 'mock',
+      cwd: process.cwd(),
+      retries: 2,
+    }, SIGNAL);
+    expect(outcome).toMatchObject({
+      ok: false,
+      errorKind: 'infra',
+      error: 'descendant cleanup failed after bounded retries',
+      attempts: 1,
+    });
   });
 
   it('reaps the escaped session when an attempt timeout terminates the worker', async () => {

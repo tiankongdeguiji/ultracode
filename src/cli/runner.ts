@@ -11,7 +11,13 @@ import { executeWorkflow } from '../engine/run.js';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { JournalWriter, KeyChain, PrefixReplayCache, argsHash, readJournal, seedKey } from '../engine/journal.js';
 import { EventWriter } from '../store/events.js';
-import { readManifest, writeManifest, HEARTBEAT_INTERVAL_MS, type RunManifest } from '../store/manifest.js';
+import {
+  isResumableStatus,
+  readManifest,
+  writeManifest,
+  HEARTBEAT_INTERVAL_MS,
+  type RunManifest,
+} from '../store/manifest.js';
 import { readRunArgs, readRunConfig } from '../store/runstore.js';
 import { agentDirName } from '../store/layout.js';
 import { MockExecutor } from '../backends/mock.js';
@@ -19,6 +25,7 @@ import { createExecutorForBackend } from '../engine/agentcall.js';
 import { readProcStat } from '../exec/procinfo.js';
 import { chainedTimeout } from '../exec/timers.js';
 import { killWorkerGroupsUntilGone } from '../exec/stop.js';
+import { errorMessage } from '../engine/errors.js';
 import { Semaphore, defaultConcurrency, isPositiveInt } from '../engine/semaphore.js';
 import { BudgetAccount } from '../budget/account.js';
 import { createWorktreeManager, repoRootSync, worktreesRootFor } from '../exec/worktree.js';
@@ -55,12 +62,21 @@ function makeExecutorMux(dir: string, permission: 'safe' | 'auto' | 'danger', at
   };
 }
 
-export async function runnerMain(dir: string): Promise<number> {
+export async function runnerMain(
+  dir: string,
+  cleanupWorkers: (runDir: string) => Promise<number> = killWorkerGroupsUntilGone,
+): Promise<number> {
   const source = readFileSync(join(dir, 'script.js'), 'utf8');
   const args = readRunArgs(dir);
   const config = readRunConfig(dir);
   const base = readManifest(dir);
   if (!base) throw new Error(`no manifest in ${dir}`);
+  if (config.resumeFromRunId !== undefined) {
+    const prior = readManifest(join(dirname(dir), config.resumeFromRunId));
+    if (prior === null || !isResumableStatus(prior.status)) {
+      throw new Error(`run ${config.resumeFromRunId} cannot be resumed before verified worker cleanup`);
+    }
+  }
 
   const events = new EventWriter(join(dir, 'events.jsonl'));
   const journal = new JournalWriter(join(dir, 'journal.jsonl'));
@@ -99,24 +115,31 @@ export async function runnerMain(dir: string): Promise<number> {
         type: 'workflow_log',
         message: `hard stop: runner did not unwind ${HARD_STOP_GRACE_MS}ms after ${reason} — force-exiting`,
       });
+      let cleanupFailure: string | undefined;
       try {
-        const killedWorkers = await killWorkerGroupsUntilGone(dir);
+        const killedWorkers = await cleanupWorkers(dir);
         if (killedWorkers > 0) {
           events.write({
             type: 'workflow_log',
             message: `hard stop reaped ${killedWorkers} worker record(s)`,
           });
         }
-        writeManifest(dir, {
-          ...manifest,
-          status: 'stopped',
-          endedAt: new Date().toISOString(),
-          heartbeatAt: new Date().toISOString(),
-          error: reason,
+      } catch (error) {
+        cleanupFailure = errorMessage(error);
+        events.write({
+          type: 'workflow_log',
+          message: `hard stop worker cleanup incomplete: ${cleanupFailure}`,
         });
-      } catch {
-        /* best effort — the point is to not leave a live orphan */
       }
+      writeManifest(dir, {
+        ...manifest,
+        status: cleanupFailure === undefined ? 'stopped' : 'cleanup-failed',
+        endedAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+        error: cleanupFailure === undefined
+          ? reason
+          : `${reason}; worker cleanup incomplete: ${cleanupFailure}`,
+      });
       events.close();
       process.exit(1);
     }, HARD_STOP_GRACE_MS);
@@ -334,13 +357,27 @@ export async function runnerMain(dir: string): Promise<number> {
   writeFileNoFollow(join(dir, 'output.json'), JSON.stringify(output, null, 2));
 
   const stopped = abort.signal.aborted;
+  let cleanupFailure: string | undefined;
+  try {
+    await cleanupWorkers(dir);
+  } catch (error) {
+    cleanupFailure = errorMessage(error);
+    events.write({
+      type: 'workflow_log',
+      message: `worker cleanup incomplete: ${cleanupFailure}`,
+    });
+  }
   manifest = {
     ...manifest,
-    status: stopped ? 'stopped' : output.error ? 'failed' : 'completed',
+    status: cleanupFailure !== undefined
+      ? 'cleanup-failed'
+      : stopped ? 'stopped' : output.error ? 'failed' : 'completed',
     endedAt: new Date().toISOString(),
     heartbeatAt: new Date().toISOString(),
     budget: { ...manifest.budget, spent: spentTotal || output.totalTokens },
-    error: output.error,
+    error: cleanupFailure === undefined
+      ? output.error
+      : [output.error, `worker cleanup incomplete: ${cleanupFailure}`].filter(Boolean).join('; '),
   };
   writeManifest(dir, manifest);
   events.close();

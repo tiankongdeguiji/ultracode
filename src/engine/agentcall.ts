@@ -7,7 +7,7 @@
  */
 import { mkdirSync, writeFileSync, writeSync, closeSync, mkdtempSync, rmSync } from 'node:fs';
 import { openWriteFdNoFollow, writeFileAtomicNoFollow, writeFileNoFollow } from '../exec/safe-write.js';
-import { readProcessIdentity } from '../exec/procinfo.js';
+import { readProcessIdentity, type ProcessInspectionOptions } from '../exec/procinfo.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NdjsonSplitter } from '../backends/ndjson.js';
@@ -22,7 +22,10 @@ import {
 import { validateWithSchema } from './ajv.js';
 import { spawnAgentProcess, TailBuffer, type SpawnedAgent } from '../exec/spawn.js';
 import { chainedTimeout } from '../exec/timers.js';
-import { workerRecordDir, workerRecordPath } from '../exec/worker-record.js';
+import {
+  workerRecordDir,
+  workerRecordPath,
+} from '../exec/worker-record.js';
 import type {
   AgentEvent,
   AgentExecutor,
@@ -75,6 +78,8 @@ export interface AgentCallOptions {
   usageTickIntervalMs?: number;
   /** Stable run-dir scope inherited by workers and checked during recovery. */
   workerScope?: string;
+  /** Explicit platform/process seam for deterministic process-supervision tests. */
+  processInspection?: ProcessInspectionOptions;
 }
 
 export const USAGE_TICK_INTERVAL_MS = 1000;
@@ -514,7 +519,6 @@ export class AgentCallExecutor implements AgentExecutor {
       : artifactDir
         ? join(artifactDir, `pgid.attempt${attempt}${stderrSuffix}`)
         : undefined;
-
     // Schema temp file (codex --output-schema wants a path). Inserted before
     // the trailing '-' stdin positional when present.
     let schemaTmpDir: string | undefined;
@@ -592,6 +596,7 @@ export class AgentCallExecutor implements AgentExecutor {
     let onAbort: (() => void) | undefined;
     let proc: SpawnedAgent | undefined;
     let descendantsRemaining: number | undefined;
+    let attemptResult: AttemptResult | undefined;
     // Delayed SIGKILL escalations scheduled after a SIGTERM. Tracked so `finally`
     // can cancel any still pending — otherwise a kill stays armed 5s out against
     // a pid that has already closed and may be recycled (→ kill the wrong group).
@@ -623,8 +628,11 @@ export class AgentCallExecutor implements AgentExecutor {
         // killed after the child starts but before identity lookup completes,
         // Linux can still find the marked process through procfs.
         onWorkerToken: processRecordFile
-          ? (token) => writeFileAtomicNoFollow(processRecordFile, `- - ${token}`)
+          ? (token) => {
+              writeFileAtomicNoFollow(processRecordFile, `- - ${token}`);
+            }
           : undefined,
+        processInspection: this.opts.processInspection,
       });
       proc = spawned;
       // Persist the worker's PGID so `ultracode stop` can kill the group if the
@@ -632,7 +640,7 @@ export class AgentCallExecutor implements AgentExecutor {
       // Record `<pid> <starttime> <worker-token>`: start-time binds the PGID to
       // this process instance; the token finds descendants that leave the PGID.
       if (processRecordFile && spawned.child.pid) {
-        const stat = readProcessIdentity(spawned.child.pid);
+        const stat = readProcessIdentity(spawned.child.pid, this.opts.processInspection);
         // Keep an explicit placeholder when a very short-lived leader exits
         // before its identity can be read; whitespace splitting must retain the
         // token as field three for recovery of descendants it already launched.
@@ -735,9 +743,20 @@ export class AgentCallExecutor implements AgentExecutor {
       } else if (abortedAtExit) {
         exit = { ok: false, errorKind: 'interrupted', retryable: false, message: 'aborted' };
       }
-      return { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, outputChars };
+      if (exit.ok && descendantsRemaining !== 0) {
+        descendantsRemaining = await spawned.cleanupEscaped();
+        if (descendantsRemaining !== 0) {
+          exit = {
+            ok: false,
+            errorKind: 'infra',
+            retryable: false,
+            message: 'descendant cleanup failed after bounded retries',
+          };
+        }
+      }
+      attemptResult = { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, outputChars };
     } catch (err) {
-      return {
+      attemptResult = {
         exit: {
           ok: false,
           errorKind: 'infra',
@@ -760,16 +779,37 @@ export class AgentCallExecutor implements AgentExecutor {
       // The normal path starts cleanup on direct-child `exit`. Retry here only
       // after an error or an incomplete sweep before dropping the recovery
       // record.
-      if (descendantsRemaining !== 0) descendantsRemaining = (await proc?.cleanupEscaped()) ?? 0;
+      if (descendantsRemaining !== 0) {
+        try {
+          descendantsRemaining = (await proc?.cleanupEscaped()) ?? 0;
+        } catch {
+          descendantsRemaining = 1;
+        }
+      }
+      if (descendantsRemaining !== 0 && attemptResult !== undefined) {
+        attemptResult = {
+          ...attemptResult,
+          exit: {
+            ok: false,
+            errorKind: 'infra',
+            retryable: false,
+            message: 'descendant cleanup failed after bounded retries',
+          },
+        };
+      }
       if (transcriptFd !== undefined) closeSync(transcriptFd);
       try {
         sidecar?.close();
       } catch {
         /* display-only */
       }
-      if (processRecordFile && descendantsRemaining === 0) rmSync(processRecordFile, { force: true });
+      if (processRecordFile && descendantsRemaining === 0) {
+        rmSync(processRecordFile, { force: true });
+      }
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }
+    if (attemptResult === undefined) throw new Error('agent attempt did not produce a result');
+    return attemptResult;
   }
 
   private toOutcome(
