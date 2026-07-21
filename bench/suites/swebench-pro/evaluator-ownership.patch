@@ -19,7 +19,36 @@ diff --git a/swe_bench_pro_eval.py b/swe_bench_pro_eval.py
      if docker is None:
          raise RuntimeError("docker SDK is not installed. Install via 'pip install docker' or run without --use_local_docker")
      uid = sample["instance_id"]
-@@ -399,6 +399,17 @@ def eval_with_docker(patch, sample, output_dir, dockerhub_username, scripts_dir,
+@@ -376,21 +376,14 @@ def eval_with_docker(patch, sample, output_dir, dockerhub_username, scripts_dir,
+
+         # Run container via Docker SDK
+         dockerhub_image_uri = get_dockerhub_image_uri(uid, dockerhub_username, sample.get("repo", ""))
+-        print(f"Using Docker Hub image: {dockerhub_image_uri}")
++        benchmark_image_id = sample.get("benchmark_image_id")
++        if not isinstance(benchmark_image_id, str) or re.fullmatch(r"sha256:[a-f0-9]{64}", benchmark_image_id) is None:
++            raise RuntimeError(f"Missing immutable benchmark image for {uid}")
++        print(f"Using manifest-pinned local image: {benchmark_image_id} (source tag {dockerhub_image_uri})")
+
+         client = docker.from_env()
+-        try:
+-            if docker_platform:
+-                client.images.pull(dockerhub_image_uri, platform=docker_platform)
+-            else:
+-                client.images.pull(dockerhub_image_uri)
+-        except Exception as pull_err:
+-            # If pull fails, fall back to a local image if present; otherwise, fail this run
+-            try:
+-                client.images.get(dockerhub_image_uri)
+-                print(f"Using locally available image: {dockerhub_image_uri}")
+-            except Exception:
+-                print(f"Failed to pull or find image locally for {uid}: {pull_err}")
+-                return None
++        local_image = client.images.get(benchmark_image_id)
++        if local_image.id != benchmark_image_id:
++            raise RuntimeError(f"Local benchmark image identity drifted for {uid}")
+
+         abs_workspace_dir = os.path.abspath(workspace_dir)
+@@ -399,6 +393,17 @@ def eval_with_docker(patch, sample, output_dir, dockerhub_username, scripts_dir,
              "entrypoint": "/bin/bash",  # Override image entrypoint
              "command": ["-c", "bash /workspace/entryscript.sh"],
          }
@@ -37,6 +66,14 @@ diff --git a/swe_bench_pro_eval.py b/swe_bench_pro_eval.py
          if block_network:
              run_kwargs["network_mode"] = "none"
          # Optional platform override (useful on Apple Silicon)
+@@ -409,6 +414,6 @@ def eval_with_docker(patch, sample, output_dir, dockerhub_username, scripts_dir,
+
+         container = client.containers.run(
+-            dockerhub_image_uri,
++            benchmark_image_id,
+             **run_kwargs,
+         )
+
 @@ -454,6 +464,13 @@ def parse_args():
      parser.add_argument(
          "--redo", action="store_true", help="Redo evaluations even if output exists"

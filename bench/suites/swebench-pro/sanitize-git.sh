@@ -15,6 +15,11 @@ unset GIT_NAMESPACE GIT_SHALLOW_FILE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 export GIT_NO_REPLACE_OBJECTS=1
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=core.fsmonitor
+export GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=core.hooksPath
+export GIT_CONFIG_VALUE_1=/dev/null
 export LC_ALL=C
 
 fail() {

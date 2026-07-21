@@ -32,17 +32,22 @@ agent process or a lookalike output file is never score authority.
 Prepared evaluator sources, Python artifacts, dataset rows, task images,
 native patches, prompt policy, container policy, and control-plane sources are
 pinned or content-addressed and re-attested at launch. Dataset acquisition
-verifies the complete reviewed canonical-row digest before replacing the cache.
+verifies the complete configured canonical-row digest before replacing the
+cache. The initial Pro pin records integrity against one local capture but has
+no retained upstream-commit or independent-reproduction evidence; it is not an
+audited provenance claim.
 The official evaluator remains trusted for score semantics, but missing,
 malformed, stale, or policy-invalid evidence remains unverified.
 
 Task sessions have no direct provider credential, auth file, generic proxy, or
-default/WAN network. Each task is stopped behind a nonce-bound gate until the
-host verifies its immutable image, labels, capability/resource policy,
-sanitized environment, and sole attachment to a dedicated internal,
-non-attachable Docker bridge. The only infrastructure endpoint on that bridge
-is a separately operated immutable-image Responses relay. The relay may retain
-an explicitly attested upstream attachment; task endpoints may not. A
+default/WAN network. Each container is created stopped so the host can verify
+its immutable image, labels, exact trusted gate command, user, mounts,
+capability/resource policy, healthcheck, sanitized environment, and configured
+network before startup. Docker then starts only a pinned musl loader and
+BusyBox gate; the host re-verifies the running attachment and complete internal
+topology before releasing its nonce. The only infrastructure endpoint on that
+bridge is a separately operated immutable-image Responses relay. The relay may
+retain an explicitly attested upstream attachment; task endpoints may not. A
 host-wide policy lock serializes transport inspection, sessions, recovery,
 evaluation, and cleanup across worktrees.
 

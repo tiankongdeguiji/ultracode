@@ -1,4 +1,4 @@
-/** Offline tests for the audited canonical SWE-bench Pro dataset descriptor. */
+/** Offline tests for the canonical SWE-bench Pro dataset descriptor. */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -47,11 +47,12 @@ function fixture(rows: readonly Record<string, unknown>[]) {
   mkdirSync(join(root, 'suites/swebench-pro'), { recursive: true });
   mkdirSync(join(root, '.cache/swebench-pro'), { recursive: true, mode: 0o700 });
   writeFileSync(join(root, 'suites/swebench-pro/dataset-pin.json'), `${JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: 'ultracode-swebench-pro-dataset-pin',
     dataset: 'ScaleAI/SWE-bench_Pro',
     config: 'default',
     split: 'test',
+    auditStatus: 'unaudited-local-content-digest',
     rowCount: descriptor.rows.length,
     descriptorSha256: sha256CanonicalJson(descriptor),
   }, null, 2)}\n`);
@@ -59,13 +60,14 @@ function fixture(rows: readonly Record<string, unknown>[]) {
 }
 
 describe('SWE-bench Pro dataset provenance', () => {
-  it('commits the reviewed 731-row descriptor digest', () => {
+  it('labels the committed 731-row descriptor as an unaudited local digest', () => {
     const pin = loadDatasetPin(createBenchPathRoots(join(process.cwd(), 'bench')));
     expect(pin).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       dataset: 'ScaleAI/SWE-bench_Pro',
       config: 'default',
       split: 'test',
+      auditStatus: 'unaudited-local-content-digest',
       rowCount: 731,
       descriptorSha256: '067bd23ae664ba2113b70d24803e04bb95242ff7c15a7c92642c482544fce0d2',
     });
@@ -87,7 +89,7 @@ describe('SWE-bench Pro dataset provenance', () => {
     expect(datasetDescriptorSha256(roots, loaded)).toBe(sha256CanonicalJson(descriptor));
   });
 
-  it('preserves existing cache bytes when fetched rows miss the audited digest', async () => {
+  it('preserves existing cache bytes when fetched rows miss the configured digest', async () => {
     const { roots } = fixture([row('task-a')]);
     const cache = join(roots.cacheRoot, 'swebench-pro/instances-v2.json');
     const original = Buffer.from('existing-cache-bytes\n');
@@ -95,7 +97,7 @@ describe('SWE-bench Pro dataset provenance', () => {
     await expect(fetchInstances(roots, async () => ({
       rows: [{ row: row('task-b') }],
       num_rows_total: 1,
-    }))).rejects.toThrow(/does not match the audited pin/);
+    }))).rejects.toThrow(/does not match the configured pin/);
     expect(readFileSync(cache)).toEqual(original);
   });
 
@@ -105,7 +107,7 @@ describe('SWE-bench Pro dataset provenance', () => {
     await expect(fetchInstances(roots, async (offset) => {
       calls.push(offset);
       return { rows: [{ row: row('task-a') }], num_rows_total: 1_000_000_000 };
-    })).rejects.toThrow(/row count does not match the audited pin/);
+    })).rejects.toThrow(/row count does not match the configured pin/);
     expect(calls).toEqual([0]);
   });
 
@@ -116,6 +118,6 @@ describe('SWE-bench Pro dataset provenance', () => {
       ...descriptor,
       rows: [row('task-b')],
     }, null, 2)}\n`, { mode: 0o600 });
-    expect(() => loadDatasetSnapshot(roots)).toThrow(/does not match the audited pin/);
+    expect(() => loadDatasetSnapshot(roots)).toThrow(/does not match the configured pin/);
   });
 });

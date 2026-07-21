@@ -38,13 +38,14 @@ must be a local, non-attachable, non-ingress Docker bridge created with
 `ultracode.egress-policy=codex-responses-via-attested-relay-v1`. Before manifest
 publication it must contain exactly the running relay. During sessions it may
 contain only that relay and exact active run-owned task containers. Each task
-container is launched by its manifest-bound immutable local image ID, with the
-image healthcheck disabled and shell/dynamic-loader bootstrap variables cleared.
-It is created with only that network; post-create inspection rejects a
-default/WAN attachment, an injected generic proxy, or any provider credential
-environment variable. The inspection also binds the exact per-attempt runtime
-nonce in both its ownership label and environment, and binds the exact attested
-relay base URL before the host publishes that nonce to the entrypoint gate.
+container is created stopped from its manifest-bound immutable local image ID,
+with the image healthcheck disabled and shell/dynamic-loader bootstrap
+variables cleared. Pre-start inspection binds the exact trusted loader/gate
+command, user, labels, mounts, capability/resource policy, runtime nonce,
+credential-free environment, relay URL, and configured network. Docker then
+starts only the pinned musl loader and BusyBox gate. The host reinspects the
+running sole-network attachment and complete relay topology before publishing
+the nonce, after which the gate may execute the task image's Bash entrypoint.
 
 The separately managed relay must use an immutable local image and declare its
 public identity/version, exact model hash, fixed-destination hash, and relay
@@ -74,12 +75,12 @@ workers inherit the same provider without a provider key.
 
 The harness inspects the network, exact endpoint IDs, task attachment, relay
 image/command/mounts/networks, and declared labels before publication, on
-resume, after each session is created, and after each normally completed
+resume, before and after each session starts, and after each normally completed
 session. After normal exit, the stopped task may be absent from the network;
 the relay remains required and every unexpected endpoint remains fatal. The
-immutable entrypoint waits on a
-nonce-bound host gate, so no task-controlled process starts before the
-post-create attachment and topology checks succeed. Stable hashes enter both
+trusted loader and BusyBox gate wait on a nonce-bound host file, so no
+task-image process starts before the running attachment and topology checks
+succeed. Stable hashes enter both
 `suiteConfig.modelTransport` and `provenance.modelTransport`; reports copy the
 latter and bind the complete suite config by hash. A user-private host policy
 lock below `/tmp/ultracode-bench-<uid>/` serializes Pro recovery, execution,
@@ -209,8 +210,9 @@ mode, `--no-deps`, the host matrix, or closure validation to publish a lock.
 
 ## Dataset pin and acquisition
 
-The cache is not the dataset authority. `dataset-pin.json` commits the reviewed
-SHA-256 of one version-1 canonical descriptor with exactly these fields:
+The cache is not the dataset authority. `dataset-pin.json` commits the SHA-256
+of one version-1 canonical descriptor. The pin itself is schema version 2 and
+records `auditStatus=unaudited-local-content-digest`; the descriptor fields are:
 
 ```text
 schemaVersion, kind, dataset, config, split, rows
@@ -222,6 +224,10 @@ recursively sorting object keys while preserving array order, then SHA-256 is
 computed over the UTF-8 canonical JSON bytes. The current pin covers 731 rows
 from `ScaleAI/SWE-bench_Pro`, config `default`, split `test`, at descriptor
 digest `067bd23ae664ba2113b70d24803e04bb95242ff7c15a7c92642c482544fce0d2`.
+This value was carried forward as a local content digest without a retained
+upstream commit, independent Parquet reproduction, audit output, or second
+review. It detects drift from that capture but is not audited dataset
+provenance. Complete the renewal procedure below before publishing scores.
 
 `fetch` downloads into memory, validates every complete row, constructs and
 verifies that descriptor, and only then atomically replaces the cache. A count
@@ -283,6 +289,8 @@ nonce whenever runtime homes are mounted. Its frozen policy is network mode
 `CHOWN`, `DAC_OVERRIDE`, and `FOWNER`, uid/gid `0:0`, and the same
 manifest-derived CPU and memory limits. The helper mounts exactly the task
 artifact directory and, when present, that session's `home` and `codex-home`.
+Its root command runs through the payload-hashed musl loader and BusyBox copy,
+not an executable supplied by the task's base image.
 
 Every reclamation attempt queries its exact Docker name before launch and after
 the Docker client settles. A same-name container is actionable only after

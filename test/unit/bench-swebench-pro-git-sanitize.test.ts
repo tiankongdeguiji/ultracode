@@ -1,12 +1,14 @@
 /** Offline regression coverage for the SWE-bench Pro Git history boundary. */
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -231,10 +233,20 @@ describe('SWE-bench Pro Git sanitizer', () => {
     mkdirSync(join(bench, 'out'), { recursive: true });
     mkdirSync(join(bench, 'logs'));
     writeFileSync(join(repository, 'tracked.txt'), 'base\n');
-    git(repository, ['add', 'tracked.txt']);
+    writeFileSync(join(repository, 'binary.bin'), Buffer.from([0, 1]));
+    git(repository, ['add', 'tracked.txt', 'binary.bin']);
     git(repository, ['commit', '--quiet', '-m', 'base']);
     const base = git(repository, ['rev-parse', 'HEAD']);
+    const fsmonitorMarker = join(root, 'fsmonitor-ran');
+    const fsmonitor = join(root, 'fsmonitor.sh');
+    writeFileSync(fsmonitor, `#!/bin/sh\n: > '${fsmonitorMarker}'\nprintf '\\n'\n`);
+    chmodSync(fsmonitor, 0o700);
+    git(repository, ['config', 'core.fsmonitor', fsmonitor]);
+    git(repository, ['status', '--porcelain']);
+    expect(existsSync(fsmonitorMarker)).toBe(true);
+    rmSync(fsmonitorMarker);
     writeFileSync(join(repository, 'tracked.txt'), 'changed\n');
+    writeFileSync(join(repository, 'binary.bin'), Buffer.from([0, 2]));
     writeFileSync(join(repository, 'pre-existing.txt'), 'image runtime file\n');
     writeFileSync(preDirty, ':(literal)pre-existing.txt\0');
 
@@ -249,9 +261,38 @@ describe('SWE-bench Pro Git sanitizer', () => {
     });
     const patch = readFileSync(join(bench, 'out/patch.diff'), 'utf8');
     expect(patch).toContain('+changed');
+    expect(patch).not.toContain('binary.bin');
     expect(patch).not.toContain('pre-existing.txt');
     expect(readFileSync(join(bench, 'out/apply-check'), 'utf8')).toBe('ok\n');
-    expect(readFileSync(join(bench, 'out/binary-stripped'), 'utf8')).toBe('0');
+    expect(readFileSync(join(bench, 'out/binary-stripped'), 'utf8')).toBe('1');
+    expect(existsSync(fsmonitorMarker)).toBe(false);
     expect(git(repository, ['status', '--porcelain'])).toBe('?? pre-existing.txt');
+  });
+
+  it('bounds patch capture before a large text diff can exhaust memory or output space', () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-bench-pro-capture-large-'));
+    temporaryRoots.push(root);
+    const repository = join(root, 'repository');
+    const bench = join(root, 'bench');
+    const preDirty = join(root, 'predirty.z');
+    initializeRepository(repository);
+    mkdirSync(join(bench, 'out'), { recursive: true });
+    mkdirSync(join(bench, 'logs'));
+    writeFileSync(join(repository, 'tracked.txt'), 'base\n');
+    git(repository, ['add', 'tracked.txt']);
+    git(repository, ['commit', '--quiet', '-m', 'base']);
+    const base = git(repository, ['rev-parse', 'HEAD']);
+    writeFileSync(join(repository, 'large.txt'), Buffer.alloc(10_100_000, 0x61));
+    writeFileSync(preDirty, '');
+
+    const result = spawnSync('bash', [capture, repository, base, bench, process.execPath, preDirty], {
+      encoding: 'utf8',
+      env: cleanGitEnvironment(),
+    });
+
+    expect(result.status).toBe(0);
+    expect(statSync(join(bench, 'out/patch.diff')).size).toBe(10_000_001);
+    expect(existsSync(join(bench, 'out/patch.full.diff'))).toBe(false);
+    expect(existsSync(join(bench, 'out/apply-check'))).toBe(false);
   });
 });

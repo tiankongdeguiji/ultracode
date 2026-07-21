@@ -32,6 +32,7 @@ import {
   loadPreparedToolchain,
   prepareSharedToolchain,
   type PreparedToolchain,
+  type ToolchainNativeAsset,
 } from '../../shared/toolchain.js';
 import {
   suiteCacheDir,
@@ -46,6 +47,15 @@ const PREPARED_IDENTITY = 'prepared-identity.json';
 const RESOLVED_REQUIREMENTS = 'resolved-requirements.lock';
 const REQUIREMENTS_LOCK = 'suites/swebench-pro/evaluator-requirements.lock';
 const REQUIREMENTS_PROVENANCE = 'suites/swebench-pro/evaluator-requirements.provenance.json';
+export const SWEBENCH_PRO_TOOLCHAIN_NATIVE_ASSETS = [
+  'entrypoint.sh',
+  'session-gate.sh',
+  'sanitize-git.sh',
+  'capture-git.sh',
+].map((destination): ToolchainNativeAsset => ({
+  source: `suites/swebench-pro/${destination}`,
+  destination,
+}));
 export const EVALUATOR_DEPENDENCY_PROVENANCE_SHA256 =
   'd9789a12b88dd5faf478d3fbca502e98e9ba7a048523d4cbfe575e5121881ba9';
 
@@ -652,7 +662,11 @@ export async function prepareSwebenchProInputs(
   const evaluatorDirectory = join(stage, 'evaluator');
   const environmentDirectory = join(stage, 'environment');
   try {
-    const toolchain = await prepareSharedToolchain(toolchainConfig, roots);
+    const toolchain = await prepareSharedToolchain(
+      toolchainConfig,
+      roots,
+      SWEBENCH_PRO_TOOLCHAIN_NATIVE_ASSETS,
+    );
     await command('git', ['clone', '--filter=blob:none', '--sparse', config.evaluator.repository, evaluatorDirectory], roots.cacheRoot);
     await command('git', ['-C', evaluatorDirectory, 'sparse-checkout', 'set', '--no-cone', ...SPARSE_PATHS], roots.cacheRoot);
     await command('git', ['-C', evaluatorDirectory, 'fetch', '--depth=1', 'origin', config.evaluator.revision], roots.cacheRoot);

@@ -38,6 +38,7 @@ import {
   evaluatorProcessArgv,
   evaluatorPolicyDocument,
   evaluatorPolicyDocumentSha256,
+  generateRawSamples,
   runOfficialEvaluator,
   type EvaluatorRunResult,
   type EvaluatorProcessExecutor,
@@ -139,7 +140,6 @@ const emptyDocker = async (argv: readonly string[]): Promise<string> => {
 };
 
 const evaluatorImages = new Map(['task-a', 'task-b'].map((taskId) => [taskId, {
-  reference: 'jefzda/sweap-images:owner.repo-task',
   localId: `sha256:${'c'.repeat(64)}`,
 }]));
 const evaluatorInvocationStarts = new Map([
@@ -147,6 +147,15 @@ const evaluatorInvocationStarts = new Map([
 ]);
 
 describe('official SWE-bench Pro evaluator seam', () => {
+  it('fails closed without a manifest-pinned evaluator image identity', () => {
+    const { root } = evaluatorFixture();
+    expect(() => generateRawSamples(
+      [instanceFromRow(row('task-a'))],
+      new Map(),
+      join(root, 'raw-samples.jsonl'),
+    )).toThrow(/immutable evaluator image identity is missing/);
+  });
+
   it('records exact non-empty invocation and artifacts while filtering native output', async () => {
     const { runDirectory, evaluatorDirectory } = evaluatorFixture();
     const dockerTimeouts: number[] = [];
@@ -203,6 +212,7 @@ describe('official SWE-bench Pro evaluator seam', () => {
       }),
       options: expect.objectContaining({ cwd: evaluatorDirectory, timeoutMs: 60_000, stream: true }),
     }]);
+    expect(calls[0]!.argv).toContain('--block_network');
     expect(result.verdicts).toEqual({ 'task-a': true });
     expect(result.malformedTaskIds).toEqual([]);
     expect(result.processFailure).toBeNull();
@@ -210,8 +220,16 @@ describe('official SWE-bench Pro evaluator seam', () => {
     expect(dockerTimeouts.every((timeoutMs) => Number.isSafeInteger(timeoutMs) && timeoutMs > 0)).toBe(true);
     expect(result.resultRelativePath).toBe('native/verifier/armA/output/eval_results.json');
     expect(readFileSync(rawSamples, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
-      expect.objectContaining({ instance_id: 'task-a', before_repo_set_cmd: 'prepare' }),
-      expect.objectContaining({ instance_id: 'task-b', selected_test_files_to_run: 'test.ts' }),
+      expect.objectContaining({
+        instance_id: 'task-a',
+        before_repo_set_cmd: 'prepare',
+        benchmark_image_id: `sha256:${'c'.repeat(64)}`,
+      }),
+      expect.objectContaining({
+        instance_id: 'task-b',
+        selected_test_files_to_run: 'test.ts',
+        benchmark_image_id: `sha256:${'c'.repeat(64)}`,
+      }),
     ]);
     expect(JSON.parse(readFileSync(predictions, 'utf8'))).toEqual([prediction]);
     expect(JSON.parse(readFileSync(policy, 'utf8'))).toEqual(policyDocument);

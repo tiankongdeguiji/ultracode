@@ -33,6 +33,12 @@ const SESSION_ID = 'b'.repeat(64);
 const IMAGE_ID = `sha256:${'c'.repeat(64)}`;
 const RUNTIME_NONCE = 'd'.repeat(64);
 const MODEL = 'gpt-test';
+const TRUSTED_LOADER = '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1';
+const TRUSTED_BUSYBOX = '/opt/bench/node-musl-runtime/busybox';
+const SESSION_GATE = '/opt/bench/session-gate.sh';
+const SESSION_COMMAND = [
+  TRUSTED_BUSYBOX, 'sh', SESSION_GATE, '/bin/bash', '/opt/bench/entrypoint.sh',
+];
 const config = {
   relayIdentity: 'relay-public-id',
   relayVersion: 'relay-v1',
@@ -98,8 +104,12 @@ function session(overrides: Record<string, unknown> = {}): string {
     Id: SESSION_ID,
     Name: '/session-one',
     Image: IMAGE_ID,
+    State: { Running: true },
     Config: {
       Image: IMAGE_ID,
+      User: '0:0',
+      Entrypoint: [TRUSTED_LOADER],
+      Cmd: SESSION_COMMAND,
       Labels: {
         'ultracode.benchmark.schema': '2',
         'ultracode.benchmark.suite': 'swebench-pro',
@@ -118,10 +128,38 @@ function session(overrides: Record<string, unknown> = {}): string {
         'ENV=',
         'LD_PRELOAD=',
         'LD_AUDIT=',
+        'LD_LIBRARY_PATH=',
       ],
       Healthcheck: { Test: ['NONE'] },
     },
-    HostConfig: { NetworkMode: bindings.restrictedNetwork },
+    HostConfig: {
+      AutoRemove: false,
+      NetworkMode: bindings.restrictedNetwork,
+      Privileged: false,
+      ReadonlyRootfs: false,
+      PublishAllPorts: false,
+      Devices: [],
+      PidMode: '',
+      IpcMode: 'private',
+      RestartPolicy: { Name: 'no', MaximumRetryCount: 0 },
+      PidsLimit: 1_024,
+      SecurityOpt: ['no-new-privileges'],
+      CapDrop: ['ALL'],
+      CapAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'],
+      NanoCpus: 1_500_000_000,
+      Memory: 2_000_000,
+    },
+    Mounts: [
+      { Type: 'bind', Source: '/run/task-one', Destination: '/bench', RW: true },
+      { Type: 'bind', Source: '/runtime/home', Destination: '/runtime/home', RW: true },
+      { Type: 'bind', Source: '/runtime/codex-home', Destination: '/runtime/codex-home', RW: true },
+      {
+        Type: 'bind',
+        Source: '/run/task-one/codex-home/sessions',
+        Destination: '/runtime/codex-home/sessions',
+        RW: true,
+      },
+    ],
     NetworkSettings: { Networks: { [bindings.restrictedNetwork]: {} } },
     ...overrides,
   }]);
@@ -136,6 +174,27 @@ const expectedSession = {
   runtimeNonce: RUNTIME_NONCE,
   imageName: IMAGE_ID,
   imageId: IMAGE_ID,
+  running: true,
+  containerPolicy: {
+    user: '0:0',
+    entrypoint: [TRUSTED_LOADER],
+    command: SESSION_COMMAND,
+    pidsLimit: 1_024,
+    securityOpt: ['no-new-privileges'],
+    capDrop: ['ALL'],
+    capAdd: ['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETPCAP', 'SETUID'],
+    nanoCpus: 1_500_000_000,
+    memoryBytes: 2_000_000,
+    mounts: [
+      { source: '/run/task-one', destination: '/bench' },
+      { source: '/runtime/home', destination: '/runtime/home' },
+      { source: '/runtime/codex-home', destination: '/runtime/codex-home' },
+      {
+        source: '/run/task-one/codex-home/sessions',
+        destination: '/runtime/codex-home/sessions',
+      },
+    ],
+  },
 };
 
 describe('SWE-bench Pro attested model relay contract', () => {
@@ -522,6 +581,17 @@ describe('SWE-bench Pro task attachment', () => {
     expect(() => inspectSwebenchProSessionAttachment(session(), expectedSession, bindings)).not.toThrow();
   });
 
+  it('attests the complete stopped container policy before startup', () => {
+    const parsed = JSON.parse(session()) as Array<Record<string, unknown>>;
+    parsed[0]!.State = { Running: false };
+    parsed[0]!.NetworkSettings = { Networks: {} };
+    expect(() => inspectSwebenchProSessionAttachment(
+      JSON.stringify(parsed),
+      { ...expectedSession, running: false },
+      bindings,
+    )).not.toThrow();
+  });
+
   it('binds the exact runtime nonce and relay URL before opening the task gate', () => {
     for (const drift of ['label nonce', 'environment nonce', 'relay URL'] as const) {
       const parsed = JSON.parse(session()) as Array<{
@@ -591,11 +661,14 @@ describe('SWE-bench Pro task attachment', () => {
 
   it('configures Codex for the unauthenticated Responses relay with no legacy key injection', () => {
     const entrypoint = readFileSync(join(process.cwd(), 'bench/suites/swebench-pro/entrypoint.sh'), 'utf8');
+    const gate = readFileSync(join(process.cwd(), 'bench/suites/swebench-pro/session-gate.sh'), 'utf8');
     expect(entrypoint).toContain('model_provider = "swebench_pro_relay"');
     expect(entrypoint).toContain('wire_api = "responses"');
     expect(entrypoint).toContain('requires_openai_auth = false');
-    expect(entrypoint.indexOf('TRANSPORT_GATE=')).toBeLessThan(entrypoint.indexOf('"$CODEX" --version'));
-    expect(entrypoint).toContain('[ "$OBSERVED_NONCE" != "$BENCH_RUNTIME_NONCE" ]');
+    expect(entrypoint).not.toContain('.model-transport-attested');
+    expect(gate).toContain(`BUSYBOX=${TRUSTED_BUSYBOX}`);
+    expect(gate).toContain('[ "$observed" = "$NONCE" ]');
+    expect(gate).toContain('exec "$@"');
     expect(entrypoint).not.toContain('CODEX_API_KEY');
     expect(entrypoint).not.toContain('auth.json');
   });

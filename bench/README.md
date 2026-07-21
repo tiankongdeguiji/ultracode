@@ -71,7 +71,9 @@ Preparation publishes content-addressed inputs. The evaluator environment uses
 a checked-in transitive artifact lock, reviewed platform provenance,
 hash-required binary-only installation, and the pinned patched evaluator tree.
 The dataset cache is published only after the complete canonical row digest
-matches the reviewed pin.
+matches the configured pin. The initial pin is explicitly marked as an
+unaudited local content digest and must be independently renewed before results
+are treated as publishable benchmark evidence.
 
 ## Model isolation
 
@@ -83,9 +85,10 @@ that bridge and may retain its explicitly attested upstream attachment.
 
 The harness binds the full endpoint inventory, selected network, relay image,
 runtime command and mounts, public identity/version, fixed destination, model,
-and strict Responses-only contract. A nonce-bound gate keeps each task stopped
-until its image, labels, capability policy, environment, and sole network
-attachment pass inspection. Drift invalidates the run.
+and strict Responses-only contract. Each task is created stopped for complete
+container-policy inspection. Startup executes a pinned musl loader and BusyBox
+nonce gate; no task-image executable runs until the live attachment and
+topology pass reinspection. Drift invalidates the run.
 
 This proves the inspected Docker topology and the relay's declared contract;
 the Docker daemon, relay implementation, upstream egress, provider, and

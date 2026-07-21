@@ -9,7 +9,7 @@ import {
   swebenchProOperatorConfigSchema,
   type SwebenchProConfig,
 } from '../../bench/src/suites/swebench-pro/config.js';
-import { repositoryDigest } from '../../bench/src/suites/swebench-pro/image.js';
+import { prepareTaskImage, repositoryDigest } from '../../bench/src/suites/swebench-pro/image.js';
 import { instanceFromRow, selectInstances } from '../../bench/src/suites/swebench-pro/instances.js';
 import type { SwebenchProContainerPolicy } from '../../bench/src/suites/swebench-pro/container-policy.js';
 import { classifyOutcome } from '../../bench/src/suites/swebench-pro/state.js';
@@ -328,7 +328,6 @@ describe('complete row freezing and strict native evidence', () => {
 describe('evaluator ownership and empty predictions', () => {
   it('requires exact repository, post-baseline ownership, start time, and output mount', () => {
     const imageIdentities = new Map([['task', {
-      reference: 'jefzda/sweap-images:task',
       localId: `sha256:${'e'.repeat(64)}`,
     }]]);
     const labels = (taskId: string) => ({
@@ -342,10 +341,10 @@ describe('evaluator ownership and empty predictions', () => {
       'ultracode.benchmark.ownership': '1',
     });
     const records = [
-      { Id: 'a'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
-      { Id: 'b'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
-      { Id: 'c'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: 'jefzda/sweap-images-evil:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
-      { Id: 'd'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: 'jefzda/sweap-images:task', Labels: labels('task') }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/other', Destination: '/workspace' }] },
+      { Id: 'a'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: `sha256:${'e'.repeat(64)}`, Labels: labels('task') }, HostConfig: { NetworkMode: 'none' }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
+      { Id: 'b'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: `sha256:${'e'.repeat(64)}`, Labels: labels('task') }, HostConfig: { NetworkMode: 'none' }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
+      { Id: 'c'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: `sha256:${'0'.repeat(64)}`, Labels: labels('task') }, HostConfig: { NetworkMode: 'none' }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/run/output/task/workspace', Destination: '/workspace' }] },
+      { Id: 'd'.repeat(64), Image: `sha256:${'e'.repeat(64)}`, Config: { Image: `sha256:${'e'.repeat(64)}`, Labels: labels('task') }, HostConfig: { NetworkMode: 'none' }, State: { StartedAt: '2026-07-20T12:01:00Z' }, Mounts: [{ Type: 'bind', Source: '/other', Destination: '/workspace' }] },
     ];
     expect(ownedEvaluatorContainerIds(records, {
       outputDirectory: '/run/output',
@@ -365,6 +364,56 @@ describe('evaluator ownership and empty predictions', () => {
     const digest = `jefzda/sweap-images@sha256:${'a'.repeat(64)}`;
     expect(repositoryDigest({ RepoDigests: [digest, `other/image@sha256:${'b'.repeat(64)}`] })).toBe(digest);
     expect(() => repositoryDigest({ RepoDigests: [`jefzda/sweap-images-evil@sha256:${'a'.repeat(64)}`] })).toThrow();
+  });
+
+  it('gives identical task overlays distinct run-owned image identities', async () => {
+    const instance = instanceFromRow(row('task'));
+    const digest = `jefzda/sweap-images@sha256:${'a'.repeat(64)}`;
+    const baseId = `sha256:${'b'.repeat(64)}`;
+    const overlayIds = [`sha256:${'c'.repeat(64)}`, `sha256:${'e'.repeat(64)}`];
+    const buildArgv: string[][] = [];
+    const docker = async (argv: readonly string[]): Promise<string> => {
+      if (argv[0] === 'build') {
+        buildArgv.push([...argv]);
+        return '';
+      }
+      if (argv[0] === 'image' && argv[1] === 'inspect') {
+        const reference = argv[2]!;
+        if (reference === `jefzda/sweap-images:${instance.dockerhubTag}`) {
+          return JSON.stringify([{
+            Id: baseId,
+            RepoDigests: [digest],
+            Os: 'linux',
+            Architecture: 'amd64',
+          }]);
+        }
+        return JSON.stringify([{
+          Id: reference === digest
+            ? baseId
+            : overlayIds[buildArgv.findIndex((entry) => entry[entry.indexOf('-t') + 1] === reference)],
+          RepoDigests: reference === digest ? [digest] : [],
+          Os: 'linux',
+          Architecture: 'amd64',
+        }]);
+      }
+      throw new Error(`unexpected Docker argv: ${argv.join(' ')}`);
+    };
+    const common = {
+      roots: createBenchPathRoots(join(process.cwd(), 'bench')),
+      toolchainDirectory: '/cache/toolchain',
+      toolchainPayloadSha256: 'd'.repeat(64),
+      docker,
+    };
+
+    const first = await prepareTaskImage(instance, { ...common, runId: 'run-one' });
+    const second = await prepareTaskImage(instance, { ...common, runId: 'run-two' });
+
+    expect(first.overlayName).not.toBe(second.overlayName);
+    expect(first.overlayLocalId).not.toBe(second.overlayLocalId);
+    expect(buildArgv.map((argv) => argv[argv.indexOf('-t') + 1]))
+      .toEqual([first.overlayName, second.overlayName]);
+    expect(buildArgv[0]).toContain('ultracode.benchmark.run=run-one');
+    expect(buildArgv[1]).toContain('ultracode.benchmark.run=run-two');
   });
 
   it('cleans only fully labelled containers for manifest-owned tasks', () => {
@@ -401,7 +450,8 @@ describe('evaluator ownership and empty predictions', () => {
     const exact = {
       Id: 'e'.repeat(64),
       Image: `sha256:${'f'.repeat(64)}`,
-      Config: { Image: 'jefzda/sweap-images:task-a', Labels: labels },
+      Config: { Image: `sha256:${'f'.repeat(64)}`, Labels: labels },
+      HostConfig: { NetworkMode: 'none' },
       State: { StartedAt: '2026-07-20T12:01:00Z' },
       Mounts: [{
         Type: 'bind',
@@ -412,7 +462,6 @@ describe('evaluator ownership and empty predictions', () => {
     const evidence = {
       runDirectory: '/run',
       imageIdentities: new Map([['task-a', {
-        reference: 'jefzda/sweap-images:task-a',
         localId: `sha256:${'f'.repeat(64)}`,
       }]]),
       invocationStartedMs: new Map([[invocation, Date.parse('2026-07-20T12:00:00Z')]]),
@@ -452,7 +501,7 @@ describe('evaluator ownership and empty predictions', () => {
       predictions: [],
       instances: [instanceFromRow(row('task-a'))],
       containerPolicy,
-      imageIdentities: new Map(),
+      imageIdentities: new Map([['task-a', { localId: `sha256:${'c'.repeat(64)}` }]]),
       invocationStartedMs: new Map(),
       docker: async () => { throw new Error('docker must not be called'); },
     });

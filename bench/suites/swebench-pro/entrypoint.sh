@@ -84,22 +84,6 @@ finish() {
   exit 0
 }
 
-# No task-controlled code runs until the host has inspected the created
-# attachment and the complete relay-only topology for this exact runtime.
-TRANSPORT_GATE="$HOME/.model-transport-attested"
-if ! [[ ${BENCH_RUNTIME_NONCE:-} =~ ^[a-f0-9]{64}$ ]]; then
-  META_FAILURE="harness-setup-failed"
-  finish
-fi
-GATE_DEADLINE=$(( $(date +%s) + 120 ))
-while [ ! -f "$TRANSPORT_GATE" ] && [ "$(date +%s)" -lt "$GATE_DEADLINE" ]; do sleep 1; done
-IFS= read -r OBSERVED_NONCE < "$TRANSPORT_GATE" 2>/dev/null || OBSERVED_NONCE=""
-if [ "$OBSERVED_NONCE" != "$BENCH_RUNTIME_NONCE" ]; then
-  META_FAILURE="harness-setup-failed"
-  finish
-fi
-rm -f "$TRANSPORT_GATE"
-
 log "entrypoint arm=$BENCH_ARM timeout=${BENCH_TIMEOUT_SECS}s model=${BENCH_MODEL:-<unset>}"
 "$NODE" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
 "$CODEX" --version >&2 || { META_FAILURE="toolchain-incompatible"; finish; }
@@ -115,6 +99,11 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE GIT_REPLACE_REF_BASE
 unset GIT_NAMESPACE GIT_SHALLOW_FILE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 export GIT_NO_REPLACE_OBJECTS=1
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=core.fsmonitor
+export GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=core.hooksPath
+export GIT_CONFIG_VALUE_1=/dev/null
 BASE_SHA=$(git rev-parse HEAD 2>/dev/null) || { META_FAILURE="harness-setup-failed"; finish; }
 [ -n "${BENCH_BASE_COMMIT:-}" ] && [ "$BASE_SHA" != "$BENCH_BASE_COMMIT" ] && {
   log "base sha $BASE_SHA != dataset base_commit $BENCH_BASE_COMMIT"
@@ -273,7 +262,7 @@ active_runs() {
 if [ "$BENCH_ARM" = b ]; then
   WAIT_START=$(date +%s)
   REMAIN=$((BENCH_TIMEOUT_SECS - (END - START)))
-  [ "$REMAIN" -lt 300 ] && REMAIN=300
+  [ "$REMAIN" -lt 0 ] && REMAIN=0
   DEADLINE=$((WAIT_START + REMAIN))
   while [ -n "$(active_runs)" ] && [ "$(date +%s)" -lt "$DEADLINE" ]; do sleep 10; done
   STRAGGLERS=$(active_runs)

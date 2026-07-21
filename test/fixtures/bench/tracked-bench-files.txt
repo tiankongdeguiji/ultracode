@@ -45,3 +45,4 @@ bench/suites/swebench-pro/evaluator-policy.py
 bench/suites/swebench-pro/evaluator-requirements.lock
 bench/suites/swebench-pro/evaluator-requirements.provenance.json
 bench/suites/swebench-pro/sanitize-git.sh
+bench/suites/swebench-pro/session-gate.sh

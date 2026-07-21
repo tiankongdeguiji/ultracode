@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type { BenchPathRoots } from '../../shared/contracts.js';
+import { validateRunId } from '../../shared/paths.js';
 import { runBenchProcess } from '../../shared/process.js';
 import type { DockerImageAttestation, SwebenchProInstance } from './types.js';
 import { ownershipUnsafe, ownershipUnsafeAggregate } from './cleanup.js';
@@ -84,6 +85,7 @@ async function ensurePulled(requested: string, docker: DockerExecutor): Promise<
 
 export interface PrepareTaskImageOptions {
   roots: BenchPathRoots;
+  runId: string;
   toolchainDirectory: string;
   toolchainPayloadSha256: string;
   docker?: DockerExecutor;
@@ -95,6 +97,7 @@ export async function prepareTaskImage(
   options: PrepareTaskImageOptions,
 ): Promise<DockerImageAttestation> {
   const docker = options.docker ?? defaultDockerExecutor;
+  const runId = validateRunId(options.runId);
   const requested = `${BASE_IMAGE_REPOSITORY}:${instance.dockerhubTag}`;
   await ensurePulled(requested, docker);
   const tagged = await inspect(requested, docker);
@@ -102,7 +105,7 @@ export async function prepareTaskImage(
   const base = await inspect(resolvedDigest, docker);
   const baseIdentity = identity(base, resolvedDigest);
   const overlayKey = createHash('sha256')
-    .update(`${resolvedDigest}\0${options.toolchainPayloadSha256}\0${instance.instanceId}`, 'utf8')
+    .update(`${runId}\0${resolvedDigest}\0${options.toolchainPayloadSha256}\0${instance.instanceId}`, 'utf8')
     .digest('hex');
   const overlayName = `ultracode-swebench-pro:${overlayKey.slice(0, 48)}`;
   await docker([
@@ -111,6 +114,7 @@ export async function prepareTaskImage(
     '--label', 'ultracode.benchmark.schema=2',
     '--label', 'ultracode.benchmark.suite=swebench-pro',
     '--label', 'ultracode.benchmark.purpose=prep',
+    '--label', `ultracode.benchmark.run=${runId}`,
     '-f', join(options.roots.benchRoot, 'suites', 'swebench-pro', 'Dockerfile'),
     '--build-arg', `BASE_IMAGE=${resolvedDigest}`,
     '-t', overlayName,

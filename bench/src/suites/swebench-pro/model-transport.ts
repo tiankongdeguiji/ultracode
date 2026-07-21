@@ -142,9 +142,48 @@ interface DockerSessionInspection {
   Id?: unknown;
   Name?: unknown;
   Image?: unknown;
-  Config?: { Image?: unknown; Labels?: unknown; Env?: unknown; Healthcheck?: { Test?: unknown } };
-  HostConfig?: { NetworkMode?: unknown };
+  Config?: {
+    Image?: unknown;
+    Labels?: unknown;
+    Env?: unknown;
+    Healthcheck?: { Test?: unknown };
+    User?: unknown;
+    Entrypoint?: unknown;
+    Cmd?: unknown;
+  };
+  State?: { Running?: unknown };
+  HostConfig?: {
+    AutoRemove?: unknown;
+    NetworkMode?: unknown;
+    Privileged?: unknown;
+    ReadonlyRootfs?: unknown;
+    PublishAllPorts?: unknown;
+    Devices?: unknown;
+    PidMode?: unknown;
+    IpcMode?: unknown;
+    RestartPolicy?: { Name?: unknown; MaximumRetryCount?: unknown };
+    PidsLimit?: unknown;
+    SecurityOpt?: unknown;
+    CapDrop?: unknown;
+    CapAdd?: unknown;
+    NanoCpus?: unknown;
+    Memory?: unknown;
+  };
+  Mounts?: unknown;
   NetworkSettings?: { Networks?: unknown };
+}
+
+export interface SwebenchProSessionContainerPolicy {
+  user: string;
+  entrypoint: readonly string[];
+  command: readonly string[];
+  pidsLimit: number;
+  securityOpt: readonly string[];
+  capDrop: readonly string[];
+  capAdd: readonly string[];
+  nanoCpus: number;
+  memoryBytes: number;
+  mounts: readonly { source: string; destination: string }[];
 }
 
 export interface SwebenchProSessionAttachment {
@@ -156,6 +195,8 @@ export interface SwebenchProSessionAttachment {
   runtimeNonce: string;
   imageName: string;
   imageId: string;
+  running: boolean;
+  containerPolicy: SwebenchProSessionContainerPolicy;
 }
 
 function relayBaseUrl(value: string): URL {
@@ -356,7 +397,36 @@ export function inspectSwebenchProTransportBoundary(
 }
 
 const FORBIDDEN_TASK_ENV = /^(?:[A-Z0-9_]*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|SESSION_TOKEN|CLIENT_SECRET|SECRET_ACCESS_KEY|APPLICATION_CREDENTIALS|PRIVATE_KEY|PASSWORD)|CODEX_AUTH_JSON_PATH|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY)=/i;
-const SANITIZED_BOOTSTRAP_ENV = ['BASH_ENV', 'ENV', 'LD_PRELOAD', 'LD_AUDIT'] as const;
+const SANITIZED_BOOTSTRAP_ENV = [
+  'BASH_ENV', 'ENV', 'LD_PRELOAD', 'LD_AUDIT', 'LD_LIBRARY_PATH',
+] as const;
+
+function exactStringArray(value: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(value) && value.length === expected.length
+    && value.every((entry, index) => entry === expected[index]);
+}
+
+function exactStringSet(value: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+    && JSON.stringify([...value].sort()) === JSON.stringify([...expected].sort());
+}
+
+function exactSessionMounts(value: unknown, expected: SwebenchProSessionContainerPolicy['mounts']): boolean {
+  if (!Array.isArray(value) || value.length !== expected.length) return false;
+  const observed = value.flatMap((entry) => {
+    if (entry === null || typeof entry !== 'object') return [];
+    const mount = entry as Record<string, unknown>;
+    return mount.Type === 'bind' && typeof mount.Source === 'string'
+      && typeof mount.Destination === 'string' && mount.RW === true
+      ? [{ source: resolve(mount.Source), destination: mount.Destination }]
+      : [];
+  }).sort((left, right) => left.destination.localeCompare(right.destination));
+  const wanted = expected.map((mount) => ({
+    source: resolve(mount.source),
+    destination: mount.destination,
+  })).sort((left, right) => left.destination.localeCompare(right.destination));
+  return observed.length === wanted.length && JSON.stringify(observed) === JSON.stringify(wanted);
+}
 
 /** Prove one launched task has only its internal network and no provider key/proxy environment. */
 function inspectSwebenchProSessionAttachmentUnchecked(
@@ -375,6 +445,9 @@ function inspectSwebenchProSessionAttachmentUnchecked(
   const sanitizedBootstrap = env !== null && SANITIZED_BOOTSTRAP_ENV.every((name) =>
     env.filter((entry) => entry === `${name}=`).length === 1
     && !env.some((entry) => typeof entry === 'string' && entry.startsWith(`${name}=`) && entry !== `${name}=`));
+  const host = session.HostConfig;
+  const policy = expected.containerPolicy;
+  const devices = host?.Devices;
   if (!/^[a-f0-9]{64}$/.test(expected.runtimeNonce)
     || session.Id !== expected.id || session.Name !== `/${expected.name}`
     || session.Image !== expected.imageId || session.Config?.Image !== expected.imageName
@@ -386,14 +459,29 @@ function inspectSwebenchProSessionAttachmentUnchecked(
     || labels['ultracode.benchmark.purpose'] !== 'session'
     || labels['ultracode.benchmark.ownership'] !== '1'
     || labels['ultracode.benchmark.runtime'] !== expected.runtimeNonce
+    || session.State?.Running !== expected.running
+    || session.Config?.User !== policy.user
+    || !exactStringArray(session.Config?.Entrypoint, policy.entrypoint)
+    || !exactStringArray(session.Config?.Cmd, policy.command)
+    || host?.AutoRemove !== false
+    || host?.Privileged !== false || host.ReadonlyRootfs !== false || host.PublishAllPorts !== false
+    || !(devices === null || (Array.isArray(devices) && devices.length === 0))
+    || host.PidMode !== '' || !['', 'private'].includes(String(host.IpcMode ?? ''))
+    || host.RestartPolicy?.Name !== 'no' || host.RestartPolicy.MaximumRetryCount !== 0
+    || host.PidsLimit !== policy.pidsLimit
+    || !exactStringSet(host.SecurityOpt, policy.securityOpt)
+    || !exactStringSet(host.CapDrop, policy.capDrop)
+    || !exactStringSet(host.CapAdd, policy.capAdd)
+    || host.NanoCpus !== policy.nanoCpus || host.Memory !== policy.memoryBytes
+    || !exactSessionMounts(session.Mounts, policy.mounts)
     || session.HostConfig?.NetworkMode !== bindings.restrictedNetwork
-    || networks.length !== 1 || networks[0] !== bindings.restrictedNetwork
+    || (expected.running && (networks.length !== 1 || networks[0] !== bindings.restrictedNetwork))
     || env === null || env.some((entry) => typeof entry !== 'string' || FORBIDDEN_TASK_ENV.test(entry))
     || !exactEnv('BENCH_RUNTIME_NONCE', expected.runtimeNonce)
     || !exactEnv('BENCH_MODEL_RELAY_BASE_URL', bindings.relayBaseUrl)
     || !sanitizedBootstrap
     || JSON.stringify(session.Config?.Healthcheck?.Test) !== JSON.stringify(['NONE'])) {
-    throw new Error('SWE-bench Pro session lacks the exact credential-free restricted-network attachment');
+    throw new Error('SWE-bench Pro session lacks the exact policy-bound credential-free restricted-network attachment');
   }
 }
 

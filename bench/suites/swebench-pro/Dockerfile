@@ -14,5 +14,6 @@ COPY --chown=0:0 --chmod=0555 codex-home-a/  /opt/bench/codex-home-a/
 COPY --chown=0:0 --chmod=0555 codex-home-b/  /opt/bench/codex-home-b/
 COPY --chown=0:0 --chmod=0555 agents-home-b/ /opt/bench/agents-home-b/
 COPY --chown=0:0 --chmod=0555 entrypoint.sh  /opt/bench/entrypoint.sh
+COPY --chown=0:0 --chmod=0555 session-gate.sh /opt/bench/session-gate.sh
 COPY --chown=0:0 --chmod=0555 sanitize-git.sh /opt/bench/sanitize-git.sh
 COPY --chown=0:0 --chmod=0555 capture-git.sh /opt/bench/capture-git.sh

@@ -166,7 +166,12 @@ import { ARM_B_PREFIX_PATH } from '../../shared/prompt.js';
 const SESSION_BACKSTOP_EXTRA_MS = 15 * 60_000;
 const SESSION_CLEANUP_RESERVE_MS = 2 * 60_000;
 const RECLAMATION_ATTEMPTS = 2;
-const RECLAMATION_COMMAND = '/bin/chown -R -- "$1" "${@:2}" && /bin/chmod 0700 "${@:2}"';
+const TRUSTED_MUSL_LOADER = '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1';
+const TRUSTED_BUSYBOX = '/opt/bench/node-musl-runtime/busybox';
+const TRUSTED_SESSION_GATE = '/opt/bench/session-gate.sh';
+const TASK_ENTRYPOINT = '/opt/bench/entrypoint.sh';
+const RECLAMATION_COMMAND = `owner=$1; shift; ${TRUSTED_BUSYBOX} chown -R "$owner" "$@"`
+  + ` && ${TRUSTED_BUSYBOX} chmod 0700 "$@"`;
 const RECLAMATION_NAME_PREFIX = 'ucbench-reclaim-';
 const RECLAMATION_NAME_RE = /^\/ucbench-reclaim-[a-f0-9]{32}$/;
 const RECLAMATION_NAMESPACE_LIMIT = 16_384;
@@ -184,7 +189,7 @@ export const SWEBENCH_PRO_ADAPTER_POLICY_SHA256 = sha256CanonicalJson({
   redo: 'task-arm-exact-helper-absence-before-invalidation',
   verifier: 'strict-partial-native-booleans',
   modelTransport: 'credential-free-task-on-internal-network-via-attested-strict-relay-run-fatal-drift',
-  dataset: 'audited-canonical-descriptor-v1',
+  dataset: 'configured-canonical-descriptor-v1-unaudited-local-digest',
   cleanup: 'typed-command-fatal-launch-settlement-exact-name-id-proof-retry-fresh-per-resource-deadlines',
   containers: 'immutable-id-no-healthcheck-sanitized-bootstrap-owned-reclamation-lifecycle-exact-evaluator-ownership',
 });
@@ -320,6 +325,7 @@ function currentPolicies(
   adapterPolicySha256 = currentControlPlaneHashes(roots).adapterPolicySha256,
 ): SwebenchProManifest['suiteConfig']['policies'] {
   const entrypoint = join(roots.benchRoot, 'suites', 'swebench-pro', 'entrypoint.sh');
+  const sessionGate = join(roots.benchRoot, 'suites', 'swebench-pro', 'session-gate.sh');
   const gitSanitizer = join(roots.benchRoot, 'suites', 'swebench-pro', 'sanitize-git.sh');
   const gitCapture = join(roots.benchRoot, 'suites', 'swebench-pro', 'capture-git.sh');
   const containerPolicyFile = join(roots.benchRoot, 'suites', 'swebench-pro', 'container-policy.json');
@@ -330,6 +336,7 @@ function currentPolicies(
   return {
     sessionSha256: sha256CanonicalJson({
       entrypointSha256: sha256File(entrypoint),
+      sessionGateSha256: sha256File(sessionGate),
       gitSanitizerSha256: sha256File(gitSanitizer),
       gitCaptureSha256: sha256File(gitCapture),
       containerPolicySha256: containerPolicySha256(policy),
@@ -375,6 +382,7 @@ function swebenchProNativeAssets(roots: BenchPathRoots): SwebenchProManifest['pr
   return [
     'suites/swebench-pro/Dockerfile',
     'suites/swebench-pro/entrypoint.sh',
+    'suites/swebench-pro/session-gate.sh',
     'suites/swebench-pro/sanitize-git.sh',
     'suites/swebench-pro/capture-git.sh',
     'suites/swebench-pro/container-policy.json',
@@ -1392,7 +1400,7 @@ function reclamationTargets(options: ReclamationContainerSpec): string[] {
 
 function reclamationCommandArgv(options: ReclamationContainerSpec): string[] {
   return [
-    '-c', RECLAMATION_COMMAND,
+    TRUSTED_BUSYBOX, 'sh', '-c', RECLAMATION_COMMAND,
     'ultracode-reclaim',
     `${options.artifactOwner.uid}:${options.artifactOwner.gid}`,
     ...reclamationTargets(options),
@@ -1432,7 +1440,7 @@ export function reclamationDockerRunArgv(options: ReclamationDockerRunArgvOption
     ...labels,
     ...reclamationContainerPolicyArgv(options.policy, options.docker),
     ...mounts,
-    '--entrypoint', '/bin/bash',
+    '--entrypoint', TRUSTED_MUSL_LOADER,
     options.image.overlayLocalId,
     ...reclamationCommandArgv(options),
   ];
@@ -1443,7 +1451,7 @@ interface SessionResult {
   meta: SessionMeta | null;
 }
 
-export interface SessionDockerRunArgvOptions {
+export interface SessionDockerCreateArgvOptions {
   name: string;
   runId: string;
   taskId: string;
@@ -1460,8 +1468,50 @@ export interface SessionDockerRunArgvOptions {
   policy: SwebenchProContainerPolicy;
 }
 
-/** Build the exact session invocation so policy parity is testable without Docker. */
-export function sessionDockerRunArgv(options: SessionDockerRunArgvOptions): string[] {
+function sessionContainerCommand(): string[] {
+  return [TRUSTED_BUSYBOX, 'sh', TRUSTED_SESSION_GATE, '/bin/bash', TASK_ENTRYPOINT];
+}
+
+function sessionAttachment(
+  id: string,
+  options: SessionDockerCreateArgvOptions,
+  running: boolean,
+): SwebenchProSessionAttachment {
+  return {
+    id,
+    name: options.name,
+    runId: options.runId,
+    taskId: options.taskId,
+    arm: options.arm,
+    runtimeNonce: options.runtimeNonce,
+    imageName: options.imageId,
+    imageId: options.imageId,
+    running,
+    containerPolicy: {
+      user: '0:0',
+      entrypoint: [TRUSTED_MUSL_LOADER],
+      command: sessionContainerCommand(),
+      pidsLimit: options.policy.session.pidsLimit,
+      securityOpt: options.policy.session.securityOpt,
+      capDrop: options.policy.session.capDrop,
+      capAdd: options.policy.session.capAdd,
+      nanoCpus: dockerNanoCpus(options.docker.cpus),
+      memoryBytes: options.docker.memoryBytes,
+      mounts: [
+        { source: options.taskDirectory, destination: '/bench' },
+        { source: options.runtimeHome, destination: '/runtime/home' },
+        { source: options.runtimeCodex, destination: '/runtime/codex-home' },
+        {
+          source: join(options.taskDirectory, 'codex-home', 'sessions'),
+          destination: '/runtime/codex-home/sessions',
+        },
+      ],
+    },
+  };
+}
+
+/** Build a stopped session whose complete policy can be attested before startup. */
+export function sessionDockerCreateArgv(options: SessionDockerCreateArgvOptions): string[] {
   const taskIdentity = sessionTaskIdentity(options.artifactOwner);
   const labels = [
     ['schema', '2'], ['suite', 'swebench-pro'], ['run', options.runId], ['task', options.taskId],
@@ -1470,7 +1520,7 @@ export function sessionDockerRunArgv(options: SessionDockerRunArgvOptions): stri
     ['artifact-uid', String(options.artifactOwner.uid)], ['artifact-gid', String(options.artifactOwner.gid)],
   ].flatMap(([key, value]) => ['--label', `ultracode.benchmark.${key}=${value}`]);
   return [
-    'run', '-d', '--name', options.name, ...labels,
+    'create', '--name', options.name, ...labels,
     '--no-healthcheck',
     ...sessionContainerPolicyArgv(options.policy, options.docker),
     '--network', options.restrictedNetwork,
@@ -1479,14 +1529,15 @@ export function sessionDockerRunArgv(options: SessionDockerRunArgvOptions): stri
     '--env', 'ENV=',
     '--env', 'LD_PRELOAD=',
     '--env', 'LD_AUDIT=',
+    '--env', 'LD_LIBRARY_PATH=',
     '--env-file', options.envFile,
     '--mount', `type=bind,src=${options.taskDirectory},dst=/bench`,
     '--mount', `type=bind,src=${options.runtimeHome},dst=/runtime/home`,
     '--mount', `type=bind,src=${options.runtimeCodex},dst=/runtime/codex-home`,
     '--mount', `type=bind,src=${join(options.taskDirectory, 'codex-home', 'sessions')},dst=/runtime/codex-home/sessions`,
-    '--entrypoint', '/bin/bash',
+    '--entrypoint', TRUSTED_MUSL_LOADER,
     options.imageId,
-    '/opt/bench/entrypoint.sh',
+    ...sessionContainerCommand(),
   ];
 }
 
@@ -1580,7 +1631,7 @@ async function runSession(
     rmSync(runtime, { recursive: true, force: true });
     throw error;
   }
-  const args = sessionDockerRunArgv({
+  const sessionOptions: SessionDockerCreateArgvOptions = {
     name,
     runId: manifest.runId,
     taskId: instance.instanceId,
@@ -1595,7 +1646,8 @@ async function runSession(
     imageId: image.overlayLocalId,
     docker: config.docker,
     policy,
-  });
+  };
+  const args = sessionDockerCreateArgv(sessionOptions);
   let endedAt = startedAt;
   let backstop = false;
   try {
@@ -1618,16 +1670,25 @@ async function runSession(
       fatalController?.throwIfAborted();
       await attestSessionTransportAttachment(
         executor,
-        {
-          id: launchedId,
-          name,
-          runId: manifest.runId,
-          taskId: instance.instanceId,
-          arm,
-          runtimeNonce,
-          imageName: image.overlayLocalId,
-          imageId: image.overlayLocalId,
-        },
+        sessionAttachment(launchedId, sessionOptions, false),
+        transportBindings,
+        processLifecycle,
+        activeTimeout(),
+      );
+      const startedId = (await executor(
+        ['start', launchedId],
+        processLifecycle,
+        activeTimeout(),
+      )).trim();
+      if (startedId !== launchedId) {
+        throw transportAttestationFailure(
+          'session-inspect',
+          new Error('Docker did not start the exact attested session container'),
+        );
+      }
+      await attestSessionTransportAttachment(
+        executor,
+        sessionAttachment(launchedId, sessionOptions, true),
         transportBindings,
         processLifecycle,
         activeTimeout(),
@@ -2190,6 +2251,7 @@ export async function runCommand(
     for (const instance of selected) {
       images.set(instance.instanceId, await prepareTaskImage(instance, {
         roots: context.paths,
+        runId: options.runId,
         toolchainDirectory: prepared.toolchain.directory,
         toolchainPayloadSha256: prepared.toolchain.provenance.payloadSha256,
       }));
@@ -2515,7 +2577,6 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
     const evaluatorImages = new Map(stores.manifest.provenance.tasks.map((task) => {
       if (task.image === null) throw new Error(`task ${task.taskId} has no evaluator image identity`);
       return [task.taskId, {
-        reference: task.image.requested,
         localId: task.image.base.localId,
       }] as const;
     }));
@@ -2959,9 +3020,9 @@ function assertExactReclamationHelper(
     || record.Image !== options.image.overlayLocalId
     || canonicalJson(observedLabels) !== canonicalJson(expectedLabels)
     || record.Config?.User !== policy.reclamation.user
-    || canonicalJson(record.Config?.Entrypoint) !== canonicalJson(['/bin/bash'])
+    || canonicalJson(record.Config?.Entrypoint) !== canonicalJson([TRUSTED_MUSL_LOADER])
     || canonicalJson(record.Config?.Cmd) !== canonicalJson(command)
-    || record.Path !== '/bin/bash'
+    || record.Path !== TRUSTED_MUSL_LOADER
     || canonicalJson(record.Args) !== canonicalJson(command)
     || host?.AutoRemove !== true
     || host?.NetworkMode !== policy.reclamation.networkMode
@@ -3441,7 +3502,6 @@ async function cleanRunContainers(
     const verifierImageIdentities = new Map(manifest.provenance.tasks.map((task) => {
       if (task.image === null) throw new Error(`task ${task.taskId} has no evaluator image identity`);
       return [task.taskId, {
-        reference: task.image.requested,
         localId: task.image.base.localId,
       }] as const;
     }));

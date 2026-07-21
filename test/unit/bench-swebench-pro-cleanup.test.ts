@@ -140,19 +140,20 @@ function reclamationFixture(taskId = 'task-a') {
     }
   }
   const imageIndex = argv.indexOf(fixture.image.overlayLocalId);
+  const entrypoint = argv[argv.indexOf('--entrypoint') + 1]!;
   const command = argv.slice(imageIndex + 1);
   const id = 'd'.repeat(64);
   const record = {
     Id: id,
     Name: `/${name}`,
     Image: fixture.image.overlayLocalId,
-    Path: '/bin/bash',
+    Path: entrypoint,
     Args: command,
     Config: {
       Image: fixture.image.overlayLocalId,
       Labels: labels,
       User: '0:0',
-      Entrypoint: ['/bin/bash'],
+      Entrypoint: [entrypoint],
       Cmd: command,
     },
     HostConfig: {

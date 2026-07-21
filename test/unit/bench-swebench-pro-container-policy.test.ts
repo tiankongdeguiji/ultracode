@@ -18,7 +18,7 @@ import type { SwebenchProConfig } from '../../bench/src/suites/swebench-pro/conf
 import {
   reclamationContainerName,
   reclamationDockerRunArgv,
-  sessionDockerRunArgv,
+  sessionDockerCreateArgv,
 } from '../../bench/src/suites/swebench-pro/runner.js';
 import {
   evaluatorPolicyDocument,
@@ -71,7 +71,7 @@ describe('SWE-bench Pro container policy', () => {
       '--cpus', '1.5',
       '--memory', '2000000',
     ]);
-    expect(sessionDockerRunArgv({
+    expect(sessionDockerCreateArgv({
       name: 'session-name',
       runId: 'pilot1',
       taskId: 'task-a',
@@ -87,7 +87,7 @@ describe('SWE-bench Pro container policy', () => {
       docker,
       policy,
     })).toEqual([
-      'run', '-d', '--name', 'session-name',
+      'create', '--name', 'session-name',
       '--label', 'ultracode.benchmark.schema=2',
       '--label', 'ultracode.benchmark.suite=swebench-pro',
       '--label', 'ultracode.benchmark.run=pilot1',
@@ -117,14 +117,16 @@ describe('SWE-bench Pro container policy', () => {
       '--env', 'ENV=',
       '--env', 'LD_PRELOAD=',
       '--env', 'LD_AUDIT=',
+      '--env', 'LD_LIBRARY_PATH=',
       '--env-file', '/runtime/container.env',
       '--mount', 'type=bind,src=/run/task-a,dst=/bench',
       '--mount', 'type=bind,src=/runtime/home,dst=/runtime/home',
       '--mount', 'type=bind,src=/runtime/codex-home,dst=/runtime/codex-home',
       '--mount', 'type=bind,src=/run/task-a/codex-home/sessions,dst=/runtime/codex-home/sessions',
-      '--entrypoint', '/bin/bash',
+      '--entrypoint', '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1',
       `sha256:${'c'.repeat(64)}`,
-      '/opt/bench/entrypoint.sh',
+      '/opt/bench/node-musl-runtime/busybox', 'sh', '/opt/bench/session-gate.sh',
+      '/bin/bash', '/opt/bench/entrypoint.sh',
     ]);
     expect(reclamationContainerPolicyArgv(policy, docker)).toEqual([
       '--network', 'none',
@@ -176,9 +178,11 @@ describe('SWE-bench Pro container policy', () => {
       '--mount', 'type=bind,src=/run/task-a,dst=/bench',
       '--mount', 'type=bind,src=/runtime/owned/home,dst=/runtime/home',
       '--mount', 'type=bind,src=/runtime/owned/codex-home,dst=/runtime/codex-home',
-      '--entrypoint', '/bin/bash',
+      '--entrypoint', '/opt/bench/node-musl-runtime/ld-musl-x86_64.so.1',
       `sha256:${'c'.repeat(64)}`,
-      '-c', '/bin/chown -R -- "$1" "${@:2}" && /bin/chmod 0700 "${@:2}"',
+      '/opt/bench/node-musl-runtime/busybox', 'sh', '-c',
+      'owner=$1; shift; /opt/bench/node-musl-runtime/busybox chown -R "$owner" "$@"'
+        + ' && /opt/bench/node-musl-runtime/busybox chmod 0700 "$@"',
       'ultracode-reclaim', '2001:2002', '/bench', '/runtime/home', '/runtime/codex-home',
     ]);
   });
@@ -211,6 +215,10 @@ describe('SWE-bench Pro container policy', () => {
       'utf8',
     );
     expect(evaluatorPatch).toContain('from ultracode_evaluator_policy import docker_run_options');
+    expect(evaluatorPatch).toContain('client.images.get(benchmark_image_id)');
+    expect(evaluatorPatch).toContain('container = client.containers.run(');
+    expect(evaluatorPatch).toContain('+            benchmark_image_id,');
+    expect(evaluatorPatch).not.toContain('+                client.images.pull');
     expect(evaluatorPatch).toContain(
       'run_kwargs.update(docker_run_options(benchmark_container_options, benchmark_policy_sha256))',
     );

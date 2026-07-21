@@ -49,16 +49,27 @@ export function parseEvaluatorResults(value: unknown): ParsedEvaluatorResults {
   return { verdicts, malformedTaskIds };
 }
 
-export function generateRawSamples(instances: readonly SwebenchProInstance[], file: string): void {
-  const lines = instances.map((instance) => JSON.stringify({
-    instance_id: instance.instanceId,
-    repo: instance.repo,
-    base_commit: instance.baseCommit,
-    before_repo_set_cmd: instance.beforeRepoSetCmd,
-    selected_test_files_to_run: instance.selectedTestFilesToRun,
-    fail_to_pass: instance.failToPass,
-    pass_to_pass: instance.passToPass,
-  }));
+export function generateRawSamples(
+  instances: readonly SwebenchProInstance[],
+  imageIdentities: ReadonlyMap<string, EvaluatorImageIdentity>,
+  file: string,
+): void {
+  const lines = instances.map((instance) => {
+    const imageId = imageIdentities.get(instance.instanceId)?.localId;
+    if (imageId === undefined || !/^sha256:[a-f0-9]{64}$/.test(imageId)) {
+      throw new Error(`immutable evaluator image identity is missing for ${instance.instanceId}`);
+    }
+    return JSON.stringify({
+      instance_id: instance.instanceId,
+      repo: instance.repo,
+      base_commit: instance.baseCommit,
+      before_repo_set_cmd: instance.beforeRepoSetCmd,
+      selected_test_files_to_run: instance.selectedTestFilesToRun,
+      benchmark_image_id: imageId,
+      fail_to_pass: instance.failToPass,
+      pass_to_pass: instance.passToPass,
+    });
+  });
   replaceArtifactFile(file, `${lines.join('\n')}\n`);
 }
 
@@ -117,11 +128,11 @@ export interface EvaluatorContainerInspect {
   Image?: string;
   Config?: { Image?: string; Labels?: Record<string, string> };
   State?: { StartedAt?: string };
+  HostConfig?: { NetworkMode?: string };
   Mounts?: Array<{ Type?: string; Source?: string; Destination?: string }>;
 }
 
 export interface EvaluatorImageIdentity {
-  reference: string;
   localId: string;
 }
 
@@ -132,7 +143,8 @@ function exactEvaluatorRuntime(
   identities: ReadonlyMap<string, EvaluatorImageIdentity>,
 ): boolean {
   const expected = identities.get(taskId);
-  if (expected === undefined || record.Config?.Image !== expected.reference || record.Image !== expected.localId) {
+  if (expected === undefined || record.Config?.Image !== expected.localId
+    || record.Image !== expected.localId || record.HostConfig?.NetworkMode !== 'none') {
     return false;
   }
   const binds = (record.Mounts ?? []).filter((mount) => mount.Type === 'bind');
@@ -443,6 +455,7 @@ export function evaluatorProcessArgv(options: EvaluatorProcessArgvOptions): stri
   return [
     'swe_bench_pro_eval.py',
     '--use_local_docker',
+    '--block_network',
     '--num_workers', String(options.workers),
     '--raw_sample_path', options.rawSamples,
     '--patch_path', options.predictions,
@@ -516,7 +529,7 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
   const policy = join(verifierRoot, 'evaluator-policy.json');
   const policyDocument = evaluatorPolicyDocument(options.config, options.containerPolicy);
   const policySha256 = evaluatorPolicyDocumentSha256(policyDocument);
-  generateRawSamples(options.instances, rawSamples);
+  generateRawSamples(options.instances, options.imageIdentities, rawSamples);
   replaceArtifactFile(predictions, `${JSON.stringify(options.predictions, null, 2)}\n`);
   replaceArtifactFile(policy, `${JSON.stringify(policyDocument, null, 2)}\n`);
   const relativePath = (path: string): string => relative(options.runDirectory, path).split(sep).join('/');

@@ -31,21 +31,23 @@ const snapshotSchema = z.strictObject({
 });
 
 const datasetPinSchema = z.strictObject({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(2),
   kind: z.literal('ultracode-swebench-pro-dataset-pin'),
   dataset: z.literal(SWE_BENCH_PRO_DATASET),
   config: z.literal(SWE_BENCH_PRO_CONFIG),
   split: z.literal(SWE_BENCH_PRO_SPLIT),
+  auditStatus: z.literal('unaudited-local-content-digest'),
   rowCount: z.number().int().positive(),
   descriptorSha256: z.string().regex(/^[a-f0-9]{64}$/),
 });
 
 export interface SwebenchProDatasetPin {
-  schemaVersion: 1;
+  schemaVersion: 2;
   kind: 'ultracode-swebench-pro-dataset-pin';
   dataset: typeof SWE_BENCH_PRO_DATASET;
   config: typeof SWE_BENCH_PRO_CONFIG;
   split: typeof SWE_BENCH_PRO_SPLIT;
+  auditStatus: 'unaudited-local-content-digest';
   rowCount: number;
   descriptorSha256: string;
 }
@@ -167,7 +169,7 @@ export function loadDatasetPin(roots: BenchPathRoots): SwebenchProDatasetPin {
   ).toString('utf8'))) as SwebenchProDatasetPin;
 }
 
-/** Verify row count and canonical digest against the reviewed repository pin. */
+/** Verify row count and canonical digest against the configured repository pin. */
 export function verifiedDatasetDescriptor(
   roots: BenchPathRoots,
   value: unknown,
@@ -183,7 +185,7 @@ export function verifiedDatasetDescriptor(
   const digest = sha256CanonicalJson(descriptor);
   if (descriptor.rows.length !== pin.rowCount || digest !== pin.descriptorSha256) {
     throw new Error(
-      `SWE-bench Pro dataset does not match the audited pin: expected ${pin.rowCount} rows at ${pin.descriptorSha256}, got ${descriptor.rows.length} at ${digest}`,
+      `SWE-bench Pro dataset does not match the configured pin: expected ${pin.rowCount} rows at ${pin.descriptorSha256}, got ${descriptor.rows.length} at ${digest}`,
     );
   }
   return descriptor;
@@ -208,7 +210,7 @@ export async function fetchInstances(
   while (total === null || rows.length < total) {
     const page = await pageFetcher(rows.length);
     if (page.num_rows_total !== pin.rowCount) {
-      throw new Error(`datasets-server row count does not match the audited pin: expected ${pin.rowCount}, got ${page.num_rows_total}`);
+      throw new Error(`datasets-server row count does not match the configured pin: expected ${pin.rowCount}, got ${page.num_rows_total}`);
     }
     if (total !== null && page.num_rows_total !== total) throw new Error('datasets-server total changed during snapshot fetch');
     total = page.num_rows_total;
@@ -229,7 +231,7 @@ export async function fetchInstances(
 export function loadDatasetSnapshot(roots: BenchPathRoots): SwebenchProDatasetSnapshot {
   const file = instancesFile(roots);
   if (!existsSync(file)) {
-    throw new Error(`SWE-bench Pro audited dataset descriptor is missing; run npm run bench -- --suite swebench-pro fetch`);
+    throw new Error(`SWE-bench Pro pinned dataset descriptor is missing; run npm run bench -- --suite swebench-pro fetch`);
   }
   return verifiedDatasetDescriptor(roots, JSON.parse(readRegularFileWithinRoot(
     suiteCacheDir(roots),
