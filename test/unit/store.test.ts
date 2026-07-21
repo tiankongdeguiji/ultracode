@@ -3,7 +3,13 @@ import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunId, RUN_ID_RE, agentDirName, ultracodeRoot } from '../../src/store/layout.js';
-import { readManifest, writeManifest, isTerminal, type RunManifest } from '../../src/store/manifest.js';
+import {
+  isResumableStatus,
+  isTerminal,
+  readManifest,
+  writeManifest,
+  type RunManifest,
+} from '../../src/store/manifest.js';
 import { EventWriter, readEventsFrom } from '../../src/store/events.js';
 import { createRunDir, getRun, listRuns, liveStatus, reapOrphans, isPidAlive, recentRuns, DEFAULT_LIST_COUNT } from '../../src/store/runstore.js';
 
@@ -67,6 +73,7 @@ describe('manifest', () => {
     expect(isTerminal('failed')).toBe(true);
     expect(isTerminal('stopped')).toBe(true);
     expect(isTerminal('orphaned')).toBe(true);
+    expect(isResumableStatus('orphaned')).toBe(false);
     expect(isTerminal('running')).toBe(false);
     expect(isTerminal('created')).toBe(false);
   });

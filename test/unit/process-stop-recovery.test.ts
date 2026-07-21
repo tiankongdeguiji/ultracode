@@ -128,6 +128,17 @@ describe('Darwin live cleanup', () => {
 });
 
 describe('persisted Darwin recovery', () => {
+  it('makes an orphan resumable only after verified recovery', async () => {
+    const run = stoppedRun('darwin-orphan');
+    const manifest = readManifest(run.directory)!;
+    writeManifest(run.directory, { ...manifest, status: 'orphaned' });
+
+    const result = await stopRun(run.root, run.runId, { platform: 'darwin' });
+
+    expect(result).toMatchObject({ ok: true, status: 'stopped' });
+    expect(readManifest(run.directory)?.status).toBe('stopped');
+  });
+
   it('inspects and signals only recorded worker leader PIDs', async () => {
     const run = stoppedRun('darwin-leader');
     writeLeaderRecord(run.directory);
@@ -191,8 +202,13 @@ describe('persisted Darwin recovery', () => {
 describe('persisted Linux recovery', () => {
   it('batches fatal token discovery once for workers in one scope', async () => {
     const discoveries: string[][] = [];
+    let baselineSnapshots = 0;
     const inspection: ProcessInspectionOptions = {
       platform: 'linux',
+      listLinuxProcessIds: () => {
+        baselineSnapshots += 1;
+        return [];
+      },
       discoverWorkerProcesses: (tokens) => {
         discoveries.push([...tokens]);
         return { processes: [], complete: true };
@@ -214,6 +230,7 @@ describe('persisted Linux recovery', () => {
 
     expect(killActiveWorkers()).toBe(2);
     await Promise.all(exits);
+    expect(baselineSnapshots).toBe(1);
     expect(discoveries).toHaveLength(1);
     expect(new Set(discoveries[0])).toEqual(new Set([first.workerToken, second.workerToken]));
     await expect(first.cleanupEscaped(50)).resolves.toBe(0);

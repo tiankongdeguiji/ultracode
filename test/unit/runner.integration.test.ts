@@ -275,6 +275,23 @@ describe('detached runner', () => {
     }
   });
 
+  it('rejects a child that fails before binding the manifest to its runner PID', async () => {
+    const { dir } = makeRun(HELLO, { resumeFromRunId: 'wf_ffffffffffff' });
+    await expect(launchRunner(dir, { startTimeoutMs: 3_000 })).rejects.toThrow(/exited before starting/u);
+    expect(readManifest(dir)).toMatchObject({ status: 'failed' });
+  });
+
+  it('keeps an ordinary completed workflow non-resumable when final cleanup is unverified', async () => {
+    const { dir } = makeRun(HELLO);
+    const { exited } = launchRunnerWithRejectedCleanup(dir);
+    await expect(exited).resolves.toBe(0);
+    expect(readManifest(dir)).toMatchObject({
+      status: 'cleanup-failed',
+      error: 'worker cleanup incomplete: deterministic cleanup rejection',
+    });
+    expect(isResumableStatus(readManifest(dir)!.status)).toBe(false);
+  });
+
   it('hard-stop backstop force-exits a run whose script never unwinds after the wall-clock cap', async () => {
     // The script awaits a never-settling promise: the wall-clock cap fires
     // abort(), but executeWorkflow never returns, so only the hard-stop backstop

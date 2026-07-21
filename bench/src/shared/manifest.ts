@@ -97,13 +97,22 @@ const proPolicySchema = z.strictObject({
 
 export const swebenchProSuiteConfigSchema = z.strictObject({
   preparedInputSha256: sha256Schema,
-  selection: z.strictObject({
-    mode: z.enum(['explicit', 'seeded-stratified']),
-    seed: z.number().int().nonnegative().nullable(),
-    count: z.number().int().positive(),
-    stratifyBy: z.enum(['repo_language', 'repo']).nullable(),
-    requestedTaskIds: z.array(taskIdSchema),
-  }),
+  selection: z.discriminatedUnion('mode', [
+    z.strictObject({
+      mode: z.literal('explicit'),
+      seed: z.null(),
+      count: z.number().int().positive(),
+      stratifyBy: z.null(),
+      requestedTaskIds: z.array(taskIdSchema),
+    }),
+    z.strictObject({
+      mode: z.literal('seeded-stratified'),
+      seed: z.number().int().nonnegative(),
+      count: z.number().int().positive(),
+      stratifyBy: z.enum(['repo_language', 'repo']),
+      requestedTaskIds: z.array(taskIdSchema),
+    }),
+  ]),
   instances: z.array(z.strictObject({
     taskId: taskIdSchema,
     row: z.record(z.string(), z.json()),

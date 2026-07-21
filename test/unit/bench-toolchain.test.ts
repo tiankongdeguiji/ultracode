@@ -1,5 +1,15 @@
 /** Shared benchmark toolchain resolution diagnostics. */
-import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -7,6 +17,7 @@ import {
   dockerPullDigest,
   downloadCacheFilename,
   resolveCodexBin,
+  stageVerifiedArchive,
 } from '../../bench/src/shared/toolchain.js';
 
 const roots: string[] = [];
@@ -16,6 +27,23 @@ afterEach(() => {
 });
 
 describe('Codex toolchain resolution', () => {
+  it('stages only checksum-bound bytes from an open cache inode', () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-toolchain-archive-'));
+    roots.push(root);
+    const source = join(root, 'cached.tar.xz');
+    const destination = join(root, 'private.tar.xz');
+    const bytes = Buffer.from('archive bytes');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    writeFileSync(source, bytes);
+
+    expect(stageVerifiedArchive(source, destination, sha256)).toBe(destination);
+    expect(readFileSync(destination)).toEqual(bytes);
+    expect(() => stageVerifiedArchive(source, join(root, 'bad.tar.xz'), '0'.repeat(64))).toThrow(
+      /checksum drifted/u,
+    );
+    expect(existsSync(join(root, 'bad.tar.xz'))).toBe(false);
+  });
+
   it('uses the immutable digest reported by the exact Docker pull', () => {
     const digest = `sha256:${'a'.repeat(64)}`;
     expect(dockerPullDigest(

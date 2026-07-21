@@ -224,6 +224,23 @@ function signalRecordedWorkerGroups(
       inspection,
     ).processes.map((proc) => [`${proc.pid}:${proc.starttime}:${proc.token}`, proc]),
   );
+  if (platform === 'darwin') {
+    const authenticated = [...groupRecords.values()].flatMap((record) => {
+      const live = verifiedLeaders.get(`${record.pid}:${record.starttime}:${record.token}`);
+      return live?.pgrp === record.pid ? [live] : [];
+    });
+    const result = signalTrackedWorkerProcesses(
+      authenticated,
+      'SIGKILL',
+      darwinWorkerSignalingInspection(tokenRecords.keys(), runDir, inspection),
+    );
+    for (const record of groupRecords.values()) {
+      if (result.identities.has(`${record.pid}:${record.starttime}:${record.pid}:${record.token}`)) {
+        actedRecords.add(record.path);
+      }
+    }
+    return actedRecords;
+  }
   for (const record of groupRecords.values()) {
     const live = verifiedLeaders.get(`${record.pid}:${record.starttime}:${record.token}`);
     // A worker can forge public PID/start-time data in this untrusted file.
@@ -233,9 +250,7 @@ function signalRecordedWorkerGroups(
     const result = signalTrackedWorkerProcesses(
       [live],
       'SIGKILL',
-      platform === 'darwin'
-        ? darwinWorkerSignalingInspection([record.token], runDir, inspection)
-        : inspection,
+      inspection,
     );
     if (result.processes > 0) {
       actedRecords.add(record.path);
@@ -394,7 +409,7 @@ async function cleanupWorkerGroupsUntilGone(
   };
 }
 
-/** Kill workers and throw unless complete observations confirm stable token absence. */
+/** Kill workers and require visible Linux token absence or recorded Darwin group absence. */
 export async function killWorkerGroupsUntilGone(
   runDir: string,
   graceMs = 100,
@@ -456,7 +471,7 @@ function persistCleanupOutcome(
     });
     return cleanupStopResult('cleanup-failed', message, report);
   }
-  if (manifest.status === 'cleanup-failed') {
+  if (manifest.status === 'cleanup-failed' || settledStatus === 'orphaned') {
     writeManifest(runDir, {
       ...manifest,
       status: 'stopped',

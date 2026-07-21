@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   discoverWorkerProcessesForTokens,
   signalTrackedWorkerProcesses,
+  withDarwinPsQueryBudget,
   workerScopeValue,
 } from '../../src/exec/procinfo.js';
 
@@ -116,6 +117,27 @@ describe('Darwin worker process discovery', () => {
         return argv.includes('-E') ? `${other}${environment}` : other;
       },
     })).toEqual({ processes: [], complete: false });
+  });
+
+  it('budgets three complete 257-leader recovery observations', () => {
+    const candidates = Array.from({ length: 257 }, (_, index) => 20_000 + index);
+    let queries = 0;
+    const inspection = withDarwinPsQueryBudget({
+      platform: 'darwin',
+      executePs: () => {
+        queries += 1;
+        return '';
+      },
+    });
+    for (let pass = 0; pass < 3; pass++) {
+      expect(discoverWorkerProcessesForTokens(
+        [TOKEN],
+        process.cwd(),
+        candidates,
+        inspection,
+      ).complete).toBe(true);
+    }
+    expect(queries).toBe(18);
   });
 
   it('distinguishes explicit candidate absence from a ps failure', () => {

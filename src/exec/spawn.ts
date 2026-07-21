@@ -29,6 +29,36 @@ interface ActiveWorker {
 }
 
 const ACTIVE_WORKERS = new Map<string, ActiveWorker>();
+const DEFAULT_LINUX_INSPECTION = Symbol('default-linux-inspection');
+const LINUX_BASELINES = new Map<object | symbol, {
+  identities: ReadonlySet<string>;
+  workers: Set<string>;
+}>();
+
+function acquireLinuxBaseline(
+  workerToken: string,
+  inspection: ProcessInspectionOptions | undefined,
+): { identities: ReadonlySet<string>; key: object | symbol } {
+  const key = inspection ?? DEFAULT_LINUX_INSPECTION;
+  let baseline = LINUX_BASELINES.get(key);
+  if (baseline === undefined) {
+    baseline = {
+      identities: snapshotLinuxProcessIdentities(inspection),
+      workers: new Set(),
+    };
+    LINUX_BASELINES.set(key, baseline);
+  }
+  baseline.workers.add(workerToken);
+  return { identities: baseline.identities, key };
+}
+
+function releaseLinuxBaseline(workerToken: string, key: object | symbol | undefined): void {
+  if (key === undefined) return;
+  const baseline = LINUX_BASELINES.get(key);
+  if (baseline === undefined) return;
+  baseline.workers.delete(workerToken);
+  if (baseline.workers.size === 0) LINUX_BASELINES.delete(key);
+}
 
 /** Signal trusted in-memory worker identities without reading recovery files. */
 export function killActiveWorkers(signal: NodeJS.Signals = 'SIGKILL'): number {
@@ -92,18 +122,29 @@ export interface SpawnAgentOptions {
 export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentOptions): SpawnedAgent {
   const workerToken = randomBytes(16).toString('hex');
   const platform = opts.processInspection?.platform ?? process.platform;
-  const preexistingLinuxIdentities = platform === 'linux'
-    ? snapshotLinuxProcessIdentities(opts.processInspection)
+  const linuxBaseline = platform === 'linux'
+    ? acquireLinuxBaseline(workerToken, opts.processInspection)
     : undefined;
-  opts.onWorkerToken?.(workerToken);
+  try {
+    opts.onWorkerToken?.(workerToken);
+  } catch (error) {
+    releaseLinuxBaseline(workerToken, linuxBaseline?.key);
+    throw error;
+  }
   const env: NodeJS.ProcessEnv = { ...opts.env, [WORKER_TOKEN_ENV]: workerToken };
   if (opts.workerScope !== undefined) env[WORKER_SCOPE_ENV] = workerScopeValue(opts.workerScope);
-  const child = spawn(bin, argv, {
-    cwd: opts.cwd,
-    env,
-    detached: true, // own process group → killable as a tree
-    stdio: [opts.stdinData !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-  });
+  let child: ChildProcess;
+  try {
+    child = spawn(bin, argv, {
+      cwd: opts.cwd,
+      env,
+      detached: true, // own process group → killable as a tree
+      stdio: [opts.stdinData !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    releaseLinuxBaseline(workerToken, linuxBaseline?.key);
+    throw error;
+  }
 
   if (opts.stdinData !== undefined && child.stdin) {
     // If the child dies before draining stdin, the write raises EPIPE on the
@@ -123,7 +164,7 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
   const tokenInspection = platform === 'linux'
     ? {
         ...opts.processInspection,
-        excludedLinuxProcessIdentities: preexistingLinuxIdentities,
+        excludedLinuxProcessIdentities: linuxBaseline?.identities,
       }
     : opts.processInspection;
   const processGroupStatus = (): 'alive' | 'absent' | 'unknown' => {
@@ -209,10 +250,12 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
       };
       if (await sweepUntil('SIGTERM', now() + graceMs)) {
         ACTIVE_WORKERS.delete(workerToken);
+        releaseLinuxBaseline(workerToken, linuxBaseline?.key);
         return 0;
       }
       if (await sweepUntil('SIGKILL', now() + graceMs)) {
         ACTIVE_WORKERS.delete(workerToken);
+        releaseLinuxBaseline(workerToken, linuxBaseline?.key);
         return 0;
       }
       retireGroupIfGone();
@@ -256,10 +299,12 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     };
     if (await sweepUntil('SIGTERM', now() + graceMs)) {
       ACTIVE_WORKERS.delete(workerToken);
+      releaseLinuxBaseline(workerToken, linuxBaseline?.key);
       return 0;
     }
     if (await sweepUntil('SIGKILL', now() + graceMs)) {
       ACTIVE_WORKERS.delete(workerToken);
+      releaseLinuxBaseline(workerToken, linuxBaseline?.key);
       return 0;
     }
     retireGroupIfGone();

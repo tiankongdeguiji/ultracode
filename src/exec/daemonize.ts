@@ -59,8 +59,10 @@ export async function launchRunner(dir: string, opts: { startTimeoutMs?: number 
   const deadline = Date.now() + (opts.startTimeoutMs ?? 15_000);
   for (;;) {
     const manifest = readManifest(dir);
-    if (manifest && manifest.status !== 'created') return { pid };
-    if (exited && (!manifest || manifest.status === 'created')) {
+    // A pre-start failure may write diagnostics, but only runnerMain's
+    // transition to running binds this manifest generation to the child PID.
+    if (manifest && manifest.status !== 'created' && manifest.pid === pid) return { pid };
+    if (exited) {
       throw new Error(`runner exited before starting; see ${join(dir, 'runner.log')}`);
     }
     if (Date.now() > deadline) {

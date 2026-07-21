@@ -596,6 +596,7 @@ export class AgentCallExecutor implements AgentExecutor {
     let onAbort: (() => void) | undefined;
     let proc: SpawnedAgent | undefined;
     let descendantsRemaining: number | undefined;
+    let attemptResult: AttemptResult | undefined;
     // Delayed SIGKILL escalations scheduled after a SIGTERM. Tracked so `finally`
     // can cancel any still pending — otherwise a kill stays armed 5s out against
     // a pid that has already closed and may be recycled (→ kill the wrong group).
@@ -748,14 +749,14 @@ export class AgentCallExecutor implements AgentExecutor {
           exit = {
             ok: false,
             errorKind: 'infra',
-            retryable: true,
+            retryable: false,
             message: 'descendant cleanup failed after bounded retries',
           };
         }
       }
-      return { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, outputChars };
+      attemptResult = { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, outputChars };
     } catch (err) {
-      return {
+      attemptResult = {
         exit: {
           ok: false,
           errorKind: 'infra',
@@ -778,7 +779,24 @@ export class AgentCallExecutor implements AgentExecutor {
       // The normal path starts cleanup on direct-child `exit`. Retry here only
       // after an error or an incomplete sweep before dropping the recovery
       // record.
-      if (descendantsRemaining !== 0) descendantsRemaining = (await proc?.cleanupEscaped()) ?? 0;
+      if (descendantsRemaining !== 0) {
+        try {
+          descendantsRemaining = (await proc?.cleanupEscaped()) ?? 0;
+        } catch {
+          descendantsRemaining = 1;
+        }
+      }
+      if (descendantsRemaining !== 0 && attemptResult !== undefined) {
+        attemptResult = {
+          ...attemptResult,
+          exit: {
+            ok: false,
+            errorKind: 'infra',
+            retryable: false,
+            message: 'descendant cleanup failed after bounded retries',
+          },
+        };
+      }
       if (transcriptFd !== undefined) closeSync(transcriptFd);
       try {
         sidecar?.close();
@@ -790,6 +808,8 @@ export class AgentCallExecutor implements AgentExecutor {
       }
       if (schemaTmpDir) rmSync(schemaTmpDir, { recursive: true, force: true });
     }
+    if (attemptResult === undefined) throw new Error('agent attempt did not produce a result');
+    return attemptResult;
   }
 
   private toOutcome(

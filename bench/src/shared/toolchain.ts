@@ -22,11 +22,13 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
@@ -326,6 +328,47 @@ function readStableExecutable(path: string): Buffer {
   }
 }
 
+/** Copy and authenticate one cache archive through an already-open source inode. */
+export function stageVerifiedArchive(source: string, destination: string, expectedSha256: string): string {
+  const nofollow = constants.O_NOFOLLOW ?? 0;
+  const sourceFd = openSync(source, constants.O_RDONLY | nofollow);
+  let destinationFd: number | undefined;
+  let complete = false;
+  try {
+    const stat = fstatSync(sourceFd);
+    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_NODE_ARCHIVE_BYTES) {
+      throw new Error('cached Node archive must be one bounded regular file');
+    }
+    destinationFd = openSync(
+      destination,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | nofollow,
+      0o600,
+    );
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let total = 0;
+    for (;;) {
+      const bytesRead = readSync(sourceFd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      hash.update(buffer.subarray(0, bytesRead));
+      let written = 0;
+      while (written < bytesRead) {
+        written += writeSync(destinationFd, buffer, written, bytesRead - written);
+      }
+    }
+    if (total !== stat.size || hash.digest('hex') !== sha256Schema.parse(expectedSha256)) {
+      throw new Error(`cached download checksum drifted while staging: ${source}`);
+    }
+    complete = true;
+    return destination;
+  } finally {
+    if (destinationFd !== undefined) closeSync(destinationFd);
+    closeSync(sourceFd);
+    if (!complete) rmSync(destination, { force: true });
+  }
+}
+
 /** Run scripts/build-release.mjs and return its exact stage and release archive. */
 async function buildReleaseStage(
   roots: BenchPathRoots,
@@ -365,9 +408,18 @@ async function populateSharedToolchain(
     nodeDistribution === 'unofficial-glibc217' ? 'unofficial' : 'nodejs',
   );
   const nodeTar = await downloadCached(nodeUrl, nodeChecksum.archiveSha256, roots);
+  const stagedNodeTar = stageVerifiedArchive(
+    nodeTar,
+    join(dir, 'node-archive.tar.xz'),
+    nodeChecksum.archiveSha256,
+  );
   const nodeDir = join(dir, 'node');
   mkdirSync(nodeDir);
-  await toolchainCommand('tar', ['-xJf', nodeTar, '-C', nodeDir, '--strip-components=1'], dir);
+  try {
+    await toolchainCommand('tar', ['-xJf', stagedNodeTar, '-C', nodeDir, '--strip-components=1'], dir);
+  } finally {
+    rmSync(stagedNodeTar, { force: true });
+  }
   const muslUrl = nodeMuslTarballUrl(normalizedNodeVersion, nodeDistribution);
   const muslChecksum = await publishedArchiveChecksum(
     normalizedNodeVersion,
@@ -375,9 +427,18 @@ async function populateSharedToolchain(
     'unofficial',
   );
   const muslTar = await downloadCached(muslUrl, muslChecksum.archiveSha256, roots);
+  const stagedMuslTar = stageVerifiedArchive(
+    muslTar,
+    join(dir, 'node-musl-archive.tar.xz'),
+    muslChecksum.archiveSha256,
+  );
   const muslDir = join(dir, 'node-musl');
   mkdirSync(muslDir);
-  await toolchainCommand('tar', ['-xJf', muslTar, '-C', muslDir, '--strip-components=1'], dir);
+  try {
+    await toolchainCommand('tar', ['-xJf', stagedMuslTar, '-C', muslDir, '--strip-components=1'], dir);
+  } finally {
+    rmSync(stagedMuslTar, { force: true });
+  }
   const nodeMuslRuntime = await prepareNodeMuslRuntime(dir, nodeVersion.replace(/^v/, ''));
   writeFileSync(join(dir, 'node-sel'), NODE_SEL, 'utf8');
   chmodSync(join(dir, 'node-sel'), 0o755);
@@ -444,10 +505,10 @@ async function populateSharedToolchain(
     payloadSha256,
     nodeVersion,
     nodeDistribution,
-    nodeArchiveSha256: sha256File(nodeTar),
+    nodeArchiveSha256: nodeChecksum.archiveSha256,
     nodeChecksumManifestSha256: nodeChecksum.checksumManifestSha256,
     nodeTreeSha256: sha256Tree(nodeDir),
-    nodeMuslArchiveSha256: sha256File(muslTar),
+    nodeMuslArchiveSha256: muslChecksum.archiveSha256,
     nodeMuslChecksumManifestSha256: muslChecksum.checksumManifestSha256,
     nodeMuslTreeSha256: sha256Tree(muslDir),
     nodeMuslRuntime,

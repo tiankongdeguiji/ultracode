@@ -118,6 +118,12 @@ class ImmediateAdapter implements BackendAdapter {
   }
 }
 
+class FailedAdapter extends ImmediateAdapter {
+  override buildSpawn(_req: AgentRequest): SpawnPlan {
+    return { bin: process.execPath, argv: ['-e', 'process.exit(7)'], env: {} };
+  }
+}
+
 async function waitForPid(file: string): Promise<number> {
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
@@ -359,6 +365,35 @@ describe('escaped worker descendant cleanup', () => {
       ok: false,
       errorKind: 'infra',
       error: 'descendant cleanup failed after bounded retries',
+    });
+  });
+
+  it('promotes unresolved cleanup for a failed child and does not start another attempt', async () => {
+    let observedAt = 0;
+    const outcome = await new AgentCallExecutor(new FailedAdapter(), {
+      processInspection: {
+        platform: 'linux',
+        listLinuxProcessIds: () => [],
+        discoverWorkerProcesses: () => ({ processes: [], complete: false }),
+        observationNow: () => {
+          observedAt += 1_000;
+          return observedAt;
+        },
+        observationWait: async () => {},
+      },
+    }).execute({
+      seq: 0,
+      prompt: 'fail with incomplete cleanup',
+      label: 'cleanup-failed-child',
+      backend: 'mock',
+      cwd: process.cwd(),
+      retries: 2,
+    }, SIGNAL);
+    expect(outcome).toMatchObject({
+      ok: false,
+      errorKind: 'infra',
+      error: 'descendant cleanup failed after bounded retries',
+      attempts: 1,
     });
   });
 

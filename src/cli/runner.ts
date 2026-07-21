@@ -357,13 +357,27 @@ export async function runnerMain(
   writeFileNoFollow(join(dir, 'output.json'), JSON.stringify(output, null, 2));
 
   const stopped = abort.signal.aborted;
+  let cleanupFailure: string | undefined;
+  try {
+    await cleanupWorkers(dir);
+  } catch (error) {
+    cleanupFailure = errorMessage(error);
+    events.write({
+      type: 'workflow_log',
+      message: `worker cleanup incomplete: ${cleanupFailure}`,
+    });
+  }
   manifest = {
     ...manifest,
-    status: stopped ? 'stopped' : output.error ? 'failed' : 'completed',
+    status: cleanupFailure !== undefined
+      ? 'cleanup-failed'
+      : stopped ? 'stopped' : output.error ? 'failed' : 'completed',
     endedAt: new Date().toISOString(),
     heartbeatAt: new Date().toISOString(),
     budget: { ...manifest.budget, spent: spentTotal || output.totalTokens },
-    error: output.error,
+    error: cleanupFailure === undefined
+      ? output.error
+      : [output.error, `worker cleanup incomplete: ${cleanupFailure}`].filter(Boolean).join('; '),
   };
   writeManifest(dir, manifest);
   events.close();

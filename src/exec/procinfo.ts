@@ -17,7 +17,9 @@ const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
 const WORKER_SCOPE_RE = /^[a-f0-9]{64}$/;
 const DARWIN_PS_BATCH_SIZE = 128;
 const DARWIN_PS_QUERY_BUDGET = 8;
-const DARWIN_RECOVERY_PS_QUERY_BUDGET = 16;
+// At most 1,000 agents can exist in one run. Eight 128-PID batches cover one
+// authentication, one signal-boundary recheck, and two stable-absence passes.
+const DARWIN_RECOVERY_PS_QUERY_BUDGET = 64;
 const MAX_PROCESS_ID = 2_147_483_647;
 
 export interface ProcessInspectionOptions {
@@ -730,7 +732,7 @@ export interface WorkerSettlementResult extends WorkerSignalResult {
   settled: boolean;
 }
 
-/** Re-authenticate Darwin lifecycle markers at each individual signal boundary. */
+/** Re-authenticate Darwin lifecycle markers immediately before each signal batch. */
 export function darwinWorkerSignalingInspection(
   tokens: Iterable<string>,
   scope: string | undefined,
@@ -760,22 +762,7 @@ export function darwinWorkerSignalingInspection(
         complete: authenticated.complete,
       };
     },
-    signalProcess: (target, signal) => {
-      const pid = Math.abs(target);
-      const authenticated = discoverWorkerProcessesForTokens(
-        accepted,
-        scope,
-        [pid],
-        boundedOptions,
-      ).processes.some((candidate) =>
-        candidate.pid === pid && (target > 0 || candidate.pgrp === pid));
-      if (!authenticated) {
-        throw Object.assign(new Error('Darwin worker identity is no longer authenticated'), {
-          code: 'ESRCH',
-        });
-      }
-      forwardSignal(target, signal);
-    },
+    signalProcess: forwardSignal,
   };
 }
 

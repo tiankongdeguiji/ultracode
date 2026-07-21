@@ -278,6 +278,28 @@ describe('strict suite-versioned manifest validation', () => {
     expect(() => parseBenchRunManifest(drift)).toThrow(/row hash/);
   });
 
+  it('requires mode-specific reproducible selection inputs', () => {
+    const sampled = structuredClone(proManifest());
+    (sampled.suiteConfig as Record<string, unknown>).selection = {
+      mode: 'seeded-stratified',
+      seed: null,
+      count: 1,
+      stratifyBy: null,
+      requestedTaskIds: [],
+    };
+    expect(() => parseBenchRunManifest(sampled)).toThrow();
+
+    const explicit = structuredClone(proManifest());
+    (explicit.suiteConfig as Record<string, unknown>).selection = {
+      mode: 'explicit',
+      seed: 7,
+      count: 1,
+      stratifyBy: 'repo',
+      requestedTaskIds: [TASK],
+    };
+    expect(() => parseBenchRunManifest(explicit)).toThrow();
+  });
+
   it('rejects credentials and secret-bearing source URLs', () => {
     const secret = structuredClone(featureManifest());
     const source = (secret.provenance as { suiteSource: { repository: string } }).suiteSource;
