@@ -1,5 +1,13 @@
 /** Final benchmark identity and results-layout contract. */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -67,7 +75,7 @@ describe('suite-qualified run layout', () => {
     mkdirSync(physical);
     symlinkSync(physical, alias);
     expect(canonicalHostPath(join(alias, 'task-owned', 'output')))
-      .toBe(join(physical, 'task-owned', 'output'));
+      .toBe(join(realpathSync(physical), 'task-owned', 'output'));
   });
 
   it('allows the same run id in different suite namespaces', () => {
