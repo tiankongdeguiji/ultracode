@@ -1,5 +1,5 @@
 /** Shared benchmark toolchain resolution diagnostics. */
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -43,7 +43,7 @@ describe('Codex toolchain resolution', () => {
     const previousPath = process.env.PATH;
     process.env.PATH = root;
     try {
-      await expect(resolveCodexBin('auto', root)).resolves.toBe(executable);
+      await expect(resolveCodexBin('auto', root)).resolves.toBe(realpathSync(executable));
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;

@@ -106,6 +106,25 @@ describe('Darwin worker process discovery', () => {
     });
   });
 
+  it('ignores non-actionable system pids in a fallback inventory', () => {
+    const scope = workerScopeValue(process.cwd());
+    const command = processLine(101, 101, '/usr/bin/node worker.js');
+    const marker = ` ULTRACODE_WORKER_TOKEN=${TOKEN} ULTRACODE_WORKER_SCOPE=${scope}`;
+    const discovery = discoverWorkerProcessesForTokens([TOKEN], process.cwd(), undefined, {
+      platform: 'darwin',
+      executePs: (argv) => {
+        if (argv.join(' ') === '-ax -o pid=') return '0\n1\n101\n';
+        if (argv.includes('-ax')) throw new Error('stdout maxBuffer length exceeded');
+        expect(argv.at(-1)).toBe('101');
+        return argv.includes('-E') ? `${command}${marker}` : command;
+      },
+    });
+    expect(discovery).toEqual({
+      complete: true,
+      processes: [{ pid: 101, pgrp: 101, starttime: START_IDENTITY, token: TOKEN }],
+    });
+  });
+
   it('fails closed when an authenticated host inventory exceeds its bound', () => {
     const scope = workerScopeValue(process.cwd());
     const commands = Array.from(

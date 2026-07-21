@@ -473,9 +473,15 @@ function darwinProcessIds(options: ProcessInspectionOptions): {
     for (const line of executeDarwinPs(['-ax', '-o', 'pid='], options).split('\n')) {
       if (line.trim() === '') continue;
       const pid = Number(line.trim());
-      if (!/^\d+$/u.test(line.trim()) || !isSafeProcessId(pid) || seen.has(pid)) {
+      if (
+        !/^\d+$/u.test(line.trim())
+        || !Number.isSafeInteger(pid)
+        || pid > MAX_PROCESS_ID
+        || seen.has(pid)
+      ) {
         return { pids: [], complete: false };
       }
+      if (!isSafeProcessId(pid)) continue;
       if (pid !== process.pid) seen.add(pid);
       if (seen.size > MAX_DARWIN_CANDIDATE_PROCESSES) {
         return { pids: [], complete: false };
