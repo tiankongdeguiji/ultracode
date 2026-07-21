@@ -2,7 +2,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { closeSync, constants, existsSync, fstatSync, openSync, opendirSync, readSync } from 'node:fs';
 import { join } from 'node:path';
-import { isTerminal, readManifest } from '../store/manifest.js';
+import { isTerminal, readManifest, writeManifest } from '../store/manifest.js';
 import { getRun, isRunnerAlive, reapOrphans } from '../store/runstore.js';
 import {
   darwinWorkerSignalingInspection,
@@ -14,6 +14,7 @@ import {
   signalWorkerProcessTokens,
   signalWorkerProcessTokensUntilGone,
   type ProcessInspectionOptions,
+  withDarwinPsQueryBudget,
 } from './procinfo.js';
 import {
   MAX_WORKER_SEQUENCES,
@@ -261,7 +262,10 @@ function recordSignaledTokens(
  * run scope; token matching contains descendants that left the original PGID. */
 export function killWorkerGroups(runDir: string): number {
   const records = loadRecoveryRecords(runDir);
-  const actedRecords = signalRecordedWorkerGroups(runDir, records);
+  const inspection = process.platform === 'darwin'
+    ? withDarwinPsQueryBudget({ platform: 'darwin' })
+    : {};
+  const actedRecords = signalRecordedWorkerGroups(runDir, records, inspection);
 
   // The run scope is checked in each target process's immutable initial
   // environment. Copying another run's readable token into this untrusted
@@ -346,10 +350,13 @@ async function cleanupWorkerGroupsUntilGone(
 ): Promise<WorkerCleanupReport> {
   const records = loadRecoveryRecords(runDir);
   const platform = inspection.platform ?? process.platform;
-  const actedRecords = signalRecordedWorkerGroups(runDir, records, inspection);
+  const boundedInspection = platform === 'darwin'
+    ? withDarwinPsQueryBudget(inspection)
+    : inspection;
+  const actedRecords = signalRecordedWorkerGroups(runDir, records, boundedInspection);
   const liveLegacyGroups = countLiveLegacyWorkerGroups(records);
   if (platform === 'darwin') {
-    const darwin = await settleDarwinWorkerGroups(runDir, records, graceMs, inspection);
+    const darwin = await settleDarwinWorkerGroups(runDir, records, graceMs, boundedInspection);
     const settled = darwin.settled && liveLegacyGroups === 0;
     const manualCleanup = settled
       ? undefined
@@ -431,6 +438,35 @@ function cleanupStopResult(status: string, message: string, report: WorkerCleanu
   return { ok: true, status, message: `${message}${killed}` };
 }
 
+function persistCleanupOutcome(
+  runDir: string,
+  manifest: NonNullable<ReturnType<typeof readManifest>>,
+  settledStatus: string,
+  message: string,
+  report: WorkerCleanupReport,
+): StopResult {
+  if (!report.settled) {
+    const reason = report.manualCleanup ?? 'worker cleanup did not reach verified stable absence';
+    writeManifest(runDir, {
+      ...manifest,
+      status: 'cleanup-failed',
+      endedAt: manifest.endedAt ?? new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      error: manifest.error?.includes(reason) ? manifest.error : [manifest.error, reason].filter(Boolean).join('; '),
+    });
+    return cleanupStopResult('cleanup-failed', message, report);
+  }
+  if (manifest.status === 'cleanup-failed') {
+    writeManifest(runDir, {
+      ...manifest,
+      status: 'stopped',
+      heartbeatAt: new Date().toISOString(),
+    });
+    return cleanupStopResult('stopped', 'worker cleanup verified; marked stopped', report);
+  }
+  return cleanupStopResult(settledStatus, message, report);
+}
+
 export async function stopRun(
   root: string,
   runId: string,
@@ -443,7 +479,13 @@ export async function stopRun(
     // and a backend can leave setsid() descendants after any terminal outcome.
     // Stale records are therefore actionable for every terminal status.
     const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
-    return cleanupStopResult(run.effectiveStatus, `already ${run.effectiveStatus}`, cleanup);
+    return persistCleanupOutcome(
+      run.dir,
+      run.manifest,
+      run.effectiveStatus,
+      `already ${run.effectiveStatus}`,
+      cleanup,
+    );
   }
   const pid = run.manifest.pid;
   // isRunnerAlive (not isPidAlive): a live PID whose start-time no longer
@@ -452,7 +494,13 @@ export async function stopRun(
   if (!isRunnerAlive(run.manifest)) {
     const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
     reapOrphans(root);
-    return cleanupStopResult('orphaned', 'runner already dead; marked orphaned', cleanup);
+    return persistCleanupOutcome(
+      run.dir,
+      readManifest(run.dir) ?? run.manifest,
+      'orphaned',
+      'runner already dead; marked orphaned',
+      cleanup,
+    );
   }
   try {
     process.kill(pid, 'SIGTERM');
@@ -464,7 +512,7 @@ export async function stopRun(
     const m = readManifest(run.dir);
     if (m && isTerminal(m.status)) {
       const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
-      return cleanupStopResult(m.status, m.status, cleanup);
+      return persistCleanupOutcome(run.dir, m, m.status, m.status, cleanup);
     }
     await sleep(200);
   }
@@ -477,5 +525,11 @@ export async function stopRun(
   // do it here so workers don't keep running/mutating files after "stopped".
   const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
   reapOrphans(root);
-  return cleanupStopResult('stopped', 'force-killed after 7s grace', cleanup);
+  return persistCleanupOutcome(
+    run.dir,
+    readManifest(run.dir) ?? run.manifest,
+    'stopped',
+    'force-killed after 7s grace',
+    cleanup,
+  );
 }

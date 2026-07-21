@@ -84,6 +84,19 @@ async function toolchainCommand(
   })).stdout.trim();
 }
 
+/** Bind a mutable pull request to the immutable digest reported by that pull. */
+export function dockerPullDigest(image: string, output: string): string {
+  const digests = [...output.matchAll(/^Digest:\s*(sha256:[a-f0-9]{64})\s*$/gmu)]
+    .map((match) => match[1]!);
+  const unique = [...new Set(digests)];
+  const lastSlash = image.lastIndexOf('/');
+  const tag = image.lastIndexOf(':');
+  if (unique.length !== 1 || tag <= lastSlash || image.includes('@')) {
+    throw new Error(`Docker pull did not report one immutable digest for ${image}`);
+  }
+  return `${image.slice(0, tag)}@${unique[0]}`;
+}
+
 function nodeTarballUrl(version: string, dist: ToolchainConfig['nodeDistribution']): string {
   switch (dist) {
     case 'npmmirror':
@@ -123,19 +136,36 @@ exit 127
 /** Bundle the C++ runtime used to build Node's musl tarball for old Alpine images. */
 async function prepareNodeMuslRuntime(dir: string, nodeVersion: string): Promise<string> {
   const image = `node:${nodeVersion}-alpine${NODE_MUSL_RUNTIME_ALPINE}`;
-  await toolchainCommand('docker', ['pull', image], dir);
+  const pullOutput = await toolchainCommand('docker', ['pull', image], dir);
+  const digest = dockerPullDigest(image, pullOutput);
+  const imageId = await toolchainCommand(
+    'docker',
+    ['image', 'inspect', '--format', '{{.Id}}', digest],
+    dir,
+  );
+  if (!/^sha256:[a-f0-9]{64}$/.test(imageId)) {
+    throw new Error(`Docker returned an invalid immutable image id for ${digest}`);
+  }
   const container = await toolchainCommand('docker', [
     'create',
     '--label', 'ultracode.benchmark.schema=2',
     '--label', 'ultracode.benchmark.suite=shared-toolchain',
     '--label', 'ultracode.benchmark.purpose=musl-runtime',
     '--label', 'ultracode.benchmark.ownership=1',
-    image,
+    digest,
   ], dir);
   if (!/^[a-f0-9]{64}$/.test(container)) throw new Error('Docker returned an invalid toolchain container id');
   const runtimeDir = join(dir, 'node-musl-runtime');
   mkdirSync(runtimeDir);
   try {
+    const containerImageId = await toolchainCommand(
+      'docker',
+      ['container', 'inspect', '--format', '{{.Image}}', container],
+      dir,
+    );
+    if (containerImageId !== imageId) {
+      throw new Error(`Docker container image identity drifted before runtime extraction: ${container}`);
+    }
     await toolchainCommand('docker', [
       'cp',
       '-L',
@@ -150,14 +180,6 @@ async function prepareNodeMuslRuntime(dir: string, nodeVersion: string): Promise
     ], dir);
   } finally {
     await toolchainCommand('docker', ['rm', '-f', container], dir);
-  }
-  const digest = await toolchainCommand(
-    'docker',
-    ['image', 'inspect', '--format', '{{index .RepoDigests 0}}', image],
-    dir,
-  );
-  if (!/^.+@sha256:[a-f0-9]{64}$/.test(digest)) {
-    throw new Error(`Node musl runtime image did not resolve to one immutable digest: ${image}`);
   }
   return digest;
 }
@@ -305,9 +327,11 @@ function readStableExecutable(path: string): Buffer {
 }
 
 /** Run scripts/build-release.mjs and return its exact stage and release archive. */
-async function buildReleaseStage(roots: BenchPathRoots): Promise<{ directory: string; archive: string }> {
+async function buildReleaseStage(
+  roots: BenchPathRoots,
+  stageOut: string,
+): Promise<{ directory: string; archive: string }> {
   const wtRoot = resolve(roots.benchRoot, '..');
-  const stageOut = join(roots.cacheRoot, 'release-stage');
   await toolchainCommand(process.execPath, ['scripts/build-release.mjs', '.', stageOut], wtRoot);
   const dirs = readdirSync(stageOut, { withFileTypes: true })
     .filter((e) => e.isDirectory() && e.name.startsWith('ultracode-'))
@@ -365,14 +389,20 @@ async function populateSharedToolchain(
   const codexVersion = await toolchainCommand(codexBin, ['--version'], dir);
   const codexSha256 = createHash('sha256').update(codexBytes).digest('hex');
 
-  const release = await buildReleaseStage(roots);
-  cpSync(release.directory, join(dir, 'ultracode'), { recursive: true });
+  const releaseStage = join(dir, 'release-stage');
+  const release = await buildReleaseStage(roots, releaseStage);
   const releaseArchive = join(dir, 'ultracode-release.tar.gz');
-  cpSync(release.archive, releaseArchive);
-  chmodSync(releaseArchive, 0o600);
-  const ultracodeVersion = (JSON.parse(readFileSync(join(release.directory, 'package.json'), 'utf8')) as {
-    version: string;
-  }).version;
+  let ultracodeVersion: string;
+  try {
+    cpSync(release.directory, join(dir, 'ultracode'), { recursive: true });
+    cpSync(release.archive, releaseArchive);
+    chmodSync(releaseArchive, 0o600);
+    ultracodeVersion = (JSON.parse(readFileSync(join(release.directory, 'package.json'), 'utf8')) as {
+      version: string;
+    }).version;
+  } finally {
+    rmSync(releaseStage, { recursive: true, force: true });
+  }
 
   const homeA = join(dir, 'codex-home-a');
   mkdirSync(homeA);
@@ -430,8 +460,16 @@ async function populateSharedToolchain(
   };
   writeFileSync(join(dir, 'content-manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
   const target = join(toolchains, payloadSha256);
-  if (existsSync(target)) rmSync(dir, { recursive: true, force: true });
-  else renameSync(dir, target);
+  if (existsSync(target)) {
+    rmSync(dir, { recursive: true, force: true });
+  } else {
+    try {
+      renameSync(dir, target);
+    } catch (error) {
+      if (!existsSync(target)) throw error;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
   return loadPreparedToolchain(target);
 }
 

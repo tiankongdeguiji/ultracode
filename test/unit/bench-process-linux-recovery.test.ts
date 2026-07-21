@@ -32,7 +32,7 @@ import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { stopRun } from '../../src/exec/stop.js';
 import { workerRecordDir, workerRecordPath } from '../../src/exec/worker-record.js';
 import { newRunId } from '../../src/store/layout.js';
-import { writeManifest } from '../../src/store/manifest.js';
+import { readManifest, writeManifest } from '../../src/store/manifest.js';
 import { createRunDir, getRun } from '../../src/store/runstore.js';
 
 const HASH = 'a'.repeat(64);
@@ -142,6 +142,53 @@ describe('Linux worker-token publication', () => {
 });
 
 describe('Linux benchmark lifecycle recovery', () => {
+  it('retires an authenticated token-only process identity to a safe terminal state', async () => {
+    const { store, directory } = await lifecycleStore(false);
+    store.lifecycleHooks(INVOCATION).onLifecycleToken(TOKEN);
+    let live = true;
+    let clock = 0;
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    await expect(store.recoverPendingLifecycleProcesses(directory, 50, {
+      platform: 'linux',
+      discoverWorkerProcesses: () => ({
+        processes: live ? [PROCESS] : [],
+        complete: true,
+      }),
+      readIdentitySnapshot: (pids) => live
+        ? identitySnapshot(pids)
+        : { identities: new Map(), complete: true },
+      signalProcess: (pid, signal) => {
+        if (signal === 0) {
+          if (!live) throw noSuchProcess();
+          return;
+        }
+        signals.push([pid, signal]);
+        live = false;
+      },
+      recoveryNow: () => clock,
+      recoveryWait: async (delayMs) => { clock += delayMs; },
+    })).resolves.toBe(1);
+    expect(signals).toEqual([[-PROCESS.pid, 'SIGTERM']]);
+    expect(store.load().invocations[0]?.lifecycleProcesses[0]?.recovery).toBe('complete');
+  });
+
+  it('keeps a never-observed token-only process record fail-closed', async () => {
+    const { store, directory } = await lifecycleStore(false);
+    store.lifecycleHooks(INVOCATION).onLifecycleToken(TOKEN);
+    let clock = 0;
+    await expect(store.recoverPendingLifecycleProcesses(directory, 25, {
+      platform: 'linux',
+      discoverWorkerProcesses: () => ({ processes: [], complete: true }),
+      readIdentitySnapshot: () => ({ identities: new Map(), complete: true }),
+      signalProcess: (_pid, signal) => {
+        if (signal !== 0) throw new Error('an unauthenticated identity must not be signaled');
+      },
+      recoveryNow: () => clock,
+      recoveryWait: async (delayMs) => { clock += delayMs; },
+    })).rejects.toThrow(/could not be recovered safely/u);
+    expect(store.load().invocations[0]?.lifecycleProcesses[0]?.recovery).toBe('failed');
+  });
+
   it('gives delayed SIGKILL settlement a fresh bounded grace phase', async () => {
     const { store, directory } = await lifecycleStore();
     const signals: Array<[number, NodeJS.Signals]> = [];
@@ -1013,12 +1060,15 @@ describe('process stop settlement', () => {
       observationWait: async (delayMs) => { clock += delayMs; },
     };
     const incomplete = await stopRun(root, runId, inspection);
-    expect(incomplete).toMatchObject({ ok: false, status: 'stopped' });
+    expect(incomplete).toMatchObject({ ok: false, status: 'cleanup-failed' });
     expect(incomplete.message).toMatch(/could not verify stable process absence/);
+    expect(readManifest(directory)?.status).toBe('cleanup-failed');
 
     complete = true;
     const recovered = await stopRun(root, runId, inspection);
     expect(recovered).toMatchObject({ ok: true, status: 'stopped' });
+    expect(recovered.message).toContain('worker cleanup verified; marked stopped');
+    expect(readManifest(directory)?.status).toBe('stopped');
   });
 
   it('does not derive a Linux absence floor from a forged future start record', async () => {
@@ -1049,7 +1099,8 @@ describe('process stop settlement', () => {
       observationNow: () => clock,
       observationWait: async (delayMs) => { clock += delayMs; },
     });
-    expect(result).toMatchObject({ ok: false, status: 'stopped' });
+    expect(result).toMatchObject({ ok: false, status: 'cleanup-failed' });
     expect(result.message).toMatch(/could not verify stable process absence/);
+    expect(readManifest(directory)?.status).toBe('cleanup-failed');
   });
 });

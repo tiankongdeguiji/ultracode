@@ -6,7 +6,14 @@ import { readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeFileNoFollow } from '../exec/safe-write.js';
 
-export type RunStatus = 'created' | 'running' | 'completed' | 'failed' | 'stopped' | 'orphaned';
+export type RunStatus =
+  | 'created'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+  | 'orphaned'
+  | 'cleanup-failed';
 
 export interface RunManifest {
   runId: string;
@@ -56,5 +63,14 @@ export function readManifest(dir: string): RunManifest | null {
 }
 
 export function isTerminal(status: RunStatus): boolean {
-  return status === 'completed' || status === 'failed' || status === 'stopped' || status === 'orphaned';
+  return status === 'completed'
+    || status === 'failed'
+    || status === 'stopped'
+    || status === 'orphaned'
+    || status === 'cleanup-failed';
+}
+
+/** Terminal runs are replayable only after worker cleanup reached verified absence. */
+export function isResumableStatus(status: RunStatus): boolean {
+  return isTerminal(status) && status !== 'cleanup-failed';
 }

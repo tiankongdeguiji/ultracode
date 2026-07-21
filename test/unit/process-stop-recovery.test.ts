@@ -1,14 +1,15 @@
 /** Deterministic bounded Darwin groups and unchanged Linux recovery visibility. */
+import { once } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ProcessInspectionOptions } from '../../src/exec/procinfo.js';
-import { spawnAgentProcess } from '../../src/exec/spawn.js';
+import { killActiveWorkers, spawnAgentProcess } from '../../src/exec/spawn.js';
 import { stopRun } from '../../src/exec/stop.js';
 import { workerRecordDir, workerRecordPath } from '../../src/exec/worker-record.js';
 import { newRunId } from '../../src/store/layout.js';
-import { writeManifest } from '../../src/store/manifest.js';
+import { readManifest, writeManifest } from '../../src/store/manifest.js';
 import { createRunDir, getRun } from '../../src/store/runstore.js';
 
 const TOKEN = 'b'.repeat(32);
@@ -181,12 +182,44 @@ describe('persisted Darwin recovery', () => {
       observationWait: async (delayMs) => { clock += delayMs; },
     });
 
-    expect(result).toMatchObject({ ok: false, status: 'stopped' });
+    expect(result).toMatchObject({ ok: false, status: 'cleanup-failed' });
     expect(signals).toBe(0);
+    expect(readManifest(run.directory)?.status).toBe('cleanup-failed');
   });
 });
 
 describe('persisted Linux recovery', () => {
+  it('batches fatal token discovery once for workers in one scope', async () => {
+    const discoveries: string[][] = [];
+    const inspection: ProcessInspectionOptions = {
+      platform: 'linux',
+      discoverWorkerProcesses: (tokens) => {
+        discoveries.push([...tokens]);
+        return { processes: [], complete: true };
+      },
+    };
+    const first = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+      cwd: process.cwd(),
+      env: {},
+      workerScope: '/shared-fatal-scope',
+      processInspection: inspection,
+    });
+    const second = spawnAgentProcess(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+      cwd: process.cwd(),
+      env: {},
+      workerScope: '/shared-fatal-scope',
+      processInspection: inspection,
+    });
+    const exits = [once(first.child, 'exit'), once(second.child, 'exit')];
+
+    expect(killActiveWorkers()).toBe(2);
+    await Promise.all(exits);
+    expect(discoveries).toHaveLength(1);
+    expect(new Set(discoveries[0])).toEqual(new Set([first.workerToken, second.workerToken]));
+    await expect(first.cleanupEscaped(50)).resolves.toBe(0);
+    await expect(second.cleanupEscaped(50)).resolves.toBe(0);
+  });
+
   it('reports inaccessible unrelated processes as a visibility limitation, not a retry promise', async () => {
     const run = stoppedRun('linux-inaccessible');
     writeLeaderRecord(run.directory);
@@ -211,9 +244,10 @@ describe('persisted Linux recovery', () => {
 
     const result = await stopRun(run.root, run.runId, inspection);
 
-    expect(result).toMatchObject({ ok: false, status: 'stopped' });
+    expect(result).toMatchObject({ ok: false, status: 'cleanup-failed' });
     expect(result.message).toMatch(/incomplete process visibility|no trusted containment proof/u);
     expect(result.message).toContain('manual verification and cleanup required');
     expect(result.message).not.toContain('retry required');
+    expect(readManifest(run.directory)?.status).toBe('cleanup-failed');
   });
 });

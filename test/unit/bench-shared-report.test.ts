@@ -26,6 +26,11 @@ import {
 const HASH = 'a'.repeat(64);
 const OTHER_HASH = 'b'.repeat(64);
 const INVOCATION = '11111111-1111-4111-8111-111111111111';
+const ANALYSIS_BINDING_IDENTITY = {
+  invocationId: INVOCATION,
+  scope: { kind: 'suite-check' as const, name: 'aggregate' },
+  nativeRecordKey: null,
+};
 
 const analysisHook: SuiteAnalysisHook<'swebench-pro'> = {
   suite: 'swebench-pro',
@@ -204,6 +209,7 @@ function receipt() {
 function taskInputs(): TaskReportInput[] {
   return [
     {
+      invocationId: INVOCATION,
       taskId: 'task-one',
       arm: 'a',
       nativeVerifier: {
@@ -217,6 +223,7 @@ function taskInputs(): TaskReportInput[] {
       attemptRunning: false,
     },
     {
+      invocationId: INVOCATION,
       taskId: 'task-one',
       arm: 'b',
       nativeVerifier: unverified,
@@ -303,12 +310,12 @@ describe('common report evidence envelope', () => {
           nativeRecordKey: null,
         }],
       },
-      nativeAnalysisArtifact: { path: 'native/aggregate.json', bytes },
+      nativeAnalysisArtifact: { ...ANALYSIS_BINDING_IDENTITY, path: 'native/aggregate.json', bytes },
       analysisHook: hook,
     });
     expect(observed).toEqual({ resolved: 1 });
     expect(() => build({
-      nativeAnalysisArtifact: { path: 'native/aggregate.json', bytes },
+      nativeAnalysisArtifact: { ...ANALYSIS_BINDING_IDENTITY, path: 'native/aggregate.json', bytes },
     })).toThrow(/not bound/);
     expect(() => build({
       verifierReceipt: {
@@ -322,7 +329,30 @@ describe('common report evidence envelope', () => {
           nativeRecordKey: null,
         }],
       },
-      nativeAnalysisArtifact: { path: 'native/aggregate.json', bytes: Buffer.from('{"resolved":0}\n') },
+      nativeAnalysisArtifact: {
+        ...ANALYSIS_BINDING_IDENTITY,
+        scope: { kind: 'suite-check', name: 'different-aggregate' },
+        path: 'native/aggregate.json',
+        bytes,
+      },
+    })).toThrow(/not bound/);
+    expect(() => build({
+      verifierReceipt: {
+        ...receipt(),
+        bindings: [...receipt().bindings, {
+          invocationId: INVOCATION,
+          scope: { kind: 'suite-check', name: 'aggregate' },
+          role: 'aggregate-report',
+          path: 'native/aggregate.json',
+          sha256,
+          nativeRecordKey: null,
+        }],
+      },
+      nativeAnalysisArtifact: {
+        ...ANALYSIS_BINDING_IDENTITY,
+        path: 'native/aggregate.json',
+        bytes: Buffer.from('{"resolved":0}\n'),
+      },
     })).toThrow(/not bound/);
   });
 
@@ -362,6 +392,9 @@ describe('common report evidence envelope', () => {
       artifact: { path: 'native/a/other.json' as never, sha256: OTHER_HASH, nativeRecordKey: 'task-one:a' },
     };
     expect(() => build({ taskResults: unbound })).toThrow(/not bound/);
+    const wrongInvocation = taskInputs();
+    wrongInvocation[0]!.invocationId = '22222222-2222-4222-8222-222222222222';
+    expect(() => build({ taskResults: wrongInvocation })).toThrow(/not bound/);
     expect(() => build({ taskResults: [...taskInputs()].reverse() })).toThrow(/order/);
     expect(() => build({
       currentPolicyHashes: {

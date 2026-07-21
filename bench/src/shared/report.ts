@@ -31,7 +31,12 @@ import {
 } from './paths.js';
 import type { BenchPathRoots, Arm } from './contracts.js';
 import { loadBenchRunStateEvidence, type BenchRunState } from './run-state.js';
-import { verifierReceiptSchema, type NativeVerifierResult, type VerifierReceipt } from './verifier.js';
+import {
+  verifierReceiptSchema,
+  type NativeVerifierResult,
+  type VerifierReceipt,
+  type VerifierScope,
+} from './verifier.js';
 
 export interface RateAnalysis {
   evaluated: number;
@@ -142,6 +147,7 @@ export interface BenchReport {
 }
 
 export interface TaskReportInput {
+  invocationId: string;
   taskId: string;
   arm: Arm;
   nativeVerifier: NativeVerifierResult;
@@ -172,6 +178,9 @@ export interface ReportPolicyHashes {
 }
 
 export interface NativeAnalysisArtifactInput {
+  invocationId: string;
+  scope: Extract<VerifierScope, { kind: 'suite-check' }>;
+  nativeRecordKey: string | null;
   /** Receipt-bound relative path whose exact bytes are parsed for analysis. */
   path: string;
   bytes: Uint8Array;
@@ -301,7 +310,8 @@ function bindNativeResult(
   }
   const path = validateRelativeArtifactPath(native.artifact.path);
   const matching = receipt.bindings.some((binding) =>
-    binding.scope.kind === 'task-arm'
+    binding.invocationId === input.invocationId
+    && binding.scope.kind === 'task-arm'
     && binding.scope.taskId === input.taskId
     && binding.scope.arm === input.arm
     && ['native-result', 'task-report', 'aggregate-report'].includes(binding.role)
@@ -336,9 +346,13 @@ function bindNativeAnalysisInput(
   const bytes = Buffer.from(input.bytes);
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const matching = receipt.bindings.some((binding) =>
-    binding.role === 'aggregate-report'
+    binding.invocationId === input.invocationId
+    && binding.role === 'aggregate-report'
+    && binding.scope.kind === 'suite-check'
+    && binding.scope.name === input.scope.name
     && binding.path === path
-    && binding.sha256 === sha256);
+    && binding.sha256 === sha256
+    && binding.nativeRecordKey === input.nativeRecordKey);
   if (!matching) throw new Error('native analysis artifact is not bound by the verifier receipt');
   try {
     return JSON.parse(bytes.toString('utf8')) as unknown;

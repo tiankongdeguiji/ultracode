@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { newRunId } from '../../src/store/layout.js';
 import { createRunDir, getRun, isPidAlive } from '../../src/store/runstore.js';
-import { readManifest, isTerminal } from '../../src/store/manifest.js';
+import { isResumableStatus, readManifest, isTerminal } from '../../src/store/manifest.js';
 import { launchRunner, resolveRunnerEntry } from '../../src/exec/daemonize.js';
 import { readJournal } from '../../src/engine/journal.js';
 import {
@@ -261,9 +261,10 @@ describe('detached runner', () => {
       const identity = readProcessIdentity(pid)!;
       writeFileSync(join(legacyDir, 'pgid'), `${pid} ${identity.starttime}`);
       const stopped = await stopRun(run.root, run.runId);
-      expect(stopped).toMatchObject({ ok: false, status: 'orphaned' });
+      expect(stopped).toMatchObject({ ok: false, status: 'cleanup-failed' });
       expect(stopped.message).toContain('unauthenticated legacy worker group(s) still active');
       expect(stopped.message).toContain('manual cleanup required');
+      expect(readManifest(run.dir)?.status).toBe('cleanup-failed');
       expect(readProcessIdentity(pid)).toBeTruthy();
     } finally {
       try {
@@ -330,9 +331,10 @@ describe('detached runner', () => {
       // have landed through synchronous writes before process.exit(1).
       const manifest = readManifest(dir);
       expect(manifest).toMatchObject({
-        status: 'stopped',
+        status: 'cleanup-failed',
         error: 'wall-clock cap; worker cleanup incomplete: deterministic cleanup rejection',
       });
+      expect(isResumableStatus(manifest!.status)).toBe(false);
       expect(manifest?.endedAt).toBeDefined();
       const workflowLogs = readFileSync(join(dir, 'events.jsonl'), 'utf8')
         .trimEnd()
@@ -359,7 +361,8 @@ describe('detached runner', () => {
           })
         : await stopRun(root, runId);
       expect(retry).toMatchObject({ ok: true, status: 'stopped' });
-      expect(retry.message).toContain('already stopped');
+      expect(retry.message).toContain('worker cleanup verified; marked stopped');
+      expect(readManifest(dir)?.status).toBe('stopped');
       if (exerciseWorkerRetry) {
         expect(retry.message).toContain('worker record(s)');
         expect(await waitProcessGone(workerPid)).toBe(true);
@@ -396,14 +399,19 @@ describe('detached runner', () => {
     let workerPid = 0;
     let escapedPid = 0;
     try {
-      ({ dir: runDir } = makeRun(HANG_WITH_AGENT, { backend: 'claude', wallClockMs: 500 }));
+      const run = makeRun(HANG_WITH_AGENT, { backend: 'claude', wallClockMs: 500 });
+      runDir = run.dir;
       ({ pid: runnerPid } = await launchRunner(runDir));
       ({ worker: workerPid, escaped: escapedPid } = await waitForRecordedPids(pidsFile));
 
-      expect(await waitTerminal(runDir, 12_000)).toBe('stopped');
+      const terminal = await waitTerminal(runDir, 12_000);
+      expect(['cleanup-failed', 'stopped']).toContain(terminal);
       expect(await waitProcessGone(runnerPid)).toBe(true);
       expect(await waitProcessGone(workerPid)).toBe(true);
       expect(await waitProcessGone(escapedPid)).toBe(true);
+      if (terminal === 'cleanup-failed') {
+        expect(isResumableStatus(readManifest(runDir)!.status)).toBe(false);
+      }
     } finally {
       if (prevBin === undefined) delete process.env.ULTRACODE_CLAUDE_BIN;
       else process.env.ULTRACODE_CLAUDE_BIN = prevBin;

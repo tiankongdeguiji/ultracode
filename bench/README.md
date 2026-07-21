@@ -19,7 +19,7 @@ All suites use the same strict envelope for:
 Suite adapters retain authority over native preparation, execution, and
 verification. A native verifier result enters a report only when a host-owned
 receipt binds its exact path, digest, invocation, scope, role, and native record
-key. Only explicitly absent evidence remains unverified with null results.
+key. Adapter-reported missing evidence remains unverified with null results.
 Malformed receipts, unknown invocations, artifact drift, and binding mismatches
 abort report generation.
 

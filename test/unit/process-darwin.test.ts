@@ -49,6 +49,22 @@ describe('Darwin worker process discovery', () => {
       const selected = argv[argv.indexOf('-p') + 1]!;
       expect(selected.split(',').length).toBeLessThanOrEqual(128);
     }
+
+    calls.length = 0;
+    const budgeted = discoverWorkerProcessesForTokens(
+      [TOKEN],
+      process.cwd(),
+      Array.from({ length: 2_000 }, (_, index) => 10_000 + index),
+      {
+        platform: 'darwin',
+        executePs: (argv) => {
+          calls.push([...argv]);
+          return '';
+        },
+      },
+    );
+    expect(budgeted).toEqual({ processes: [], complete: false });
+    expect(calls).toHaveLength(8);
   });
 
   it('authenticates token, scope, PID, PGID, and start identity', () => {

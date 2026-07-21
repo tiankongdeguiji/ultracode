@@ -8,6 +8,8 @@ import {
   signal0Status,
   signalTrackedWorkerProcesses,
   type ProcessInspectionOptions,
+  type TrackedWorkerProcess,
+  withDarwinPsQueryBudget,
 } from '../../../src/exec/procinfo.js';
 import { FAILURE_CODES, type BenchPathRoots, type BenchSuite, type FailureCode } from './contracts.js';
 import type { BenchLockHandle } from './locks.js';
@@ -67,6 +69,11 @@ async function recoverLinuxPhase(
   const byToken = new Map(entries.map((entry) => [entry.token, entry]));
   const tokens = [...byToken.keys()];
   const emptyPasses = new Map(tokens.map((token) => [token, 0]));
+  const retainedTokenOnly = new Map<string, Map<string, TrackedWorkerProcess>>(
+    entries
+      .filter((entry) => entry.pid === null || entry.processStartIdentity === null)
+      .map((entry) => [entry.token, new Map()]),
+  );
   const observe = (separated: boolean) => {
     const discovery = discoverWorkerProcessesForTokens(
       tokens,
@@ -75,14 +82,47 @@ async function recoverLinuxPhase(
       inspection,
     );
     const foundTokens = new Set(discovery.processes.map((process) => process.token));
+    for (const candidate of discovery.processes) {
+      retainedTokenOnly.get(candidate.token)?.set(
+        `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}`,
+        candidate,
+      );
+    }
     const leaderPids = entries.flatMap((entry) => entry.pid === null ? [] : [entry.pid]);
     const leaders = readProcessIdentitySnapshot(leaderPids, inspection);
+    const retainedCandidates = [...retainedTokenOnly.values()]
+      .flatMap((candidates) => [...candidates.values()]);
+    const retainedIdentities = readProcessIdentitySnapshot(
+      retainedCandidates.map((candidate) => candidate.pid),
+      inspection,
+    );
     const signalCandidates = new Map(discovery.processes.map((candidate) => [
       `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}:${candidate.token}`,
       candidate,
     ]));
+    for (const candidate of retainedCandidates) {
+      signalCandidates.set(
+        `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}:${candidate.token}`,
+        candidate,
+      );
+    }
     for (const token of tokens) {
       const entry = byToken.get(token)!;
+      const retained = retainedTokenOnly.get(token);
+      if (retained !== undefined) {
+        const retainedAbsent = retained.size > 0
+          && retainedIdentities.complete
+          && [...retained.values()].every((candidate) => {
+            const live = retainedIdentities.identities.get(candidate.pid);
+            return live === undefined
+              || live.starttime !== candidate.starttime
+              || live.pgrp !== candidate.pgrp;
+          });
+        const absent = discovery.complete && !foundTokens.has(token) && retainedAbsent;
+        const prior = emptyPasses.get(token) ?? 0;
+        emptyPasses.set(token, absent ? (separated && prior > 0 ? prior + 1 : 1) : 0);
+        continue;
+      }
       let leaderAbsent = false;
       if (entry.pid !== null && entry.processStartIdentity !== null) {
         const identity = leaders.identities.get(entry.pid);
@@ -691,6 +731,7 @@ export class BenchRunStateStore {
     if (recoverable.length === 0) return 0;
     const platform = inspection.platform ?? process.platform;
     if (platform === 'darwin') {
+      const termInspection = withDarwinPsQueryBudget(inspection);
       const valid = recoverable.filter((entry) =>
         entry.pid !== null && entry.processStartIdentity !== null);
       const invalidTokens = recoverable
@@ -702,16 +743,19 @@ export class BenchRunStateStore {
         workerScope,
         'SIGTERM',
         graceMs,
-        inspection,
+        termInspection,
         retiredPids,
       );
       if (liveTokens.size > 0) {
+        const killInspection = inspection.darwinPsQueryBudget === undefined
+          ? withDarwinPsQueryBudget({ ...inspection, darwinPsQueryBudget: undefined })
+          : termInspection;
         liveTokens = await recoverDarwinPhase(
           valid.filter((entry) => liveTokens.has(entry.token)),
           workerScope,
           'SIGKILL',
           graceMs,
-          inspection,
+          killInspection,
           retiredPids,
         );
       }

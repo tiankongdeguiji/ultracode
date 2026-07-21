@@ -12,6 +12,7 @@ import {
   snapshotLinuxProcessIdentities,
   signalTrackedWorkerProcesses,
   signal0Status,
+  signalWorkerProcessTokens,
   signalWorkerProcesses,
   type ProcessInspectionOptions,
   WORKER_SCOPE_ENV,
@@ -20,7 +21,11 @@ import {
 } from './procinfo.js';
 
 interface ActiveWorker {
-  signal(signal: NodeJS.Signals): number;
+  inspection?: ProcessInspectionOptions;
+  platform: NodeJS.Platform;
+  scope?: string;
+  signalGroup(signal: NodeJS.Signals): boolean;
+  token: string;
 }
 
 const ACTIVE_WORKERS = new Map<string, ActiveWorker>();
@@ -28,11 +33,36 @@ const ACTIVE_WORKERS = new Map<string, ActiveWorker>();
 /** Signal trusted in-memory worker identities without reading recovery files. */
 export function killActiveWorkers(signal: NodeJS.Signals = 'SIGKILL'): number {
   let signaled = 0;
+  const linuxBatches: Array<{
+    inspection: ProcessInspectionOptions | undefined;
+    scope: string | undefined;
+    tokens: string[];
+  }> = [];
   for (const worker of ACTIVE_WORKERS.values()) {
     try {
-      signaled += worker.signal(signal);
+      signaled += Number(worker.signalGroup(signal));
+      if (worker.platform !== 'linux') continue;
+      let batch = linuxBatches.find((candidate) =>
+        candidate.scope === worker.scope && candidate.inspection === worker.inspection);
+      if (batch === undefined) {
+        batch = { inspection: worker.inspection, scope: worker.scope, tokens: [] };
+        linuxBatches.push(batch);
+      }
+      batch.tokens.push(worker.token);
     } catch {
       // A compromised record path must not prevent containment of siblings.
+    }
+  }
+  for (const batch of linuxBatches) {
+    try {
+      signaled += signalWorkerProcessTokens(
+        batch.tokens,
+        signal,
+        batch.scope,
+        batch.inspection,
+      ).processes;
+    } catch {
+      // Fatal cleanup remains best-effort across independent run scopes.
     }
   }
   return signaled;
@@ -131,7 +161,15 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
       + signalWorkerProcesses(workerToken, signal, opts.workerScope, tokenInspection);
   };
 
-  if (pid) ACTIVE_WORKERS.set(workerToken, { signal: signalLiveWorker });
+  if (pid) {
+    ACTIVE_WORKERS.set(workerToken, {
+      inspection: opts.processInspection,
+      platform,
+      scope: opts.workerScope,
+      signalGroup,
+      token: workerToken,
+    });
+  }
 
   const killTree = (signal: NodeJS.Signals = 'SIGTERM'): void => {
     // Linux lifecycle markers cover descendants that leave the original PGID.

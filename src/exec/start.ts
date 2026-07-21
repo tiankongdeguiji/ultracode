@@ -9,7 +9,7 @@ import { validateArgsAgainstInputSchema } from '../engine/run.js';
 import { defaultConcurrency } from '../engine/semaphore.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir, getRun } from '../store/runstore.js';
-import { isTerminal } from '../store/manifest.js';
+import { isResumableStatus, isTerminal } from '../store/manifest.js';
 import { launchRunner } from './daemonize.js';
 
 export interface StartRunInput {
@@ -69,6 +69,9 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     if (!prior) throw new Error(`no run ${input.resumeFromRunId} under ${root}`);
     if (!isTerminal(prior.effectiveStatus)) {
       throw new Error(`run ${input.resumeFromRunId} is still ${prior.effectiveStatus} — stop it first`);
+    }
+    if (!isResumableStatus(prior.effectiveStatus)) {
+      throw new Error(`run ${input.resumeFromRunId} cannot resume before verified worker cleanup`);
     }
     resumedFrom = input.resumeFromRunId;
     config.resumeFromRunId = input.resumeFromRunId;

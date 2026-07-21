@@ -3,7 +3,11 @@ import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { downloadCacheFilename, resolveCodexBin } from '../../bench/src/shared/toolchain.js';
+import {
+  dockerPullDigest,
+  downloadCacheFilename,
+  resolveCodexBin,
+} from '../../bench/src/shared/toolchain.js';
 
 const roots: string[] = [];
 
@@ -12,6 +16,17 @@ afterEach(() => {
 });
 
 describe('Codex toolchain resolution', () => {
+  it('uses the immutable digest reported by the exact Docker pull', () => {
+    const digest = `sha256:${'a'.repeat(64)}`;
+    expect(dockerPullDigest(
+      'registry.example:5000/node:22-alpine3.20',
+      `22-alpine3.20: Pulling from node\nDigest: ${digest}\nStatus: Downloaded newer image`,
+    )).toBe(`registry.example:5000/node@${digest}`);
+    expect(() => dockerPullDigest('node:22-alpine3.20', 'Status: Image is up to date')).toThrow(
+      /did not report one immutable digest/u,
+    );
+  });
+
   it('names same-basename downloads by their immutable digest', () => {
     const official = downloadCacheFilename(
       'https://nodejs.org/dist/v22.0.0/node-v22.0.0-linux-x64.tar.xz',

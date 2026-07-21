@@ -11,7 +11,13 @@ import { executeWorkflow } from '../engine/run.js';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { JournalWriter, KeyChain, PrefixReplayCache, argsHash, readJournal, seedKey } from '../engine/journal.js';
 import { EventWriter } from '../store/events.js';
-import { readManifest, writeManifest, HEARTBEAT_INTERVAL_MS, type RunManifest } from '../store/manifest.js';
+import {
+  isResumableStatus,
+  readManifest,
+  writeManifest,
+  HEARTBEAT_INTERVAL_MS,
+  type RunManifest,
+} from '../store/manifest.js';
 import { readRunArgs, readRunConfig } from '../store/runstore.js';
 import { agentDirName } from '../store/layout.js';
 import { MockExecutor } from '../backends/mock.js';
@@ -65,6 +71,12 @@ export async function runnerMain(
   const config = readRunConfig(dir);
   const base = readManifest(dir);
   if (!base) throw new Error(`no manifest in ${dir}`);
+  if (config.resumeFromRunId !== undefined) {
+    const prior = readManifest(join(dirname(dir), config.resumeFromRunId));
+    if (prior === null || !isResumableStatus(prior.status)) {
+      throw new Error(`run ${config.resumeFromRunId} cannot be resumed before verified worker cleanup`);
+    }
+  }
 
   const events = new EventWriter(join(dir, 'events.jsonl'));
   const journal = new JournalWriter(join(dir, 'journal.jsonl'));
@@ -121,7 +133,7 @@ export async function runnerMain(
       }
       writeManifest(dir, {
         ...manifest,
-        status: 'stopped',
+        status: cleanupFailure === undefined ? 'stopped' : 'cleanup-failed',
         endedAt: new Date().toISOString(),
         heartbeatAt: new Date().toISOString(),
         error: cleanupFailure === undefined

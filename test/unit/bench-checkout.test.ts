@@ -13,11 +13,13 @@ describe('pinned checkout plans', () => {
     expect(planPinnedClone('https://example.test/repo.git', PIN, '/tmp/checkout')).toEqual([
       ['git', 'clone', '--filter=blob:none', '--no-checkout', '--no-tags', '--', 'https://example.test/repo.git', '/tmp/checkout'],
       ['git', '-C', '/tmp/checkout', 'fetch', '--filter=blob:none', '--depth=1', '--no-tags', 'origin', PIN],
-      ['git', '-C', '/tmp/checkout', 'checkout', '--detach', PIN],
+      ['git', '-C', '/tmp/checkout', 'checkout', '--detach', '--force', PIN],
+      ['git', '-C', '/tmp/checkout', 'reset', '--hard', PIN],
+      ['git', '-C', '/tmp/checkout', 'clean', '-ffdx'],
     ]);
   });
 
-  it('plans only fetch and detached checkout for an existing clone', () => {
+  it('restores tracked and untracked bytes in an existing cache checkout', () => {
     const update = planPinnedUpdate('/tmp/repo with spaces', PIN);
     expect(planPinnedCheckout({
       repository: 'unused',
@@ -26,6 +28,8 @@ describe('pinned checkout plans', () => {
       existing: true,
     })).toEqual(update);
     expect(update.every((argv) => argv[0] === 'git')).toBe(true);
+    expect(update.at(-2)).toEqual(['git', '-C', '/tmp/repo with spaces', 'reset', '--hard', PIN]);
+    expect(update.at(-1)).toEqual(['git', '-C', '/tmp/repo with spaces', 'clean', '-ffdx']);
   });
 
   it('requires a full immutable object id and valid argv values', () => {

@@ -36,7 +36,9 @@ export function planPinnedUpdate(directory: string, pin: string): Argv[] {
   validatePin(pin);
   return [
     ['git', '-C', directory, 'fetch', '--filter=blob:none', '--depth=1', '--no-tags', 'origin', pin],
-    ['git', '-C', directory, 'checkout', '--detach', pin],
+    ['git', '-C', directory, 'checkout', '--detach', '--force', pin],
+    ['git', '-C', directory, 'reset', '--hard', pin],
+    ['git', '-C', directory, 'clean', '-ffdx'],
   ];
 }
 

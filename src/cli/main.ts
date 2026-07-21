@@ -219,10 +219,29 @@ program
     try {
       process.exit(await runnerMain(opts.runDir));
     } catch (err) {
+      let cleanupFailure: string | undefined;
       try {
         await killWorkerGroupsUntilGone(opts.runDir);
+      } catch (cleanupError) {
+        cleanupFailure = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      }
+      try {
+        const { readManifest, writeManifest } = await import('../store/manifest.js');
+        const manifest = readManifest(opts.runDir);
+        if (manifest !== null) {
+          const failure = err instanceof Error ? err.message : String(err);
+          writeManifest(opts.runDir, {
+            ...manifest,
+            status: cleanupFailure === undefined ? 'failed' : 'cleanup-failed',
+            endedAt: manifest.endedAt ?? new Date().toISOString(),
+            heartbeatAt: new Date().toISOString(),
+            error: cleanupFailure === undefined
+              ? failure
+              : `${failure}; worker cleanup incomplete: ${cleanupFailure}`,
+          });
+        }
       } catch {
-        /* fatal path: best-effort worker containment */
+        /* fatal path: manifest persistence is best-effort */
       }
       process.stderr.write(`runner fatal: ${(err as Error)?.stack ?? err}\n`);
       process.exit(1);

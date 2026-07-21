@@ -16,6 +16,8 @@ export const WORKER_SCOPE_ENV = 'ULTRACODE_WORKER_SCOPE';
 const WORKER_TOKEN_RE = /^[a-f0-9]{32}$/;
 const WORKER_SCOPE_RE = /^[a-f0-9]{64}$/;
 const DARWIN_PS_BATCH_SIZE = 128;
+const DARWIN_PS_QUERY_BUDGET = 8;
+const DARWIN_RECOVERY_PS_QUERY_BUDGET = 16;
 const MAX_PROCESS_ID = 2_147_483_647;
 
 export interface ProcessInspectionOptions {
@@ -51,6 +53,18 @@ export interface ProcessInspectionOptions {
   observationNow?: () => number;
   /** Bounded polling seam for deterministic process-settlement tests. */
   observationWait?: (delayMs: number) => Promise<void>;
+  /** Shared synchronous-ps budget for one bounded Darwin recovery operation. */
+  darwinPsQueryBudget?: { remaining: number };
+}
+
+/** Share one fail-closed Darwin ps budget across discovery and re-authentication. */
+export function withDarwinPsQueryBudget(
+  options: ProcessInspectionOptions = {},
+): ProcessInspectionOptions {
+  if (inspectionPlatform(options) !== 'darwin' || options.darwinPsQueryBudget !== undefined) {
+    return options;
+  }
+  return { ...options, darwinPsQueryBudget: { remaining: DARWIN_RECOVERY_PS_QUERY_BUDGET } };
 }
 
 export interface ProcStat {
@@ -325,7 +339,13 @@ export function readProcessIdentitySnapshot(
     return { identities: found, complete: platform === 'darwin' };
   }
   let complete = true;
+  const queryBudget = options.darwinPsQueryBudget ?? { remaining: DARWIN_PS_QUERY_BUDGET };
   for (let offset = 0; offset < requested.length; offset += DARWIN_PS_BATCH_SIZE) {
+    if (queryBudget.remaining < 1) {
+      complete = false;
+      break;
+    }
+    queryBudget.remaining -= 1;
     const batch = requested.slice(offset, offset + DARWIN_PS_BATCH_SIZE);
     const accepted = new Set(batch);
     try {
@@ -506,7 +526,13 @@ export function discoverWorkerProcessesForTokens(
       batches.push(candidates.slice(offset, offset + DARWIN_PS_BATCH_SIZE));
     }
     let complete = true;
+    const queryBudget = options.darwinPsQueryBudget ?? { remaining: DARWIN_PS_QUERY_BUDGET };
     while (batches.length > 0) {
+      if (queryBudget.remaining < 2) {
+        complete = false;
+        break;
+      }
+      queryBudget.remaining -= 2;
       const batch = batches.shift()!;
       const selected = new Set(batch);
       const commands = darwinProcessQuery(batch, false, options);
@@ -711,11 +737,12 @@ export function darwinWorkerSignalingInspection(
   options: ProcessInspectionOptions = {},
 ): ProcessInspectionOptions {
   const accepted = [...new Set([...tokens].filter(isWorkerToken))];
-  const forwardSignal = options.signalProcess ?? ((pid: number, signal: NodeJS.Signals | 0) => {
+  const boundedOptions = withDarwinPsQueryBudget(options);
+  const forwardSignal = boundedOptions.signalProcess ?? ((pid: number, signal: NodeJS.Signals | 0) => {
     process.kill(pid, signal);
   });
   return {
-    ...options,
+    ...boundedOptions,
     // Darwin's second-granularity lstart can match a same-second PID/PGID
     // replacement. Token and scope are therefore re-read for every target.
     readIdentitySnapshot: (pids) => {
@@ -723,7 +750,7 @@ export function darwinWorkerSignalingInspection(
         accepted,
         scope,
         pids,
-        options,
+        boundedOptions,
       );
       return {
         identities: new Map(authenticated.processes.map((candidate) => [
@@ -739,7 +766,7 @@ export function darwinWorkerSignalingInspection(
         accepted,
         scope,
         [pid],
-        options,
+        boundedOptions,
       ).processes.some((candidate) =>
         candidate.pid === pid && (target > 0 || candidate.pgrp === pid));
       if (!authenticated) {

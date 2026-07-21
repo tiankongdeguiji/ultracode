@@ -10,7 +10,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { pythonEnvironmentSha256, sha256Tree } from '../../bench/src/shared/provenance.js';
+import { canonicalJson, pythonEnvironmentSha256, sha256Tree } from '../../bench/src/shared/provenance.js';
 import { parsePublishedArchiveChecksum } from '../../bench/src/shared/toolchain.js';
 
 const roots: string[] = [];
@@ -26,6 +26,12 @@ afterEach(() => {
 });
 
 describe('benchmark provenance trees', () => {
+  it('preserves own special keys in canonical JSON identities', () => {
+    const withPrototypeKey = JSON.parse('{"__proto__":{"polluted":true},"value":1}') as unknown;
+    expect(canonicalJson(withPrototypeKey)).toBe('{"__proto__":{"polluted":true},"value":1}');
+    expect(canonicalJson(withPrototypeKey)).not.toBe(canonicalJson({ value: 1 }));
+  });
+
   it('frames file contents separately from following tree-entry metadata', () => {
     const root = temporary();
     const one = join(root, 'one');
