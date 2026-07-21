@@ -10,8 +10,9 @@ arm64 on glibc 2.28-or-newer Linux, macOS 10.9-or-newer on x64, and macOS
 architectures, pip versions, musl, and older OS floors fail preflight before a
 dependency index or other preparation network path is reached. The suite does
 not use or require `uv` or GNU `patch`; those tools belong to other suites.
-Preparation and official evaluation remain manual networked operations. Task
-sessions do not receive ordinary outbound access.
+Preparation is a manual networked operation. Official evaluation is manual and
+local: evaluator containers run with `NetworkMode=none`. Task sessions do not
+receive ordinary outbound access.
 
 SWE-bench Pro intentionally has no direct `chatgpt` or `api-key` session mode.
 Relay-backed Pro operator configuration and run manifests use schema version 3.

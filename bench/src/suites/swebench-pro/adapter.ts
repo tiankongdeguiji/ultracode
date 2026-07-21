@@ -187,7 +187,7 @@ export const swebenchProAdapter: SuiteAdapter<'swebench-pro'> = {
     await runner.cleanupSwebenchProRuntime();
   },
   commands: {
-    fetch: cacheSpec('verify and freeze the audited canonical dataset descriptor', 'fetchCommand'),
+    fetch: cacheSpec('verify and freeze the pinned unaudited dataset descriptor', 'fetchCommand'),
     prep: cacheSpec('prepare immutable toolchain and evaluator inputs', 'prepCommand'),
     run: runSpec,
     eval: evalSpec,

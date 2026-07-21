@@ -159,8 +159,10 @@ describe('official SWE-bench Pro evaluator seam', () => {
   it('records exact non-empty invocation and artifacts while filtering native output', async () => {
     const { runDirectory, evaluatorDirectory } = evaluatorFixture();
     const dockerTimeouts: number[] = [];
+    const dockerQueries: string[][] = [];
     const boundedDocker = async (argv: readonly string[], timeoutMs?: number): Promise<string> => {
       dockerTimeouts.push(timeoutMs!);
+      dockerQueries.push([...argv]);
       return emptyDocker(argv);
     };
     const calls: Array<{ command: string; argv: readonly string[]; options: BenchProcessOptions }> = [];
@@ -218,6 +220,12 @@ describe('official SWE-bench Pro evaluator seam', () => {
     expect(result.processFailure).toBeNull();
     expect(dockerTimeouts.length).toBeGreaterThan(0);
     expect(dockerTimeouts.every((timeoutMs) => Number.isSafeInteger(timeoutMs) && timeoutMs > 0)).toBe(true);
+    expect(dockerQueries.filter((argv) => argv[0] === 'ps').every((argv) => (
+      argv.includes('label=ultracode.benchmark.suite=swebench-pro')
+      && argv.includes('label=ultracode.benchmark.run=pilot1')
+      && argv.includes('label=ultracode.benchmark.purpose=verifier')
+      && argv.includes('label=ultracode.benchmark.invocation=11111111-1111-4111-8111-111111111111')
+    ))).toBe(true);
     expect(result.resultRelativePath).toBe('native/verifier/armA/output/eval_results.json');
     expect(readFileSync(rawSamples, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
       expect.objectContaining({

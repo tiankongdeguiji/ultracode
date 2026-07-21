@@ -416,6 +416,43 @@ describe('evaluator ownership and empty predictions', () => {
     expect(buildArgv[1]).toContain('ultracode.benchmark.run=run-two');
   });
 
+  it('removes a run-owned overlay when post-build inspection fails', async () => {
+    const instance = instanceFromRow(row('task'));
+    const digest = `jefzda/sweap-images@sha256:${'a'.repeat(64)}`;
+    const baseId = `sha256:${'b'.repeat(64)}`;
+    let overlayName = '';
+    const calls: string[][] = [];
+    const docker = async (argv: readonly string[]): Promise<string> => {
+      calls.push([...argv]);
+      if (argv[0] === 'build') {
+        overlayName = argv[argv.indexOf('-t') + 1]!;
+        return '';
+      }
+      if (argv[0] === 'image' && argv[1] === 'inspect') {
+        if (argv[2] === overlayName) throw new Error('injected post-build inspect failure');
+        return JSON.stringify([{
+          Id: baseId,
+          RepoDigests: [digest],
+          Os: 'linux',
+          Architecture: 'amd64',
+        }]);
+      }
+      if (argv[0] === 'image' && argv[1] === 'rm') return '';
+      if (argv[0] === 'image' && argv[1] === 'ls') return '';
+      throw new Error(`unexpected Docker argv: ${argv.join(' ')}`);
+    };
+
+    await expect(prepareTaskImage(instance, {
+      roots: createBenchPathRoots(join(process.cwd(), 'bench')),
+      runId: 'run-failed',
+      toolchainDirectory: '/cache/toolchain',
+      toolchainPayloadSha256: 'd'.repeat(64),
+      docker,
+    })).rejects.toThrow(/injected post-build inspect failure/);
+    expect(calls).toContainEqual(['image', 'rm', overlayName]);
+    expect(calls).toContainEqual(['image', 'ls', '-q', '--no-trunc', overlayName]);
+  });
+
   it('cleans only fully labelled containers for manifest-owned tasks', () => {
     const labels = {
       'ultracode.benchmark.schema': '2',

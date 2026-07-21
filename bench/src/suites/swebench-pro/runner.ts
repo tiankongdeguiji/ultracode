@@ -84,6 +84,7 @@ import {
   defaultDockerExecutor,
   prepareTaskImage,
   reattestTaskImage,
+  removeTaskImageTargets,
   removeTaskImages,
   type DockerExecutor,
 } from './image.js';
@@ -999,6 +1000,66 @@ export async function attestSessionTransportAttachment(
   inspectSwebenchProSessionAttachment(inspection, expected, bindings);
 }
 
+export interface StartAttestedSessionTransportOptions {
+  executor: SessionDockerExecutor;
+  expected: SwebenchProSessionAttachment;
+  bindings: SwebenchProTransportBindings;
+  config: SwebenchProConfig;
+  manifest: SwebenchProManifest;
+  allowedSessions: ReadonlyMap<string, string>;
+  runtimeHome: string;
+  lifecycle?: ProcessLifecycle;
+  timeoutMs: () => number;
+}
+
+/** Start only a stopped-attested session and publish its gate after live topology proof. */
+export async function startAttestedSessionTransport(
+  options: StartAttestedSessionTransportOptions,
+): Promise<void> {
+  const lifecycle = options.lifecycle ?? {};
+  const expected = { ...options.expected, running: false };
+  await attestSessionTransportAttachment(
+    options.executor,
+    expected,
+    options.bindings,
+    lifecycle,
+    options.timeoutMs(),
+  );
+  const startedId = (await options.executor(
+    ['start', expected.id],
+    lifecycle,
+    options.timeoutMs(),
+  )).trim();
+  if (startedId !== expected.id) {
+    throw transportAttestationFailure(
+      'session-inspect',
+      new Error('Docker did not start the exact attested session container'),
+    );
+  }
+  await attestSessionTransportAttachment(
+    options.executor,
+    { ...expected, running: true },
+    options.bindings,
+    lifecycle,
+    options.timeoutMs(),
+  );
+  const transport = await attestModelTransport(
+    options.config,
+    options.bindings,
+    options.executor,
+    lifecycle,
+    options.timeoutMs(),
+    options.allowedSessions,
+    new Set([expected.name]),
+  );
+  assertModelTransportProvenance(options.manifest, transport);
+  writePrivateFileAtomic(
+    options.runtimeHome,
+    join(options.runtimeHome, '.model-transport-attested'),
+    `${expected.runtimeNonce}\n`,
+  );
+}
+
 export function assertModelTransportProvenance(
   manifest: SwebenchProManifest,
   attestation: SwebenchProTransportAttestation,
@@ -1530,6 +1591,7 @@ export function sessionDockerCreateArgv(options: SessionDockerCreateArgvOptions)
     '--env', 'LD_PRELOAD=',
     '--env', 'LD_AUDIT=',
     '--env', 'LD_LIBRARY_PATH=',
+    '--env', 'NODE_OPTIONS=',
     '--env-file', options.envFile,
     '--mount', `type=bind,src=${options.taskDirectory},dst=/bench`,
     '--mount', `type=bind,src=${options.runtimeHome},dst=/runtime/home`,
@@ -1668,46 +1730,17 @@ async function runSession(
         executor,
       }, () => executor(args, processLifecycle, activeTimeout()));
       fatalController?.throwIfAborted();
-      await attestSessionTransportAttachment(
+      await startAttestedSessionTransport({
         executor,
-        sessionAttachment(launchedId, sessionOptions, false),
-        transportBindings,
-        processLifecycle,
-        activeTimeout(),
-      );
-      const startedId = (await executor(
-        ['start', launchedId],
-        processLifecycle,
-        activeTimeout(),
-      )).trim();
-      if (startedId !== launchedId) {
-        throw transportAttestationFailure(
-          'session-inspect',
-          new Error('Docker did not start the exact attested session container'),
-        );
-      }
-      await attestSessionTransportAttachment(
-        executor,
-        sessionAttachment(launchedId, sessionOptions, true),
-        transportBindings,
-        processLifecycle,
-        activeTimeout(),
-      );
-      const transport = await attestModelTransport(
+        expected: sessionAttachment(launchedId, sessionOptions, false),
+        bindings: transportBindings,
         config,
-        transportBindings,
-        executor,
-        processLifecycle,
-        activeTimeout(),
-        activeSessionEndpoints(),
-        new Set([name]),
-      );
-      assertModelTransportProvenance(manifest, transport);
-      writePrivateFileAtomic(
+        manifest,
+        allowedSessions: activeSessionEndpoints(),
         runtimeHome,
-        join(runtimeHome, '.model-transport-attested'),
-        `${runtimeNonce}\n`,
-      );
+        lifecycle: processLifecycle,
+        timeoutMs: activeTimeout,
+      });
     }, fatalController);
     unlinkSync(envFile);
     const waited = executor(
@@ -2225,6 +2258,7 @@ export async function runCommand(
   let initialized: Awaited<ReturnType<typeof initializeRun>> | null = null;
   let policyLock: BenchLockHandle | null = null;
   let inputLocks: BenchLockHandle[] = [];
+  const unpublishedImages: DockerImageAttestation[] = [];
   try {
     const freshDirectory = runDir(context.paths, 'swebench-pro', options.runId);
     if (existsSync(freshDirectory)) {
@@ -2249,12 +2283,14 @@ export async function runCommand(
     const selected = selectInstances(snapshot, config.selection);
     const images = new Map<string, DockerImageAttestation>();
     for (const instance of selected) {
-      images.set(instance.instanceId, await prepareTaskImage(instance, {
+      const image = await prepareTaskImage(instance, {
         roots: context.paths,
         runId: options.runId,
         toolchainDirectory: prepared.toolchain.directory,
         toolchainPayloadSha256: prepared.toolchain.provenance.payloadSha256,
-      }));
+      });
+      images.set(instance.instanceId, image);
+      unpublishedImages.push(image);
     }
     const transport = await attestModelTransport(config, transportBindings, dependencies.sessionDocker);
     const manifest = buildManifest(
@@ -2294,6 +2330,18 @@ export async function runCommand(
       );
       throw error;
     }
+  } catch (error) {
+    if (initialized === null && unpublishedImages.length > 0) {
+      try {
+        await removeTaskImageTargets(unpublishedImages.map((image) => image.overlayName));
+      } catch (cleanupError) {
+        throw ownershipUnsafeAggregate('fresh SWE-bench Pro setup image cleanup failed', [
+          error,
+          cleanupError,
+        ]);
+      }
+    }
+    throw error;
   } finally {
     try { claim.release(); } catch { /* already released after publication */ }
     try {
@@ -2586,13 +2634,18 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
       invocation.invocationId,
       Date.parse(invocation.startedAt),
     ]));
-    const modes: Array<{ prefix: string; arm: Arm | null; predictions: ReturnType<typeof goldPredictions> }> = options.gold
-      ? [{ prefix: 'gold', arm: null, predictions: goldPredictions(instances) }]
+    const modes: Array<{ prefix: string; arm: Arm | null }> = options.gold
+      ? [{ prefix: 'gold', arm: null }]
       : options.nullCheck
-        ? [{ prefix: 'nullcheck', arm: null, predictions: nullPredictions(instances) }]
+        ? [{ prefix: 'nullcheck', arm: null }]
         : (stores.manifest.experiment.arm === 'both' ? ['a', 'b'] as Arm[] : [stores.manifest.experiment.arm])
-          .map((arm) => ({ prefix: arm === 'a' ? 'armA' : 'armB', arm, predictions: collectPredictions(stores.manifest, runDirectory, arm, instances) }));
+          .map((arm) => ({ prefix: arm === 'a' ? 'armA' : 'armB', arm }));
     for (const mode of modes) {
+      const predictions = options.gold
+        ? goldPredictions(instances)
+        : options.nullCheck
+          ? nullPredictions(instances)
+          : collectPredictions(stores.manifest, runDirectory, mode.arm!, instances);
       const result = await runOfficialEvaluator({
         runDirectory,
         evaluatorDirectory: prepared.evaluatorDirectory,
@@ -2602,7 +2655,7 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
         runId: stores.manifest.runId,
         armLabel: mode.arm ?? (mode.prefix === 'gold' ? 'gold' : 'nullcheck'),
         prefix: mode.prefix,
-        predictions: mode.predictions,
+        predictions,
         instances,
         containerPolicy: loadSwebenchProContainerPolicy(context.paths),
         imageIdentities: evaluatorImages,
@@ -2620,10 +2673,10 @@ export async function evalCommand(options: EvalOptions, context: CommandContext)
         prefix: mode.prefix,
         arm: mode.arm,
         result,
-        submitted: new Set(mode.predictions.map((prediction) => prediction.instance_id)),
+        submitted: new Set(predictions.map((prediction) => prediction.instance_id)),
         invocationId,
       });
-      output(context, `${mode.prefix}: ${Object.values(result.verdicts).filter(Boolean).length}/${mode.predictions.length} verified resolved; ${mode.predictions.length - Object.keys(result.verdicts).length} unverified`);
+      output(context, `${mode.prefix}: ${Object.values(result.verdicts).filter(Boolean).length}/${predictions.length} verified resolved; ${predictions.length - Object.keys(result.verdicts).length} unverified`);
     }
     await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
   } catch (error) {
@@ -2779,7 +2832,6 @@ export async function reportCommand(options: RunIdentityOptions, context: Comman
       });
     };
     invocationId = await beginInvocation(stores.state, 'report', context.clock.now());
-    assemble();
     await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
     const report = assemble();
     const written = writeBenchReport(context.paths, report);

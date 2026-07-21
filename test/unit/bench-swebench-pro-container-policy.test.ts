@@ -118,6 +118,7 @@ describe('SWE-bench Pro container policy', () => {
       '--env', 'LD_PRELOAD=',
       '--env', 'LD_AUDIT=',
       '--env', 'LD_LIBRARY_PATH=',
+      '--env', 'NODE_OPTIONS=',
       '--env-file', '/runtime/container.env',
       '--mount', 'type=bind,src=/run/task-a,dst=/bench',
       '--mount', 'type=bind,src=/runtime/home,dst=/runtime/home',

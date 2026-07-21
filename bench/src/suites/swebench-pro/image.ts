@@ -91,6 +91,37 @@ export interface PrepareTaskImageOptions {
   docker?: DockerExecutor;
 }
 
+/** Remove run-owned pre-publication image tags and prove no matching tag remains. */
+export async function removeTaskImageTargets(
+  targets: readonly string[],
+  docker: DockerExecutor = defaultDockerExecutor,
+): Promise<number> {
+  let removed = 0;
+  for (const target of new Set(targets)) {
+    if (!/^ultracode-swebench-pro:[a-f0-9]{48}$/.test(target)) {
+      throw new Error(`invalid run-owned overlay target: ${target}`);
+    }
+    let removalFailure: unknown;
+    try {
+      await docker(['image', 'rm', target], IMAGE_QUERY_TIMEOUT_MS);
+    } catch (error) {
+      removalFailure = error;
+    }
+    const remaining = (await docker(
+      ['image', 'ls', '-q', '--no-trunc', target],
+      IMAGE_QUERY_TIMEOUT_MS,
+    )).split('\n').map((entry) => entry.trim()).filter(Boolean);
+    if (remaining.length > 0 || remaining.some((id) => !/^sha256:[a-f0-9]{64}$/.test(id))) {
+      throw ownershipUnsafeAggregate('run-owned overlay target absence was not proven', [
+        removalFailure,
+        new Error(`run-owned overlay target remains present: ${target}`),
+      ]);
+    }
+    removed += 1;
+  }
+  return removed;
+}
+
 /** Build FROM the immutable digest and freeze both local image identities. */
 export async function prepareTaskImage(
   instance: SwebenchProInstance,
@@ -108,28 +139,43 @@ export async function prepareTaskImage(
     .update(`${runId}\0${resolvedDigest}\0${options.toolchainPayloadSha256}\0${instance.instanceId}`, 'utf8')
     .digest('hex');
   const overlayName = `ultracode-swebench-pro:${overlayKey.slice(0, 48)}`;
-  await docker([
-    'build',
-    '--pull=false',
-    '--label', 'ultracode.benchmark.schema=2',
-    '--label', 'ultracode.benchmark.suite=swebench-pro',
-    '--label', 'ultracode.benchmark.purpose=prep',
-    '--label', `ultracode.benchmark.run=${runId}`,
-    '-f', join(options.roots.benchRoot, 'suites', 'swebench-pro', 'Dockerfile'),
-    '--build-arg', `BASE_IMAGE=${resolvedDigest}`,
-    '-t', overlayName,
-    options.toolchainDirectory,
-  ], IMAGE_TRANSFER_TIMEOUT_MS);
-  const overlay = identity(await inspect(overlayName, docker), overlayName);
-  return {
-    requested,
-    resolvedDigest,
-    baseLocalId: baseIdentity.localId,
-    basePlatform: baseIdentity.platform,
-    overlayName,
-    overlayLocalId: overlay.localId,
-    overlayPlatform: overlay.platform,
-  };
+  let built = false;
+  try {
+    await docker([
+      'build',
+      '--pull=false',
+      '--label', 'ultracode.benchmark.schema=2',
+      '--label', 'ultracode.benchmark.suite=swebench-pro',
+      '--label', 'ultracode.benchmark.purpose=prep',
+      '--label', `ultracode.benchmark.run=${runId}`,
+      '-f', join(options.roots.benchRoot, 'suites', 'swebench-pro', 'Dockerfile'),
+      '--build-arg', `BASE_IMAGE=${resolvedDigest}`,
+      '-t', overlayName,
+      options.toolchainDirectory,
+    ], IMAGE_TRANSFER_TIMEOUT_MS);
+    built = true;
+    const overlay = identity(await inspect(overlayName, docker), overlayName);
+    return {
+      requested,
+      resolvedDigest,
+      baseLocalId: baseIdentity.localId,
+      basePlatform: baseIdentity.platform,
+      overlayName,
+      overlayLocalId: overlay.localId,
+      overlayPlatform: overlay.platform,
+    };
+  } catch (error) {
+    if (!built) throw error;
+    try {
+      await removeTaskImageTargets([overlayName], docker);
+    } catch (cleanupError) {
+      throw ownershipUnsafeAggregate('failed to clean an unpublishable task overlay', [
+        error,
+        cleanupError,
+      ]);
+    }
+    throw error;
+  }
 }
 
 /** Fail immediately if either immutable launch identity drifted. */

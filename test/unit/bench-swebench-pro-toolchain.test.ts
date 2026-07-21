@@ -6,12 +6,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { createBenchPathRoots } from '../../bench/src/shared/paths.js';
 import {
   evaluatorRequirementsForTarget,
   preflightEvaluatorDependencies,
   prepareEvaluatorEnvironment,
   selectEvaluatorDependencyTarget,
   SWEBENCH_PRO_TOOLCHAIN_NATIVE_ASSETS,
+  swebenchProToolchainNativeAssetsSha256,
   validateEvaluatorDependencies,
   type EvaluatorCommand,
   type EvaluatorHost,
@@ -71,6 +73,31 @@ describe('SWE-bench Pro evaluator dependency assets', () => {
       source: `suites/swebench-pro/${destination}`,
       destination,
     })));
+  });
+
+  it('rejects a prepared script copy that differs from current policy source', () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-pro-native-assets-'));
+    try {
+      const sourceRoot = join(root, 'suites/swebench-pro');
+      const toolchain = join(root, 'toolchain');
+      mkdirSync(sourceRoot, { recursive: true });
+      mkdirSync(toolchain);
+      for (const asset of SWEBENCH_PRO_TOOLCHAIN_NATIVE_ASSETS) {
+        writeFileSync(join(root, asset.source), `${asset.destination}\n`);
+        writeFileSync(join(toolchain, asset.destination), `${asset.destination}\n`);
+      }
+      expect(swebenchProToolchainNativeAssetsSha256(
+        createBenchPathRoots(root),
+        toolchain,
+      )).toMatch(/^[a-f0-9]{64}$/u);
+      writeFileSync(join(sourceRoot, 'entrypoint.sh'), 'changed\n');
+      expect(() => swebenchProToolchainNativeAssetsSha256(
+        createBenchPathRoots(root),
+        toolchain,
+      )).toThrow(/toolchain asset drifted/u);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('contains the exact reviewed pins, hashes, target partitions, and full closure', () => {

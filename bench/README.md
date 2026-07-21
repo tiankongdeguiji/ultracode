@@ -11,8 +11,10 @@ state, process recovery, provenance, metrics, verifier receipts, and reports.
 - Git and Docker.
 - CPython 3.11 with pip 24.2 and `venv` on a reviewed Linux/glibc or macOS
   target; it does not require `uv` or GNU `patch`.
-- Network access while fetching pinned sources, Python artifacts, Codex, and
-  task images.
+- A local standalone Linux-x64 Codex ELF selected by `toolchain.codexBinary`;
+  this is required on macOS too and is never fetched by preparation.
+- Network access while fetching pinned sources, Python artifacts, and task
+  images.
 
 Copy `bench/bench.example.config.json` to the ignored, operator-owned
 `bench/bench.config.json`, fill in the model and public relay identity, and set

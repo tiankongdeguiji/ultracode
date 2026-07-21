@@ -1,6 +1,6 @@
 /** Deterministic offline coverage for the Pro relay contract and Docker topology. */
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -26,6 +26,7 @@ import {
   attestModelTransport,
   attestSessionTransportAttachment,
   sessionFailure,
+  startAttestedSessionTransport,
 } from '../../bench/src/suites/swebench-pro/runner.js';
 
 const RELAY_ID = 'a'.repeat(64);
@@ -129,6 +130,7 @@ function session(overrides: Record<string, unknown> = {}): string {
         'LD_PRELOAD=',
         'LD_AUDIT=',
         'LD_LIBRARY_PATH=',
+        'NODE_OPTIONS=',
       ],
       Healthcheck: { Test: ['NONE'] },
     },
@@ -592,6 +594,63 @@ describe('SWE-bench Pro task attachment', () => {
     )).not.toThrow();
   });
 
+  it('never starts or opens the gate around a failed session attestation', async () => {
+    const runtimeHome = mkdtempSync(join(tmpdir(), 'uc-pro-gate-order-'));
+    try {
+      const gate = join(runtimeHome, '.model-transport-attested');
+      const stopped = JSON.parse(session()) as Array<Record<string, unknown>>;
+      stopped[0]!.State = { Running: false };
+      stopped[0]!.NetworkSettings = { Networks: {} };
+      const invalidPreStart = structuredClone(stopped) as Array<{
+        Config: { Env: string[] };
+      }>;
+      invalidPreStart[0]!.Config.Env.push('NODE_OPTIONS=--require=/payload.js');
+      const preCalls: string[] = [];
+      await expect(startAttestedSessionTransport({
+        executor: async (argv) => {
+          preCalls.push(argv[0]!);
+          if (argv[0] === 'inspect') return JSON.stringify(invalidPreStart);
+          throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
+        },
+        expected: expectedSession,
+        bindings,
+        config: { model: MODEL, modelTransport: config } as never,
+        manifest: {} as never,
+        allowedSessions: new Map([['session-one', SESSION_ID]]),
+        runtimeHome,
+        timeoutMs: () => 1_000,
+      })).rejects.toMatchObject({ stage: 'session-attachment' });
+      expect(preCalls).toEqual(['inspect']);
+      expect(existsSync(gate)).toBe(false);
+
+      let inspection = 0;
+      await expect(startAttestedSessionTransport({
+        executor: async (argv) => {
+          if (argv[0] === 'start') return `${SESSION_ID}\n`;
+          if (argv[0] !== 'inspect') throw new Error(`unexpected Docker invocation: ${argv.join(' ')}`);
+          inspection += 1;
+          if (inspection === 1) return JSON.stringify(stopped);
+          const running = JSON.parse(session()) as Array<{
+            HostConfig: { PidsLimit: number };
+          }>;
+          running[0]!.HostConfig.PidsLimit = 2_048;
+          return JSON.stringify(running);
+        },
+        expected: expectedSession,
+        bindings,
+        config: { model: MODEL, modelTransport: config } as never,
+        manifest: {} as never,
+        allowedSessions: new Map([['session-one', SESSION_ID]]),
+        runtimeHome,
+        timeoutMs: () => 1_000,
+      })).rejects.toMatchObject({ stage: 'session-attachment' });
+      expect(inspection).toBe(2);
+      expect(existsSync(gate)).toBe(false);
+    } finally {
+      rmSync(runtimeHome, { recursive: true, force: true });
+    }
+  });
+
   it('binds the exact runtime nonce and relay URL before opening the task gate', () => {
     for (const drift of ['label nonce', 'environment nonce', 'relay URL'] as const) {
       const parsed = JSON.parse(session()) as Array<{
@@ -620,9 +679,12 @@ describe('SWE-bench Pro task attachment', () => {
   });
 
   it('rejects inherited startup hooks or a live image healthcheck', () => {
-    for (const kind of ['environment', 'healthcheck'] as const) {
+    for (const kind of ['environment', 'node-options', 'healthcheck'] as const) {
       const parsed = JSON.parse(session()) as Array<{ Config: Record<string, unknown> }>;
       if (kind === 'environment') parsed[0]!.Config.Env = ['BASH_ENV=/task/hook'];
+      else if (kind === 'node-options') {
+        (parsed[0]!.Config.Env as string[]).push('NODE_OPTIONS=--require=/task/payload.js');
+      }
       else parsed[0]!.Config.Healthcheck = { Test: ['CMD', '/task/hook'] };
       expect(() => inspectSwebenchProSessionAttachment(
         JSON.stringify(parsed), expectedSession, bindings,

@@ -398,7 +398,7 @@ export function inspectSwebenchProTransportBoundary(
 
 const FORBIDDEN_TASK_ENV = /^(?:[A-Z0-9_]*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|SESSION_TOKEN|CLIENT_SECRET|SECRET_ACCESS_KEY|APPLICATION_CREDENTIALS|PRIVATE_KEY|PASSWORD)|CODEX_AUTH_JSON_PATH|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY)=/i;
 const SANITIZED_BOOTSTRAP_ENV = [
-  'BASH_ENV', 'ENV', 'LD_PRELOAD', 'LD_AUDIT', 'LD_LIBRARY_PATH',
+  'BASH_ENV', 'ENV', 'LD_PRELOAD', 'LD_AUDIT', 'LD_LIBRARY_PATH', 'NODE_OPTIONS',
 ] as const;
 
 function exactStringArray(value: unknown, expected: readonly string[]): boolean {

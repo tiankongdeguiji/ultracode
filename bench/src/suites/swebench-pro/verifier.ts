@@ -245,8 +245,32 @@ const defaultDocker: EvaluatorDocker = async (argv, timeoutMs = EVALUATOR_DOCKER
 
 const defaultProcessExecutor: EvaluatorProcessExecutor = runBenchProcess;
 
-async function containerIds(docker: EvaluatorDocker): Promise<Set<string>> {
-  const output = await docker(['ps', '-aq', '--no-trunc'], EVALUATOR_DOCKER_TIMEOUT_MS);
+interface EvaluatorContainerQuery {
+  runId: string;
+  armLabel: string;
+  invocationId?: string;
+}
+
+function evaluatorContainerFilters(query: EvaluatorContainerQuery): string[] {
+  return [
+    ['schema', '2'],
+    ['suite', 'swebench-pro'],
+    ['run', query.runId],
+    ['arm', query.armLabel],
+    ['purpose', 'verifier'],
+    ...(query.invocationId === undefined ? [] : [['invocation', query.invocationId]]),
+  ].flatMap(([key, value]) => [
+    '--filter', `label=ultracode.benchmark.${key}=${value}`,
+  ]);
+}
+
+async function containerIds(
+  docker: EvaluatorDocker,
+  query: EvaluatorContainerQuery,
+): Promise<Set<string>> {
+  const output = await docker([
+    'ps', '-aq', '--no-trunc', ...evaluatorContainerFilters(query),
+  ], EVALUATOR_DOCKER_TIMEOUT_MS);
   const ids = output.split('\n').map((entry) => entry.trim()).filter(Boolean);
   if (ids.some((id) => !/^[a-f0-9]{64}$/.test(id))) {
     throw new Error('Docker returned an invalid evaluator container id');
@@ -254,8 +278,11 @@ async function containerIds(docker: EvaluatorDocker): Promise<Set<string>> {
   return new Set(ids);
 }
 
-async function inspectContainers(docker: EvaluatorDocker): Promise<EvaluatorContainerInspect[]> {
-  const ids = [...await containerIds(docker)];
+async function inspectContainers(
+  docker: EvaluatorDocker,
+  query: EvaluatorContainerQuery,
+): Promise<EvaluatorContainerInspect[]> {
+  const ids = [...await containerIds(docker, query)];
   if (ids.length === 0) return [];
   const parsed = JSON.parse(await docker(['inspect', ...ids], EVALUATOR_DOCKER_TIMEOUT_MS)) as unknown;
   if (!Array.isArray(parsed) || parsed.length !== ids.length
@@ -293,7 +320,8 @@ async function cleanupOwned(
       nowMs: Date.now(),
       maximumAgeMs,
     };
-    const records = await inspectContainers(docker);
+    const query = { runId, armLabel, invocationId };
+    const records = await inspectContainers(docker, query);
     for (const id of ownedEvaluatorContainerIds(records, ownershipOptions)) {
       let removalFailure: unknown;
       try {
@@ -301,7 +329,7 @@ async function cleanupOwned(
       } catch (error) {
         removalFailure = error;
       }
-      const remaining = await inspectContainers(docker);
+      const remaining = await inspectContainers(docker, query);
       if (remaining.some((record) => record.Id === id)) {
         throw ownershipUnsafeAggregate('evaluator container absence was not proven after removal', [
           removalFailure,
@@ -310,7 +338,7 @@ async function cleanupOwned(
       }
     }
     const remainingOwned = ownedEvaluatorContainerIds(
-      await inspectContainers(docker),
+      await inspectContainers(docker, query),
       { ...ownershipOptions, nowMs: Date.now() },
     );
     if (remainingOwned.length > 0) {
@@ -326,7 +354,8 @@ async function cleanupPreviousOutput(
   options: Parameters<typeof existingEvaluatorContainerIds>[1],
 ): Promise<void> {
   try {
-    const records = await inspectContainers(docker);
+    const query = { runId: options.runId, armLabel: options.armLabel };
+    const records = await inspectContainers(docker, query);
     for (const id of existingEvaluatorContainerIds(records, options)) {
       let removalFailure: unknown;
       try {
@@ -334,14 +363,17 @@ async function cleanupPreviousOutput(
       } catch (error) {
         removalFailure = error;
       }
-      if ((await inspectContainers(docker)).some((record) => record.Id === id)) {
+      if ((await inspectContainers(docker, query)).some((record) => record.Id === id)) {
         throw ownershipUnsafeAggregate('previous evaluator container absence was not proven', [
           removalFailure,
           new Error(`previous evaluator container remains present: ${id}`),
         ]);
       }
     }
-    const remainingOwned = existingEvaluatorContainerIds(await inspectContainers(docker), options);
+    const remainingOwned = existingEvaluatorContainerIds(
+      await inspectContainers(docker, query),
+      options,
+    );
     if (remainingOwned.length > 0) {
       throw new Error(`previous evaluator containers remain after cleanup: ${remainingOwned.join(', ')}`);
     }
@@ -571,7 +603,11 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
     return { ...baseResult, artifactSha256: artifactSha256() };
   }
 
-  const baselineIds = await containerIds(docker);
+  const baselineIds = await containerIds(docker, {
+    runId: options.runId,
+    armLabel: options.armLabel,
+    invocationId: options.invocationId,
+  });
   const startedAt = Date.now();
   let processFailure: FailureCode | null = null;
   let exitCode = 0;

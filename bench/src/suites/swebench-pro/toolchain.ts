@@ -215,6 +215,7 @@ const preparedIdentitySchema = z.strictObject({
   evaluatorPolicyHelperSha256: sha256Schema,
   containerPolicyFileSha256: sha256Schema,
   toolchainPayloadSha256: sha256Schema,
+  toolchainNativeAssetsSha256: sha256Schema,
 });
 
 const preparedContentManifestSchema = preparedIdentitySchema.extend({
@@ -534,6 +535,22 @@ function sourceTreeSha256(directory: string): string {
   return sha256Tree(directory, { exclude: ['.git'], excludePythonCacheArtifacts: true });
 }
 
+/** Bind each staged suite script to the current source used for policy hashes. */
+export function swebenchProToolchainNativeAssetsSha256(
+  roots: BenchPathRoots,
+  toolchainDirectory: string,
+): string {
+  const assets = SWEBENCH_PRO_TOOLCHAIN_NATIVE_ASSETS.map((asset) => {
+    const sourceSha256 = sha256File(join(roots.benchRoot, ...asset.source.split('/')));
+    const stagedSha256 = sha256File(join(toolchainDirectory, asset.destination));
+    if (sourceSha256 !== stagedSha256) {
+      throw new Error(`prepared SWE-bench Pro toolchain asset drifted: ${asset.destination}`);
+    }
+    return { source: asset.source, destination: asset.destination, sha256: sourceSha256 };
+  });
+  return sha256CanonicalJson(assets);
+}
+
 function loadEvaluatorDependencies(roots: BenchPathRoots): ValidatedEvaluatorDependencies {
   const reviewedRequirements = readRegularFileWithinRoot(roots.benchRoot, REQUIREMENTS_LOCK).toString('utf8');
   const provenance = JSON.parse(readRegularFileWithinRoot(
@@ -582,6 +599,13 @@ export function loadPreparedSwebenchProInputs(
   const evaluatorPolicyHelper = join(roots.benchRoot, 'suites', 'swebench-pro', 'evaluator-policy.py');
   const containerPolicy = join(roots.benchRoot, 'suites', 'swebench-pro', 'container-policy.json');
   const environment = evaluatorEnvironmentIdentity(evaluatorEnvironmentDirectory);
+  const toolchain = loadPreparedToolchain(
+    join(roots.cacheRoot, 'toolchains', manifest.toolchainPayloadSha256),
+  );
+  const toolchainNativeAssetsSha256 = swebenchProToolchainNativeAssetsSha256(
+    roots,
+    toolchain.directory,
+  );
   const dependencyTarget = dependencies.provenance.targets.find((target) => (
     target.id === manifest.evaluatorDependencyTarget
   ));
@@ -598,7 +622,8 @@ export function loadPreparedSwebenchProInputs(
     || sha256File(ownershipPatch) !== manifest.ownershipPatchSha256
     || sha256File(evaluatorPolicyHelper) !== manifest.evaluatorPolicyHelperSha256
     || sha256File(join(evaluatorDirectory, 'ultracode_evaluator_policy.py')) !== manifest.evaluatorPolicyHelperSha256
-    || sha256File(containerPolicy) !== manifest.containerPolicyFileSha256) {
+    || sha256File(containerPolicy) !== manifest.containerPolicyFileSha256
+    || toolchainNativeAssetsSha256 !== manifest.toolchainNativeAssetsSha256) {
     throw new Error('prepared SWE-bench Pro evaluator provenance drifted');
   }
   return {
@@ -606,7 +631,7 @@ export function loadPreparedSwebenchProInputs(
     evaluatorDirectory,
     evaluatorEnvironmentDirectory,
     evaluatorPythonBinary: join(evaluatorEnvironmentDirectory, 'bin', 'python'),
-    toolchain: loadPreparedToolchain(join(roots.cacheRoot, 'toolchains', manifest.toolchainPayloadSha256)),
+    toolchain,
     evaluatorSource: {
       repository: manifest.evaluatorRepository,
       revision: manifest.evaluatorRevision,
@@ -727,6 +752,10 @@ export async function prepareSwebenchProInputs(
       evaluatorPolicyHelperSha256: sha256File(evaluatorPolicyHelper),
       containerPolicyFileSha256: sha256File(containerPolicy),
       toolchainPayloadSha256: toolchain.provenance.payloadSha256,
+      toolchainNativeAssetsSha256: swebenchProToolchainNativeAssetsSha256(
+        roots,
+        toolchain.directory,
+      ),
     };
     writePrivateJsonAtomic(stage, join(stage, PREPARED_IDENTITY), manifestWithoutPayload);
     const payloadSha256 = sha256Tree(stage, { excludePythonCacheArtifacts: true });
