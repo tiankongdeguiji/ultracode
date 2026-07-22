@@ -20,7 +20,7 @@ The synchronous uncaught-exception monitor signals only worker identities held i
 
 These controls protect signaling decisions made from worker-writable records, but they are **not** a general boundary against arbitrary same-user code. In particular, **`resume` re-executes `script.js`/`config.json` from that worker-writable dir with no review gate** — so a poisoned prior run can influence a later resume (including its `permission`). Treat resuming an untrusted run as running its inputs. Two known replay caveats: a `pipeline()` whose later-stage dispatch order depends on completion timing can lose its cache prefix on resume, and fallback token estimates (no-usage backends) are approximate. Full isolation (control-plane outside the workspace and a separate-process sandbox) is future work.
 
-## SWE-bench Pro benchmark boundary
+## Benchmark harness boundaries
 
 The benchmark control plane treats task repositories, task containers, and
 native runner output as untrusted producers. Private host-owned manifests,
@@ -29,11 +29,26 @@ score is accepted only when a receipt binds the exact official-evaluator bytes,
 digest, invocation, task/arm scope, role, and native record key. A successful
 agent process or a lookalike output file is never score authority.
 
+### SWE-Marathon
+
 SWE-Marathon repository-controlled task code shares a security domain with the
 reusable Codex credential needed for that session. Its harness keeps credential
 material out of persistent result trees, but cannot prevent malicious task code
 from reading or exfiltrating a live credential. Operators must use disposable,
 narrowly scoped benchmark accounts and independently restricted egress.
+
+Prepared Harbor and native bridge assets are content-addressed and must match
+their tracked hashes at launch. Container labels and ephemeral credential-home
+markers include a canonical run-root scope, preventing equal run/task names in
+different worktrees from claiming one another's resources on a shared Docker
+daemon. Resume accepts only the exact native job config previously bound to the
+manifest-scoped receipt; redo starts from the immutable plan while retaining the
+old native tree for cumulative paid-usage accounting. Incomplete verifier output
+never becomes score evidence, but an identity-valid trial config is sufficient
+to retain telemetry after a crash. Arm B waits on the engine's effective run
+status, including orphan and cleanup-failed terminal states.
+
+### SWE-bench Pro
 
 Prepared evaluator sources, Python artifacts, dataset rows, task images,
 native patches, prompt policy, container policy, and control-plane sources are

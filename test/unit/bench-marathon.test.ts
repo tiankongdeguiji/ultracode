@@ -47,6 +47,7 @@ import {
 import {
   harborEvidenceInvocationId,
   hasCompleteHarborReceipt,
+  marathonRunScope,
   marathonTaskInputs,
   marathonTaskFailure,
   planHarborRun,
@@ -57,6 +58,7 @@ import {
 import { indexSweMarathonMetrics } from '../../bench/src/suites/swe-marathon/telemetry.js';
 import {
   indexHarborEvidence,
+  validateHarborResume,
   validateHarborJobConfig,
   type HarborExecutionIdentity,
 } from '../../bench/src/suites/swe-marathon/verifier.js';
@@ -268,6 +270,7 @@ describe('SWE-Marathon command and provenance boundaries', () => {
     const runtime = createMarathonRuntimeHome(config, '/bridge', {
       ULTRACODE_BENCHMARK_SCHEMA: '2',
       ULTRACODE_BENCHMARK_SUITE: 'swe-marathon',
+      ULTRACODE_BENCHMARK_ROOT: 'f'.repeat(64),
       ULTRACODE_BENCHMARK_RUN: 'pilot1',
       ULTRACODE_BENCHMARK_TASK: 'zstd-decoder',
       ULTRACODE_BENCHMARK_ARM: 'a',
@@ -278,12 +281,24 @@ describe('SWE-Marathon command and provenance boundaries', () => {
     expect(runtime.environment.CODEX_AUTH_JSON_PATH).toBe(join(runtime.directory, 'auth.json'));
     expect(runtime.environment.PYTHONPATH).toBe('/bridge');
     expect(JSON.stringify(runtime.environment)).not.toContain('{"tokens"');
-    expect(cleanupMarathonRuntimeHome('pilot1', 'zstd-decoder', 'a', 'b'.repeat(64))).toBe(0);
+    expect(cleanupMarathonRuntimeHome(
+      'f'.repeat(64), 'pilot1', 'zstd-decoder', 'a', 'b'.repeat(64),
+    )).toBe(0);
     expect(existsSync(runtime.directory)).toBe(true);
-    expect(cleanupMarathonRuntimeHomes('foreign', 'zstd-decoder', 'a')).toBe(0);
-    expect(cleanupMarathonRuntimeHomes('pilot1', 'zstd-decoder', 'a')).toBe(1);
+    expect(cleanupMarathonRuntimeHomes('e'.repeat(64), 'pilot1', 'zstd-decoder', 'a')).toBe(0);
+    expect(cleanupMarathonRuntimeHomes('f'.repeat(64), 'foreign', 'zstd-decoder', 'a')).toBe(0);
+    expect(cleanupMarathonRuntimeHomes('f'.repeat(64), 'pilot1', 'zstd-decoder', 'a')).toBe(1);
     runtime.cleanup();
     expect(existsSync(runtime.directory)).toBe(false);
+  });
+
+  it('scopes cleanup ownership to the canonical run root', () => {
+    const first = temporaryDirectory();
+    const second = temporaryDirectory();
+    expect(marathonRunScope(first)).toMatch(/^[a-f0-9]{64}$/);
+    expect(marathonRunScope(first)).not.toBe(marathonRunScope(second));
+    const ownership = readFileSync(resolve('bench/suites/swe-marathon/harbor-ownership.patch'), 'utf8');
+    expect(ownership).toContain('ultracode.benchmark.root');
   });
 });
 
@@ -360,8 +375,8 @@ describe('native Harbor evidence', () => {
     expect(indexed.nativeResult).toMatchObject({ verification: 'verified', score: 0.75, resolved: false });
     expect(indexed.bindings.map((binding) => [binding.role, binding.nativeRecordKey])).toEqual([
       ['native-config', 'job-config'],
-      ['run-metadata', 'job-result'],
       ['native-config', 'trial-config:trial-1'],
+      ['run-metadata', 'job-result'],
       ['native-result', 'zstd-decoder/trial-1/verifier_result.rewards.reward'],
     ]);
     expect(hasCompleteHarborReceipt(
@@ -511,6 +526,23 @@ describe('native Harbor evidence', () => {
     expect(() => validateHarborJobConfig(config, identity)).toThrow(/one attempt/);
   });
 
+  it('pins resume to the exact previously receipt-bound native config', () => {
+    const fixture = nativeFixture();
+    const invocationId = '11111111-1111-4111-8111-111111111111';
+    const bindings = indexHarborEvidence(fixture.root, fixture.identity, invocationId).bindings;
+    expect(() => validateHarborResume(fixture.root, fixture.identity, bindings)).not.toThrow();
+    put(join(fixture.root, ...fixture.identity.jobRelativeRoot.split('/'), 'config.json'), `${JSON.stringify({
+      task: { path: `tasks/${fixture.identity.taskId}` },
+      agent: { name: 'arm_b_codex:ArmBCodex', model_name: fixture.identity.model, kwargs: {
+        reasoning_effort: fixture.identity.requestedEffort, web_search: 'disabled', workflow_wait_seconds: 1,
+      } },
+      n_attempts: 1,
+      max_retries: 0,
+    })}\n`);
+    expect(() => validateHarborResume(fixture.root, fixture.identity, bindings)).toThrow(/drifted/);
+    expect(() => validateHarborResume(fixture.root, fixture.identity, [])).toThrow(/no prior receipt binding/);
+  });
+
   it('ignores nested lookalikes and accepts resolved only for reward exactly one', () => {
     const fixture = nativeFixture(1);
     put(join(fixture.trial, 'nested', 'result.json'), `${JSON.stringify({
@@ -569,6 +601,29 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(indexed.workflows).toMatchObject([{ workflowId: 'wf-1', billingClass: 'mock' }]);
   });
 
+  it('keeps interrupted and redo-archived paid attempts in cumulative telemetry', () => {
+    const fixture = nativeFixture();
+    const firstSession = '11111111-1111-4111-8111-111111111111';
+    put(join(fixture.trial, 'agent', 'sessions', `rollout-${firstSession}.jsonl`), '{}\n');
+    rmSync(join(fixture.root, ...fixture.identity.jobRelativeRoot.split('/'), 'result.json'));
+    rmSync(join(fixture.trial, 'result.json'));
+    expect(indexSweMarathonMetrics(fixture.manifest, fixture.root).rollouts).toHaveLength(1);
+
+    const archiveId = '22222222-2222-4222-8222-222222222222';
+    const archive = join(fixture.root, 'native', 'attempts', archiveId, artifactKey(fixture.identity.taskId));
+    const current = join(fixture.root, ...fixture.identity.jobRelativeRoot.split('/'));
+    cpSync(current, archive, { recursive: true });
+    rmSync(current, { recursive: true });
+    cpSync(archive, current, { recursive: true });
+    rmSync(join(fixture.trial, 'agent', 'sessions'), { recursive: true });
+    const secondSession = '33333333-3333-4333-8333-333333333333';
+    put(join(fixture.trial, 'agent', 'sessions', `rollout-${secondSession}.jsonl`), '{}\n');
+    expect(indexSweMarathonMetrics(fixture.manifest, fixture.root).rollouts.map((rollout) => rollout.path)).toEqual([
+      expect.stringContaining(firstSession),
+      expect.stringContaining(secondSession),
+    ]);
+  });
+
   it('keeps native and policy-adjusted reward analysis separately named', () => {
     const fixture = nativeFixture();
     const result = sweMarathonAnalysisHook.analyze({
@@ -599,6 +654,9 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(bridge).toContain('ARM_B_PREFIX_PATH = Path(__file__).resolve().parents[1] / "shared" / "arm-b-prefix.txt"');
     expect(bridge).toContain('ARM_B_PREFIX + instruction');
     expect(bridge).toContain('arm_b_lifecycle.json');
+    expect(bridge).toContain("dist/store/runstore.js");
+    expect(bridge).toContain('run.effectiveStatus');
+    expect(bridge).not.toContain('manifest.status');
     expect(bridge).not.toContain('arm_b_metrics.json');
     expect(bridge).not.toContain('total_token_usage');
     expect(ownership).toContain('ultracode.benchmark.ownership');

@@ -16,7 +16,6 @@ from harbor.models.trial.paths import EnvironmentPaths
 
 ARM_B_PREFIX_PATH = Path(__file__).resolve().parents[1] / "shared" / "arm-b-prefix.txt"
 ARM_B_PREFIX = ARM_B_PREFIX_PATH.read_text(encoding="utf-8")
-TERMINAL_WORKFLOW_STATES = {"completed", "failed", "stopped", "orphaned"}
 
 
 class ArmBCodex(Codex):
@@ -86,25 +85,22 @@ const fs = require('node:fs');
 const path = require('node:path');
 const home = {json.dumps(self._ULTRACODE_HOME)};
 const deadline = Date.now() + Number(process.env.MARATHON_WAIT_SECONDS) * 1000;
-const terminal = new Set({json.dumps(sorted(TERMINAL_WORKFLOW_STATES))});
 function runIds() {{
   const runs = path.join(home, 'runs');
   if (!fs.existsSync(runs)) return [];
   return fs.readdirSync(runs, {{ withFileTypes: true }})
     .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
 }}
-function active() {{
-  const runs = path.join(home, 'runs');
-  return runIds().filter((runId) => {{
-    try {{
-      const manifest = JSON.parse(fs.readFileSync(path.join(runs, runId, 'manifest.json'), 'utf8'));
-      return !terminal.has(String(manifest.status));
-    }} catch {{
-      return true;
-    }}
-  }});
-}}
 (async () => {{
+  const {{ listRuns }} = await import('file:///opt/bench/ultracode/dist/store/runstore.js');
+  const {{ isTerminal }} = await import('file:///opt/bench/ultracode/dist/store/manifest.js');
+  function active() {{
+    const summaries = new Map(listRuns(home).map((run) => [run.runId, run]));
+    return runIds().filter((runId) => {{
+      const run = summaries.get(runId);
+      return run === undefined || !isTerminal(run.effectiveStatus);
+    }});
+  }}
   if (runIds().length === 0) {{
     process.stderr.write('Arm B did not start an ultracode run\\n');
     process.exitCode = 1;

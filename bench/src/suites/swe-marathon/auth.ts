@@ -85,6 +85,7 @@ export function createMarathonRuntimeHome(
     const marker = {
       schemaVersion: 2,
       kind: 'ultracode-swe-marathon-runtime',
+      rootScope: labels.ULTRACODE_BENCHMARK_ROOT,
       runId: labels.ULTRACODE_BENCHMARK_RUN,
       taskId: labels.ULTRACODE_BENCHMARK_TASK,
       arm: labels.ULTRACODE_BENCHMARK_ARM,
@@ -92,6 +93,7 @@ export function createMarathonRuntimeHome(
     };
     if (labels.ULTRACODE_BENCHMARK_SCHEMA !== '2'
       || labels.ULTRACODE_BENCHMARK_SUITE !== 'swe-marathon'
+      || !/^[a-f0-9]{64}$/.test(marker.rootScope ?? '')
       || labels.ULTRACODE_BENCHMARK_PURPOSE !== 'session'
       || labels.ULTRACODE_BENCHMARK_OWNERSHIP !== '1'
       || Object.values(marker).some((value) => value === undefined)
@@ -119,7 +121,9 @@ export function createMarathonRuntimeHome(
       environment,
       cleanup() {
         if (cleaned) return;
-        cleanupMarathonRuntimeHome(marker.runId!, marker.taskId!, marker.arm as 'a' | 'b', marker.runtimeNonce!);
+        cleanupMarathonRuntimeHome(
+          marker.rootScope!, marker.runId!, marker.taskId!, marker.arm as 'a' | 'b', marker.runtimeNonce!,
+        );
         cleaned = true;
       },
     };
@@ -130,11 +134,13 @@ export function createMarathonRuntimeHome(
 }
 
 function marathonRuntimeCandidates(
+  rootScope: string,
   runId: string,
   taskId: string,
   arm: 'a' | 'b',
   runtimeNonce?: string,
 ): Array<{ directory: string; runtimeNonce: string }> {
+  if (!/^[a-f0-9]{64}$/.test(rootScope)) throw new Error('invalid SWE-Marathon root scope');
   if (runtimeNonce !== undefined && !/^[a-f0-9]{64}$/.test(runtimeNonce)) {
     throw new Error('invalid SWE-Marathon runtime nonce');
   }
@@ -152,6 +158,7 @@ function marathonRuntimeCandidates(
         const expected = {
           schemaVersion: 2,
           kind: 'ultracode-swe-marathon-runtime',
+          rootScope,
           runId,
           taskId,
           arm,
@@ -170,12 +177,13 @@ function marathonRuntimeCandidates(
 
 /** Remove the one exact crash-surviving credential home bound to native labels. */
 export function cleanupMarathonRuntimeHome(
+  rootScope: string,
   runId: string,
   taskId: string,
   arm: 'a' | 'b',
   runtimeNonce: string,
 ): number {
-  const candidates = marathonRuntimeCandidates(runId, taskId, arm, runtimeNonce);
+  const candidates = marathonRuntimeCandidates(rootScope, runId, taskId, arm, runtimeNonce);
   if (candidates.length > 1) throw new Error('SWE-Marathon runtime nonce is not unique');
   if (candidates.length === 0) return 0;
   rmSync(candidates[0]!.directory, { recursive: true });
@@ -183,8 +191,13 @@ export function cleanupMarathonRuntimeHome(
 }
 
 /** Remove every exact orphan for one manifest-owned task after its containers stop. */
-export function cleanupMarathonRuntimeHomes(runId: string, taskId: string, arm: 'a' | 'b'): number {
-  const candidates = marathonRuntimeCandidates(runId, taskId, arm);
+export function cleanupMarathonRuntimeHomes(
+  rootScope: string,
+  runId: string,
+  taskId: string,
+  arm: 'a' | 'b',
+): number {
+  const candidates = marathonRuntimeCandidates(rootScope, runId, taskId, arm);
   if (new Set(candidates.map((candidate) => candidate.runtimeNonce)).size !== candidates.length) {
     throw new Error('SWE-Marathon runtime nonce is not unique');
   }

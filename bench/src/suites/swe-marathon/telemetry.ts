@@ -84,9 +84,31 @@ function workflowIndex(
   return { workflows, sessionBackends };
 }
 
-function invocationId(state: BenchRunState | null, taskId: string, arm: 'a' | 'b'): string | null {
+function invocationId(
+  state: BenchRunState | null,
+  taskId: string,
+  arm: 'a' | 'b',
+  nativePath: string,
+): string | null {
   return [...(state?.attempts ?? [])].reverse().find((attempt) =>
-    attempt.taskId === taskId && attempt.arm === arm && attempt.phase === 'session')?.invocationId ?? null;
+    attempt.taskId === taskId && attempt.arm === arm && attempt.phase === 'session'
+    && attempt.nativePath === nativePath)?.invocationId ?? null;
+}
+
+function executionJobRoots(runDirectory: string, nativeRoot: string, key: string): string[] {
+  const output: string[] = [];
+  const attempts = join(runDirectory, 'native', 'attempts');
+  let entries: Dirent[] = [];
+  try { entries = readdirSync(attempts, { withFileTypes: true }); } catch { /* no redo archives */ }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[0-9a-f-]{36}$/i.test(entry.name)) continue;
+    const children = readdirSync(join(attempts, entry.name), { withFileTypes: true });
+    if (children.some((child) => child.isDirectory() && child.name === key)) {
+      output.push(`native/attempts/${entry.name}/${key}`);
+    }
+  }
+  if (existsSync(join(runDirectory, ...nativeRoot.split('/')))) output.push(nativeRoot);
+  return output.sort();
 }
 
 /** Enumerate only manifest jobs and validated direct-child trials; run-root lookalikes are ignored. */
@@ -99,52 +121,54 @@ export function indexSweMarathonMetrics(
   const workflows: WorkflowArtifact[] = [];
   const timings: MetricsArtifactIndex['timings'][number][] = [];
   for (const execution of manifest.artifacts.executions) {
-    let trial: ReturnType<typeof locateExactHarborTrial>;
-    try { trial = locateExactHarborTrial(runDirectory, execution.nativeRoot); } catch { continue; }
-    const evidence = indexHarborEvidence(runDirectory, {
-      taskId: execution.taskId,
-      arm: execution.arm,
-      model: manifest.experiment.model,
-      requestedEffort: manifest.experiment.requestedEffort,
-      jobRelativeRoot: execution.nativeRoot,
-    }, randomUUID());
-    if (evidence.trialName !== trial.name) continue;
-    const agentDirectory = join(runDirectory, ...trial.root.split('/'), 'agent');
-    const lifecyclePath = portable(runDirectory, join(agentDirectory, 'arm_b_lifecycle.json'));
-    const lifecycle = existsSync(join(runDirectory, ...lifecyclePath.split('/')))
-      ? json(runDirectory, lifecyclePath)
-      : null;
-    const hostSessionId = typeof lifecycle?.host_session_id === 'string' ? lifecycle.host_session_id : null;
-    const workflow = workflowIndex(runDirectory, agentDirectory, execution.taskId, execution.arm);
-    workflows.push(...workflow.workflows);
-    for (const path of files(join(agentDirectory, 'sessions'), (name) => /^rollout-.*\.jsonl$/.test(name))) {
-      const id = sessionId(path);
-      const host = execution.arm === 'a' || id === hostSessionId;
-      const backend = host ? 'codex' : id === null ? null : workflow.sessionBackends.get(id) ?? null;
-      rollouts.push({
-        scope: { taskId: execution.taskId, arm: execution.arm },
-        path: portable(runDirectory, path),
-        roleHint: host ? 'host' : 'worker',
-        backend,
-        billingClass: backend === 'mock' ? 'mock' : backend === null ? 'unknown' : 'billable',
-      });
-    }
-    const observedInvocation = invocationId(state, execution.taskId, execution.arm);
-    if (observedInvocation !== null
-      && typeof lifecycle?.wait_started_at === 'string'
-      && typeof lifecycle.wait_ended_at === 'string'
-      && typeof lifecycle.wait_elapsed_ms === 'number'
-      && Number.isFinite(lifecycle.wait_elapsed_ms)
-      && lifecycle.wait_elapsed_ms >= 0) {
-      timings.push({
-        sourceKey: `${execution.nativeRoot}/${trial.name}/arm-b-detached-wait`,
-        invocationId: observedInvocation,
-        scope: { taskId: execution.taskId, arm: execution.arm },
-        phase: 'detached-wait',
-        startedAt: lifecycle.wait_started_at,
-        endedAt: lifecycle.wait_ended_at,
-        elapsedMs: lifecycle.wait_elapsed_ms,
-      });
+    for (const jobRoot of executionJobRoots(runDirectory, execution.nativeRoot, execution.key)) {
+      let trial: ReturnType<typeof locateExactHarborTrial>;
+      try { trial = locateExactHarborTrial(runDirectory, jobRoot); } catch { continue; }
+      const evidence = indexHarborEvidence(runDirectory, {
+        taskId: execution.taskId,
+        arm: execution.arm,
+        model: manifest.experiment.model,
+        requestedEffort: manifest.experiment.requestedEffort,
+        jobRelativeRoot: jobRoot,
+      }, randomUUID());
+      if (evidence.trialName !== trial.name) continue;
+      const agentDirectory = join(runDirectory, ...trial.root.split('/'), 'agent');
+      const lifecyclePath = portable(runDirectory, join(agentDirectory, 'arm_b_lifecycle.json'));
+      const lifecycle = existsSync(join(runDirectory, ...lifecyclePath.split('/')))
+        ? json(runDirectory, lifecyclePath)
+        : null;
+      const hostSessionId = typeof lifecycle?.host_session_id === 'string' ? lifecycle.host_session_id : null;
+      const workflow = workflowIndex(runDirectory, agentDirectory, execution.taskId, execution.arm);
+      workflows.push(...workflow.workflows);
+      for (const path of files(join(agentDirectory, 'sessions'), (name) => /^rollout-.*\.jsonl$/.test(name))) {
+        const id = sessionId(path);
+        const host = execution.arm === 'a' || id === hostSessionId;
+        const backend = host ? 'codex' : id === null ? null : workflow.sessionBackends.get(id) ?? null;
+        rollouts.push({
+          scope: { taskId: execution.taskId, arm: execution.arm },
+          path: portable(runDirectory, path),
+          roleHint: host ? 'host' : 'worker',
+          backend,
+          billingClass: backend === 'mock' ? 'mock' : backend === null ? 'unknown' : 'billable',
+        });
+      }
+      const observedInvocation = invocationId(state, execution.taskId, execution.arm, jobRoot);
+      if (observedInvocation !== null
+        && typeof lifecycle?.wait_started_at === 'string'
+        && typeof lifecycle.wait_ended_at === 'string'
+        && typeof lifecycle.wait_elapsed_ms === 'number'
+        && Number.isFinite(lifecycle.wait_elapsed_ms)
+        && lifecycle.wait_elapsed_ms >= 0) {
+        timings.push({
+          sourceKey: `${jobRoot}/${trial.name}/arm-b-detached-wait`,
+          invocationId: observedInvocation,
+          scope: { taskId: execution.taskId, arm: execution.arm },
+          phase: 'detached-wait',
+          startedAt: lifecycle.wait_started_at,
+          endedAt: lifecycle.wait_ended_at,
+          elapsedMs: lifecycle.wait_elapsed_ms,
+        });
+      }
     }
   }
   return { rollouts, workflows, timings, annotations: [], failures: [] };

@@ -1,7 +1,7 @@
 /** SWE-Marathon lifecycle on shared v2 state, metrics, receipt, and report services. */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, rmSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { existsSync, lstatSync, realpathSync, renameSync, rmSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
 import type { Arm, BenchPathRoots, CommandContext, FailureCode } from '../../shared/contracts.js';
 import { FAILURE_POLICY_SHA256, failureObservationSchema, taskArmScope } from '../../shared/failure.js';
 import {
@@ -211,6 +211,14 @@ function pricing(config: SweMarathonConfig): SweMarathonManifest['pricing'] {
   return selected === undefined ? null : { currency: 'USD', model: config.model, ...selected };
 }
 
+function assertPreparedNativeAssets(roots: BenchPathRoots, common: MarathonCommonAttestation): void {
+  const suite = join(roots.benchRoot, 'suites', 'swe-marathon');
+  if (common.prepared.ownershipPatchSha256 !== sha256File(join(suite, 'harbor-ownership.patch'))
+    || common.prepared.bridgeSha256 !== sha256File(join(suite, 'arm_b_codex.py'))) {
+    throw new Error('prepared SWE-Marathon native assets are stale; rerun prep');
+  }
+}
+
 function buildManifest(
   roots: BenchPathRoots,
   runId: string,
@@ -218,6 +226,7 @@ function buildManifest(
   common: MarathonCommonAttestation,
   now: Date,
 ): SweMarathonManifest {
+  assertPreparedNativeAssets(roots, common);
   const selected = config.taskIds.map((taskId) => {
     const task = common.prepared.tasks.find((candidate) => candidate.taskId === taskId);
     if (!task) throw new Error(`prepared SWE-Marathon task is missing: ${taskId}`);
@@ -363,6 +372,7 @@ function assertProvenance(
 ): void {
   const selected = manifest.experiment.taskIds.map((taskId) => common.prepared.tasks.find((task) => task.taskId === taskId)!);
   const currentControl = currentControlPlaneHashes(roots);
+  assertPreparedNativeAssets(roots, common);
   if (canonicalJson(common.prepared.toolchain.provenance) !== canonicalJson(manifest.provenance.toolchain)
     || common.preparedIdentity !== manifest.suiteConfig.preparedInputSha256
     || canonicalJson(common.prepared.source) !== canonicalJson(manifest.provenance.suiteSource)
@@ -420,7 +430,12 @@ async function loadRunStores(
     await state.recoverPendingLifecycleProcesses(runDir(roots, 'swe-marathon', runId));
     if (state.load().invocations.some((invocation) => invocation.endedAt === null)) {
       for (const taskId of manifest.experiment.taskIds) {
-        await cleanupMarathonContainers(manifest.runId, taskId, manifest.experiment.arm as Arm);
+        await cleanupMarathonContainers(
+          marathonRunScope(runDir(roots, 'swe-marathon', runId)),
+          manifest.runId,
+          taskId,
+          manifest.experiment.arm as Arm,
+        );
       }
       await state.closeInterruptedInvocations();
     }
@@ -536,10 +551,22 @@ export function planHarborRun(
   };
 }
 
-function labelEnvironment(runId: string, taskId: string, arm: Arm, runtimeNonce: string): Record<string, string> {
+/** Hash a canonical run root into a non-secret Docker/runtime ownership namespace. */
+export function marathonRunScope(runDirectory: string): string {
+  return createHash('sha256').update(realpathSync(runDirectory), 'utf8').digest('hex');
+}
+
+function labelEnvironment(
+  rootScope: string,
+  runId: string,
+  taskId: string,
+  arm: Arm,
+  runtimeNonce: string,
+): Record<string, string> {
   return {
     ULTRACODE_BENCHMARK_SCHEMA: '2',
     ULTRACODE_BENCHMARK_SUITE: 'swe-marathon',
+    ULTRACODE_BENCHMARK_ROOT: rootScope,
     ULTRACODE_BENCHMARK_RUN: runId,
     ULTRACODE_BENCHMARK_TASK: taskId,
     ULTRACODE_BENCHMARK_ARM: arm,
@@ -555,6 +582,7 @@ interface ContainerInspect {
 }
 
 interface ActiveMarathonExecution {
+  rootScope: string;
   runId: string;
   taskId: string;
   arm: Arm;
@@ -575,7 +603,7 @@ async function cleanupTrackedExecution(key: string): Promise<void> {
   execution.cleanupPromise ??= (async () => {
     const failures: unknown[] = [];
     try {
-      await cleanupMarathonContainers(execution.runId, execution.taskId, execution.arm);
+      await cleanupMarathonContainers(execution.rootScope, execution.runId, execution.taskId, execution.arm);
     } catch (error) {
       failures.push(error);
     }
@@ -606,10 +634,17 @@ export async function cleanupSweMarathonRuntime(): Promise<void> {
 }
 
 /** Remove only containers bearing the complete exact ownership label tuple. */
-export async function cleanupMarathonContainers(runId: string, taskId: string, arm: Arm): Promise<number> {
+export async function cleanupMarathonContainers(
+  rootScope: string,
+  runId: string,
+  taskId: string,
+  arm: Arm,
+): Promise<number> {
+  if (!/^[a-f0-9]{64}$/.test(rootScope)) throw new Error('invalid SWE-Marathon root scope');
   const expected = {
     ULTRACODE_BENCHMARK_SCHEMA: '2',
     ULTRACODE_BENCHMARK_SUITE: 'swe-marathon',
+    ULTRACODE_BENCHMARK_ROOT: rootScope,
     ULTRACODE_BENCHMARK_RUN: runId,
     ULTRACODE_BENCHMARK_TASK: taskId,
     ULTRACODE_BENCHMARK_ARM: arm,
@@ -644,6 +679,7 @@ export async function cleanupMarathonContainers(runId: string, taskId: string, a
     const exact = {
       schema: labels['ultracode.benchmark.schema'],
       suite: labels['ultracode.benchmark.suite'],
+      root: labels['ultracode.benchmark.root'],
       run: labels['ultracode.benchmark.run'],
       task: labels['ultracode.benchmark.task'],
       arm: labels['ultracode.benchmark.arm'],
@@ -651,7 +687,8 @@ export async function cleanupMarathonContainers(runId: string, taskId: string, a
       ownership: labels['ultracode.benchmark.ownership'],
     };
     if (canonicalJson(exact) !== canonicalJson({
-      schema: '2', suite: 'swe-marathon', run: runId, task: taskId, arm, purpose: 'session', ownership: '1',
+      schema: '2', suite: 'swe-marathon', root: rootScope,
+      run: runId, task: taskId, arm, purpose: 'session', ownership: '1',
     })) throw new Error(`refusing to remove unowned Harbor container ${id}`);
     const runtimeNonce = labels['ultracode.benchmark.runtime'] ?? '';
     if (!/^[a-f0-9]{64}$/.test(runtimeNonce)) throw new Error(`Harbor container ${id} has no valid runtime owner`);
@@ -662,7 +699,7 @@ export async function cleanupMarathonContainers(runId: string, taskId: string, a
     });
     removed += 1;
   }
-  cleanupMarathonRuntimeHomes(runId, taskId, arm);
+  cleanupMarathonRuntimeHomes(rootScope, runId, taskId, arm);
   return removed;
 }
 
@@ -767,14 +804,15 @@ async function runTask(
 ): Promise<void> {
   await attestMarathonTask(common, taskId);
   const directory = runDir(context.paths, 'swe-marathon', manifest.runId);
+  const rootScope = marathonRunScope(directory);
   const identity = executionIdentity(manifest, taskId);
-  await cleanupMarathonContainers(manifest.runId, taskId, identity.arm);
+  await cleanupMarathonContainers(rootScope, manifest.runId, taskId, identity.arm);
   const jobDirectory = join(directory, ...identity.jobRelativeRoot.split('/'));
   const exists = existsSync(jobDirectory);
   if (exists && !resume) throw new Error(`unexpected native Harbor job for fresh task ${taskId}`);
   const resumeNativeJob = shouldResumeHarborJob(exists, redo);
   const plan = planHarborRun(context.paths, directory, manifest, common, taskId, resumeNativeJob);
-  if (resumeNativeJob) validateHarborResume(directory, identity);
+  if (resumeNativeJob) validateHarborResume(directory, identity, receipt.load().bindings);
   if (resumeNativeJob) {
     const evidenceInvocationId = harborEvidenceInvocationId(
       state.load(),
@@ -789,7 +827,7 @@ async function runTask(
       return;
     }
   }
-  const labels = labelEnvironment(manifest.runId, taskId, identity.arm, randomBytes(32).toString('hex'));
+  const labels = labelEnvironment(rootScope, manifest.runId, taskId, identity.arm, randomBytes(32).toString('hex'));
   const runtime = createMarathonRuntimeHome(
     config,
     join(context.paths.benchRoot, 'suites', 'swe-marathon'),
@@ -803,6 +841,7 @@ async function runTask(
   const lifecycle = state.lifecycleHooks(invocationId);
   try {
     trackExecution(activeKey, {
+      rootScope,
       runId: manifest.runId,
       taskId,
       arm: identity.arm,
@@ -873,10 +912,30 @@ async function invalidateRedo(
   rmSync(join(directory, 'report.md'), { force: true });
   for (const execution of manifest.artifacts.executions) {
     if (!targets.has(execution.taskId)) continue;
-    resetArtifactDirectory(directory, join(directory, ...execution.nativeRoot.split('/')));
-    await state.updateCurrent((currentState) => ({
-      ...currentState,
-      attempts: [...currentState.attempts, {
+    const source = join(directory, ...execution.nativeRoot.split('/'));
+    const archiveRoot = validateRelativeArtifactPath(`native/attempts/${invocationId}/${execution.key}`);
+    const archive = join(directory, ...archiveRoot.split('/'));
+    let archived = false;
+    let sourceInfo: ReturnType<typeof lstatSync> | null = null;
+    try { sourceInfo = lstatSync(source); } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
+    }
+    if (sourceInfo?.isDirectory() && !sourceInfo.isSymbolicLink()) {
+      ensurePrivateDirectoryWithin(directory, dirname(archive));
+      renameSync(source, archive);
+      archived = true;
+    }
+    resetArtifactDirectory(directory, source);
+    await state.updateCurrent((currentState) => {
+      let latest = -1;
+      currentState.attempts.forEach((attempt, index) => {
+        if (attempt.taskId === execution.taskId && attempt.arm === execution.arm
+          && attempt.phase === 'session' && attempt.nativePath === execution.nativeRoot) latest = index;
+      });
+      return {
+        ...currentState,
+        attempts: [...currentState.attempts.map((attempt, index) =>
+          archived && index === latest ? { ...attempt, nativePath: archiveRoot } : attempt), {
         attemptId: randomUUID(),
         invocationId,
         taskId: execution.taskId,
@@ -887,14 +946,15 @@ async function invalidateRedo(
         startedAt: now.toISOString(),
         endedAt: now.toISOString(),
         elapsedMs: 0,
-        nativePath: execution.nativeRoot,
+        nativePath: archived ? archiveRoot : execution.nativeRoot,
         exitCode: 0,
         signal: null,
         status: 'succeeded',
         failures: [],
         annotations: ['redo-invalidated'],
-      }],
-    }));
+        }],
+      };
+    });
   }
 }
 

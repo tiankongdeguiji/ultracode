@@ -1,12 +1,13 @@
 diff --git a/harbor/environments/docker/docker-compose-build.yaml b/harbor/environments/docker/docker-compose-build.yaml
 --- a/harbor/environments/docker/docker-compose-build.yaml
 +++ b/harbor/environments/docker/docker-compose-build.yaml
-@@ -1,2 +1,10 @@
+@@ -1,2 +1,11 @@
  services:
    main:
 +    labels:
 +      ultracode.benchmark.schema: "${ULTRACODE_BENCHMARK_SCHEMA}"
 +      ultracode.benchmark.suite: "${ULTRACODE_BENCHMARK_SUITE}"
++      ultracode.benchmark.root: "${ULTRACODE_BENCHMARK_ROOT}"
 +      ultracode.benchmark.run: "${ULTRACODE_BENCHMARK_RUN}"
 +      ultracode.benchmark.task: "${ULTRACODE_BENCHMARK_TASK}"
 +      ultracode.benchmark.arm: "${ULTRACODE_BENCHMARK_ARM}"
@@ -16,12 +17,13 @@ diff --git a/harbor/environments/docker/docker-compose-build.yaml b/harbor/envir
 diff --git a/harbor/environments/docker/docker-compose-prebuilt.yaml b/harbor/environments/docker/docker-compose-prebuilt.yaml
 --- a/harbor/environments/docker/docker-compose-prebuilt.yaml
 +++ b/harbor/environments/docker/docker-compose-prebuilt.yaml
-@@ -1,2 +1,10 @@
+@@ -1,2 +1,11 @@
  services:
    main:
 +    labels:
 +      ultracode.benchmark.schema: "${ULTRACODE_BENCHMARK_SCHEMA}"
 +      ultracode.benchmark.suite: "${ULTRACODE_BENCHMARK_SUITE}"
++      ultracode.benchmark.root: "${ULTRACODE_BENCHMARK_ROOT}"
 +      ultracode.benchmark.run: "${ULTRACODE_BENCHMARK_RUN}"
 +      ultracode.benchmark.task: "${ULTRACODE_BENCHMARK_TASK}"
 +      ultracode.benchmark.arm: "${ULTRACODE_BENCHMARK_ARM}"

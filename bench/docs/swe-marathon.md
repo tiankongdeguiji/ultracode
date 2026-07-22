@@ -16,6 +16,9 @@ the exact Harbor config and result bytes but never recomputes a reward.
 It prepares the shared Codex/Node/Ultracode toolchain, checks out the exact
 source revision, performs the frozen `uv` sync, applies the tracked Harbor
 ownership-label patch, and pulls every runnable digest-pinned task image.
+Execution rejects a prepared environment when its recorded bridge or ownership
+patch hash no longer matches the tracked native asset; rerun `prep` after either
+asset changes.
 It requires `uv` and GNU `patch` (including `--batch` and `--forward`) and preflights both before
 network access, cache staging, or Python environment construction.
 
@@ -31,13 +34,18 @@ bench/results/<suite>/<runId>/
   report.json
   report.md
   native/tasks/<artifactKey>/
+  native/attempts/<redoInvocationId>/<artifactKey>/
 ```
 
 One run contains one arm. Every selected task is one sequential native Harbor
 job with one attempt and zero retries. `<runDir>/native/tasks` is passed as
 Harbor's `--jobs-dir`; the collision-resistant artifact key is its job name.
-Resume validates exact job fields before using Harbor's native `job resume`.
-Redo invalidates that task's receipt bindings before resetting its job tree.
+Resume requires the exact job config bytes previously bound into the
+manifest-scoped verifier receipt before using Harbor's native `job resume`.
+Redo invalidates that task's receipt bindings, moves its prior job into the
+attempt archive, and starts a fresh job from the immutable plan. Reports scan
+both current and archived jobs so interrupted and invalidated paid usage remains
+cumulative.
 
 Before execution, common prepared inputs are re-attested once. Each task TOML
 and Docker image identity is then re-attested immediately before that task is
@@ -52,7 +60,8 @@ Arm A uses Harbor's built-in `codex` agent. Arm B uses
 `bench/suites/swe-marathon/arm_b_codex.py`, the same exact prefix asset used by
 other suites, and the read-only shared toolchain. The bridge chooses neither
 model nor effort. It waits for detached workflows, preserves worker rollouts
-and the run store, and writes only `arm_b_lifecycle.json`. Shared TypeScript
+using Ultracode's effective status (including dead-runner detection), preserves
+worker rollouts and the run store, and writes only `arm_b_lifecycle.json`. Shared TypeScript
 metrics code is the sole public token aggregator.
 
 Reporting indexes only the manifest-declared job and its single direct-child
@@ -61,6 +70,9 @@ policy, and a finite reward in `[0,1]`. Identity-valid trial results whose exact
 `exception_info.exception_type` is `VerifierTimeoutError` are bound as terminal
 verifier-timeout evidence without synthesizing a reward. Nested lookalikes are
 ignored. A task is resolved only when the native reward is exactly `1`.
+Telemetry needs a unique identity-valid trial config but not terminal job or
+trial results, so a watchdog or crash after model calls does not erase billable
+usage.
 
 The four CUA tasks without authoritative verifier results are not runnable:
 `excel-clone`, `mastodon-clone`, `s3-clone`, and `slack-clone`. The
@@ -81,8 +93,10 @@ Task code shares the credential's security domain, so use a disposable,
 narrowly scoped account with restricted egress.
 
 Harbor containers receive the complete benchmark ownership label tuple from
-the pinned patch. Cleanup discovers containers by all labels, reinspects the
-full tuple, and refuses to remove anything that does not match exactly.
+the pinned patch, including a hash of the canonical run root. Runtime-home
+markers carry the same scope. Cleanup discovers containers and credential homes
+only within that root/run/task/arm namespace, reinspects the full tuple, and
+refuses to remove anything that does not match exactly.
 
 ```bash
 npm run bench -- --suite swe-marathon prep

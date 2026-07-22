@@ -94,7 +94,7 @@ export function locateExactHarborTrial(
     .flatMap((entry) => {
       const config = join(directory, entry.name, 'config.json');
       const result = join(directory, entry.name, 'result.json');
-      return existsSync(config) && existsSync(result)
+      return existsSync(config)
         ? [{
             name: entry.name,
             config: portable(runDirectory, config),
@@ -174,6 +174,22 @@ export function indexHarborEvidence(
     return { bindings, nativeResult, terminalFailure, trialName };
   }
 
+  try {
+    const trial = locateExactHarborTrial(runDirectory, identity.jobRelativeRoot);
+    const trialConfig = json(runDirectory, trial.config, 'trial config');
+    validateTrialConfig(trialConfig.value, trial.name, identity);
+    trialName = trial.name;
+    bindings.push(createVerifierBinding(runDirectory, {
+      invocationId,
+      scope: { kind: 'task-arm', taskId: identity.taskId, arm: identity.arm },
+      role: 'native-config',
+      path: validateRelativeArtifactPath(trial.config),
+      nativeRecordKey: `trial-config:${trial.name}`,
+    }, trialConfig.sha256));
+  } catch {
+    return { bindings, nativeResult, terminalFailure, trialName };
+  }
+
   const jobResultPath = `${identity.jobRelativeRoot}/result.json`;
   if (!existsSync(join(runDirectory, ...jobResultPath.split('/')))) {
     return { bindings, nativeResult, terminalFailure, trialName };
@@ -191,18 +207,11 @@ export function indexHarborEvidence(
     return { bindings, nativeResult, terminalFailure, trialName };
   }
 
+  const trial = locateExactHarborTrial(runDirectory, identity.jobRelativeRoot);
+  if (!existsSync(join(runDirectory, ...trial.result.split('/')))) {
+    return { bindings, nativeResult, terminalFailure, trialName };
+  }
   try {
-    const trial = locateExactHarborTrial(runDirectory, identity.jobRelativeRoot);
-    const trialConfig = json(runDirectory, trial.config, 'trial config');
-    validateTrialConfig(trialConfig.value, trial.name, identity);
-    trialName = trial.name;
-    bindings.push(createVerifierBinding(runDirectory, {
-      invocationId,
-      scope: { kind: 'task-arm', taskId: identity.taskId, arm: identity.arm },
-      role: 'native-config',
-      path: validateRelativeArtifactPath(trial.config),
-      nativeRecordKey: `trial-config:${trial.name}`,
-    }, trialConfig.sha256));
     const result = json(runDirectory, trial.result, 'trial result');
     validateTrialResultIdentity(result.value, trial.name, identity.taskId);
     if (hasVerifierTimeout(result.value)) {
@@ -239,8 +248,22 @@ export function indexHarborEvidence(
 export function validateHarborResume(
   runDirectory: string,
   identity: HarborExecutionIdentity,
+  bindings: readonly VerifierBinding[],
 ): void {
   const path = `${identity.jobRelativeRoot}/config.json`;
   resolveRegularFileWithinRoot(runDirectory, path, 'Harbor resume config');
-  validateHarborJobConfig(json(runDirectory, path, 'resume config').value, identity);
+  const config = json(runDirectory, path, 'resume config');
+  validateHarborJobConfig(config.value, identity);
+  const pinned = bindings.filter((binding) => binding.role === 'native-config'
+    && binding.nativeRecordKey === 'job-config'
+    && binding.path === path
+    && binding.scope.kind === 'task-arm'
+    && binding.scope.taskId === identity.taskId
+    && binding.scope.arm === identity.arm);
+  if (pinned.length === 0) {
+    throw new Error('Harbor resume config has no prior receipt binding; use --redo to start from the immutable plan');
+  }
+  if (pinned.some((binding) => binding.sha256 !== config.sha256)) {
+    throw new Error('Harbor resume config drifted from its prior receipt binding');
+  }
 }
