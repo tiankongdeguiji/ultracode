@@ -656,6 +656,7 @@ function ownershipLabels(runId: string, arm: Arm): Record<string, string> {
 }
 
 const FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS = 30_000;
+const FEATUREBENCH_CONTROL_DOCKER_TIMEOUT_MS = 30_000;
 const FEATUREBENCH_WORKFLOW_MAX_WAIT_MS = 3_300_000;
 const FEATUREBENCH_WORKFLOW_STOP_GRACE_MS = 120_000;
 
@@ -816,9 +817,13 @@ async function attestRuntime(
   await cleanupFeatureBenchContainers(runId, config.arm, config.taskIds, executor);
   const network = await executor('docker', ['network', 'inspect', bindings.restrictedNetwork], {
     env: allowlistedEnvironment(process.env),
+    timeoutMs: FEATUREBENCH_CONTROL_DOCKER_TIMEOUT_MS,
   });
   const brokerHost = new URL(bindings.brokerUrl).hostname;
-  const broker = await executor('docker', ['inspect', brokerHost], { env: allowlistedEnvironment(process.env) });
+  const broker = await executor('docker', ['inspect', brokerHost], {
+    env: allowlistedEnvironment(process.env),
+    timeoutMs: FEATUREBENCH_CONTROL_DOCKER_TIMEOUT_MS,
+  });
   const trust = inspectFeatureBenchTrustBoundary(network.stdout, broker.stdout, config, bindings);
   const selectedTasks = config.taskIds.map((taskId) => {
     const task = prepared.tasks.find((candidate) => candidate.taskId === taskId);
@@ -828,6 +833,7 @@ async function attestRuntime(
   for (const task of selectedTasks) {
     const inspection = await executor('docker', ['image', 'inspect', task.imageResolvedDigest], {
       env: allowlistedEnvironment(process.env),
+      timeoutMs: FEATUREBENCH_CONTROL_DOCKER_TIMEOUT_MS,
     });
     assertImageInspection(inspection.stdout, task);
   }

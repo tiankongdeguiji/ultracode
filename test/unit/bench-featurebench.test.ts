@@ -34,6 +34,7 @@ import {
   FEATUREBENCH_SOURCE_REVISION,
   FEATUREBENCH_SPLIT,
   loadFeatureBenchRuntimeBindings,
+  validateFeatureBenchConfig,
   type FeatureBenchConfig,
 } from '../../bench/src/suites/featurebench/config.js';
 import { validateFeatureBenchHost } from '../../bench/src/suites/featurebench/host.js';
@@ -533,6 +534,16 @@ describe('FeatureBench immutable inputs and host policy', () => {
       FEATUREBENCH_CREDENTIAL_BROKER_URL: 'https://user:secret@broker.test/v1',
       FEATUREBENCH_RESTRICTED_NETWORK: 'featurebench-private',
     })).toThrow(/without userinfo/);
+  });
+
+  it('requires the CPU quota to map to a positive safe Docker NanoCpus value', () => {
+    expect(() => validateFeatureBenchConfig(config())).not.toThrow();
+    expect(() => validateFeatureBenchConfig({
+      ...config(), resources: { ...config().resources, cpus: 0.000_000_000_1 },
+    })).toThrow(/positive safe NanoCpus/);
+    expect(() => validateFeatureBenchConfig({
+      ...config(), resources: { ...config().resources, cpus: Number.MAX_SAFE_INTEGER },
+    })).toThrow(/positive safe NanoCpus/);
   });
 
   it('serializes separate worktrees on one host-wide policy lock identity', async () => {
@@ -1837,6 +1848,35 @@ describe('FeatureBench state-bound telemetry', () => {
       attempts: [{ ...state.attempts[0]!, nativePath: 'native/latest' }],
     })).toThrow(/non-timestamp native root/);
   });
+
+  it('marks expected missing host usage incomplete and rejects unreadable telemetry trees', () => {
+    const runDirectory = temporary();
+    const attempt = join(runDirectory, 'native', TIMESTAMP, 'run_outputs', 'task-alpha', 'attempt-1');
+    mkdirSync(attempt, { recursive: true });
+    const telemetryManifest = {
+      ...manifest(),
+      artifacts: { executions: [{ taskId: 'task-alpha', arm: 'b', nativeRoot: 'native' }] },
+    } as FeatureBenchManifest;
+    const state = {
+      attempts: [{
+        phase: 'inference',
+        nativePath: `native/${TIMESTAMP}`,
+        status: 'failed',
+        taskId: 'task-alpha',
+      }],
+    } as BenchRunState;
+
+    const missing = indexFeatureBenchMetrics(telemetryManifest, runDirectory, state);
+    expect(missing.pricingEvidenceIncomplete).toBe(true);
+    expect(missing.annotations).toEqual([{
+      code: 'host-telemetry-missing',
+      scope: { kind: 'task-arm', taskId: 'task-alpha', arm: 'b' },
+    }]);
+
+    writeFileSync(join(attempt, 'codex_sessions'), 'not a directory\n');
+    expect(() => indexFeatureBenchMetrics(telemetryManifest, runDirectory, state))
+      .toThrow(/telemetry directory is unreadable/);
+  });
 });
 
 describe('FeatureBench owned assets', () => {
@@ -1848,7 +1888,11 @@ describe('FeatureBench owned assets', () => {
     expect(patch).toContain('FEATUREBENCH_EVALUATOR_NETWORK');
     expect(patch).toContain('No pinned evaluation image digest');
     expect(patch).toContain('pids_limit=pids_limit');
+    expect(patch).toContain('host_config.get("NanoCpus")');
+    expect(patch).toContain('host_config.get("Memory")');
     expect(patch).toContain("const recovery = new Set(['orphaned', 'cleanup-failed'])");
+    expect(patch).toContain("mode === 'all'");
+    expect(patch).toContain('host=True, ultracode=False');
     expect(patch).not.toMatch(/ultracode\.external-run|FEATUREBENCH_RUN_OWNER/);
     expect(readFileSync('bench/suites/featurebench/.gitattributes', 'utf8')).toContain('codex-chatgpt.patch');
   });

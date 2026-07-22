@@ -92,6 +92,10 @@ export function validateFeatureBenchConfig(config: FeatureBenchConfig): void {
   if (!config.requestedEffort) throw new Error('FeatureBench run requires an explicit requested effort');
   if (config.taskIds.length === 0) throw new Error('FeatureBench run requires at least one --task-id');
   if (new Set(config.taskIds).size !== config.taskIds.length) throw new Error('FeatureBench task ids must be unique');
+  const nanoCpus = config.resources.cpus * 1_000_000_000;
+  if (!Number.isSafeInteger(nanoCpus) || nanoCpus <= 0) {
+    throw new Error('FeatureBench CPU limit must convert to a positive safe NanoCpus integer');
+  }
   config.taskIds.forEach(validateFeatureBenchTaskId);
 }
 

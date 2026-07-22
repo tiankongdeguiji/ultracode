@@ -1,8 +1,8 @@
 diff --git a/featurebench/harness/container.py b/featurebench/harness/container.py
-index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..ba5c03e32ff9a6908701c6466231776d931d2d54 100644
+index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..4e8e21c164e1dd48c77c51ca69986b3cbe65bfe0 100644
 --- a/featurebench/harness/container.py
 +++ b/featurebench/harness/container.py
-@@ -216,6 +216,21 @@ class EvalContainerManager:
+@@ -216,6 +216,26 @@ class EvalContainerManager:
              number_once = 1
          shm_size = docker_runtime_config.get("shm_size")
  
@@ -10,9 +10,14 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..ba5c03e32ff9a6908701c6466231776d
 +            raise RuntimeError("Unsupported runtime capability: this FeatureBench adapter is CPU-only")
 +        raw_cpus = os.environ.get("FB_CONTAINER_CPUS")
 +        nano_cpus = int(float(raw_cpus) * 1_000_000_000) if raw_cpus else None
-+        mem_limit = os.environ.get("FB_CONTAINER_MEMORY") or None
++        raw_memory = os.environ.get("FB_CONTAINER_MEMORY")
++        memory_limit = int(raw_memory) if raw_memory else None
 +        raw_pids = os.environ.get("FB_CONTAINER_PIDS")
 +        pids_limit = int(raw_pids) if raw_pids else None
++        if nano_cpus is None or nano_cpus <= 0:
++            raise RuntimeError("A positive FeatureBench evaluator NanoCpus limit is required")
++        if memory_limit is None or memory_limit <= 0:
++            raise RuntimeError("A positive FeatureBench evaluator memory limit is required")
 +        if pids_limit is None or pids_limit <= 0:
 +            raise RuntimeError("A positive FeatureBench evaluator PID limit is required")
 +        evaluator_network = os.environ.get("FEATUREBENCH_EVALUATOR_NETWORK")
@@ -24,7 +29,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..ba5c03e32ff9a6908701c6466231776d
          # Sanitize instance_id: replace / and . with -
          sanitized_id = instance_id.replace("/", "-").replace(".", "-").replace("--", "-")
          # Add timestamp to avoid name conflicts in parallel execution
-@@ -269,19 +284,7 @@ class EvalContainerManager:
+@@ -269,19 +289,7 @@ class EvalContainerManager:
              environment.update(env_vars_from_config)
              self.logger.info(f"Added environment variables from config: {list(env_vars_from_config.keys())}")
  
@@ -45,12 +50,12 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..ba5c03e32ff9a6908701c6466231776d
  
          if shm_size:
              self.logger.info(f"Using shared memory size: {shm_size}")
-@@ -299,9 +302,28 @@ class EvalContainerManager:
+@@ -299,9 +307,30 @@ class EvalContainerManager:
              environment=environment,
              network_mode=network_mode,
              shm_size=shm_size,
 +            nano_cpus=nano_cpus,
-+            mem_limit=mem_limit,
++            mem_limit=memory_limit,
 +            pids_limit=pids_limit,
              labels=labels,
          )
@@ -61,9 +66,11 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..ba5c03e32ff9a6908701c6466231776d
 +            if (
 +                not isinstance(host_config, dict)
 +                or host_config.get("NetworkMode") != "none"
++                or host_config.get("NanoCpus") != nano_cpus
++                or host_config.get("Memory") != memory_limit
 +                or host_config.get("PidsLimit") != pids_limit
 +            ):
-+                raise RuntimeError("FeatureBench evaluator network attestation failed")
++                raise RuntimeError("FeatureBench evaluator runtime attestation failed")
 +        except Exception:
 +            try:
 +                container.remove(force=True)
@@ -74,7 +81,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..ba5c03e32ff9a6908701c6466231776d
          # Check if GPU is available
          if need_gpu:
              exit_code, output = container.exec_run("nvidia-smi --list-gpus")
-@@ -368,4 +390,4 @@ class EvalContainerManager:
+@@ -368,4 +397,4 @@ class EvalContainerManager:
              container.remove()
              self.logger.info("Container removed successfully")
          except Exception as e:
@@ -175,7 +182,7 @@ index beb48fbb82384af44f5d18ce2b7d22a779699014..bee919dc77ded07ea115216158b1fbad
 \ No newline at end of file
 +    raise SystemExit(main())
 diff --git a/featurebench/infer/agents/codex.py b/featurebench/infer/agents/codex.py
-index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca96316c5d9be6 100644
+index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a7367a1c963 100644
 --- a/featurebench/infer/agents/codex.py
 +++ b/featurebench/infer/agents/codex.py
 @@ -40,6 +40,13 @@ set -e
@@ -192,7 +199,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
  if command -v codex >/dev/null 2>&1; then
      echo "codex already available; skipping installation"
      codex --version || true
-@@ -102,14 +109,125 @@ echo "Codex installation complete"
+@@ -102,14 +109,149 @@ echo "Codex installation complete"
  
          return True
  
@@ -221,10 +228,10 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
 +  try {
 +    const manifest = JSON.parse(fs.readFileSync(path.join(runs, runId, 'manifest.json'), 'utf8'));
 +    const status = String(manifest.status);
-+    if ((mode === 'recovery' && recovery.has(status)) || (mode === 'active' && !verified.has(status))) {
++    if (mode === 'all' || (mode === 'recovery' && recovery.has(status)) || (mode === 'active' && !verified.has(status))) {
 +      console.log(runId);
 +    }
-+  } catch { if (mode === 'active') console.log(runId); }
++  } catch { if (mode === 'active' || mode === 'all') console.log(runId); }
 +}
 +NODE
 +  )
@@ -240,16 +247,18 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
 +  printf '%s' "$result"
 +}
 +stop_runs() {
++  failed=0
 +  for run_id in $1; do
 +    ULTRACODE_HOME=/agent-logs/ultracode /opt/bench/node-sel \
-+      /opt/bench/ultracode/dist/cli/main.js stop "$run_id" >&2 || true
++      /opt/bench/ultracode/dist/cli/main.js stop "$run_id" >&2 || failed=1
 +  done
++  [ "$failed" -eq 0 ]
 +}
 +recover_workflows() {
 +  recovery=$(scan_runs recovery) || return 1
 +  if [ -z "$recovery" ]; then return 0; fi
 +  printf 'recovering unverified workflows: %s\n' "$recovery" >&2
-+  stop_runs "$recovery"
++  stop_runs "$recovery" || return 1
 +  remaining_recovery=$(scan_runs recovery) || return 1
 +  [ -z "$remaining_recovery" ] || {
 +    printf 'workflow cleanup remains unverified: %s\n' "$remaining_recovery" >&2
@@ -264,9 +273,15 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
 +  recover_workflows || exit 1
 +  stragglers=$(scan_runs active) || exit 1
 +done
-+if [ -z "$stragglers" ]; then exit 0; fi
++if [ -z "$stragglers" ]; then
++  all_runs=$(scan_runs all) || exit 1
++  printf 'verifying workflow process cleanup: %s\n' "$all_runs" >&2
++  stop_runs "$all_runs" || exit 1
++  recover_workflows || exit 1
++  exit 0
++fi
 +printf 'workflow wait expired; stopping: %s\n' "$stragglers" >&2
-+stop_runs "$stragglers"
++stop_runs "$stragglers" || exit 1
 +stop_deadline=$(( $(date +%s) + 120 ))
 +recover_workflows || exit 1
 +remaining=$(scan_runs active) || exit 1
@@ -285,20 +300,31 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
 +            return False
 +        return True
 +
-+    def _copy_outputs(self, container, log_file, *, best_effort: bool) -> bool:
++    def _copy_outputs(
++        self,
++        container,
++        log_file,
++        *,
++        best_effort: bool,
++        host: bool,
++        ultracode: bool,
++    ) -> bool:
 +        """Persist Codex telemetry before FeatureBench removes the container."""
 +
 +        log_dir = Path(log_file).parent
-+        copies = [
-+            ("/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl"),
-+            ("/root/.codex/sessions", log_dir / "codex_sessions"),
-+        ]
-+        if self.env_vars.get("FEATUREBENCH_ARM") == "b":
++        copies = []
++        if host:
++            copies.extend([
++                ("/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl"),
++                ("/root/.codex/sessions", log_dir / "codex_sessions"),
++            ])
++        if ultracode and self.env_vars.get("FEATUREBENCH_ARM") == "b":
 +            copies.append(("/agent-logs/ultracode", log_dir / "ultracode"))
 +        copied = True
 +        for source, destination in copies:
 +            try:
-+                self.cm.copy_from_container(container, source, destination)
++                if not self.cm.copy_from_container(container, source, destination):
++                    raise RuntimeError("container copy returned no artifacts")
 +            except Exception as e:
 +                copied = False
 +                log = self.logger.warning if best_effort else self.logger.error
@@ -313,16 +339,21 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
 -            self.cm.copy_from_container(container, "/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl")
 -        except Exception:
 -            pass
++        self._copy_outputs(
++            container, log_file, best_effort=True, host=True, ultracode=False
++        )
 +        workflows_complete = self._wait_for_workflows(container)
 +        if not workflows_complete:
 +            return False
-+        outputs_copied = self._copy_outputs(container, log_file, best_effort=False)
++        outputs_copied = self._copy_outputs(
++            container, log_file, best_effort=False, host=True, ultracode=True
++        )
 +        if not outputs_copied:
 +            return False
          # Validate the run finished cleanly: last JSONL event should be turn.completed with usage.
          try:
              events_path = log_dir / "codex_events.jsonl"
-@@ -153,18 +271,16 @@ echo "Codex installation complete"
+@@ -153,18 +295,21 @@ echo "Codex installation complete"
      def failure_hook(self, container, log_file: Path) -> None:
          """Collect outputs on failures (best-effort)."""
  
@@ -331,8 +362,13 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
 -            self.cm.copy_from_container(container, "/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl")
 -        except Exception:
 -            pass
++        self._copy_outputs(
++            container, log_file, best_effort=True, host=True, ultracode=False
++        )
 +        if self._wait_for_workflows(container):
-+            self._copy_outputs(container, log_file, best_effort=True)
++            self._copy_outputs(
++                container, log_file, best_effort=True, host=True, ultracode=True
++            )
  
      def get_run_command(self, instruction: str) -> str:
          """Get the command to run Codex."""
@@ -345,7 +381,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
  
          model = self._kwargs.get("model")
          # Preserve provider-prefixed model names (e.g., "azure/<deployment>").
-@@ -179,7 +295,7 @@ echo "Codex installation complete"
+@@ -179,7 +324,7 @@ echo "Codex installation complete"
              # Preserve the exit code when piping JSONL to a file.
              "set -o pipefail; "
              f"codex exec "
@@ -354,7 +390,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
              f"--skip-git-repo-check "
              f"--json "
              f"{model_arg}"
-@@ -192,20 +308,21 @@ echo "Codex installation complete"
+@@ -192,20 +337,21 @@ echo "Codex installation complete"
          lines = ["#!/bin/bash", ""]
  
          api_key = self.env_vars.get("OPENAI_API_KEY")
@@ -382,7 +418,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
              env_settings["AZURE_OPENAI_API_KEY"] = self.env_vars.get("AZURE_OPENAI_API_KEY") or api_key
  
          # Optional settings
-@@ -262,7 +379,7 @@ echo "Codex installation complete"
+@@ -262,7 +408,7 @@ echo "Codex installation complete"
              reasoning_effort = reasoning_effort.replace("\\", "\\\\").replace('"', '\\"')
  
          # Azure: https://learn.microsoft.com/zh-cn/azure/ai-foundry/openai/how-to/codex?view=foundry-classic&tabs=npm
@@ -391,7 +427,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca9631
              deployment = raw_model.split("/", 1)[1] if raw_model.startswith("azure/") else raw_model
  
              # Codex CLI Azure v1 requires /openai/v1 in the base URL.
-@@ -300,6 +417,63 @@ echo "Codex installation complete"
+@@ -300,6 +446,63 @@ echo "Codex installation complete"
                  ]
              )
  
@@ -485,18 +521,23 @@ index 796c784bee86b17e337fd4e47044cd5ce4ac04db..783769fad7c7a874a1a22fdad7c194be
              for item in dataset:
                  item_dict = dict(item)
 diff --git a/featurebench/infer/container.py b/featurebench/infer/container.py
-index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..763a82fade812fab6475b4f6d634541285c5520b 100644
+index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..aee11be8c2aacc094f2fb83e58e88cdcab64fae0 100644
 --- a/featurebench/infer/container.py
 +++ b/featurebench/infer/container.py
-@@ -190,6 +190,16 @@ class ContainerManager:
+@@ -190,6 +190,21 @@ class ContainerManager:
          if not isinstance(number_once, int) or number_once <= 0:
              number_once = 1
          shm_size = docker_runtime_config.get("shm_size")
 +        raw_cpus = self.env_vars.get("FB_CONTAINER_CPUS")
 +        nano_cpus = int(float(raw_cpus) * 1_000_000_000) if raw_cpus else None
-+        mem_limit = self.env_vars.get("FB_CONTAINER_MEMORY") or None
++        raw_memory = self.env_vars.get("FB_CONTAINER_MEMORY")
++        memory_limit = int(raw_memory) if raw_memory else None
 +        raw_pids = self.env_vars.get("FB_CONTAINER_PIDS")
 +        pids_limit = int(raw_pids) if raw_pids else None
++        if nano_cpus is None or nano_cpus <= 0:
++            raise RuntimeError("A positive FeatureBench inference NanoCpus limit is required")
++        if memory_limit is None or memory_limit <= 0:
++            raise RuntimeError("A positive FeatureBench inference memory limit is required")
 +        if pids_limit is None or pids_limit <= 0:
 +            raise RuntimeError("A positive FeatureBench inference PID limit is required")
 +        restricted_network = self.env_vars.get("FEATUREBENCH_RESTRICTED_NETWORK")
@@ -505,7 +546,7 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..763a82fade812fab6475b4f6d6345412
  
          # Configure GPU access
          device_requests = None
-@@ -244,11 +254,25 @@ class ContainerManager:
+@@ -244,11 +259,30 @@ class ContainerManager:
                  volumes=volumes,
                  command="tail -f /dev/null",  # Keep container running
                  platform="linux/amd64",
@@ -514,15 +555,20 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..763a82fade812fab6475b4f6d6345412
                  device_requests=device_requests,
                  shm_size=shm_size,
 +                nano_cpus=nano_cpus,
-+                mem_limit=mem_limit,
++                mem_limit=memory_limit,
 +                pids_limit=pids_limit,
                  labels=labels,
              )
 +            try:
 +                container.reload()
 +                host_config = container.attrs.get("HostConfig")
-+                if not isinstance(host_config, dict) or host_config.get("PidsLimit") != pids_limit:
-+                    raise RuntimeError("FeatureBench inference PID-limit attestation failed")
++                if (
++                    not isinstance(host_config, dict)
++                    or host_config.get("NanoCpus") != nano_cpus
++                    or host_config.get("Memory") != memory_limit
++                    or host_config.get("PidsLimit") != pids_limit
++                ):
++                    raise RuntimeError("FeatureBench inference resource attestation failed")
 +            except Exception:
 +                try:
 +                    container.remove(force=True)
@@ -532,7 +578,7 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..763a82fade812fab6475b4f6d6345412
              
              # Check if GPU is available
              if need_gpu:
-@@ -662,4 +686,4 @@ class ContainerManager:
+@@ -662,4 +696,4 @@ class ContainerManager:
          try:
              return container.logs().decode("utf-8", errors="replace")
          except Exception as e:

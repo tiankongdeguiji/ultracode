@@ -1,8 +1,9 @@
 /** Exact FeatureBench telemetry indexing beneath state-bound timestamped runs. */
-import { existsSync, readdirSync, type Dirent } from 'node:fs';
+import { lstatSync, readdirSync, type Dirent } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import type { FeatureBenchManifest } from '../../shared/manifest.js';
 import type { MetricsArtifactIndex, WorkflowArtifact } from '../../shared/metrics.js';
+import type { Annotation } from '../../shared/failure.js';
 import { forEachJsonLine } from '../../shared/jsonl.js';
 import { readRegularFileWithinRoot } from '../../shared/paths.js';
 import type { BenchRunState } from '../../shared/run-state.js';
@@ -13,13 +14,36 @@ function portable(root: string, path: string): string {
   return relative(root, path).split(sep).join('/');
 }
 
+function missing(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
+}
+
+function directoryEntries(directory: string): Dirent[] {
+  try {
+    return readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    if (missing(error)) return [];
+    throw new Error(`FeatureBench telemetry directory is unreadable: ${directory}`, { cause: error });
+  }
+}
+
+function regularFileExists(path: string): boolean {
+  try {
+    const info = lstatSync(path);
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new Error(`FeatureBench telemetry path is not a regular file: ${path}`);
+    }
+    return true;
+  } catch (error) {
+    if (missing(error)) return false;
+    throw error;
+  }
+}
+
 function files(root: string, predicate: (name: string) => boolean): string[] {
-  if (!existsSync(root)) return [];
   const output: string[] = [];
   const walk = (directory: string): void => {
-    let entries: Dirent[];
-    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
+    for (const entry of directoryEntries(directory)) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) walk(path);
       else if (entry.isFile() && predicate(entry.name)) output.push(path);
@@ -30,13 +54,21 @@ function files(root: string, predicate: (name: string) => boolean): string[] {
 }
 
 function json(runDirectory: string, path: string): Record<string, unknown> | null {
+  const absolute = join(runDirectory, ...path.split('/'));
+  try {
+    lstatSync(absolute);
+  } catch (error) {
+    if (missing(error)) return null;
+    throw new Error(`FeatureBench telemetry file is unreadable: ${path}`, { cause: error });
+  }
   try {
     const value = JSON.parse(readRegularFileWithinRoot(runDirectory, path).toString('utf8')) as unknown;
-    return value !== null && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`FeatureBench telemetry JSON must be an object: ${path}`);
+    }
+    return value as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(`FeatureBench telemetry JSON is malformed: ${path}`, { cause: error });
   }
 }
 
@@ -44,14 +76,17 @@ function sessionId(path: string): string | null {
   return /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path)?.[1] ?? null;
 }
 
-function hostSessionIds(eventsPath: string): Set<string> {
+function hostSessionIds(eventsPath: string): { ids: Set<string>; complete: boolean } {
   const ids = new Set<string>();
-  forEachJsonLine(eventsPath, (value) => {
+  const stats = forEachJsonLine(eventsPath, (value) => {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return;
     const event = value as Record<string, unknown>;
     if (event.type === 'thread.started' && typeof event.thread_id === 'string') ids.add(event.thread_id);
   });
-  return ids;
+  return {
+    ids,
+    complete: stats.opened && stats.malformedLines === 0 && stats.oversizeLines === 0 && !stats.unterminatedTail,
+  };
 }
 
 function number(value: unknown): number {
@@ -121,6 +156,8 @@ export function indexFeatureBenchMetrics(
   const workflows: WorkflowArtifact[] = [];
   const seenRollouts = new Set<string>();
   const seenWorkflows = new Set<string>();
+  const annotations: Annotation[] = [];
+  const missingHostTelemetry = new Set<string>();
   const roots = latestInferenceRoots(state);
   for (const execution of manifest.artifacts.executions) {
     for (const nativeRoot of roots.get(execution.taskId) ?? []) {
@@ -132,19 +169,33 @@ export function indexFeatureBenchMetrics(
         'attempt-1',
       );
       const eventsPath = join(attemptDirectory, 'codex_events.jsonl');
-      const hosts = existsSync(eventsPath) ? hostSessionIds(eventsPath) : new Set<string>();
+      const hasEvents = regularFileExists(eventsPath);
+      const hostEvidence = hasEvents
+        ? hostSessionIds(eventsPath)
+        : { ids: new Set<string>(), complete: false };
       const workflow = workflowArtifacts(runDirectory, attemptDirectory, execution.taskId, execution.arm);
       for (const entry of workflow.workflows) {
         const key = `${entry.scope.taskId}\0${entry.scope.arm}\0${entry.workflowId}`;
         if (!seenWorkflows.has(key)) workflows.push(entry);
         seenWorkflows.add(key);
       }
-      for (const path of files(join(attemptDirectory, 'codex_sessions'), (name) => /^rollout-.*\.jsonl$/.test(name))) {
+      const sessionPaths = files(join(attemptDirectory, 'codex_sessions'), (name) => /^rollout-.*\.jsonl$/.test(name));
+      if (!hostEvidence.complete || sessionPaths.length === 0) {
+        const key = `${execution.taskId}\0${execution.arm}`;
+        if (!missingHostTelemetry.has(key)) {
+          missingHostTelemetry.add(key);
+          annotations.push({
+            code: 'host-telemetry-missing',
+            scope: { kind: 'task-arm', taskId: execution.taskId, arm: execution.arm },
+          });
+        }
+      }
+      for (const path of sessionPaths) {
         const relativePath = portable(runDirectory, path);
         if (seenRollouts.has(relativePath)) continue;
         seenRollouts.add(relativePath);
         const id = sessionId(path);
-        const host = execution.arm === 'a' || (id !== null && hosts.has(id));
+        const host = execution.arm === 'a' || (id !== null && hostEvidence.ids.has(id));
         const backend = host ? 'codex' : id === null ? null : workflow.backends.get(id) ?? null;
         rollouts.push({
           scope: { taskId: execution.taskId, arm: execution.arm },
@@ -156,5 +207,12 @@ export function indexFeatureBenchMetrics(
       }
     }
   }
-  return { rollouts, workflows, timings: [], annotations: [], failures: [] };
+  return {
+    rollouts,
+    workflows,
+    timings: [],
+    annotations,
+    failures: [],
+    pricingEvidenceIncomplete: missingHostTelemetry.size > 0,
+  };
 }

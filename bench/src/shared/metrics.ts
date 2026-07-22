@@ -78,6 +78,8 @@ export interface MetricsArtifactIndex {
   timings: readonly TimingObservation[];
   annotations: readonly Annotation[];
   failures: readonly FailureObservation[];
+  /** True when a suite knows potentially billable usage artifacts are absent. */
+  pricingEvidenceIncomplete?: boolean;
 }
 
 export interface TokenUsage {
@@ -711,7 +713,7 @@ export function normalizeMetrics(options: NormalizeMetricsOptions): NormalizedMe
   const failures = index.failures.map((failure) => failureObservationSchema.parse(failure));
   const parsedSessions: ParsedRollout[] = [];
   const sessions: NormalizedSessionMetrics[] = [];
-  let pricingUsageIncomplete = false;
+  let pricingUsageIncomplete = index.pricingEvidenceIncomplete === true;
   let unparsedRollouts = 0;
   for (const artifact of index.rollouts) {
     try {

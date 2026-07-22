@@ -58,11 +58,13 @@ The operator provisions a broker container and dedicated Docker network before
   own upstream egress, credential injection, scoping, and request validation.
 
 Only hashes of the public broker identity, public version, runtime
-configuration, and restricted-network policy enter the manifest. Runtime URL
-and Docker names live only in a private `0600` temporary config that is removed
-after execution. The containing `0700` runtime home has an exact run/arm/nonce
-marker; the next run removes matching hard-crash orphans before writing a new
-runtime config and refuses malformed lookalikes.
+configuration, and restricted-network policy enter host-owned manifests and
+receipts. Runtime URL and Docker names also enter a private `0600` temporary
+config that is removed after execution. Copied native Codex and Ultracode
+telemetry is untrusted, potentially retains those runtime identifiers, and
+must be handled as sensitive. The containing `0700` runtime home has an exact
+run/arm/nonce marker; the next run removes matching hard-crash orphans before
+writing a new runtime config and refuses malformed lookalikes.
 
 One UID-scoped policy lock below `/tmp/ultracode-bench-<uid>/.locks/` covers
 preflight, inference, evaluation, and cleanup across separate worktrees. This

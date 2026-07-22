@@ -535,6 +535,17 @@ describe('normalized aggregation invariants', () => {
       .map(({ code }) => code)).not.toContain('model-unobserved');
   });
 
+  it('keeps configured pricing partial when a suite reports missing billable evidence', () => {
+    const metrics = normalizeMetrics({
+      runDirectory: root(),
+      index: { ...emptyMetricsArtifactIndex(), pricingEvidenceIncomplete: true },
+      requested: { model: 'gpt-test', effort: 'high' },
+      policy,
+      pricing,
+    });
+    expect(metrics.pricing).toEqual({ currency: 'USD', verification: 'partial', billableCost: 0 });
+  });
+
   it('rejects duplicate paths and same-scope session ids, but permits ids across scopes', () => {
     const runDirectory = root();
     const first = put(runDirectory, 'native/rollout-one.jsonl', jsonl(
