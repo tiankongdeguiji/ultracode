@@ -336,6 +336,7 @@ describe('benchmark process boundary', () => {
     }
     expect(failure).toBeInstanceOf(BenchProcessError);
     expect((failure as Error).message).toMatch(/timed out/);
+    expect((failure as BenchProcessError).failureKind).toBe('timeout');
     expect((failure as BenchProcessError).result.stdout).toBe('x'.repeat(13));
     expect((failure as BenchProcessError).result.stderr).toBe('');
     expect(target.writableEnded).toBe(false);

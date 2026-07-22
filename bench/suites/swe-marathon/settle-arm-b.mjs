@@ -8,7 +8,10 @@ import { isResumableStatus } from '/opt/bench/ultracode/dist/store/manifest.js';
 
 const home = process.env.ULTRACODE_HOME;
 const waitSeconds = Number(process.env.MARATHON_WAIT_SECONDS);
-const runnerEntry = '/opt/bench/ultracode/dist/cli/main.js';
+const RUNNER_ENTRY = '/opt/bench/ultracode/dist/cli/main.js';
+const RUN_ID_PATTERN = /^wf_[a-z0-9-]{6,}$/u;
+const MAXIMUM_RUNS = 256;
+const STOP_CONCURRENCY = 4;
 if (!home || !Number.isSafeInteger(waitSeconds) || waitSeconds < 1) {
   process.stderr.write('Arm B settlement environment is invalid\n');
   process.exit(1);
@@ -21,10 +24,13 @@ const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mil
 function runIds() {
   const runs = join(home, 'runs');
   if (!existsSync(runs)) return [];
-  return readdirSync(runs, { withFileTypes: true })
+  const ids = readdirSync(runs, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
+  if (ids.length > MAXIMUM_RUNS) throw new Error(`Arm B run count exceeds ${MAXIMUM_RUNS}`);
+  if (ids.some((runId) => !RUN_ID_PATTERN.test(runId))) throw new Error('Arm B run store has an invalid run id');
+  return ids;
 }
 
 function observed() {
@@ -42,7 +48,7 @@ function runnerProcesses() {
       const runner = argv.indexOf('__runner');
       const option = argv.indexOf('--run-dir', runner + 1);
       const stat = readProcStat(pid);
-      return argv.includes(runnerEntry) && runner !== -1 && option !== -1
+      return argv.includes(RUNNER_ENTRY) && runner !== -1 && option !== -1
         && expectedDirectories.has(argv[option + 1] ?? '') && stat
         ? [{ pid, starttime: stat.starttime }]
         : [];
@@ -111,6 +117,24 @@ function stop(runId, deadline) {
   });
 }
 
+async function stopRuns(runIdsToStop, deadline) {
+  const results = new Array(runIdsToStop.length);
+  let next = 0;
+  async function worker() {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= runIdsToStop.length) return;
+      results[index] = await stop(runIdsToStop[index], deadline);
+    }
+  }
+  await Promise.all(Array.from(
+    { length: Math.min(STOP_CONCURRENCY, runIdsToStop.length) },
+    () => worker(),
+  ));
+  return results;
+}
+
 let runs = observed();
 if (runs.length === 0) {
   process.stderr.write('Arm B did not start an ultracode run\n');
@@ -139,7 +163,7 @@ while (Date.now() < deadline) {
     if (runIds().every((runId) => verified.has(runId))) break;
     continue;
   }
-  const results = await Promise.all(pending.map((runId) => stop(runId, deadline)));
+  const results = await stopRuns(pending, deadline);
   if (results.some((result) => !result.ok)) {
     process.stderr.write('Arm B could not verify workflow worker-group cleanup\n');
     process.exit(1);

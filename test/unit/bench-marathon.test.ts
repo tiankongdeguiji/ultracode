@@ -17,6 +17,7 @@ import type { BenchPathRoots } from '../../bench/src/shared/contracts.js';
 import { artifactKey } from '../../bench/src/shared/paths.js';
 import type { SweMarathonManifest } from '../../bench/src/shared/manifest.js';
 import { sha256File } from '../../bench/src/shared/provenance.js';
+import { BenchProcessError } from '../../bench/src/shared/process.js';
 import { sweMarathonAdapter } from '../../bench/src/suites/swe-marathon/adapter.js';
 import {
   assertMarathonRuntimeBinding,
@@ -50,6 +51,7 @@ import {
   harborEvidenceInvocationId,
   hasCompleteHarborReceipt,
   marathonRunScope,
+  marathonProcessFailure,
   marathonTaskInputs,
   marathonTaskFailure,
   planHarborRun,
@@ -476,12 +478,17 @@ describe('native Harbor evidence', () => {
       .toEqual(new Set([noOpInvocation]));
 
     const source = readFileSync(resolve('bench/src/suites/swe-marathon/runner.ts'), 'utf8');
+    const begin = source.indexOf('const attemptId = await beginAttempt(');
+    const launch = source.indexOf('await runBenchProcess(', begin);
     const outcomeAt = source.indexOf('const evidence = indexHarborEvidence(directory, identity, invocationId);');
     const outcomeBlock = source.slice(outcomeAt, source.indexOf('output(context,', outcomeAt));
+    expect(begin).toBeGreaterThan(0);
+    expect(begin).toBeLessThan(launch);
     expect(outcomeAt).toBeGreaterThan(0);
-    expect(outcomeBlock.indexOf('await recordAttempt(state,')).toBeGreaterThan(0);
-    expect(outcomeBlock.indexOf('await updateReceipt(receipt, identity, evidence.bindings);'))
-      .toBeGreaterThan(outcomeBlock.indexOf('await recordAttempt(state,'));
+    expect(outcomeBlock.indexOf('await updateReceipt(receipt, identity, evidence.bindings);')).toBeGreaterThan(0);
+    expect(outcomeBlock.indexOf('await finalizeAttempt(state, attemptId,'))
+      .toBeGreaterThan(outcomeBlock.indexOf('await updateReceipt(receipt, identity, evidence.bindings);'));
+    expect(source).toContain("['receipt-reconciled']");
   });
 
   it('binds exact identity-valid VerifierTimeoutError evidence without a reward', () => {
@@ -562,6 +569,14 @@ describe('native Harbor evidence', () => {
       } },
     };
     expect(() => validateHarborJobConfig(config, identity)).toThrow(/one attempt/);
+  });
+
+  it('classifies the outer watchdog from structured process supervision', () => {
+    const result = { stdout: '', stderr: 'native verifier timed out', exitCode: 1, signal: null, elapsedMs: 1 };
+    expect(marathonProcessFailure(new BenchProcessError('harbor exited 1: native verifier timed out', result, 'exit')))
+      .toBe('native-runner-failed');
+    expect(marathonProcessFailure(new BenchProcessError('harbor timed out', result, 'timeout')))
+      .toBe('driver-watchdog');
   });
 
   it('pins resume to the exact previously receipt-bound native config', () => {
@@ -683,7 +698,11 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     put(join(fixture.trial, 'agent', 'sessions', `rollout-${firstSession}.jsonl`), '{}\n');
     rmSync(join(fixture.root, ...fixture.identity.jobRelativeRoot.split('/'), 'result.json'));
     rmSync(join(fixture.trial, 'result.json'));
-    expect(indexSweMarathonMetrics(fixture.manifest, fixture.root).rollouts).toHaveLength(1);
+    expect(indexSweMarathonMetrics(fixture.manifest, fixture.root).rollouts).toMatchObject([{
+      roleHint: 'host',
+      backend: 'codex',
+      billingClass: 'billable',
+    }]);
 
     const archiveId = '22222222-2222-4222-8222-222222222222';
     const archive = join(fixture.root, 'native', 'attempts', archiveId, artifactKey(fixture.identity.taskId));
@@ -749,7 +768,10 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(() => execFileSync(process.execPath, ['--check', settlement])).not.toThrow();
     const settlementSource = readFileSync(settlement, 'utf8');
     expect(settlementSource).toContain('isRunnerAlive');
+    expect(settlementSource).toContain('const MAXIMUM_RUNS = 256');
+    expect(settlementSource).toContain('const STOP_CONCURRENCY = 4');
+    expect(settlementSource).toContain('RUN_ID_PATTERN.test(runId)');
     expect(settlementSource).toContain("process.stderr.write('Arm B could not verify workflow process absence\\n')");
-    expect(settlementSource).toContain('await Promise.all(pending.map((runId) => stop(runId, deadline)))');
+    expect(settlementSource).toContain('const results = await stopRuns(pending, deadline)');
   });
 });

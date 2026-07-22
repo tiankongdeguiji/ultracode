@@ -137,22 +137,21 @@ export function indexSweMarathonMetrics(
       const lifecycle = existsSync(join(runDirectory, ...lifecyclePath.split('/')))
         ? json(runDirectory, lifecyclePath)
         : null;
-      const hostSessionId = typeof lifecycle?.host_session_id === 'string' ? lifecycle.host_session_id : null;
       const workflow = workflowIndex(runDirectory, agentDirectory, execution.taskId, execution.arm);
       workflows.push(...workflow.workflows);
-      const sessionPaths = ['sessions', 'worker-sessions'].flatMap((directory) =>
-        files(join(agentDirectory, directory), (name) => /^rollout-.*\.jsonl$/.test(name)));
-      for (const path of sessionPaths) {
-        const id = sessionId(path);
-        const host = execution.arm === 'a' || id === hostSessionId;
-        const backend = host ? 'codex' : id === null ? null : workflow.sessionBackends.get(id) ?? null;
-        rollouts.push({
-          scope: { taskId: execution.taskId, arm: execution.arm },
-          path: portable(runDirectory, path),
-          roleHint: host ? 'host' : 'worker',
-          backend,
-          billingClass: backend === 'mock' ? 'mock' : backend === null ? 'unknown' : 'billable',
-        });
+      for (const directory of ['sessions', 'worker-sessions'] as const) {
+        for (const path of files(join(agentDirectory, directory), (name) => /^rollout-.*\.jsonl$/.test(name))) {
+          const id = sessionId(path);
+          const host = directory === 'sessions';
+          const backend = host ? 'codex' : id === null ? null : workflow.sessionBackends.get(id) ?? null;
+          rollouts.push({
+            scope: { taskId: execution.taskId, arm: execution.arm },
+            path: portable(runDirectory, path),
+            roleHint: host ? 'host' : 'worker',
+            backend,
+            billingClass: backend === 'mock' ? 'mock' : backend === null ? 'unknown' : 'billable',
+          });
+        }
       }
       const observedInvocation = invocationId(state, execution.taskId, execution.arm, jobRoot);
       if (observedInvocation !== null

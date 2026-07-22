@@ -47,12 +47,13 @@ daemon. Resume accepts only the exact native job config previously bound to the
 manifest-scoped receipt; redo starts from the immutable plan while retaining the
 old native tree for cumulative paid-usage accounting. Incomplete verifier output
 never becomes score evidence, but an identity-valid trial config is sufficient
-to retain telemetry after a crash. Arm B writes non-secret workflow/session
-telemetry incrementally to Harbor's host-mounted agent directory while keeping
-the copied credential in a container-local temporary home. Before verification,
-the bridge independently discovers and terminates matching live runners, invokes
-bounded worker-group cleanup for every run, and rejects any lifecycle whose
-process absence cannot be verified.
+to retain telemetry after a crash. Arm B writes untrusted, potentially sensitive
+workflow/session telemetry incrementally to Harbor's host-mounted agent
+directory while keeping the harness-created credential copy in a container-local
+temporary home. Operators must scan retained telemetry for task-persisted secrets
+before wider access. Before verification, the bridge independently discovers and
+terminates matching live runners, invokes bounded worker-group cleanup for every
+run, and rejects any lifecycle whose process absence cannot be verified.
 
 ### SWE-bench Pro
 

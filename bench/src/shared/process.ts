@@ -77,6 +77,8 @@ export interface BenchProcessResult {
   elapsedMs: number;
 }
 
+export type BenchProcessFailureKind = 'timeout' | 'exit' | 'signal' | 'descendant-cleanup' | 'output-forwarding';
+
 /** Build a minimal child environment without forwarding ambient credentials. */
 export function allowlistedEnvironment(
   source: NodeJS.ProcessEnv,
@@ -104,6 +106,7 @@ export class BenchProcessError extends Error {
   constructor(
     message: string,
     readonly result: Omit<BenchProcessResult, 'exitCode'> & { exitCode: number | null },
+    readonly failureKind: BenchProcessFailureKind = 'exit',
   ) {
     super(message);
     this.name = 'BenchProcessError';
@@ -473,12 +476,14 @@ export async function runBenchProcess(
       throw new BenchProcessError(
         `${command} descendant cleanup failed`,
         { ...output, exitCode: termination.code },
+        'descendant-cleanup',
       );
     }
     if (outputDrainFailure !== null) {
       throw new BenchProcessError(
         `${command} output forwarding failed: ${sanitizeDiagnostic(outputDrainFailure.message)}`,
         { ...output, exitCode: termination.code },
+        'output-forwarding',
       );
     }
     if (termination.code === 0 && !timedOut) return output;
@@ -491,6 +496,7 @@ export async function runBenchProcess(
     throw new BenchProcessError(
       `${command} ${reason}${diagnostic ? `: ${diagnostic}` : ''}`,
       { ...output, exitCode: termination.code },
+      timedOut ? 'timeout' : termination.code === null ? 'signal' : 'exit',
     );
   } finally {
     timeout?.clear();

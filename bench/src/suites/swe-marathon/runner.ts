@@ -775,36 +775,63 @@ async function updateReceipt(
   ]);
 }
 
-async function recordAttempt(
+async function beginAttempt(
   state: BenchRunStateStore,
   invocationId: string,
   identity: HarborExecutionIdentity,
   startedAt: Date,
-  endedAt: Date,
-  elapsedMs: number,
-  failure: FailureCode | null,
   nativePath: string,
-): Promise<void> {
+): Promise<string> {
+  const attemptId = randomUUID();
   await state.updateCurrent((current) => ({
     ...current,
     attempts: [...current.attempts, {
-      attemptId: randomUUID(),
+      attemptId,
       invocationId,
       taskId: identity.taskId,
       arm: identity.arm,
       ordinal: current.attempts.filter((attempt) => attempt.taskId === identity.taskId && attempt.arm === identity.arm).length + 1,
       phase: 'session',
       startedAt: startedAt.toISOString(),
-      endedAt: endedAt.toISOString(),
-      elapsedMs,
+      endedAt: null,
+      elapsedMs: null,
       nativePath: validateRelativeArtifactPath(nativePath),
-      exitCode: failure === null ? 0 : 1,
+      exitCode: null,
       signal: null,
-      status: failure === null ? 'succeeded' : 'failed',
-      failures: failure === null ? [] : [failure],
+      status: 'running',
+      failures: [],
       annotations: [],
     }],
   }));
+  return attemptId;
+}
+
+async function finalizeAttempt(
+  state: BenchRunStateStore,
+  attemptId: string,
+  endedAt: Date,
+  elapsedMs: number | null,
+  failure: FailureCode | null,
+  annotations: readonly string[] = [],
+): Promise<void> {
+  await state.updateCurrent((current) => {
+    const attempt = current.attempts.find((candidate) => candidate.attemptId === attemptId);
+    if (attempt === undefined || attempt.status !== 'running') {
+      throw new Error(`cannot finalize non-running SWE-Marathon attempt ${attemptId}`);
+    }
+    return {
+      ...current,
+      attempts: current.attempts.map((candidate) => candidate.attemptId === attemptId ? {
+        ...candidate,
+        endedAt: endedAt.toISOString(),
+        elapsedMs,
+        exitCode: failure === null ? 0 : 1,
+        status: failure === null ? 'succeeded' as const : 'failed' as const,
+        failures: failure === null ? [] : [failure],
+        annotations: [...annotations],
+      } : candidate),
+    };
+  });
 }
 
 /** Reconcile Harbor terminal evidence without relabeling the outer process watchdog. */
@@ -819,6 +846,17 @@ export function marathonTaskFailure(
     return 'verifier-output-missing';
   }
   return processFailure;
+}
+
+/** Classify process supervision from its structured cause, never diagnostic text. */
+export function marathonProcessFailure(error: unknown): FailureCode {
+  if (error instanceof BenchProcessError) {
+    if (error.failureKind === 'timeout') return 'driver-watchdog';
+    if (error.failureKind === 'descendant-cleanup') return 'descendant-cleanup-failed';
+  }
+  return /auth|credential|unauthorized|forbidden/iu.test(error instanceof Error ? error.message : String(error))
+    ? 'auth-failed'
+    : 'native-runner-failed';
 }
 
 async function runTask(
@@ -845,18 +883,44 @@ async function runTask(
   const plan = planHarborRun(context.paths, directory, manifest, common, taskId, resumeNativeJob);
   if (resumeNativeJob) validateHarborResume(directory, identity, receipt.load().bindings);
   if (resumeNativeJob) {
+    const currentState = state.load();
     const evidenceInvocationId = harborEvidenceInvocationId(
-      state.load(),
+      currentState,
       identity.taskId,
       identity.arm,
       invocationId,
     );
     const existingEvidence = indexHarborEvidence(directory, identity, evidenceInvocationId);
+    const pendingAttempt = [...currentState.attempts].reverse().find((attempt) =>
+      attempt.taskId === identity.taskId && attempt.arm === identity.arm && attempt.phase === 'session'
+      && attempt.invocationId === evidenceInvocationId && attempt.status === 'running');
     if (existingEvidence.nativeResult.verification === 'verified' || existingEvidence.terminalFailure !== null) {
-      assertTerminalHarborEvidencePinned(identity, existingEvidence.bindings, receipt.load().bindings);
+      try {
+        assertTerminalHarborEvidencePinned(identity, existingEvidence.bindings, receipt.load().bindings);
+      } catch (error) {
+        if (pendingAttempt !== undefined) {
+          await finalizeAttempt(state, pendingAttempt.attemptId, context.clock.now(), null,
+            'native-runner-failed', ['receipt-reconciled']);
+        }
+        throw error;
+      }
+      if (pendingAttempt !== undefined) {
+        await finalizeAttempt(
+          state,
+          pendingAttempt.attemptId,
+          context.clock.now(),
+          null,
+          marathonTaskFailure(null, existingEvidence),
+          ['receipt-reconciled'],
+        );
+      }
       await updateReceipt(receipt, identity, existingEvidence.bindings);
       output(context, `${taskId} ${identity.arm}: already ${existingEvidence.terminalFailure ?? 'verified'}`);
       return;
+    }
+    if (pendingAttempt !== undefined) {
+      await finalizeAttempt(state, pendingAttempt.attemptId, context.clock.now(), null,
+        'native-runner-failed', ['receipt-reconciled']);
     }
   }
   const runtimeNonce = randomBytes(32).toString('hex');
@@ -870,6 +934,13 @@ async function runTask(
   const activeKey = `${rootScope}\0${manifest.runId}\0${taskId}\0${identity.arm}\0${runtimeNonce}`;
   const startedAt = context.clock.now();
   const startedMs = performance.now();
+  const attemptId = await beginAttempt(
+    state,
+    invocationId,
+    identity,
+    startedAt,
+    identity.jobRelativeRoot,
+  );
   let failure: FailureCode | null = null;
   let tracked = false;
   const lifecycle = state.lifecycleHooks(invocationId);
@@ -894,13 +965,7 @@ async function runTask(
       ...lifecycle,
     });
   } catch (error) {
-    failure = error instanceof BenchProcessError && /timed out/u.test(error.message)
-      ? 'driver-watchdog'
-      : error instanceof BenchProcessError && /descendant cleanup failed/u.test(error.message)
-        ? 'descendant-cleanup-failed'
-      : /auth|credential|unauthorized|forbidden/iu.test(error instanceof Error ? error.message : String(error))
-        ? 'auth-failed'
-        : 'native-runner-failed';
+    failure = marathonProcessFailure(error);
   } finally {
     let cleanupFailure: unknown;
     try {
@@ -914,9 +979,9 @@ async function runTask(
     const evidence = indexHarborEvidence(directory, identity, invocationId);
     failure = marathonTaskFailure(failure, evidence);
     const endedAt = context.clock.now();
-    await recordAttempt(state, invocationId, identity, startedAt, endedAt,
-      Math.max(0, performance.now() - startedMs), failure, identity.jobRelativeRoot);
     await updateReceipt(receipt, identity, evidence.bindings);
+    await finalizeAttempt(state, attemptId, endedAt,
+      Math.max(0, performance.now() - startedMs), failure);
     output(context, `${taskId} ${identity.arm}: ${evidence.nativeResult.verification}${failure ? ` (${failure})` : ''}`);
     if (cleanupFailure !== undefined) throw cleanupFailure;
   }

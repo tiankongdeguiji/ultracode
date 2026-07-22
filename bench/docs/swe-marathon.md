@@ -59,12 +59,15 @@ as `driver-watchdog`, not as a native verifier timeout.
 Arm A uses Harbor's built-in `codex` agent. Arm B uses
 `bench/suites/swe-marathon/arm_b_codex.py`, the same exact prefix asset used by
 other suites, and the read-only shared toolchain. The bridge chooses neither
-model nor effort. It waits for detached workflows using Ultracode's effective
-status and requires a resumable terminal state. Orphaned or cleanup-failed runs
-trigger concurrent bounded stops; artifacts are not copied until worker absence
-is verified. It then preserves worker rollouts and the run store and writes only
-`arm_b_lifecycle.json`. Shared TypeScript
-metrics code is the sole public token aggregator.
+model nor effort. Worker rollouts and the run store are written incrementally to
+Harbor's host-mounted agent logs and must be treated as untrusted, potentially
+sensitive artifacts. The bridge bounds and validates the workflow inventory,
+independently discovers exact live runner commands through procfs, terminates
+them with PID-start checks, and invokes the engine's bounded worker cleanup with
+fixed concurrency. It proceeds only after process absence is verified and then
+writes `arm_b_lifecycle.json`. Shared TypeScript metrics code is the sole public
+token aggregator; source-directory provenance keeps interrupted host rollouts
+billable even when lifecycle metadata was never written.
 
 Reporting indexes only the manifest-declared job and its single direct-child
 trial. It validates task, job, trial, arm, model, effort, one-attempt/no-retry

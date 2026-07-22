@@ -1855,7 +1855,7 @@ function errorCauses(error: unknown): unknown[] {
 export function sessionFailure(error: unknown): FailureCode {
   const causes = errorCauses(error);
   const descendantFailure = causes.find((cause) =>
-    cause instanceof BenchProcessError && /descendant cleanup failed/u.test(cause.message));
+    cause instanceof BenchProcessError && cause.failureKind === 'descendant-cleanup');
   if (descendantFailure !== undefined) return 'descendant-cleanup-failed';
   if (error instanceof ArtifactUnsafeError) return 'artifact-unsafe';
   const message = error instanceof Error ? error.message : String(error);
