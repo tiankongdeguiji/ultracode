@@ -86,7 +86,7 @@ function runSettlementScenario(scenario: string): { status: number | null; stops
   const countFile = join(root, 'stop-count.txt');
   mkdirSync(join(home, 'runs', 'wf_abcdef'), { recursive: true });
   const production = readFileSync(resolve('bench/suites/swe-marathon/settle-arm-b.mjs'), 'utf8');
-  const script = production
+  let script = production
     .replace("import { spawn } from 'node:child_process';", "import { spawn } from './stub.mjs';")
     .replace(
       "import { readProcStat } from '/opt/bench/ultracode/dist/exec/procinfo.js';",
@@ -100,6 +100,11 @@ function runSettlementScenario(scenario: string): { status: number | null; stops
       "import { isResumableStatus } from '/opt/bench/ultracode/dist/store/manifest.js';",
       "import { isResumableStatus } from './stub.mjs';",
     );
+  const processScanStart = script.indexOf('function runnerProcesses() {');
+  const processScanEnd = script.indexOf('\n}\n\nfunction runnerAlive', processScanStart);
+  expect(processScanStart).toBeGreaterThan(0);
+  expect(processScanEnd).toBeGreaterThan(processScanStart);
+  script = `${script.slice(0, processScanStart)}function runnerProcesses() { return []; }${script.slice(processScanEnd + 2)}`;
   put(join(root, 'settle.mjs'), script);
   put(join(root, 'stub.mjs'), `
 import { EventEmitter } from 'node:events';
