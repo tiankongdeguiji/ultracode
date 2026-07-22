@@ -55,5 +55,30 @@
     "timeouts": {
       "taskMs": 43200000
     }
+  },
+  "featureBench": {
+    "model": "gpt-5.2-codex",
+    "requestedEffort": "high",
+    "arm": "a",
+    "taskIds": [
+      "operator-selected-featurebench-task"
+    ],
+    "broker": {
+      "publicIdentity": "operator-supplied-broker-identity",
+      "publicVersion": "operator-supplied-broker-version"
+    },
+    "concurrency": {
+      "inference": 4,
+      "evaluation": 4
+    },
+    "timeouts": {
+      "inferenceMs": 43200000,
+      "evaluationMs": 21600000
+    },
+    "resources": {
+      "cpus": 8,
+      "memoryBytes": 25769803776,
+      "pids": 4096
+    }
   }
 }

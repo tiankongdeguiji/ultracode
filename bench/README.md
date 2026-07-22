@@ -1,8 +1,8 @@
 # Benchmark harness
 
 This harness compares stock Codex (Arm A) with Codex plus Ultracode (Arm B)
-on pinned software-engineering suites and their native verifiers. SWE-bench Pro
-and SWE-Marathon share the benchmark foundation for immutable manifests,
+on pinned software-engineering suites and their native verifiers. SWE-bench Pro,
+SWE-Marathon, and FeatureBench share the benchmark foundation for immutable manifests,
 leases, hash-chained run state, process recovery, provenance, metrics, verifier
 receipts, and reports.
 
@@ -14,6 +14,8 @@ receipts, and reports.
   reviewed Linux/glibc or macOS target; it does not require `uv` or GNU `patch`.
 - SWE-Marathon preparation requires Linux x64 with a Linux amd64 Docker daemon,
   plus `uv` and GNU `patch`.
+- FeatureBench preparation requires Linux x64 with a Linux amd64 Docker daemon,
+  plus `uv`.
 - A local standalone Linux-x64 Codex ELF selected by `toolchain.codexBinary`;
   this is required on macOS too and is never fetched by preparation.
 - Network access while fetching pinned sources, Python artifacts, and task
@@ -22,8 +24,9 @@ receipts, and reports.
 Copy `bench/bench.example.config.json` to the ignored, operator-owned
 `bench/bench.config.json`, fill in the selected suite's model, authentication,
 and public infrastructure identity fields, and set its mode to `0600`.
-SWE-bench Pro runtime relay URLs and Docker network names are supplied through
-the environment and never belong in the config file.
+SWE-bench Pro runtime relay and FeatureBench credential-broker URLs and Docker
+network names are supplied through the environment and never belong in the
+config file.
 
 ## CLI
 
@@ -34,6 +37,7 @@ npm run bench -- --help
 npm run bench -- --suite swebench-pro --help
 npm run bench -- --suite swebench-pro <fetch|prep|run|eval|report|status|clean> [options]
 npm run bench -- --suite swe-marathon <prep|run|report> [options]
+npm run bench -- --suite featurebench <prep|run|report> [options]
 ```
 
 A typical pilot is:
@@ -57,6 +61,17 @@ CODEX_AUTH_JSON_PATH=/path/to/auth.json \
 npm run bench -- --suite swe-marathon run --run-id marathon-a1 \
   --model <model> --effort <effort> --arm a --task-id zstd-decoder
 npm run bench -- --suite swe-marathon report --run-id marathon-a1
+```
+
+A FeatureBench pilot also freezes exactly one arm per run:
+
+```bash
+npm run bench -- --suite featurebench prep
+FEATUREBENCH_CREDENTIAL_BROKER_URL=https://broker.internal/v1 \
+FEATUREBENCH_RESTRICTED_NETWORK=featurebench-private \
+npm run bench -- --suite featurebench run --run-id feature-b1 \
+  --model <model> --effort <effort> --arm b --task-id <featurebench-task>
+npm run bench -- --suite featurebench report --run-id feature-b1
 ```
 
 The native evaluator is the sole score authority. Agent success, a captured
@@ -109,6 +124,17 @@ job so available usage telemetry remains cumulative. Pricing can be partial;
 `billableCost` is the verified subtotal and excludes unknown worker usage. See
 the suite guide for its distinct credential and native-evidence boundary.
 
+### FeatureBench persistence
+
+FeatureBench uses a schema-v2 manifest for exactly one arm. Preparation pins
+the upstream source, Python environment, Codex patch, official dataset revision,
+and the reviewed complete task/image inventory. Resume re-attests that exact
+prepared identity; targeted redo invalidates only the selected task evidence
+while preserving still-attributable evidence for untouched tasks. Official
+per-task `pass_rate` remains distinct from `resolved`, and the run-level
+`attempt_1.pass_rate` is the native headline only when the complete receipt set
+binds the official evaluation bytes.
+
 ## Model isolation
 
 SWE-bench Pro has no direct ChatGPT/API-key mode. Task containers receive no
@@ -141,6 +167,16 @@ benchmark accounts must be disposable, narrowly scoped, and protected by
 independently restricted egress. Treat retained output as sensitive. See the
 [SWE-Marathon guide](docs/swe-marathon.md) for pins, lifecycle rules, and native
 evidence requirements.
+
+## FeatureBench boundary
+
+FeatureBench task containers receive no reusable provider credential. They run
+on a dedicated internal Docker network whose sole pre-existing endpoint must be
+a separately managed, labeled HTTPS credential broker. A host-wide policy lock
+covers broker-only topology inspection, inference, official evaluation, and
+cleanup. The broker remains trusted to scope credentials, validate requests,
+and control its upstream egress. See the [FeatureBench guide](docs/featurebench.md)
+for pins, redo semantics, score interpretation, and the exact isolation boundary.
 
 ## Development
 

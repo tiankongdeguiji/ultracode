@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "kind": "ultracode-featurebench-dataset-pin",
+  "dataset": "LiberCoders/FeatureBench",
+  "revision": "e99d6efdfe511ea832c1b5735c536129561ec96a",
+  "split": "fast",
+  "taskCount": 100,
+  "inventorySha256": "4eed1b33a6783154287a0dd8281212b4096b93659a35a4f8b0ebde38d99d916f",
+  "sourceParquetSha256": "e8a704f83d673e1cc78086eefb76bd56461ead8a65ca06fd6972f7363be8a775"
+}

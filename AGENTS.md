@@ -19,7 +19,7 @@ Canonical instructions for AI coding agents here. `CLAUDE.md` imports this file;
 
 ## Benchmark Harness
 
-- Run registered suites with `npm run bench -- --suite <swebench-pro|swe-marathon> ...`; see `bench/README.md` and the suite guides under `bench/docs/`. Shared multi-suite contracts live under `bench/src/shared/`. Use `npm run bench:check`; never commit `bench/.cache/`, `bench/results/`, or `bench/bench.config.json`. Live runs are manual and spend tokens.
+- Run registered suites with `npm run bench -- --suite <swebench-pro|swe-marathon|featurebench> ...`; see `bench/README.md` and the suite guides under `bench/docs/`. Shared multi-suite contracts live under `bench/src/shared/`. Use `npm run bench:check`; never commit `bench/.cache/`, `bench/results/`, or `bench/bench.config.json`. Live runs are manual and spend tokens.
 
 ## Testing
 

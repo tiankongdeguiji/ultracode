@@ -173,6 +173,7 @@ export const featureBenchSuiteConfigSchema = z.strictObject({
   resources: z.strictObject({
     cpus: z.number().finite().positive(),
     memoryBytes: z.number().int().positive(),
+    pids: z.number().int().positive(),
   }),
   policies: z.strictObject({
     promptSha256: sha256Schema,
