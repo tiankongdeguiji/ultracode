@@ -662,9 +662,9 @@ export async function runOfficialEvaluator(options: RunEvaluatorOptions): Promis
     });
   } catch (error) {
     exitCode = error instanceof BenchProcessError ? error.result.exitCode ?? -1 : -1;
-    processFailure = error instanceof BenchProcessError && /timed out/.test(error.message)
+    processFailure = error instanceof BenchProcessError && error.failureKind === 'timeout'
       ? 'verifier-timeout'
-      : error instanceof BenchProcessError && /descendant cleanup failed/.test(error.message)
+      : error instanceof BenchProcessError && error.failureKind === 'descendant-cleanup'
         ? 'descendant-cleanup-failed'
       : 'verifier-process-failed';
   } finally {

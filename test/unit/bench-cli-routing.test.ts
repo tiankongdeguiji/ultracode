@@ -72,6 +72,12 @@ describe('unified benchmark CLI routing', () => {
       command: 'report',
       argv: ['--run-id', 'trial1'],
     });
+    expect(parseBenchCliRoute(['--suite', 'swe-marathon', 'run', '--run-id', 'marathon1'])).toEqual({
+      kind: 'command',
+      suite: 'swe-marathon',
+      command: 'run',
+      argv: ['--run-id', 'marathon1'],
+    });
     expect(() => parseBenchCliRoute(['swebench-pro', 'run'])).toThrow(/--suite must precede/);
     expect(() => parseBenchCliRoute(['run', '--suite', 'swebench-pro'])).toThrow(/--suite must precede/);
     expect(() => parseBenchCliRoute(['--suite', 'swebench-pro', 'run', '--suite', 'swebench-pro'])).toThrow(
@@ -448,7 +454,7 @@ describe.skipIf(SUBPROCESS_BLOCKED)('benchmark executable boundary', () => {
     if (root.error) throw root.error;
     expect(root.status).toBe(0);
     expect(root.stderr).toBe('');
-    expect(root.stdout).toContain('npm run bench -- --suite <swebench-pro>');
+    expect(root.stdout).toContain('npm run bench -- --suite <swebench-pro|swe-marathon>');
 
     for (const argv of [
       ['--suite', 'swebench-pro', '--help'],

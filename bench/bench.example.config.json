@@ -39,5 +39,21 @@
       "pipIndex": "https://pypi.org/simple"
     },
     "sanitizeGitHistory": true
+  },
+  "sweMarathon": {
+    "model": "gpt-5.2-codex",
+    "requestedEffort": "high",
+    "arm": "a",
+    "taskIds": [
+      "zstd-decoder"
+    ],
+    "auth": {
+      "mechanism": "chatgpt",
+      "publicIdentity": "operator-supplied-chatgpt-account"
+    },
+    "workflowWaitMs": 3300000,
+    "timeouts": {
+      "taskMs": 43200000
+    }
   }
 }

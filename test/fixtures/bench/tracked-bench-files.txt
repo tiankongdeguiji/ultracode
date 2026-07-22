@@ -19,6 +19,14 @@ bench/src/shared/run-state-ledger.ts
 bench/src/shared/run-state.ts
 bench/src/shared/toolchain.ts
 bench/src/shared/verifier.ts
+bench/src/suites/swe-marathon/adapter.ts
+bench/src/suites/swe-marathon/auth.ts
+bench/src/suites/swe-marathon/config.ts
+bench/src/suites/swe-marathon/prepare.ts
+bench/src/suites/swe-marathon/provenance.ts
+bench/src/suites/swe-marathon/runner.ts
+bench/src/suites/swe-marathon/telemetry.ts
+bench/src/suites/swe-marathon/verifier.ts
 bench/src/suites/swebench-pro/adapter.ts
 bench/src/suites/swebench-pro/analysis.ts
 bench/src/suites/swebench-pro/cleanup.ts
@@ -35,6 +43,9 @@ bench/src/suites/swebench-pro/toolchain.ts
 bench/src/suites/swebench-pro/types.ts
 bench/src/suites/swebench-pro/verifier.ts
 bench/suites/shared/arm-b-prefix.txt
+bench/suites/swe-marathon/arm_b_codex.py
+bench/suites/swe-marathon/harbor-ownership.patch
+bench/suites/swe-marathon/settle-arm-b.mjs
 bench/suites/swebench-pro/Dockerfile
 bench/suites/swebench-pro/capture-git.sh
 bench/suites/swebench-pro/container-policy.json

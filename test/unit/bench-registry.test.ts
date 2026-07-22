@@ -48,6 +48,7 @@ describe('suite registry contracts', () => {
     expect(Object.keys(registry.get('swebench-pro').commands)).toEqual([...SUITE_COMMANDS['swebench-pro']]);
     expect(suiteRegistry.list().map(({ suite }) => suite)).toEqual([
       'swebench-pro',
+      'swe-marathon',
     ]);
     for (const suite of suiteRegistry.list()) {
       expect(Object.keys(suite.commands)).toEqual([...SUITE_COMMANDS[suite.suite]]);
@@ -77,7 +78,7 @@ describe('suite registry contracts', () => {
     const registry = readFileSync(join(root, 'bench/src/registry.ts'), 'utf8');
     expect(contracts).not.toMatch(/from ['"].*(?:registry|suites)\//);
     expect(registry).toContain("from './shared/contracts.js'");
-    for (const suite of ['swebench-pro']) {
+    for (const suite of ['swebench-pro', 'swe-marathon']) {
       expect(registry).toContain(`from './suites/${suite}/adapter.js'`);
       const adapterSource = readFileSync(join(root, 'bench/src/suites', suite, 'adapter.ts'), 'utf8');
       expect(adapterSource, suite).not.toMatch(/from ['"].*registry\.js/);

@@ -435,7 +435,7 @@ describe('SWE-bench Pro attested model relay contract', () => {
 
     const descendant = new BenchProcessError('docker descendant cleanup failed', {
       stdout: '', stderr: '', exitCode: 0, signal: null, elapsedMs: 1,
-    });
+    }, 'descendant-cleanup');
     expect(sessionFailure(new SwebenchProTransportAttestationError(
       'session-inspect',
       descendant,
