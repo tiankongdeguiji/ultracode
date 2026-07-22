@@ -57,11 +57,14 @@ import {
   consolidateFeatureBenchPredictions,
   createFeatureBenchEvidenceResolver,
   featureBenchEvaluatorLaunched,
+  featureBenchInferenceWatchdogMs,
   featureBenchAnalysisHook,
   featureBenchTaskInputs,
   featureBenchPolicyLockFile,
+  featureBenchPolicyLockRoot,
   hasCompleteFeatureBenchReceipt,
   hasCompleteFeatureBenchTaskReceipt,
+  invalidateFeatureBenchEvaluationReceipt,
   invalidateFeatureBenchRedo,
   inspectFeatureBenchTrustBoundary,
   planFeatureBenchEval,
@@ -523,14 +526,28 @@ describe('FeatureBench immutable inputs and host policy', () => {
     })).toThrow(/without userinfo/);
   });
 
-  it('serializes every run on one host-wide policy lock identity', async () => {
+  it('serializes separate worktrees on one host-wide policy lock identity', async () => {
     const roots = createBenchPathRoots(temporary());
-    const lock = featureBenchPolicyLockFile(roots);
-    expect(lock).toBe(join(roots.cacheRoot, '.locks', `featurebench-network-${FEATUREBENCH_NETWORK_POLICY_SHA256}.lock`));
-    expect(lock).not.toContain('run-one');
-    const held = await acquireBenchLock(roots.cacheRoot, lock);
-    await expect(acquireBenchLock(roots.cacheRoot, featureBenchPolicyLockFile(roots))).rejects.toThrow(/already held/);
+    const otherRoots = createBenchPathRoots(temporary());
+    const coordinationRoot = temporary();
+    const lock = featureBenchPolicyLockFile(roots, coordinationRoot);
+    expect(featureBenchPolicyLockFile(otherRoots, coordinationRoot)).toBe(lock);
+    expect(lock).toBe(join(
+      coordinationRoot,
+      '.locks',
+      `featurebench-network-${FEATUREBENCH_NETWORK_POLICY_SHA256}.lock`,
+    ));
+    const held = await acquireBenchLock(coordinationRoot, lock);
+    await expect(acquireBenchLock(
+      coordinationRoot,
+      featureBenchPolicyLockFile(otherRoots, coordinationRoot),
+    )).rejects.toThrow(/already held/);
     held.release();
+    expect(featureBenchPolicyLockRoot()).toBe(join(
+      '/tmp',
+      `ultracode-bench-${typeof process.getuid === 'function' ? process.getuid() : 0}`,
+    ));
+    expect(() => featureBenchPolicyLockRoot('relative-root')).toThrow(/must be absolute/);
   });
 
   it('removes only an exact run-owned runtime binding orphan', () => {
@@ -619,10 +636,10 @@ describe('FeatureBench credential-broker trust boundary', () => {
     })).toThrow(/public identity, version/);
   });
 
-  it('uses one common-label discovery for 100 tasks and validates every container before removal', async () => {
+  it('discovers and validates inference and no-network evaluation containers before removal', async () => {
     const taskIds = Array.from({ length: 100 }, (_, index) => `task-${index}`);
-    const candidates = ['a', 'b', 'c'].map((character) => character.repeat(12));
-    const fullIds = ['a', 'b', 'c'].map((character) => character.repeat(64));
+    const candidates = ['a', 'b', 'c', 'd'].map((character) => character.repeat(12));
+    const fullIds = ['a', 'b', 'c', 'd'].map((character) => character.repeat(64));
     const commands: string[][] = [];
     const executor = async (command: string, argv: readonly string[]) => {
       commands.push([command, ...argv]);
@@ -637,14 +654,15 @@ describe('FeatureBench credential-broker trust boundary', () => {
             'ultracode.benchmark.run': 'run-one',
             'ultracode.benchmark.arm': 'b',
             'ultracode.benchmark.ownership': '1',
-            'ultracode.benchmark.task': taskIds[index * 40],
-            'ultracode.benchmark.purpose': index === 1 ? 'prep' : 'session',
+            'ultracode.benchmark.task': taskIds[index * 25],
+            'ultracode.benchmark.purpose': index === 1 ? 'prep' : index === 2 ? 'evaluation' : 'session',
           } },
+          HostConfig: { NetworkMode: index === 2 ? 'none' : 'featurebench-private' },
         }]), stderr: '' };
       }
       return { stdout: '', stderr: '' };
     };
-    await expect(cleanupFeatureBenchContainers('run-one', 'b', taskIds, executor)).resolves.toBe(3);
+    await expect(cleanupFeatureBenchContainers('run-one', 'b', taskIds, executor)).resolves.toBe(4);
     const discoveries = commands.filter((argv) => argv[1] === 'ps');
     expect(discoveries).toEqual([[
       'docker', 'ps', '--all', '--quiet',
@@ -682,6 +700,15 @@ describe('FeatureBench credential-broker trust boundary', () => {
         name: 'purpose membership',
         listed: prefix,
         inspection: { Id: fullId, Config: { Labels: { ...labels, 'ultracode.benchmark.purpose': 'foreign' } } },
+      },
+      {
+        name: 'evaluation network',
+        listed: prefix,
+        inspection: {
+          Id: fullId,
+          Config: { Labels: { ...labels, 'ultracode.benchmark.purpose': 'evaluation' } },
+          HostConfig: { NetworkMode: 'bridge' },
+        },
       },
       {
         name: 'common ownership labels',
@@ -775,6 +802,14 @@ describe('FeatureBench credential-broker trust boundary', () => {
 });
 
 describe('pinned native fb commands', () => {
+  it('scales the outer inference watchdog by bounded concurrency waves', () => {
+    expect(featureBenchInferenceWatchdogMs(100, 4, 43_200_000)).toBe(1_080_030_000);
+    expect(featureBenchInferenceWatchdogMs(1, 4, 60_000)).toBe(90_000);
+    expect(() => featureBenchInferenceWatchdogMs(0, 4, 60_000)).toThrow(/positive safe integers/);
+    expect(() => featureBenchInferenceWatchdogMs(100, 4, Number.MAX_SAFE_INTEGER))
+      .toThrow(/safe range/);
+  });
+
   it('plans upstream infer and eval with CPU policy and the immutable task set', () => {
     const run = planFeatureBenchRun(prepared(), manifest(), {
       brokerUrl: 'https://broker.test/v1', restrictedNetwork: 'featurebench-private',
@@ -818,6 +853,37 @@ describe('pinned native fb commands', () => {
 });
 
 describe('FeatureBench resume and redo assembly', () => {
+  it('preserves untouched task receipts while a targeted evaluation is in flight', async () => {
+    const runDirectory = nativeFixture();
+    let bindings = indexFeatureBenchEvidence(
+      runDirectory,
+      `native/${TIMESTAMP}`,
+      TASK_IDS,
+      'b',
+      '00000000-0000-4000-8000-000000000040',
+    ).bindings;
+    let revision = 0;
+    const receipt = {
+      load() { return { revision, bindings }; },
+      async update(
+        expectedRevision: number,
+        mutate: (current: readonly VerifierBinding[]) => readonly VerifierBinding[],
+      ) {
+        expect(expectedRevision).toBe(revision);
+        bindings = [...mutate(bindings)];
+        revision += 1;
+      },
+    } as never;
+
+    await invalidateFeatureBenchEvaluationReceipt(receipt, manifest(), ['task-alpha']);
+
+    expect(bindings.some((binding) => binding.role === 'aggregate-report')).toBe(false);
+    expect(bindings.some((binding) => binding.scope.kind === 'task-arm'
+      && binding.scope.taskId === 'task-alpha')).toBe(false);
+    expect(bindings.some((binding) => binding.scope.kind === 'task-arm'
+      && binding.scope.taskId === 'task-beta')).toBe(true);
+  });
+
   it('retries the full immutable task set fresh after null-only history with no native root', () => {
     const outputDirectory = join(temporary(), 'native');
     mkdirSync(outputDirectory);
@@ -1452,6 +1518,44 @@ describe('FeatureBench official verifier evidence', () => {
     )).toBe(false);
   });
 
+  it('binds a successful targeted redo through task and aggregate receipt assembly', () => {
+    const runDirectory = nativeFixture();
+    const nativeRoot = `native/${TIMESTAMP}`;
+    const nativeDirectory = join(runDirectory, ...nativeRoot.split('/'));
+    const invocationId = '00000000-0000-4000-8000-000000000041';
+    writeFileSync(join(nativeDirectory, 'run_metadata.json'), JSON.stringify({ task_ids: ['task-alpha'] }));
+    writeFileSync(join(nativeDirectory, 'output.jsonl'), `${JSON.stringify({
+      instance_id: 'task-alpha',
+      model_patch: 'redo-alpha',
+    })}\n`);
+    const evidence = indexFeatureBenchEvidence(
+      runDirectory,
+      nativeRoot,
+      TASK_IDS,
+      'b',
+      invocationId,
+      ['task-alpha'],
+    );
+    const complete = completeEvaluationBindings(runDirectory, evidence.bindings);
+
+    expect(evidence.bindings.some((binding) => binding.role === 'rollout-output')).toBe(true);
+    expect(TASK_IDS.every((taskId) => hasCompleteFeatureBenchTaskReceipt(
+      complete,
+      invocationId,
+      taskId,
+      'b',
+    ))).toBe(true);
+    expect(hasCompleteFeatureBenchReceipt(complete, invocationId, TASK_IDS, 'b')).toBe(true);
+    expect(() => indexFeatureBenchEvidence(
+      runDirectory,
+      nativeRoot,
+      TASK_IDS,
+      'b',
+      invocationId,
+      ['foreign-task'],
+    )).toThrow(/subset is not within the task inventory/);
+  });
+
   it.each([
     { name: 'run metadata', role: 'run-metadata' },
     { name: 'rollout output', role: 'rollout-output' },
@@ -1708,6 +1812,8 @@ describe('FeatureBench owned assets', () => {
     expect(patch).toContain('ultracode.benchmark.{name}');
     expect(patch).toContain('("schema", "suite", "run", "arm", "ownership")');
     expect(patch).toContain('ultracode.benchmark.purpose');
+    expect(patch).toContain('FEATUREBENCH_EVALUATOR_NETWORK');
+    expect(patch).toContain('No pinned evaluation image digest');
     expect(patch).not.toMatch(/ultracode\.external-run|FEATUREBENCH_RUN_OWNER/);
     expect(readFileSync('bench/suites/featurebench/.gitattributes', 'utf8')).toContain('codex-chatgpt.patch');
   });

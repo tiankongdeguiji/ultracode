@@ -227,6 +227,11 @@ export function indexFeatureBenchEvidence(
   invocationId: string,
   metadataTaskIds: readonly string[] = taskIds,
 ): IndexedFeatureBenchEvidence {
+  const taskMembership = new Set(taskIds);
+  if (metadataTaskIds.length === 0 || new Set(metadataTaskIds).size !== metadataTaskIds.length
+    || metadataTaskIds.some((taskId) => !taskMembership.has(taskId))) {
+    throw new Error('FeatureBench native inference subset is not within the task inventory');
+  }
   const root = timestampRoot(nativeRoot);
   const bindings: VerifierBinding[] = [];
   const taskResults = new Map<string, NativeVerifierResult>();
@@ -254,7 +259,9 @@ export function indexFeatureBenchEvidence(
         }
         return value.instance_id;
       });
-      if (!sameSet(predictions, taskIds)) throw new Error('FeatureBench predictions do not match the task inventory');
+      if (!sameSet(predictions, metadataTaskIds)) {
+        throw new Error('FeatureBench predictions do not match the native inference subset');
+      }
       bindings.push(createVerifierBinding(runDirectory, {
         invocationId,
         scope: { kind: 'suite-check', name: `featurebench-predictions-${arm}` },

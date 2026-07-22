@@ -15,8 +15,9 @@ export const FEATUREBENCH_SPLIT = 'fast';
 export const FEATUREBENCH_PYTHON_VERSION = '3.13.5';
 
 export const FEATUREBENCH_NETWORK_POLICY = Object.freeze({
-  schemaVersion: 2,
+  schemaVersion: 3,
   dockerNetwork: 'internal',
+  evaluatorNetwork: 'none',
   policyLabel: 'openai-via-credential-broker',
   preexistingEndpoints: 1,
   brokerLabel: 'ultracode.credential-broker=true',

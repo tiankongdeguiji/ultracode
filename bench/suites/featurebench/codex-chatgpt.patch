@@ -1,8 +1,134 @@
+diff --git a/featurebench/harness/container.py b/featurebench/harness/container.py
+index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..67b36f84fb7392628403bdd9e54b67aed89313ab 100644
+--- a/featurebench/harness/container.py
++++ b/featurebench/harness/container.py
+@@ -216,6 +216,17 @@ class EvalContainerManager:
+             number_once = 1
+         shm_size = docker_runtime_config.get("shm_size")
+ 
++        if os.environ.get("FEATUREBENCH_CPU_ONLY") == "1" and need_gpu:
++            raise RuntimeError("Unsupported runtime capability: this FeatureBench adapter is CPU-only")
++        raw_cpus = os.environ.get("FB_CONTAINER_CPUS")
++        nano_cpus = int(float(raw_cpus) * 1_000_000_000) if raw_cpus else None
++        mem_limit = os.environ.get("FB_CONTAINER_MEMORY") or None
++        evaluator_network = os.environ.get("FEATUREBENCH_EVALUATOR_NETWORK")
++        if evaluator_network != "none":
++            raise RuntimeError("FeatureBench evaluator containers must use Docker's none network")
++        if proxy_port is not None:
++            raise RuntimeError("FeatureBench evaluator proxy access is forbidden")
++
+         # Sanitize instance_id: replace / and . with -
+         sanitized_id = instance_id.replace("/", "-").replace(".", "-").replace("--", "-")
+         # Add timestamp to avoid name conflicts in parallel execution
+@@ -269,19 +280,7 @@ class EvalContainerManager:
+             environment.update(env_vars_from_config)
+             self.logger.info(f"Added environment variables from config: {list(env_vars_from_config.keys())}")
+ 
+-        # Configure proxy if specified (use bridge mode with Docker host gateway)
+-        network_mode = "bridge"
+-        if proxy_port is not None:
+-            proxy_url = f"http://{DOCKER_HOST_GATEWAY}:{proxy_port}"
+-            environment.update({
+-                'HTTP_PROXY': proxy_url,
+-                'HTTPS_PROXY': proxy_url,
+-                'http_proxy': proxy_url,
+-                'https_proxy': proxy_url,
+-                'NO_PROXY': f'localhost,127.0.0.1,{DOCKER_HOST_GATEWAY}',
+-                'no_proxy': f'localhost,127.0.0.1,{DOCKER_HOST_GATEWAY}',
+-            })
+-            self.logger.info(f"Using bridge network with proxy via Docker host gateway: {proxy_url}")
++        network_mode = evaluator_network
+ 
+         if shm_size:
+             self.logger.info(f"Using shared memory size: {shm_size}")
+@@ -299,9 +298,26 @@ class EvalContainerManager:
+             environment=environment,
+             network_mode=network_mode,
+             shm_size=shm_size,
++            nano_cpus=nano_cpus,
++            mem_limit=mem_limit,
+             labels=labels,
+         )
+ 
++        try:
++            container.reload()
++            host_config = container.attrs.get("HostConfig")
++            if (
++                not isinstance(host_config, dict)
++                or host_config.get("NetworkMode") != "none"
++            ):
++                raise RuntimeError("FeatureBench evaluator network attestation failed")
++        except Exception:
++            try:
++                container.remove(force=True)
++            except Exception:
++                pass
++            raise
++
+         # Check if GPU is available
+         if need_gpu:
+             exit_code, output = container.exec_run("nvidia-smi --list-gpus")
 diff --git a/featurebench/harness/run_evaluation.py b/featurebench/harness/run_evaluation.py
-index beb48fbb82384af44f5d18ce2b7d22a779699014..b619696e6c0904643551836df09855d287e07f13 100644
+index beb48fbb82384af44f5d18ce2b7d22a779699014..27b36cb9ddabe0c984c6b91ffdcf725b235f148a 100644
 --- a/featurebench/harness/run_evaluation.py
 +++ b/featurebench/harness/run_evaluation.py
-@@ -767,9 +767,11 @@ def load_dataset_from_hf(
+@@ -66,7 +66,6 @@ from featurebench.harness.review_codes import (
+ from featurebench.harness.runtime import run_instance_level1, run_instance_level2
+ from featurebench.harness.utils import (
+     filter_predictions_by_ids,
+-    get_docker_image_name,
+     get_docker_runtime_config,
+     get_instance_from_dataset,
+     get_predictions_from_file,
+@@ -234,12 +233,19 @@ class EvalContainerCleanup:
+         n_attempt: int,
+         purpose: str = "eval",
+     ) -> dict[str, str]:
++        ownership = {
++            f"ultracode.benchmark.{name}": os.environ[f"ULTRACODE_BENCHMARK_{name.upper()}"]
++            for name in ("schema", "suite", "run", "arm", "ownership")
++        }
+         return {
+             FEATUREBENCH_RUN_LABEL: self.run_id,
+             FEATUREBENCH_KIND_LABEL: "eval",
+             FEATUREBENCH_TASK_LABEL: str(instance_id),
+             FEATUREBENCH_ATTEMPT_LABEL: str(n_attempt),
+             "featurebench.purpose": purpose,
++            **ownership,
++            "ultracode.benchmark.task": str(instance_id),
++            "ultracode.benchmark.purpose": "evaluation",
+         }
+ 
+     def register(self, container: Container) -> None:
+@@ -430,6 +436,18 @@ def _load_force_rerun_ids(raw_values: list[str] | None) -> set[str]:
+     return set(dict.fromkeys(ids))
+ 
+ 
++def _pinned_eval_image(instance_id: str) -> str:
++    raw = os.environ.get("FEATUREBENCH_IMAGE_DIGESTS") or ""
++    try:
++        digests = json.loads(raw)
++    except json.JSONDecodeError as exc:
++        raise RuntimeError("FeatureBench image digest map is invalid") from exc
++    pinned = digests.get(instance_id) if isinstance(digests, dict) else None
++    if not isinstance(pinned, str) or "@sha256:" not in pinned:
++        raise RuntimeError(f"No pinned evaluation image digest for {instance_id}")
++    return pinned
++
++
+ def run_instance(
+     instance: pd.Series,
+     pred: dict,
+@@ -549,7 +567,7 @@ def run_instance(
+             )
+ 
+         # Get Docker image and create container
+-        docker_image = get_docker_image_name(instance)
++        docker_image = _pinned_eval_image(instance_id)
+         logger.info(f"Using Docker image: {docker_image}")
+ 
+         container_manager.pull_image_if_needed(docker_image)
+@@ -767,9 +785,11 @@ def load_dataset_from_hf(
          config_loader = InferConfigLoader(resolved_path)
          env_vars = config_loader.env_vars
          hf_token = env_vars.get("HF_TOKEN")
@@ -14,7 +140,7 @@ index beb48fbb82384af44f5d18ce2b7d22a779699014..b619696e6c0904643551836df09855d2
  
      console.print(f"[bold blue]Loading dataset from HuggingFace...[/]")
      console.print(f"[dim]Repository: {dataset}[/]")
-@@ -780,7 +782,12 @@ def load_dataset_from_hf(
+@@ -780,7 +800,12 @@ def load_dataset_from_hf(
  
      try:
          # Load the specified split
@@ -28,7 +154,7 @@ index beb48fbb82384af44f5d18ce2b7d22a779699014..b619696e6c0904643551836df09855d2
          df = pd.DataFrame(hf_dataset)
  
          # Determine level from instance_id's last segment (e.g., "xxx.lv1" -> level 1)
-@@ -1221,4 +1228,4 @@ def main():
+@@ -1221,4 +1246,4 @@ def main():
  
  
  if __name__ == "__main__":

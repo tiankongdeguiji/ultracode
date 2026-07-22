@@ -11,7 +11,7 @@ import {
   statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Arm, BenchPathRoots, CommandContext, FailureCode } from '../../shared/contracts.js';
 import { FAILURE_POLICY_SHA256, failureObservationSchema, taskArmScope } from '../../shared/failure.js';
 import {
@@ -205,14 +205,14 @@ interface RunOptions {
 interface ReportOptions { runId: string; recoverStaleLock: boolean }
 
 export const FEATUREBENCH_ADAPTER_POLICY_SHA256 = sha256CanonicalJson({
-  schemaVersion: 2,
+  schemaVersion: 3,
   layout: 'suite-run/native/timestamp',
   arm: 'one-per-run',
   runner: 'pinned-fb-infer-and-fb-eval',
-  runtime: 'cpu-only',
+  runtime: 'cpu-and-memory-limited',
   credentials: 'broker-outside-task-containers',
   network: FEATUREBENCH_NETWORK_POLICY,
-  ownership: 'ultracode-benchmark-label-namespace',
+  ownership: 'ultracode-benchmark-label-namespace-inference-and-evaluation',
   verifier: 'task-pass-rate-plus-run-attempt-1-aggregate',
   timestamps: 'accepted-invocation-snapshots-bound-in-run-state-and-receipt',
 });
@@ -242,8 +242,24 @@ function sha256Text(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-export function featureBenchPolicyLockFile(roots: BenchPathRoots): string {
-  return join(roots.cacheRoot, '.locks', `featurebench-network-${FEATUREBENCH_NETWORK_POLICY_SHA256}.lock`);
+/** Stable UID-scoped host root, with an explicit isolated-root seam for tests. */
+export function featureBenchPolicyLockRoot(coordinationRoot?: string): string {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  const root = coordinationRoot ?? join('/tmp', `ultracode-bench-${uid}`);
+  if (!isAbsolute(root)) throw new Error('FeatureBench policy coordination root must be absolute');
+  return resolve(root);
+}
+
+/** One host policy identity serializing restricted-network use across worktrees. */
+export function featureBenchPolicyLockFile(
+  _roots: BenchPathRoots,
+  coordinationRoot: string = featureBenchPolicyLockRoot(),
+): string {
+  return join(
+    featureBenchPolicyLockRoot(coordinationRoot),
+    '.locks',
+    `featurebench-network-${FEATUREBENCH_NETWORK_POLICY_SHA256}.lock`,
+  );
 }
 
 async function acquireInputLocks(roots: BenchPathRoots, recoverStale: boolean): Promise<BenchLockHandle[]> {
@@ -506,7 +522,7 @@ interface DockerContainerInspect {
   Args?: unknown;
   State?: { Running?: unknown };
   Config?: { Labels?: unknown };
-  HostConfig?: { Binds?: unknown; Mounts?: unknown; Tmpfs?: unknown };
+  HostConfig?: { Binds?: unknown; Mounts?: unknown; NetworkMode?: unknown; Tmpfs?: unknown };
   Mounts?: unknown;
   NetworkSettings?: { Networks?: unknown };
 }
@@ -640,7 +656,24 @@ function ownershipLabels(runId: string, arm: Arm): Record<string, string> {
 
 const FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS = 30_000;
 
-/** Remove only exact run-owned FeatureBench session/prep containers. */
+/** Scale the host watchdog to the number of bounded native inference waves. */
+export function featureBenchInferenceWatchdogMs(
+  taskCount: number,
+  concurrency: number,
+  perTaskTimeoutMs: number,
+): number {
+  if (!Number.isSafeInteger(taskCount) || taskCount <= 0
+    || !Number.isSafeInteger(concurrency) || concurrency <= 0
+    || !Number.isSafeInteger(perTaskTimeoutMs) || perTaskTimeoutMs <= 0) {
+    throw new Error('FeatureBench inference watchdog inputs must be positive safe integers');
+  }
+  const timeoutMs = Math.ceil(taskCount / concurrency) * perTaskTimeoutMs
+    + FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs)) throw new Error('FeatureBench inference watchdog exceeds the safe range');
+  return timeoutMs;
+}
+
+/** Remove only exact run-owned FeatureBench inference and evaluation containers. */
 export async function cleanupFeatureBenchContainers(
   runId: string,
   arm: Arm,
@@ -679,12 +712,13 @@ export async function cleanupFeatureBenchContainers(
     })).stdout, 'owned FeatureBench container');
     const observed = inspected.Config?.Labels !== null && typeof inspected.Config?.Labels === 'object'
       && !Array.isArray(inspected.Config.Labels) ? inspected.Config.Labels as Record<string, unknown> : {};
+    const purpose = observed['ultracode.benchmark.purpose'];
     if (typeof inspected.Id !== 'string' || !/^[a-f0-9]{64}$/.test(inspected.Id) || !inspected.Id.startsWith(candidate)
       || Object.entries(labels).some(([name, value]) => observed[name] !== value)
       || typeof observed['ultracode.benchmark.task'] !== 'string'
       || !taskMembership.has(observed['ultracode.benchmark.task'])
-      || (observed['ultracode.benchmark.purpose'] !== 'prep'
-        && observed['ultracode.benchmark.purpose'] !== 'session')) {
+      || (purpose !== 'prep' && purpose !== 'session' && purpose !== 'evaluation')
+      || (purpose === 'evaluation' && inspected.HostConfig?.NetworkMode !== 'none')) {
       throw new Error(`refusing to remove unowned FeatureBench container ${candidate}`);
     }
     if (verified.has(inspected.Id)) {
@@ -917,6 +951,10 @@ function childEnvironment(
   runtimeHome: string,
 ): NodeJS.ProcessEnv {
   const env = allowlistedEnvironment(process.env);
+  const imageDigests = Object.fromEntries(manifest.provenance.tasks.map((task) => [
+    task.taskId,
+    task.image!.resolvedDigest,
+  ]));
   Object.assign(env, {
     PYTHONDONTWRITEBYTECODE: '1',
     HOME: runtimeHome,
@@ -924,6 +962,11 @@ function childEnvironment(
     FEATUREBENCH_CODEX_BIN_HOST_PATH: join(prepared.toolchain.directory, 'codex'),
     FEATUREBENCH_CREDENTIAL_BROKER_URL: runtime.brokerUrl,
     FEATUREBENCH_RESTRICTED_NETWORK: runtime.restrictedNetwork,
+    FEATUREBENCH_EVALUATOR_NETWORK: 'none',
+    FEATUREBENCH_IMAGE_DIGESTS: JSON.stringify(imageDigests),
+    FEATUREBENCH_CPU_ONLY: '1',
+    FB_CONTAINER_CPUS: String(manifest.suiteConfig.resources.cpus),
+    FB_CONTAINER_MEMORY: String(manifest.suiteConfig.resources.memoryBytes),
     ULTRACODE_BENCHMARK_SCHEMA: '2',
     ULTRACODE_BENCHMARK_SUITE: 'featurebench',
     ULTRACODE_BENCHMARK_RUN: manifest.runId,
@@ -1320,11 +1363,13 @@ async function replaceReceiptBindings(
   await store.update(current.revision, () => bindings);
 }
 
-async function invalidateEvaluationReceipt(
+/** Invalidate only task evidence that the next evaluation can replace. */
+export async function invalidateFeatureBenchEvaluationReceipt(
   store: VerifierReceiptStore,
   manifest: FeatureBenchManifest,
+  taskIds: readonly string[],
 ): Promise<void> {
-  const tasks = new Set(manifest.experiment.taskIds);
+  const tasks = new Set(taskIds);
   const current = store.load();
   await store.update(current.revision, (bindings) => bindings.filter((binding) => {
     if (binding.scope.kind === 'task-arm' && binding.scope.arm === manifest.experiment.arm
@@ -1592,7 +1637,11 @@ async function executeNativeRunWithHome(
       cwd: infer.cwd,
       env: childEnvironment(prepared, manifest, runtime, runtimeHome),
       stream: true,
-      timeoutMs: manifest.suiteConfig.inference.timeoutMs,
+      timeoutMs: featureBenchInferenceWatchdogMs(
+        inferTasks.length,
+        manifest.suiteConfig.inference.concurrency,
+        manifest.suiteConfig.inference.timeoutMs,
+      ),
       workerScope: directory,
       ...lifecycle,
     });
@@ -1660,7 +1709,7 @@ async function executeNativeRunWithHome(
       manifest.experiment.taskIds,
       invocationId,
     );
-    await invalidateEvaluationReceipt(stores.receipt, manifest);
+    await invalidateFeatureBenchEvaluationReceipt(stores.receipt, manifest, inferTasks);
     const evaluationLifecycle = {
       ...lifecycle,
       onLifecycleStarted(token: string, pid: number | null, processStartIdentity: string | null): void {
@@ -1823,7 +1872,7 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
     let invocationId: string | null = null;
     const startedMs = performance.now();
     try {
-      policyLock = await acquireBenchLock(context.paths.cacheRoot, featureBenchPolicyLockFile(context.paths), {
+      policyLock = await acquireBenchLock(featureBenchPolicyLockRoot(), featureBenchPolicyLockFile(context.paths), {
         recoverStale: options.recoverStaleLock,
       });
       stores = await loadRunStores(
@@ -1901,7 +1950,7 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
       rmSync(directory, { recursive: true });
     }
     const config = overrideConfig(operator.featureBench, options);
-    policyLock = await acquireBenchLock(context.paths.cacheRoot, featureBenchPolicyLockFile(context.paths), {
+    policyLock = await acquireBenchLock(featureBenchPolicyLockRoot(), featureBenchPolicyLockFile(context.paths), {
       recoverStale: options.recoverStaleLock,
     });
     locks = await acquireInputLocks(context.paths, options.recoverStaleLock);
@@ -2270,7 +2319,7 @@ export async function reportCommand(options: ReportOptions, context: CommandCont
   const startedMs = performance.now();
   let invocationId: string | null = null;
   try {
-    policyLock = await acquireBenchLock(context.paths.cacheRoot, featureBenchPolicyLockFile(context.paths), {
+    policyLock = await acquireBenchLock(featureBenchPolicyLockRoot(), featureBenchPolicyLockFile(context.paths), {
       recoverStale: options.recoverStaleLock,
     });
     stores = await loadRunStores(

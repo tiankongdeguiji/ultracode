@@ -45,6 +45,9 @@ The operator provisions a broker container and dedicated Docker network before
 - Before each native phase, the network must have exactly one endpoint: the
   named, running broker container. The broker must have immutable image identity
   and the configured public identity/version labels.
+- Official evaluator containers use Docker's `none` network and attest that
+  mode immediately after creation; they receive the same pinned image, resource,
+  CPU-only, and ownership policy as inference containers.
 - Reusable host credentials and auth files are never mounted or forwarded to
   repository-controlled task containers. The broker is responsible for its
   own upstream egress, credential injection, scoping, and request validation.
@@ -56,9 +59,10 @@ after execution. The containing `0700` runtime home has an exact run/arm/nonce
 marker; the next run removes matching hard-crash orphans before writing a new
 runtime config and refuses malformed lookalikes.
 
-One policy lock below `bench/.cache/.locks/` covers preflight, inference,
-evaluation, and cleanup. This prevents concurrent FeatureBench runs from
-invalidating the broker-only host-wide network assertion. Cleanup discovers
+One UID-scoped policy lock below `/tmp/ultracode-bench-<uid>/.locks/` covers
+preflight, inference, evaluation, and cleanup across separate worktrees. This
+prevents concurrent FeatureBench runs from invalidating the broker-only
+host-wide network assertion. Cleanup discovers
 containers using the complete `ultracode.benchmark.*` ownership tuple,
 reinspects every label including task and purpose, and refuses ambiguous or
 unowned targets.
@@ -93,7 +97,10 @@ operator's current public broker identity/version must still match the frozen
 hashes, while runtime broker URL and network names are resolved anew from the
 environment and re-attested on every launch. `--redo <task-id>` requires
 `--resume` plus a non-null state-bound inference baseline. The baseline check
-precedes receipt/report invalidation. Ordinary resume targets the first
+precedes receipt/report invalidation. The native inference timeout remains a
+per-task limit, while the host watchdog scales it by the number of concurrency
+waves and adds cleanup grace.
+Ordinary resume targets the first
 non-null inference root with native `--resume`; null-only history retries the
 complete immutable task set fresh only while `native/` has no timestamp root.
 Any timestamp root absent from inference state is ambiguous and rejected. Redo
@@ -102,9 +109,11 @@ then evaluates a complete prediction set whose selected tasks must come from
 the new root and whose untouched tasks come only from immutable, receipt-bound
 prediction snapshots accepted by an earlier successful evaluation. A redo
 invalidation removes task evidence only for its selected tasks and removes the
-run aggregate. If inference or evaluation preparation fails before the
-evaluator child launches, no verifier attempt is recorded and accepted task
-evidence for untouched tasks remains eligible for task-level reporting.
+run aggregate. Untouched bindings remain valid until complete replacement
+evidence is published, including after an evaluator timeout or crash. If
+inference or evaluation preparation fails before the evaluator child launches,
+no verifier attempt is recorded and accepted task evidence for untouched tasks
+remains eligible for task-level reporting.
 Each consolidated snapshot has an invocation-unique filename inside the
 current timestamp root. This keeps accepted inputs immutable while preserving
 the upstream evaluator's contract that reports are emitted beside its
