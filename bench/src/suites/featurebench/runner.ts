@@ -94,6 +94,7 @@ import {
   loadPreparedFeatureBenchInputs,
   prepareFeatureBenchInputs,
   reattestPreparedFeatureBench,
+  FEATUREBENCH_DATASET_PARQUET,
   type FeatureBenchExecOptions,
   type FeatureBenchExecutor,
   type FeatureBenchTaskInput,
@@ -205,11 +206,11 @@ interface RunOptions {
 interface ReportOptions { runId: string; recoverStaleLock: boolean }
 
 export const FEATUREBENCH_ADAPTER_POLICY_SHA256 = sha256CanonicalJson({
-  schemaVersion: 3,
+  schemaVersion: 4,
   layout: 'suite-run/native/timestamp',
   arm: 'one-per-run',
   runner: 'pinned-fb-infer-and-fb-eval',
-  runtime: 'cpu-and-memory-limited',
+  runtime: 'cpu-memory-and-pids-limited',
   credentials: 'broker-outside-task-containers',
   network: FEATUREBENCH_NETWORK_POLICY,
   ownership: 'ultracode-benchmark-label-namespace-inference-and-evaluation',
@@ -655,19 +656,25 @@ function ownershipLabels(runId: string, arm: Arm): Record<string, string> {
 }
 
 const FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS = 30_000;
+const FEATUREBENCH_WORKFLOW_MAX_WAIT_MS = 3_300_000;
+const FEATUREBENCH_WORKFLOW_STOP_GRACE_MS = 120_000;
 
 /** Scale the host watchdog to the number of bounded native inference waves. */
 export function featureBenchInferenceWatchdogMs(
   taskCount: number,
   concurrency: number,
   perTaskTimeoutMs: number,
+  arm: Arm,
 ): number {
   if (!Number.isSafeInteger(taskCount) || taskCount <= 0
     || !Number.isSafeInteger(concurrency) || concurrency <= 0
     || !Number.isSafeInteger(perTaskTimeoutMs) || perTaskTimeoutMs <= 0) {
     throw new Error('FeatureBench inference watchdog inputs must be positive safe integers');
   }
-  const timeoutMs = Math.ceil(taskCount / concurrency) * perTaskTimeoutMs
+  const workflowDrainMs = arm === 'b'
+    ? 2 * (Math.min(perTaskTimeoutMs, FEATUREBENCH_WORKFLOW_MAX_WAIT_MS) + FEATUREBENCH_WORKFLOW_STOP_GRACE_MS)
+    : 0;
+  const timeoutMs = Math.ceil(taskCount / concurrency) * (perTaskTimeoutMs + workflowDrainMs)
     + FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeoutMs)) throw new Error('FeatureBench inference watchdog exceeds the safe range');
   return timeoutMs;
@@ -705,6 +712,7 @@ export async function cleanupFeatureBenchContainers(
   }
 
   const verified = new Set<string>();
+  const policyViolations: string[] = [];
   for (const candidate of candidates) {
     const inspected = oneDockerInspectRow<DockerContainerInspect>((await executor('docker', ['inspect', candidate], {
       env: allowlistedEnvironment(process.env),
@@ -717,9 +725,11 @@ export async function cleanupFeatureBenchContainers(
       || Object.entries(labels).some(([name, value]) => observed[name] !== value)
       || typeof observed['ultracode.benchmark.task'] !== 'string'
       || !taskMembership.has(observed['ultracode.benchmark.task'])
-      || (purpose !== 'prep' && purpose !== 'session' && purpose !== 'evaluation')
-      || (purpose === 'evaluation' && inspected.HostConfig?.NetworkMode !== 'none')) {
+      || (purpose !== 'prep' && purpose !== 'session' && purpose !== 'evaluation')) {
       throw new Error(`refusing to remove unowned FeatureBench container ${candidate}`);
+    }
+    if (purpose === 'evaluation' && inspected.HostConfig?.NetworkMode !== 'none') {
+      policyViolations.push(inspected.Id);
     }
     if (verified.has(inspected.Id)) {
       throw new Error(`Docker returned ambiguous ownership for FeatureBench container ${inspected.Id}`);
@@ -732,6 +742,9 @@ export async function cleanupFeatureBenchContainers(
       stream: true,
       timeoutMs: FEATUREBENCH_CLEANUP_DOCKER_TIMEOUT_MS,
     });
+  }
+  if (policyViolations.length > 0) {
+    throw new Error(`removed owned FeatureBench evaluator(s) with invalid network policy: ${policyViolations.join(', ')}`);
   }
   return verified.size;
 }
@@ -856,11 +869,13 @@ export function featureBenchRuntimeConfig(
   const lines = [
     '[env_vars]',
     `FEATUREBENCH_DATASET_REVISION = ${tomlString(FEATUREBENCH_DATASET_REVISION)}`,
+    `FEATUREBENCH_DATASET_PARQUET = ${tomlString(FEATUREBENCH_DATASET_PARQUET)}`,
     '',
     '[infer_config.codex]',
     `CODEX_REASONING_EFFORT = ${tomlString(manifest.experiment.requestedEffort)}`,
     `FB_CONTAINER_CPUS = ${tomlString(String(manifest.suiteConfig.resources.cpus))}`,
     `FB_CONTAINER_MEMORY = ${tomlString(String(manifest.suiteConfig.resources.memoryBytes))}`,
+    `FB_CONTAINER_PIDS = ${tomlString(String(manifest.suiteConfig.resources.pids))}`,
     'FEATUREBENCH_BROKER_AUTH = "1"',
     `FEATUREBENCH_BROKER_BASE_URL = ${tomlString(runtime.brokerUrl)}`,
     `FEATUREBENCH_RESTRICTED_NETWORK = ${tomlString(runtime.restrictedNetwork)}`,
@@ -967,6 +982,7 @@ function childEnvironment(
     FEATUREBENCH_CPU_ONLY: '1',
     FB_CONTAINER_CPUS: String(manifest.suiteConfig.resources.cpus),
     FB_CONTAINER_MEMORY: String(manifest.suiteConfig.resources.memoryBytes),
+    FB_CONTAINER_PIDS: String(manifest.suiteConfig.resources.pids),
     ULTRACODE_BENCHMARK_SCHEMA: '2',
     ULTRACODE_BENCHMARK_SUITE: 'featurebench',
     ULTRACODE_BENCHMARK_RUN: manifest.runId,
@@ -1641,6 +1657,7 @@ async function executeNativeRunWithHome(
         inferTasks.length,
         manifest.suiteConfig.inference.concurrency,
         manifest.suiteConfig.inference.timeoutMs,
+        manifest.experiment.arm as Arm,
       ),
       workerScope: directory,
       ...lifecycle,

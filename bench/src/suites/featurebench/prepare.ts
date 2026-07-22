@@ -49,6 +49,7 @@ import { requireFeatureBenchHost } from './host.js';
 const CONTENT_MANIFEST = 'content-manifest.json';
 const PREPARED_IDENTITY = 'prepared-identity.json';
 export const FEATUREBENCH_DATASET_MAP = '.git/ultracode-benchmark-dataset-map.json';
+export const FEATUREBENCH_DATASET_PARQUET = '.git/ultracode-benchmark-dataset.parquet';
 
 export interface FeatureBenchExecOptions {
   cwd?: string;
@@ -79,7 +80,7 @@ export interface FeatureBenchTaskInput {
 }
 
 interface FeatureBenchContentManifest {
-  schemaVersion: 3;
+  schemaVersion: 4;
   kind: 'ultracode-featurebench-inputs';
   payloadSha256: string;
   source: SourceProvenance;
@@ -89,6 +90,7 @@ interface FeatureBenchContentManifest {
   fbSha256: string;
   patchSha256: string;
   datasetMapSha256: string;
+  datasetParquetSha256: string;
   tasks: FeatureBenchTaskInput[];
   toolchainPayloadSha256: string;
 }
@@ -105,6 +107,7 @@ export interface PreparedFeatureBenchInputs {
   pythonRuntimeSha256: string;
   patchSha256: string;
   datasetMapSha256: string;
+  datasetParquetSha256: string;
   tasks: FeatureBenchTaskInput[];
   toolchain: PreparedToolchain;
 }
@@ -238,8 +241,9 @@ export function parseFeatureBenchDatasetMap(value: unknown): FeatureBenchDataset
 }
 
 export const FEATUREBENCH_DATASET_MEMBERSHIP_SCRIPT = `import json
+import os
 from datasets import load_dataset
-rows = load_dataset(${JSON.stringify(FEATUREBENCH_DATASET)}, split=${JSON.stringify(FEATUREBENCH_SPLIT)}, revision=${JSON.stringify(FEATUREBENCH_DATASET_REVISION)})
+rows = load_dataset("parquet", data_files=os.environ["FEATUREBENCH_DATASET_PARQUET"], split="train")
 tasks = {}
 for row in rows:
     task_id = row["instance_id"]
@@ -252,6 +256,18 @@ for row in rows:
         raise ValueError(f"FeatureBench dataset contains duplicate task id {task_id}")
     tasks[task_id] = image_name
 print(json.dumps({"dataset": ${JSON.stringify(FEATUREBENCH_DATASET)}, "revision": ${JSON.stringify(FEATUREBENCH_DATASET_REVISION)}, "split": ${JSON.stringify(FEATUREBENCH_SPLIT)}, "tasks": tasks}, sort_keys=True))`;
+
+export const FEATUREBENCH_DATASET_DOWNLOAD_SCRIPT = `from huggingface_hub import hf_hub_download
+print(hf_hub_download(repo_id=${JSON.stringify(FEATUREBENCH_DATASET)}, repo_type="dataset", revision=${JSON.stringify(FEATUREBENCH_DATASET_REVISION)}, filename="data/${FEATUREBENCH_SPLIT}-00000-of-00001.parquet"))`;
+
+/** Verify the exact pinned parquet bytes before they enter prepared state. */
+export function verifyFeatureBenchDatasetArtifact(path: string): string {
+  const observed = sha256File(path);
+  if (observed !== loadFeatureBenchDatasetPin().sourceParquetSha256) {
+    throw new Error('FeatureBench downloaded dataset artifact does not match the audited byte pin');
+  }
+  return observed;
+}
 
 function normalizePatchTargetHashes(patch: string): string {
   return patch.trimEnd().replace(/^(index [0-9a-f]{40}\.\.)[0-9a-f]{40}( \d+)$/gmu, '$1<derived-target>$2');
@@ -548,10 +564,11 @@ function requireRelocatableFeatureBenchLauncher(path: string): void {
 function contentManifest(directory: string): FeatureBenchContentManifest {
   const value = readPrivateJson(directory, join(directory, CONTENT_MANIFEST)) as Partial<FeatureBenchContentManifest>;
   const sha = (candidate: unknown): candidate is string => typeof candidate === 'string' && /^[a-f0-9]{64}$/.test(candidate);
-  if (value.schemaVersion !== 3 || value.kind !== 'ultracode-featurebench-inputs'
+  if (value.schemaVersion !== 4 || value.kind !== 'ultracode-featurebench-inputs'
     || !sha(value.payloadSha256) || !sha(value.environmentSha256) || !sha(value.fbSha256)
     || !sha(value.pythonRuntimeSha256)
-    || !sha(value.patchSha256) || !sha(value.datasetMapSha256) || !sha(value.toolchainPayloadSha256)
+    || !sha(value.patchSha256) || !sha(value.datasetMapSha256) || !sha(value.datasetParquetSha256)
+    || !sha(value.toolchainPayloadSha256)
     || value.pythonVersion !== FEATUREBENCH_PYTHON_VERSION || value.source === undefined
     || value.source.repository !== FEATUREBENCH_REPOSITORY || value.source.revision !== FEATUREBENCH_SOURCE_REVISION
     || !sha(value.source.treeSha256) || !Array.isArray(value.tasks) || value.tasks.length === 0
@@ -585,6 +602,7 @@ export function loadPreparedFeatureBenchInputs(directory: string): PreparedFeatu
   const fbBinary = join(environmentDirectory, 'bin', 'fb');
   requireRelocatableFeatureBenchLauncher(fbBinary);
   const mapPath = join(sourceDirectory, ...FEATUREBENCH_DATASET_MAP.split('/'));
+  const datasetParquetPath = join(sourceDirectory, ...FEATUREBENCH_DATASET_PARQUET.split('/'));
   const environmentIdentity = featureBenchEnvironmentIdentity(environmentDirectory);
   const parsedMap = parseFeatureBenchDatasetMap(JSON.parse(
     readRegularFileWithinRoot(sourceDirectory, FEATUREBENCH_DATASET_MAP).toString('utf8'),
@@ -593,6 +611,7 @@ export function loadPreparedFeatureBenchInputs(directory: string): PreparedFeatu
     || environmentIdentity.environmentSha256 !== manifest.environmentSha256
     || environmentIdentity.pythonRuntimeSha256 !== manifest.pythonRuntimeSha256
     || sha256File(fbBinary) !== manifest.fbSha256 || sha256File(mapPath) !== manifest.datasetMapSha256
+    || verifyFeatureBenchDatasetArtifact(datasetParquetPath) !== manifest.datasetParquetSha256
     || canonicalJson(Object.keys(parsedMap.tasks)) !== canonicalJson(manifest.tasks.map((task) => task.taskId))
     || manifest.tasks.some((task) => task.imageRequested !== parsedMap.tasks[task.taskId]
       || !task.imageResolvedDigest.startsWith(`${repositoryName(task.imageRequested)}@sha256:`)
@@ -617,6 +636,7 @@ export function loadPreparedFeatureBenchInputs(directory: string): PreparedFeatu
     pythonRuntimeSha256: manifest.pythonRuntimeSha256,
     patchSha256: manifest.patchSha256,
     datasetMapSha256: manifest.datasetMapSha256,
+    datasetParquetSha256: manifest.datasetParquetSha256,
     tasks: manifest.tasks,
     toolchain: loadPreparedToolchain(join(resolved, '..', '..', 'toolchains', manifest.toolchainPayloadSha256)),
   };
@@ -687,7 +707,21 @@ export async function prepareFeatureBenchInputs(
     const fbBinary = join(sourceDirectory, '.venv', 'bin', 'fb');
     const pythonVersion = await command(executor, pythonBinary, ['--version'], sourceDirectory, env);
     if (pythonVersion !== `Python ${plan.pythonVersion}`) throw new Error(`unexpected FeatureBench Python version: ${pythonVersion}`);
-    await command(executor, fbBinary, ['pull', '--mode', plan.split], sourceDirectory, env);
+    const downloadedParquet = await command(
+      executor,
+      pythonBinary,
+      ['-c', FEATUREBENCH_DATASET_DOWNLOAD_SCRIPT],
+      sourceDirectory,
+      env,
+    );
+    const datasetParquetSha256 = verifyFeatureBenchDatasetArtifact(downloadedParquet);
+    const datasetParquetPath = join(sourceDirectory, ...FEATUREBENCH_DATASET_PARQUET.split('/'));
+    writePrivateFileAtomic(
+      join(sourceDirectory, '.git'),
+      datasetParquetPath,
+      readFileSync(downloadedParquet),
+    );
+    env.FEATUREBENCH_DATASET_PARQUET = datasetParquetPath;
     const rawMap = await command(
       executor,
       pythonBinary,
@@ -701,6 +735,9 @@ export async function prepareFeatureBenchInputs(
     await requireExactPatch(executor, sourceDirectory, plan.patch);
 
     const tasks: FeatureBenchTaskInput[] = [];
+    for (const imageRequested of new Set(Object.values(datasetMap.tasks))) {
+      await command(executor, 'docker', ['pull', imageRequested], roots.benchRoot, env);
+    }
     for (const [taskId, imageRequested] of Object.entries(datasetMap.tasks)) {
       const inspect = await command(executor, 'docker', ['image', 'inspect', imageRequested], roots.benchRoot);
       tasks.push({
@@ -725,7 +762,7 @@ export async function prepareFeatureBenchInputs(
     };
     const environmentIdentity = featureBenchEnvironmentIdentity(environmentDirectory);
     const manifestWithoutPayload = {
-      schemaVersion: 3 as const,
+      schemaVersion: 4 as const,
       kind: 'ultracode-featurebench-inputs' as const,
       source,
       pythonVersion: plan.pythonVersion,
@@ -733,6 +770,7 @@ export async function prepareFeatureBenchInputs(
       fbSha256: sha256File(fbBinary),
       patchSha256: sha256File(plan.patch),
       datasetMapSha256: sha256File(mapPath),
+      datasetParquetSha256,
       tasks,
       toolchainPayloadSha256: toolchain.provenance.payloadSha256,
     };

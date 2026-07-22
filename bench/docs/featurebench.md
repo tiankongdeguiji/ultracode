@@ -20,7 +20,10 @@ another grader.
 `bench/suites/featurebench/codex-chatgpt.patch`, performs a frozen,
 configuration-isolated `uv sync` with copied packages and managed Python,
 pulls the pinned split, and writes the complete task-to-image map inside Git
-metadata. Every image is resolved to one repository digest and local image ID.
+metadata. Preparation verifies the exact pinned parquet bytes, retains that
+artifact in the content-addressed input, and both inference and evaluation load
+only the retained local copy. Every image is resolved to one repository digest
+and local image ID.
 The prepared source, environment, patch, dataset map, task inventory, images,
 and common toolchain are content-addressed and re-attested before native work.
 Python bytecode caches are removed and forbidden in published inputs. The
@@ -44,10 +47,12 @@ The operator provisions a broker container and dedicated Docker network before
   `ultracode.egress-policy=openai-via-credential-broker`.
 - Before each native phase, the network must have exactly one endpoint: the
   named, running broker container. The broker must have immutable image identity
-  and the configured public identity/version labels.
+  and these exact labels: `ultracode.credential-broker=true`,
+  `ultracode.credential-broker.identity=<featureBench.broker.publicIdentity>`,
+  and `ultracode.credential-broker.version=<featureBench.broker.publicVersion>`.
 - Official evaluator containers use Docker's `none` network and attest that
-  mode immediately after creation; they receive the same pinned image, resource,
-  CPU-only, and ownership policy as inference containers.
+  mode immediately after creation; they receive the same pinned image, CPU,
+  memory, PID-limit, CPU-only, and ownership policy as inference containers.
 - Reusable host credentials and auth files are never mounted or forwarded to
   repository-controlled task containers. The broker is responsible for its
   own upstream egress, credential injection, scoping, and request validation.
@@ -84,8 +89,8 @@ npm run bench -- --suite featurebench report --run-id feature-a1
 The operator config in `bench/bench.config.json` supplies the complete run
 configuration. On a fresh run, the only configuration values that the CLI can
 override are `--model`, `--effort`, `--arm`, and repeatable `--task-id`. Public
-broker identity/version, inference and evaluation concurrency, timeouts, CPU
-and memory resources, and optional model pricing are config-only; the CLI has
+broker identity/version, inference and evaluation concurrency, timeouts, CPU,
+memory, and PID resources, and optional model pricing are config-only; the CLI has
 no flags for them.
 
 The fresh run resolves config plus those four optional overrides, validates the
@@ -99,7 +104,7 @@ environment and re-attested on every launch. `--redo <task-id>` requires
 `--resume` plus a non-null state-bound inference baseline. The baseline check
 precedes receipt/report invalidation. The native inference timeout remains a
 per-task limit, while the host watchdog scales it by the number of concurrency
-waves and adds cleanup grace.
+waves and adds Arm B workflow-drain plus cleanup grace.
 Ordinary resume targets the first
 non-null inference root with native `--resume`; null-only history retries the
 complete immutable task set fresh only while `native/` has no timestamp root.

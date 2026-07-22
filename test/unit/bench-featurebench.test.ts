@@ -40,13 +40,16 @@ import { validateFeatureBenchHost } from '../../bench/src/suites/featurebench/ho
 import {
   assertNoFeatureBenchPythonCacheArtifacts,
   assertNoFeatureBenchStageReferences,
+  FEATUREBENCH_DATASET_DOWNLOAD_SCRIPT,
   FEATUREBENCH_DATASET_MEMBERSHIP_SCRIPT,
+  FEATUREBENCH_DATASET_PARQUET,
   featureBenchEnvironmentIdentity,
   makeFeatureBenchEnvironmentRelocatable,
   parseFeatureBenchDatasetMap,
   prepareFeatureBenchInputs,
   preflightFeatureBenchUv,
   removeFeatureBenchPythonCacheArtifacts,
+  verifyFeatureBenchDatasetArtifact,
   type PreparedFeatureBenchInputs,
 } from '../../bench/src/suites/featurebench/prepare.js';
 import {
@@ -109,9 +112,9 @@ function projectFeatureBenchRows(rows: readonly unknown[]) {
   writeFileSync(join(stubDirectory, 'datasets.py'), `import json
 import os
 
-def load_dataset(dataset, *, split, revision):
+def load_dataset(dataset, *, data_files, split):
     expected = json.loads(os.environ["FEATUREBENCH_STUB_EXPECTED"])
-    if {"dataset": dataset, "split": split, "revision": revision} != expected:
+    if {"dataset": dataset, "data_files": data_files, "split": split} != expected:
         raise AssertionError("projection did not use the pinned load_dataset arguments")
     return json.loads(os.environ["FEATUREBENCH_STUB_ROWS"])
 `);
@@ -120,10 +123,11 @@ def load_dataset(dataset, *, split, revision):
     env: {
       ...process.env,
       FEATUREBENCH_STUB_EXPECTED: JSON.stringify({
-        dataset: FEATUREBENCH_DATASET,
-        revision: FEATUREBENCH_DATASET_REVISION,
-        split: FEATUREBENCH_SPLIT,
+        dataset: 'parquet',
+        data_files: '/pinned/featurebench.parquet',
+        split: 'train',
       }),
+      FEATUREBENCH_DATASET_PARQUET: '/pinned/featurebench.parquet',
       FEATUREBENCH_STUB_ROWS: JSON.stringify(rows),
       PYTHONPATH: stubDirectory,
       PYTHONDONTWRITEBYTECODE: '1',
@@ -153,7 +157,7 @@ function config(): FeatureBenchConfig {
     broker: { publicIdentity: 'broker-public-id', publicVersion: 'broker-v1' },
     concurrency: { inference: 4, evaluation: 4 },
     timeouts: { inferenceMs: 60_000, evaluationMs: 60_000 },
-    resources: { cpus: 8, memoryBytes: 24_000_000_000 },
+    resources: { cpus: 8, memoryBytes: 24_000_000_000, pids: 4_096 },
   };
 }
 
@@ -164,7 +168,7 @@ function manifest(): FeatureBenchManifest {
     suiteConfig: {
       inference: { concurrency: 4, timeoutMs: 60_000 },
       evaluation: { concurrency: 3, timeoutMs: 120_000 },
-      resources: { cpus: 8, memoryBytes: 24_000_000_000 },
+      resources: { cpus: 8, memoryBytes: 24_000_000_000, pids: 4_096 },
     },
     provenance: {
       tasks: TASK_IDS.map((taskId) => ({
@@ -334,6 +338,8 @@ describe('FeatureBench immutable inputs and host policy', () => {
     expect(FEATUREBENCH_DATASET_REVISION).toBe('e99d6efdfe511ea832c1b5735c536129561ec96a');
     expect(FEATUREBENCH_SPLIT).toBe('fast');
     expect(FEATUREBENCH_PYTHON_VERSION).toBe('3.13.5');
+    expect(FEATUREBENCH_DATASET_PARQUET).toBe('.git/ultracode-benchmark-dataset.parquet');
+    expect(FEATUREBENCH_DATASET_DOWNLOAD_SCRIPT).toContain(FEATUREBENCH_DATASET_REVISION);
     expect({
       dataset: inventory.dataset,
       revision: inventory.revision,
@@ -367,6 +373,9 @@ describe('FeatureBench immutable inputs and host policy', () => {
       split: FEATUREBENCH_SPLIT,
       tasks: { 'task-alpha': 'example.test/image:tag' },
     })).toThrow(/pinned dataset/);
+    const wrongArtifact = join(temporary(), 'featurebench.parquet');
+    writeFileSync(wrongArtifact, 'wrong bytes');
+    expect(() => verifyFeatureBenchDatasetArtifact(wrongArtifact)).toThrow(/audited byte pin/);
   });
 
   it('preflights uv on PATH before creating preparation state or invoking Docker', async () => {
@@ -702,15 +711,6 @@ describe('FeatureBench credential-broker trust boundary', () => {
         inspection: { Id: fullId, Config: { Labels: { ...labels, 'ultracode.benchmark.purpose': 'foreign' } } },
       },
       {
-        name: 'evaluation network',
-        listed: prefix,
-        inspection: {
-          Id: fullId,
-          Config: { Labels: { ...labels, 'ultracode.benchmark.purpose': 'evaluation' } },
-          HostConfig: { NetworkMode: 'bridge' },
-        },
-      },
-      {
         name: 'common ownership labels',
         listed: prefix,
         inspection: {
@@ -755,6 +755,34 @@ describe('FeatureBench credential-broker trust boundary', () => {
       ).rejects.toThrow();
       expect(commands.filter((argv) => argv[1] === 'rm'), scenario.name).toHaveLength(0);
     }
+  });
+
+  it('removes an exactly owned evaluator before reporting its network-policy violation', async () => {
+    const prefix = 'a'.repeat(12);
+    const fullId = 'a'.repeat(64);
+    const commands: string[][] = [];
+    const executor = async (command: string, argv: readonly string[]) => {
+      commands.push([command, ...argv]);
+      if (argv[0] === 'ps') return { stdout: `${prefix}\n`, stderr: '' };
+      if (argv[0] === 'inspect') return { stdout: JSON.stringify([{
+        Id: fullId,
+        Config: { Labels: {
+          'ultracode.benchmark.schema': '2',
+          'ultracode.benchmark.suite': 'featurebench',
+          'ultracode.benchmark.run': 'run-one',
+          'ultracode.benchmark.arm': 'b',
+          'ultracode.benchmark.ownership': '1',
+          'ultracode.benchmark.task': 'task-alpha',
+          'ultracode.benchmark.purpose': 'evaluation',
+        } },
+        HostConfig: { NetworkMode: 'bridge' },
+      }]), stderr: '' };
+      return { stdout: '', stderr: '' };
+    };
+
+    await expect(cleanupFeatureBenchContainers('run-one', 'b', ['task-alpha'], executor))
+      .rejects.toThrow(/removed owned FeatureBench evaluator/);
+    expect(commands.filter((argv) => argv[1] === 'rm')).toEqual([['docker', 'rm', '--force', fullId]]);
   });
 
   it('does not remove an earlier verified container when a later inspection is unsafe', async () => {
@@ -803,10 +831,12 @@ describe('FeatureBench credential-broker trust boundary', () => {
 
 describe('pinned native fb commands', () => {
   it('scales the outer inference watchdog by bounded concurrency waves', () => {
-    expect(featureBenchInferenceWatchdogMs(100, 4, 43_200_000)).toBe(1_080_030_000);
-    expect(featureBenchInferenceWatchdogMs(1, 4, 60_000)).toBe(90_000);
-    expect(() => featureBenchInferenceWatchdogMs(0, 4, 60_000)).toThrow(/positive safe integers/);
-    expect(() => featureBenchInferenceWatchdogMs(100, 4, Number.MAX_SAFE_INTEGER))
+    expect(featureBenchInferenceWatchdogMs(100, 4, 43_200_000, 'a')).toBe(1_080_030_000);
+    expect(featureBenchInferenceWatchdogMs(100, 4, 43_200_000, 'b')).toBe(1_251_030_000);
+    expect(featureBenchInferenceWatchdogMs(1, 4, 60_000, 'a')).toBe(90_000);
+    expect(featureBenchInferenceWatchdogMs(1, 4, 60_000, 'b')).toBe(450_000);
+    expect(() => featureBenchInferenceWatchdogMs(0, 4, 60_000, 'a')).toThrow(/positive safe integers/);
+    expect(() => featureBenchInferenceWatchdogMs(100, 4, Number.MAX_SAFE_INTEGER, 'b'))
       .toThrow(/safe range/);
   });
 
@@ -822,6 +852,8 @@ describe('pinned native fb commands', () => {
       '--timeout', '60', '--output-dir', '/run/native',
     ]);
     expect(run.config).toContain('FEATUREBENCH_CPU_ONLY = "1"');
+    expect(run.config).toContain('FEATUREBENCH_DATASET_PARQUET = ".git/ultracode-benchmark-dataset.parquet"');
+    expect(run.config).toContain('FB_CONTAINER_PIDS = "4096"');
     expect(run.config).toContain('FEATUREBENCH_PROMPT_PREFIX = "ultracode\\n"');
     const armAManifest = structuredClone(manifest());
     armAManifest.experiment.arm = 'a';
@@ -1439,6 +1471,7 @@ describe('FeatureBench CLI configuration boundary', () => {
     'evaluation-timeout-ms',
     'cpus',
     'memory-bytes',
+    'pids',
     'pricing',
   ])('rejects config-only --%s', (name) => {
     expect(() => featureBenchAdapter.commands.run.parse([
@@ -1814,6 +1847,8 @@ describe('FeatureBench owned assets', () => {
     expect(patch).toContain('ultracode.benchmark.purpose');
     expect(patch).toContain('FEATUREBENCH_EVALUATOR_NETWORK');
     expect(patch).toContain('No pinned evaluation image digest');
+    expect(patch).toContain('pids_limit=pids_limit');
+    expect(patch).toContain("const recovery = new Set(['orphaned', 'cleanup-failed'])");
     expect(patch).not.toMatch(/ultracode\.external-run|FEATUREBENCH_RUN_OWNER/);
     expect(readFileSync('bench/suites/featurebench/.gitattributes', 'utf8')).toContain('codex-chatgpt.patch');
   });

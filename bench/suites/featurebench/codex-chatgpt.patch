@@ -1,8 +1,8 @@
 diff --git a/featurebench/harness/container.py b/featurebench/harness/container.py
-index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..67b36f84fb7392628403bdd9e54b67aed89313ab 100644
+index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..ba5c03e32ff9a6908701c6466231776d931d2d54 100644
 --- a/featurebench/harness/container.py
 +++ b/featurebench/harness/container.py
-@@ -216,6 +216,17 @@ class EvalContainerManager:
+@@ -216,6 +216,21 @@ class EvalContainerManager:
              number_once = 1
          shm_size = docker_runtime_config.get("shm_size")
  
@@ -11,6 +11,10 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..67b36f84fb7392628403bdd9e54b67ae
 +        raw_cpus = os.environ.get("FB_CONTAINER_CPUS")
 +        nano_cpus = int(float(raw_cpus) * 1_000_000_000) if raw_cpus else None
 +        mem_limit = os.environ.get("FB_CONTAINER_MEMORY") or None
++        raw_pids = os.environ.get("FB_CONTAINER_PIDS")
++        pids_limit = int(raw_pids) if raw_pids else None
++        if pids_limit is None or pids_limit <= 0:
++            raise RuntimeError("A positive FeatureBench evaluator PID limit is required")
 +        evaluator_network = os.environ.get("FEATUREBENCH_EVALUATOR_NETWORK")
 +        if evaluator_network != "none":
 +            raise RuntimeError("FeatureBench evaluator containers must use Docker's none network")
@@ -20,7 +24,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..67b36f84fb7392628403bdd9e54b67ae
          # Sanitize instance_id: replace / and . with -
          sanitized_id = instance_id.replace("/", "-").replace(".", "-").replace("--", "-")
          # Add timestamp to avoid name conflicts in parallel execution
-@@ -269,19 +280,7 @@ class EvalContainerManager:
+@@ -269,19 +284,7 @@ class EvalContainerManager:
              environment.update(env_vars_from_config)
              self.logger.info(f"Added environment variables from config: {list(env_vars_from_config.keys())}")
  
@@ -41,12 +45,13 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..67b36f84fb7392628403bdd9e54b67ae
  
          if shm_size:
              self.logger.info(f"Using shared memory size: {shm_size}")
-@@ -299,9 +298,26 @@ class EvalContainerManager:
+@@ -299,9 +302,28 @@ class EvalContainerManager:
              environment=environment,
              network_mode=network_mode,
              shm_size=shm_size,
 +            nano_cpus=nano_cpus,
 +            mem_limit=mem_limit,
++            pids_limit=pids_limit,
              labels=labels,
          )
  
@@ -56,6 +61,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..67b36f84fb7392628403bdd9e54b67ae
 +            if (
 +                not isinstance(host_config, dict)
 +                or host_config.get("NetworkMode") != "none"
++                or host_config.get("PidsLimit") != pids_limit
 +            ):
 +                raise RuntimeError("FeatureBench evaluator network attestation failed")
 +        except Exception:
@@ -68,8 +74,15 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..67b36f84fb7392628403bdd9e54b67ae
          # Check if GPU is available
          if need_gpu:
              exit_code, output = container.exec_run("nvidia-smi --list-gpus")
+@@ -368,4 +390,4 @@ class EvalContainerManager:
+             container.remove()
+             self.logger.info("Container removed successfully")
+         except Exception as e:
+-            self.logger.warning(f"Failed to cleanup container: {e}")
+\ No newline at end of file
++            self.logger.warning(f"Failed to cleanup container: {e}")
 diff --git a/featurebench/harness/run_evaluation.py b/featurebench/harness/run_evaluation.py
-index beb48fbb82384af44f5d18ce2b7d22a779699014..27b36cb9ddabe0c984c6b91ffdcf725b235f148a 100644
+index beb48fbb82384af44f5d18ce2b7d22a779699014..bee919dc77ded07ea115216158b1fbad5b168a02 100644
 --- a/featurebench/harness/run_evaluation.py
 +++ b/featurebench/harness/run_evaluation.py
 @@ -66,7 +66,6 @@ from featurebench.harness.review_codes import (
@@ -128,29 +141,29 @@ index beb48fbb82384af44f5d18ce2b7d22a779699014..27b36cb9ddabe0c984c6b91ffdcf725b
          logger.info(f"Using Docker image: {docker_image}")
  
          container_manager.pull_image_if_needed(docker_image)
-@@ -767,9 +785,11 @@ def load_dataset_from_hf(
+@@ -767,9 +785,16 @@ def load_dataset_from_hf(
          config_loader = InferConfigLoader(resolved_path)
          env_vars = config_loader.env_vars
          hf_token = env_vars.get("HF_TOKEN")
 +        dataset_revision = env_vars.get("FEATUREBENCH_DATASET_REVISION") or None
++        dataset_parquet = env_vars.get("FEATUREBENCH_DATASET_PARQUET") or None
      except FileNotFoundError:
          console.print("[yellow]Warning: config.toml not found, using defaults[/]")
          hf_token = os.environ.get('HF_TOKEN', None)
 +        dataset_revision = None
++        dataset_parquet = None
++
++    if not dataset_revision or not dataset_parquet:
++        raise RuntimeError("Pinned FeatureBench dataset revision and parquet are required")
  
      console.print(f"[bold blue]Loading dataset from HuggingFace...[/]")
      console.print(f"[dim]Repository: {dataset}[/]")
-@@ -780,7 +800,12 @@ def load_dataset_from_hf(
+@@ -780,7 +805,7 @@ def load_dataset_from_hf(
  
      try:
          # Load the specified split
 -        hf_dataset = load_dataset(dataset, split=split, token=hf_token)
-+        hf_dataset = load_dataset(
-+            dataset,
-+            split=split,
-+            token=hf_token,
-+            revision=dataset_revision,
-+        )
++        hf_dataset = load_dataset("parquet", data_files=dataset_parquet, split="train")
          df = pd.DataFrame(hf_dataset)
  
          # Determine level from instance_id's last segment (e.g., "xxx.lv1" -> level 1)
@@ -162,7 +175,7 @@ index beb48fbb82384af44f5d18ce2b7d22a779699014..27b36cb9ddabe0c984c6b91ffdcf725b
 \ No newline at end of file
 +    raise SystemExit(main())
 diff --git a/featurebench/infer/agents/codex.py b/featurebench/infer/agents/codex.py
-index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db538ef48ae 100644
+index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..395edf36a6686ff80abeb6ff8fca96316c5d9be6 100644
 --- a/featurebench/infer/agents/codex.py
 +++ b/featurebench/infer/agents/codex.py
 @@ -40,6 +40,13 @@ set -e
@@ -179,7 +192,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
  if command -v codex >/dev/null 2>&1; then
      echo "codex already available; skipping installation"
      codex --version || true
-@@ -102,14 +109,100 @@ echo "Codex installation complete"
+@@ -102,14 +109,125 @@ echo "Codex installation complete"
  
          return True
  
@@ -190,12 +203,14 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
 +            return True
 +        wait_seconds = int(self.env_vars.get("FEATUREBENCH_WORKFLOW_WAIT_SECONDS", "3300"))
 +        script = r'''set -u
-+active_runs() {
-+  result=$(/opt/bench/node-sel - <<'NODE'
++scan_runs() {
++  result=$(ULTRACODE_SCAN_MODE="$1" /opt/bench/node-sel - <<'NODE'
 +const fs = require('node:fs');
 +const path = require('node:path');
 +const home = '/agent-logs/ultracode';
-+const terminal = new Set(['completed', 'failed', 'stopped', 'orphaned']);
++const verified = new Set(['completed', 'failed', 'stopped']);
++const recovery = new Set(['orphaned', 'cleanup-failed']);
++const mode = process.env.ULTRACODE_SCAN_MODE;
 +const runs = path.join(home, 'runs');
 +if (!fs.existsSync(runs)) process.exit(3);
 +const entries = fs.readdirSync(runs, { withFileTypes: true })
@@ -205,8 +220,11 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
 +  const runId = entry.name;
 +  try {
 +    const manifest = JSON.parse(fs.readFileSync(path.join(runs, runId, 'manifest.json'), 'utf8'));
-+    if (!terminal.has(String(manifest.status))) console.log(runId);
-+  } catch { console.log(runId); }
++    const status = String(manifest.status);
++    if ((mode === 'recovery' && recovery.has(status)) || (mode === 'active' && !verified.has(status))) {
++      console.log(runId);
++    }
++  } catch { if (mode === 'active') console.log(runId); }
 +}
 +NODE
 +  )
@@ -221,23 +239,41 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
 +  fi
 +  printf '%s' "$result"
 +}
-+stragglers=$(active_runs) || exit 1
++stop_runs() {
++  for run_id in $1; do
++    ULTRACODE_HOME=/agent-logs/ultracode /opt/bench/node-sel \
++      /opt/bench/ultracode/dist/cli/main.js stop "$run_id" >&2 || true
++  done
++}
++recover_workflows() {
++  recovery=$(scan_runs recovery) || return 1
++  if [ -z "$recovery" ]; then return 0; fi
++  printf 'recovering unverified workflows: %s\n' "$recovery" >&2
++  stop_runs "$recovery"
++  remaining_recovery=$(scan_runs recovery) || return 1
++  [ -z "$remaining_recovery" ] || {
++    printf 'workflow cleanup remains unverified: %s\n' "$remaining_recovery" >&2
++    return 1
++  }
++}
++recover_workflows || exit 1
++stragglers=$(scan_runs active) || exit 1
 +deadline=$(( $(date +%s) + FEATUREBENCH_WORKFLOW_WAIT_SECONDS ))
 +while [ -n "$stragglers" ] && [ "$(date +%s)" -lt "$deadline" ]; do
 +  sleep 5
-+  stragglers=$(active_runs) || exit 1
++  recover_workflows || exit 1
++  stragglers=$(scan_runs active) || exit 1
 +done
 +if [ -z "$stragglers" ]; then exit 0; fi
 +printf 'workflow wait expired; stopping: %s\n' "$stragglers" >&2
-+for run_id in $stragglers; do
-+  ULTRACODE_HOME=/agent-logs/ultracode /opt/bench/node-sel \
-+    /opt/bench/ultracode/dist/cli/main.js stop "$run_id" >&2 || true
-+done
++stop_runs "$stragglers"
 +stop_deadline=$(( $(date +%s) + 120 ))
-+remaining=$(active_runs) || exit 1
++recover_workflows || exit 1
++remaining=$(scan_runs active) || exit 1
 +while [ -n "$remaining" ] && [ "$(date +%s)" -lt "$stop_deadline" ]; do
 +  sleep 5
-+  remaining=$(active_runs) || exit 1
++  recover_workflows || exit 1
++  remaining=$(scan_runs active) || exit 1
 +done
 +[ -z "$remaining" ] || printf 'workflows did not stop: %s\n' "$remaining" >&2
 +exit 1'''
@@ -278,13 +314,15 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
 -        except Exception:
 -            pass
 +        workflows_complete = self._wait_for_workflows(container)
++        if not workflows_complete:
++            return False
 +        outputs_copied = self._copy_outputs(container, log_file, best_effort=False)
-+        if not workflows_complete or not outputs_copied:
++        if not outputs_copied:
 +            return False
          # Validate the run finished cleanly: last JSONL event should be turn.completed with usage.
          try:
              events_path = log_dir / "codex_events.jsonl"
-@@ -153,18 +246,16 @@ echo "Codex installation complete"
+@@ -153,18 +271,16 @@ echo "Codex installation complete"
      def failure_hook(self, container, log_file: Path) -> None:
          """Collect outputs on failures (best-effort)."""
  
@@ -293,8 +331,8 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
 -            self.cm.copy_from_container(container, "/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl")
 -        except Exception:
 -            pass
-+        self._wait_for_workflows(container)
-+        self._copy_outputs(container, log_file, best_effort=True)
++        if self._wait_for_workflows(container):
++            self._copy_outputs(container, log_file, best_effort=True)
  
      def get_run_command(self, instruction: str) -> str:
          """Get the command to run Codex."""
@@ -307,7 +345,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
  
          model = self._kwargs.get("model")
          # Preserve provider-prefixed model names (e.g., "azure/<deployment>").
-@@ -179,7 +270,7 @@ echo "Codex installation complete"
+@@ -179,7 +295,7 @@ echo "Codex installation complete"
              # Preserve the exit code when piping JSONL to a file.
              "set -o pipefail; "
              f"codex exec "
@@ -316,7 +354,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
              f"--skip-git-repo-check "
              f"--json "
              f"{model_arg}"
-@@ -192,20 +283,21 @@ echo "Codex installation complete"
+@@ -192,20 +308,21 @@ echo "Codex installation complete"
          lines = ["#!/bin/bash", ""]
  
          api_key = self.env_vars.get("OPENAI_API_KEY")
@@ -344,7 +382,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
              env_settings["AZURE_OPENAI_API_KEY"] = self.env_vars.get("AZURE_OPENAI_API_KEY") or api_key
  
          # Optional settings
-@@ -262,7 +354,7 @@ echo "Codex installation complete"
+@@ -262,7 +379,7 @@ echo "Codex installation complete"
              reasoning_effort = reasoning_effort.replace("\\", "\\\\").replace('"', '\\"')
  
          # Azure: https://learn.microsoft.com/zh-cn/azure/ai-foundry/openai/how-to/codex?view=foundry-classic&tabs=npm
@@ -353,7 +391,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
              deployment = raw_model.split("/", 1)[1] if raw_model.startswith("azure/") else raw_model
  
              # Codex CLI Azure v1 requires /openai/v1 in the base URL.
-@@ -300,6 +392,63 @@ echo "Codex installation complete"
+@@ -300,6 +417,63 @@ echo "Codex installation complete"
                  ]
              )
  
@@ -418,45 +456,56 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db5
          else:
              model_name = raw_model
 diff --git a/featurebench/infer/config.py b/featurebench/infer/config.py
-index 796c784bee86b17e337fd4e47044cd5ce4ac04db..4bac9e7ede3431c246a015bf7eaae1a3a090fce5 100644
+index 796c784bee86b17e337fd4e47044cd5ce4ac04db..783769fad7c7a874a1a22fdad7c194be4c8e3998 100644
 --- a/featurebench/infer/config.py
 +++ b/featurebench/infer/config.py
-@@ -194,6 +194,7 @@ class DatasetLoader:
+@@ -193,7 +193,10 @@ class DatasetLoader:
+         from datasets import load_dataset
          
          env_vars = self.config.env_vars
-         hf_token = env_vars.get("HF_TOKEN")
+-        hf_token = env_vars.get("HF_TOKEN")
 +        dataset_revision = env_vars.get("FEATUREBENCH_DATASET_REVISION") or None
++        dataset_parquet = env_vars.get("FEATUREBENCH_DATASET_PARQUET") or None
++        if not dataset_revision or not dataset_parquet:
++            raise RuntimeError("Pinned FeatureBench dataset revision and parquet are required")
  
          dataset_name = str(dataset or "").strip()
          if not dataset_name:
-@@ -208,7 +209,8 @@ class DatasetLoader:
-             dataset = load_dataset(
-                 dataset_name,
-                 split=split,
+@@ -205,11 +208,7 @@ class DatasetLoader:
+         all_instances = []
+         
+         try:
+-            dataset = load_dataset(
+-                dataset_name,
+-                split=split,
 -                token=hf_token
-+                token=hf_token,
-+                revision=dataset_revision,
-             )
+-            )
++            dataset = load_dataset("parquet", data_files=dataset_parquet, split="train")
              
              for item in dataset:
+                 item_dict = dict(item)
 diff --git a/featurebench/infer/container.py b/featurebench/infer/container.py
-index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..07f2f9ccd67eac222ae1eb4d29a46da902c20d29 100644
+index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..763a82fade812fab6475b4f6d634541285c5520b 100644
 --- a/featurebench/infer/container.py
 +++ b/featurebench/infer/container.py
-@@ -190,6 +190,12 @@ class ContainerManager:
+@@ -190,6 +190,16 @@ class ContainerManager:
          if not isinstance(number_once, int) or number_once <= 0:
              number_once = 1
          shm_size = docker_runtime_config.get("shm_size")
 +        raw_cpus = self.env_vars.get("FB_CONTAINER_CPUS")
 +        nano_cpus = int(float(raw_cpus) * 1_000_000_000) if raw_cpus else None
 +        mem_limit = self.env_vars.get("FB_CONTAINER_MEMORY") or None
++        raw_pids = self.env_vars.get("FB_CONTAINER_PIDS")
++        pids_limit = int(raw_pids) if raw_pids else None
++        if pids_limit is None or pids_limit <= 0:
++            raise RuntimeError("A positive FeatureBench inference PID limit is required")
 +        restricted_network = self.env_vars.get("FEATUREBENCH_RESTRICTED_NETWORK")
 +        if restricted_network in {None, "", "bridge", "host", "default", "none"}:
 +            raise RuntimeError("A dedicated restricted FeatureBench network is required")
  
          # Configure GPU access
          device_requests = None
-@@ -244,9 +250,11 @@ class ContainerManager:
+@@ -244,11 +254,25 @@ class ContainerManager:
                  volumes=volumes,
                  command="tail -f /dev/null",  # Keep container running
                  platform="linux/amd64",
@@ -466,10 +515,24 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..07f2f9ccd67eac222ae1eb4d29a46da9
                  shm_size=shm_size,
 +                nano_cpus=nano_cpus,
 +                mem_limit=mem_limit,
++                pids_limit=pids_limit,
                  labels=labels,
              )
++            try:
++                container.reload()
++                host_config = container.attrs.get("HostConfig")
++                if not isinstance(host_config, dict) or host_config.get("PidsLimit") != pids_limit:
++                    raise RuntimeError("FeatureBench inference PID-limit attestation failed")
++            except Exception:
++                try:
++                    container.remove(force=True)
++                except Exception:
++                    pass
++                raise
              
-@@ -662,4 +670,4 @@ class ContainerManager:
+             # Check if GPU is available
+             if need_gpu:
+@@ -662,4 +686,4 @@ class ContainerManager:
          try:
              return container.logs().decode("utf-8", errors="replace")
          except Exception as e:
@@ -477,7 +540,7 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..07f2f9ccd67eac222ae1eb4d29a46da9
 \ No newline at end of file
 +            return f"Failed to get logs: {e}"
 diff --git a/featurebench/infer/run_infer.py b/featurebench/infer/run_infer.py
-index 594e8f6cd3e9b3436439ce879b7d1611edd04e00..40d7a1a88502b94d4a509770dfa41bb0523af375 100644
+index 594e8f6cd3e9b3436439ce879b7d1611edd04e00..71d7b1a08be64dba86e504e1778c8f75e4118416 100644
 --- a/featurebench/infer/run_infer.py
 +++ b/featurebench/infer/run_infer.py
 @@ -491,8 +491,51 @@ class InferenceRunner:

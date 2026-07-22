@@ -64,13 +64,15 @@ on a dedicated internal Docker network. The sole pre-existing endpoint must be
 a separately managed, running, immutable-image HTTPS credential broker with the
 configured public identity and version labels. A host-wide policy lock covers
 cleanup, broker-only network preflight, inference, official evaluation, and
-final cleanup. Persistent artifacts contain public identity, version, and policy
-hashes, never the broker URL, Docker runtime names, credential material, or
-credential-file paths. The runtime-only broker URL is written under a private
-run/arm/nonce-marked home that normal finalization and the next exact run cleanup
-remove. The broker remains trusted to scope credentials, validate requests, and
-control its own upstream egress; compromise of that broker is outside the task
-container isolation guarantee.
+final cleanup. Host-owned manifests and verifier receipts contain only public
+identity, version, and policy hashes, never the broker URL, Docker runtime names,
+credential material, or credential-file paths. Task-controlled native output is
+untrusted and may retain the runtime broker URL or Docker network name supplied
+inside the container, so operators must treat it as sensitive. The runtime-only
+broker URL is written under a private run/arm/nonce-marked home that normal
+finalization and the next exact run cleanup remove. The broker remains trusted
+to scope credentials, validate requests, and control its own upstream egress;
+compromise of that broker is outside the task container isolation guarantee.
 
 ### SWE-bench Pro
 

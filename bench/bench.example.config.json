@@ -77,7 +77,8 @@
     },
     "resources": {
       "cpus": 8,
-      "memoryBytes": 25769803776
+      "memoryBytes": 25769803776,
+      "pids": 4096
     }
   }
 }

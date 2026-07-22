@@ -235,7 +235,7 @@ function featureManifest(): Record<string, unknown> {
       retries: 0,
       inference: { concurrency: 1, timeoutMs: 60_000 },
       evaluation: { concurrency: 1, timeoutMs: 60_000 },
-      resources: { cpus: 2, memoryBytes: 4_000_000_000 },
+      resources: { cpus: 2, memoryBytes: 4_000_000_000, pids: 1_024 },
       policies: { promptSha256: HASH, patchSha256: HASH, datasetMapSha256: HASH, adapterSha256: HASH },
     },
   };

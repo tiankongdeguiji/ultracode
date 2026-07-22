@@ -52,6 +52,7 @@ export const featureBenchConfigSchema = z.strictObject({
   resources: z.strictObject({
     cpus: z.number().finite().positive(),
     memoryBytes: z.number().int().positive(),
+    pids: z.number().int().positive(),
   }),
   pricing: z.record(z.string(), pricingEntrySchema).optional(),
 });
@@ -83,7 +84,7 @@ export const DEFAULT_FEATUREBENCH_CONFIG: FeatureBenchConfig = {
   },
   concurrency: { inference: 4, evaluation: 4 },
   timeouts: { inferenceMs: 43_200_000, evaluationMs: 21_600_000 },
-  resources: { cpus: 8, memoryBytes: 24 * 1_024 * 1_024 * 1_024 },
+  resources: { cpus: 8, memoryBytes: 24 * 1_024 * 1_024 * 1_024, pids: 4_096 },
 };
 
 export function validateFeatureBenchConfig(config: FeatureBenchConfig): void {
