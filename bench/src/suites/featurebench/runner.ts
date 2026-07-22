@@ -67,7 +67,11 @@ import {
   type TaskReportInput,
 } from '../../shared/report.js';
 import { BenchRunStateStore, type BenchRunState } from '../../shared/run-state.js';
-import { oneDockerInspectRow } from '../../shared/docker-isolation.js';
+import {
+  dockerObject,
+  inspectInternalDockerNetwork,
+  oneDockerInspectRow,
+} from '../../shared/docker-isolation.js';
 import {
   UNVERIFIED_NATIVE_RESULT,
   VerifierReceiptStore,
@@ -504,18 +508,6 @@ function assertResumeOptions(options: RunOptions, manifest: FeatureBenchManifest
   }
 }
 
-interface DockerNetworkInspect {
-  Internal?: unknown;
-  Driver?: unknown;
-  Scope?: unknown;
-  Attachable?: unknown;
-  Ingress?: unknown;
-  Labels?: unknown;
-  Options?: unknown;
-  IPAM?: unknown;
-  Containers?: unknown;
-}
-
 interface DockerContainerInspect {
   Id?: unknown;
   Image?: unknown;
@@ -535,21 +527,21 @@ export function inspectFeatureBenchTrustBoundary(
   config: FeatureBenchConfig,
   bindings: FeatureBenchRuntimeBindings,
 ): Pick<RuntimeAttestation, 'endpointPolicySha256' | 'brokerRuntimeSha256'> {
-  const network = oneDockerInspectRow<DockerNetworkInspect>(networkStdout, 'FeatureBench network');
-  const labels = network.Labels !== null && typeof network.Labels === 'object' && !Array.isArray(network.Labels)
-    ? network.Labels as Record<string, unknown>
-    : {};
-  const containers = network.Containers !== null && typeof network.Containers === 'object' && !Array.isArray(network.Containers)
-    ? Object.entries(network.Containers as Record<string, unknown>)
-    : [];
   const brokerEndpoint = new URL(bindings.brokerUrl);
   const brokerHost = brokerEndpoint.hostname;
-  if (network.Internal !== true || labels['ultracode.egress-policy'] !== FEATUREBENCH_NETWORK_POLICY.policyLabel
-    || containers.length !== 1 || !containers.every(([, value]) => value !== null && typeof value === 'object'
-      && !Array.isArray(value) && (value as Record<string, unknown>).Name === brokerHost)) {
-    throw new Error('restricted FeatureBench network must be internal and contain exactly the named credential broker');
-  }
-  const broker = oneDockerInspectRow<DockerContainerInspect>(brokerStdout, 'FeatureBench broker');
+  const boundary = inspectInternalDockerNetwork(networkStdout, brokerStdout, {
+    description: 'FeatureBench restricted network',
+    networkName: bindings.restrictedNetwork,
+    policyLabel: FEATUREBENCH_NETWORK_POLICY.policyLabel,
+    expectedEndpointNames: new Set([brokerHost]),
+    requiredEndpointNames: new Set([brokerHost]),
+    allowAdditionalNetworkEndpointNames: new Set([brokerHost]),
+    dedicatedLocalBridge: true,
+  });
+  const network = boundary.inspection;
+  const labels = dockerObject(network.Labels);
+  const containers = boundary.containers;
+  const broker = boundary.containerInspections[0]![1] as DockerContainerInspect;
   const brokerLabels = broker.Config?.Labels !== null && typeof broker.Config?.Labels === 'object'
     && !Array.isArray(broker.Config.Labels) ? broker.Config.Labels as Record<string, unknown> : {};
   const brokerNetworks = broker.NetworkSettings?.Networks !== null
@@ -1893,7 +1885,7 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
     let policyLock: BenchLockHandle | null = null;
     let stores: Awaited<ReturnType<typeof loadRunStores>> | null = null;
     let invocationId: string | null = null;
-    const startedMs = performance.now();
+    let startedMs: number | null = null;
     try {
       policyLock = await acquireBenchLock(featureBenchPolicyLockRoot(), featureBenchPolicyLockFile(context.paths), {
         recoverStale: options.recoverStaleLock,
@@ -1919,6 +1911,9 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
       ));
       const attestation = await attestRuntime(context.paths, options.runId, config, runtime, prepared);
       assertProvenance(context.paths, stores.manifest, prepared, attestation);
+      releaseLocks(locks);
+      locks = [];
+      startedMs = performance.now();
       invocationId = await beginInvocation(stores.state, 'run', context.clock.now());
       await invalidateFeatureBenchRedo(
         context.paths,
@@ -1943,7 +1938,7 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
       );
       await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
     } catch (error) {
-      if (invocationId !== null && stores !== null) {
+      if (invocationId !== null && stores !== null && startedMs !== null) {
         await finishInvocation(stores.state, invocationId, startedMs, context.clock.now(), 'unknown-terminal');
       }
       throw error;
@@ -1980,6 +1975,8 @@ export async function runCommand(options: RunOptions, context: CommandContext): 
     const prepared = loadCurrentPreparedFeatureBenchInputs(context.paths);
     const attestation = await attestRuntime(context.paths, options.runId, config, runtime, prepared);
     const manifest = buildManifest(context.paths, options.runId, config, prepared, attestation, context.clock.now());
+    releaseLocks(locks);
+    locks = [];
     stores = await initializeRun(context.paths, manifest, options.recoverStaleLock, claim);
     claim.release();
     const startedMs = performance.now();
@@ -2339,7 +2336,7 @@ function featureBenchNativeAnalysisArtifact(
 export async function reportCommand(options: ReportOptions, context: CommandContext): Promise<void> {
   let policyLock: BenchLockHandle | null = null;
   let stores: Awaited<ReturnType<typeof loadRunStores>> | null = null;
-  const startedMs = performance.now();
+  let startedMs: number | null = null;
   let invocationId: string | null = null;
   try {
     policyLock = await acquireBenchLock(featureBenchPolicyLockRoot(), featureBenchPolicyLockFile(context.paths), {
@@ -2385,6 +2382,7 @@ export async function reportCommand(options: ReportOptions, context: CommandCont
         generatedAt: context.clock.now(),
       });
     };
+    startedMs = performance.now();
     invocationId = await beginInvocation(stores.state, 'report', context.clock.now());
     assemble();
     await finishInvocation(stores.state, invocationId, startedMs, context.clock.now());
@@ -2394,7 +2392,7 @@ export async function reportCommand(options: ReportOptions, context: CommandCont
   } catch (error) {
     rmSync(reportJsonFile(context.paths, 'featurebench', options.runId), { force: true });
     rmSync(reportMarkdownFile(context.paths, 'featurebench', options.runId), { force: true });
-    if (invocationId !== null && stores !== null) {
+    if (invocationId !== null && stores !== null && startedMs !== null) {
       await finishInvocation(stores.state, invocationId, startedMs, context.clock.now(), 'unknown-terminal');
     }
     throw error;

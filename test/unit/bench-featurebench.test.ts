@@ -85,6 +85,8 @@ const FIXTURE = resolve('test/fixtures/bench/featurebench');
 const INVENTORY_FIXTURE = resolve(
   'test/fixtures/bench/featurebench-inventory-e99d6efdfe511ea832c1b5735c536129561ec96a.json',
 );
+const UPSTREAM_PREIMAGE_FIXTURE = resolve('test/fixtures/featurebench/upstream-preimages.tar.gz.base64');
+const UPSTREAM_PREIMAGE_SHA256 = '19f53a17502bd49ecb143ff71cddc4cb4e754197dcb53dba0fe50d439d690ccc';
 const TIMESTAMP = '2026-07-19__13-00-41';
 const TASK_IDS = ['task-alpha', 'task-beta', 'task-gamma', 'task-delta', 'task-epsilon'];
 const HASH = 'a'.repeat(64);
@@ -627,12 +629,18 @@ describe('FeatureBench immutable inputs and host policy', () => {
 
 describe('FeatureBench credential-broker trust boundary', () => {
   const network = JSON.stringify([{
+    Name: 'featurebench-private',
     Internal: true,
+    Driver: 'bridge',
+    Scope: 'local',
+    Attachable: false,
+    Ingress: false,
     Labels: { 'ultracode.egress-policy': 'openai-via-credential-broker' },
     Containers: { ['b'.repeat(64)]: { Name: 'broker.test' } },
   }]);
   const broker = JSON.stringify([{
     Id: 'b'.repeat(64),
+    Name: '/broker.test',
     Image: `sha256:${HASH}`,
     Path: '/broker',
     Args: ['serve'],
@@ -666,23 +674,34 @@ describe('FeatureBench credential-broker trust boundary', () => {
       brokerUrl: 'https://broker.test/v2',
       restrictedNetwork: 'featurebench-private',
     });
-    const networkDrift = inspectFeatureBenchTrustBoundary(network, broker, config(), {
+    expect(pathDrift.endpointPolicySha256).not.toBe(first.endpointPolicySha256);
+    expect(() => inspectFeatureBenchTrustBoundary(network, broker, config(), {
       brokerUrl: 'https://broker.test/v1',
       restrictedNetwork: 'upstream',
-    });
-    expect(pathDrift.endpointPolicySha256).not.toBe(first.endpointPolicySha256);
-    expect(networkDrift.endpointPolicySha256).not.toBe(first.endpointPolicySha256);
+    })).toThrow(/required labeled internal network/);
   });
 
-  it('rejects extra endpoints and broker identity drift', () => {
+  it('rejects non-dedicated topology, extra endpoints, and broker identity drift', () => {
+    const overlay = network.replace('"Driver":"bridge"', '"Driver":"overlay"');
+    expect(() => inspectFeatureBenchTrustBoundary(overlay, broker, config(), {
+      brokerUrl: 'https://broker.test/v1', restrictedNetwork: 'featurebench-private',
+    })).toThrow(/dedicated local bridge/);
     const extra = JSON.stringify([{
+      Name: 'featurebench-private',
       Internal: true,
+      Driver: 'bridge',
+      Scope: 'local',
+      Attachable: false,
+      Ingress: false,
       Labels: { 'ultracode.egress-policy': 'openai-via-credential-broker' },
-      Containers: { ['b'.repeat(64)]: { Name: 'broker.test' }, extra: { Name: 'other' } },
+      Containers: {
+        ['b'.repeat(64)]: { Name: 'broker.test' },
+        ['c'.repeat(64)]: { Name: 'other' },
+      },
     }]);
     expect(() => inspectFeatureBenchTrustBoundary(extra, broker, config(), {
       brokerUrl: 'https://broker.test/v1', restrictedNetwork: 'featurebench-private',
-    })).toThrow(/exactly the named credential broker/);
+    })).toThrow(/outside the attested allowlist/);
     const drifted = broker.replace('broker-v1', 'broker-v2');
     expect(() => inspectFeatureBenchTrustBoundary(network, drifted, config(), {
       brokerUrl: 'https://broker.test/v1', restrictedNetwork: 'featurebench-private',
@@ -1852,10 +1871,12 @@ describe('FeatureBench state-bound telemetry', () => {
     const workflow = join(attempt, 'ultracode', 'runs', 'wf-one');
     mkdirSync(join(workflow, 'agents', '1-worker'), { recursive: true });
     writeFileSync(join(workflow, 'config.json'), JSON.stringify({ backend: 'codex' }));
-    writeFileSync(join(workflow, 'manifest.json'), JSON.stringify({ status: 'completed' }));
+    writeFileSync(join(workflow, 'manifest.json'), JSON.stringify({
+      status: 'completed', endedAt: '2026-07-22T00:00:00.000Z', agentCount: 1,
+    }));
     writeFileSync(join(workflow, 'output.json'), JSON.stringify({ agentCount: 1, failures: [], workspaces: [] }));
     writeFileSync(join(workflow, 'agents', '1-worker', 'result.json'), JSON.stringify({
-      sessionId: workerId, backend: 'mock',
+      status: 'ok', cached: false, usage: { totalTokens: 1 }, sessionId: workerId, backend: 'mock',
     }));
     const telemetryManifest = {
       ...manifest(),
@@ -1876,6 +1897,17 @@ describe('FeatureBench state-bound telemetry', () => {
     ]);
     expect(indexed.workflows).toHaveLength(1);
     expect(indexed.workflows[0]).toMatchObject({ workflowId: 'wf-one', status: 'completed', agentCount: 1 });
+    expect(indexed.pricingEvidenceIncomplete).toBe(false);
+
+    rmSync(join(workflow, 'output.json'));
+    const missingOutput = indexFeatureBenchMetrics(telemetryManifest, runDirectory, state);
+    expect(missingOutput.pricingEvidenceIncomplete).toBe(true);
+    expect(missingOutput.annotations.map(({ code }) => code)).toContain('workflow-telemetry-missing');
+    writeFileSync(join(workflow, 'output.json'), JSON.stringify({ agentCount: 2, failures: [], workspaces: [] }));
+    expect(indexFeatureBenchMetrics(telemetryManifest, runDirectory, state).pricingEvidenceIncomplete).toBe(true);
+    writeFileSync(join(workflow, 'output.json'), JSON.stringify({ agentCount: 1, failures: [], workspaces: [] }));
+    rmSync(join(attempt, 'codex_sessions', `rollout-2026-07-19-${workerId}.jsonl`));
+    expect(indexFeatureBenchMetrics(telemetryManifest, runDirectory, state).pricingEvidenceIncomplete).toBe(true);
     expect(() => indexFeatureBenchMetrics(telemetryManifest, runDirectory, {
       ...state,
       attempts: [{ ...state.attempts[0]!, nativePath: 'native/latest' }],
@@ -1974,14 +2006,40 @@ describe('FeatureBench owned assets', () => {
     expect(patch).toContain('FEATUREBENCH_EVALUATOR_NETWORK');
     expect(patch).toContain('No pinned evaluation image digest');
     expect(patch).toContain('pids_limit=pids_limit');
-    expect(patch).toContain('attest_container_policy(container.attrs.get("HostConfig"), limits, "none")');
-    expect(patch).toContain('attest_container_policy(container.attrs.get("HostConfig"), limits)');
+    expect(patch).toContain('container.attrs.get("NetworkSettings")');
+    expect(patch).toContain('restricted_network,');
     expect(patch).toContain('for source, relative_destination in output_copy_plan(');
     expect(patch).toContain("const recovery = new Set(['orphaned', 'cleanup-failed'])");
     expect(patch).toContain("mode === 'all'");
     expect(patch).toContain('workflows_complete=False');
     expect(patch).not.toMatch(/ultracode\.external-run|FEATUREBENCH_RUN_OWNER/);
     expect(readFileSync('bench/suites/featurebench/.gitattributes', 'utf8')).toContain('codex-chatgpt.patch');
+  });
+
+  it('applies and compiles the complete patch against pinned upstream preimages offline', () => {
+    const root = temporary();
+    const archive = Buffer.from(readFileSync(UPSTREAM_PREIMAGE_FIXTURE, 'utf8').replace(/\s/gu, ''), 'base64');
+    expect(createHash('sha256').update(archive).digest('hex')).toBe(UPSTREAM_PREIMAGE_SHA256);
+    const archivePath = join(root, 'preimages.tar.gz');
+    writeFileSync(archivePath, archive);
+    const extracted = spawnSync('tar', ['-xzf', archivePath, '-C', root], { encoding: 'utf8' });
+    expect(extracted.status, extracted.stderr).toBe(0);
+    const patchPath = resolve('bench/suites/featurebench/codex-chatgpt.patch');
+    const checked = spawnSync('git', ['apply', '--check', patchPath], { cwd: root, encoding: 'utf8' });
+    expect(checked.status, checked.stderr).toBe(0);
+    const applied = spawnSync('git', ['apply', patchPath], { cwd: root, encoding: 'utf8' });
+    expect(applied.status, applied.stderr).toBe(0);
+    const modules = [
+      'featurebench/harness/container.py',
+      'featurebench/harness/run_evaluation.py',
+      'featurebench/infer/agents/codex.py',
+      'featurebench/infer/config.py',
+      'featurebench/infer/container.py',
+      'featurebench/infer/run_infer.py',
+      'featurebench/ultracode_policy.py',
+    ];
+    const compiled = spawnSync('python3', ['-B', '-m', 'py_compile', ...modules], { cwd: root, encoding: 'utf8' });
+    expect(compiled.status, compiled.stderr).toBe(0);
   });
 
   it('executes the patched trust policy against rejection and cleanup-failure cases', () => {
@@ -2003,15 +2061,16 @@ limits = policy.container_limits({
 }, "test")
 assert limits == (1500000000, 2000000, 64)
 host_config = {"NetworkMode": "none", "NanoCpus": 1500000000, "Memory": 2000000, "PidsLimit": 64}
-policy.attest_container_policy(host_config, limits, "none")
+policy.attest_container_policy(host_config, {"Networks": {}}, limits, "none")
 for invalid in (
-    {**host_config, "NetworkMode": "bridge"},
-    {**host_config, "NanoCpus": 0},
-    {**host_config, "Memory": 1},
-    {**host_config, "PidsLimit": 1},
+    ({**host_config, "NetworkMode": "bridge"}, {"Networks": {}}),
+    ({**host_config, "NanoCpus": 0}, {"Networks": {}}),
+    ({**host_config, "Memory": 1}, {"Networks": {}}),
+    ({**host_config, "PidsLimit": 1}, {"Networks": {}}),
+    (host_config, {"Networks": {"bridge": {}}}),
 ):
     try:
-        policy.attest_container_policy(invalid, limits, "none")
+        policy.attest_container_policy(invalid[0], invalid[1], limits, "none")
     except RuntimeError:
         pass
     else:
@@ -2026,6 +2085,24 @@ except RuntimeError:
     pass
 else:
     raise AssertionError("zero NanoCpus was accepted")
+inference_host = {**host_config, "NetworkMode": "featurebench-private"}
+policy.attest_container_policy(
+    inference_host,
+    {"Networks": {"featurebench-private": {}}},
+    limits,
+    "featurebench-private",
+)
+try:
+    policy.attest_container_policy(
+        inference_host,
+        {"Networks": {"featurebench-private": {}, "bridge": {}}},
+        limits,
+        "featurebench-private",
+    )
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("additional inference network was accepted")
 model = 'provider/model"\\variant'
 assert json.loads(policy.toml_string(model)) == model
 failed_cleanup = policy.output_copy_plan("b", False)

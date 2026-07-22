@@ -1,5 +1,5 @@
 diff --git a/featurebench/harness/container.py b/featurebench/harness/container.py
-index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..b721face08d0dc5d5d826600f4a577bdae622d53 100644
+index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..ed8babb34604bb4a94f94619dbb223eef8b22e47 100644
 --- a/featurebench/harness/container.py
 +++ b/featurebench/harness/container.py
 @@ -21,6 +21,7 @@ from featurebench.harness.constants import (
@@ -48,7 +48,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..b721face08d0dc5d5d826600f4a577bd
  
          if shm_size:
              self.logger.info(f"Using shared memory size: {shm_size}")
-@@ -299,9 +298,22 @@ class EvalContainerManager:
+@@ -299,9 +298,27 @@ class EvalContainerManager:
              environment=environment,
              network_mode=network_mode,
              shm_size=shm_size,
@@ -60,7 +60,12 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..b721face08d0dc5d5d826600f4a577bd
  
 +        try:
 +            container.reload()
-+            attest_container_policy(container.attrs.get("HostConfig"), limits, "none")
++            attest_container_policy(
++                container.attrs.get("HostConfig"),
++                container.attrs.get("NetworkSettings"),
++                limits,
++                "none",
++            )
 +        except Exception:
 +            try:
 +                container.remove(force=True)
@@ -71,7 +76,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..b721face08d0dc5d5d826600f4a577bd
          # Check if GPU is available
          if need_gpu:
              exit_code, output = container.exec_run("nvidia-smi --list-gpus")
-@@ -368,4 +380,4 @@ class EvalContainerManager:
+@@ -368,4 +385,4 @@ class EvalContainerManager:
              container.remove()
              self.logger.info("Container removed successfully")
          except Exception as e:
@@ -479,7 +484,7 @@ index 796c784bee86b17e337fd4e47044cd5ce4ac04db..783769fad7c7a874a1a22fdad7c194be
              for item in dataset:
                  item_dict = dict(item)
 diff --git a/featurebench/infer/container.py b/featurebench/infer/container.py
-index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..4a062a13d258eb6d3d28bdad8defc53449275ea0 100644
+index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..3a76729eea0ef49efa55d83b50ca233f146ccad2 100644
 --- a/featurebench/infer/container.py
 +++ b/featurebench/infer/container.py
 @@ -19,6 +19,7 @@ import docker
@@ -502,7 +507,7 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..4a062a13d258eb6d3d28bdad8defc534
  
          # Configure GPU access
          device_requests = None
-@@ -244,11 +250,23 @@ class ContainerManager:
+@@ -244,11 +250,28 @@ class ContainerManager:
                  volumes=volumes,
                  command="tail -f /dev/null",  # Keep container running
                  platform="linux/amd64",
@@ -517,7 +522,12 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..4a062a13d258eb6d3d28bdad8defc534
              )
 +            try:
 +                container.reload()
-+                attest_container_policy(container.attrs.get("HostConfig"), limits)
++                attest_container_policy(
++                    container.attrs.get("HostConfig"),
++                    container.attrs.get("NetworkSettings"),
++                    limits,
++                    restricted_network,
++                )
 +            except Exception:
 +                try:
 +                    container.remove(force=True)
@@ -527,7 +537,7 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..4a062a13d258eb6d3d28bdad8defc534
              
              # Check if GPU is available
              if need_gpu:
-@@ -662,4 +680,4 @@ class ContainerManager:
+@@ -662,4 +685,4 @@ class ContainerManager:
          try:
              return container.logs().decode("utf-8", errors="replace")
          except Exception as e:
@@ -690,10 +700,10 @@ index 594e8f6cd3e9b3436439ce879b7d1611edd04e00..71d7b1a08be64dba86e504e1778c8f75
 +    raise SystemExit(main())
 diff --git a/featurebench/ultracode_policy.py b/featurebench/ultracode_policy.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..09d08103109af0c730cec70f92c9d8baa44a7854
+index 0000000000000000000000000000000000000000..4aa11f2913fb1d256917a091dce1862721aa5576
 --- /dev/null
 +++ b/featurebench/ultracode_policy.py
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,149 @@
 +"""Pure policy helpers injected by the Ultracode FeatureBench adapter."""
 +
 +import json
@@ -810,15 +820,20 @@ index 0000000000000000000000000000000000000000..09d08103109af0c730cec70f92c9d8ba
 +
 +def attest_container_policy(
 +    host_config: Any,
++    network_settings: Any,
 +    limits: tuple[int, int, int],
-+    expected_network: str | None = None,
++    expected_network: str,
 +) -> None:
 +    """Require Docker to report the exact requested runtime policy."""
 +
 +    nano_cpus, memory_limit, pids_limit = limits
++    expected_networks: set[str] = set() if expected_network == "none" else {expected_network}
++    networks = network_settings.get("Networks") if isinstance(network_settings, dict) else None
 +    if (
 +        not isinstance(host_config, dict)
-+        or expected_network is not None and host_config.get("NetworkMode") != expected_network
++        or host_config.get("NetworkMode") != expected_network
++        or not isinstance(networks, dict)
++        or set(networks) != expected_networks
 +        or host_config.get("NanoCpus") != nano_cpus
 +        or host_config.get("Memory") != memory_limit
 +        or host_config.get("PidsLimit") != pids_limit

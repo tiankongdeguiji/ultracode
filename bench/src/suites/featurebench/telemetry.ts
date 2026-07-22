@@ -9,6 +9,7 @@ import { readRegularFileWithinRoot } from '../../shared/paths.js';
 import type { BenchRunState } from '../../shared/run-state.js';
 
 const TIMESTAMP_ROOT_RE = /^native\/\d{4}-\d{2}-\d{2}__\d{2}-\d{2}-\d{2}$/;
+const TERMINAL_WORKFLOW_STATUSES = new Set(['completed', 'failed', 'stopped', 'orphaned', 'cleanup-failed']);
 
 function portable(root: string, path: string): string {
   return relative(root, path).split(sep).join('/');
@@ -102,8 +103,8 @@ function hostSessionIds(eventsPath: string): { ids: Set<string>; complete: boole
   };
 }
 
-function number(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+function count(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 function workflowArtifacts(
@@ -111,36 +112,70 @@ function workflowArtifacts(
   attemptDirectory: string,
   taskId: string,
   arm: 'a' | 'b',
-): { workflows: WorkflowArtifact[]; backends: Map<string, string>; complete: boolean } {
+): {
+  workflows: WorkflowArtifact[];
+  backends: Map<string, string>;
+  requiredSessionIds: Set<string>;
+  complete: boolean;
+} {
   const runs = join(attemptDirectory, 'ultracode', 'runs');
-  if (!directoryExists(runs)) return { workflows: [], backends: new Map(), complete: false };
+  if (!directoryExists(runs)) {
+    return { workflows: [], backends: new Map(), requiredSessionIds: new Set(), complete: false };
+  }
   const entries = directoryEntries(runs);
+  const workflowEntries = entries.filter((candidate) => candidate.isDirectory());
   const workflows: WorkflowArtifact[] = [];
   const backends = new Map<string, string>();
-  for (const entry of entries.filter((candidate) => candidate.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+  const requiredSessionIds = new Set<string>();
+  let complete = workflowEntries.length > 0;
+  for (const entry of workflowEntries.sort((a, b) => a.name.localeCompare(b.name))) {
     const root = join(runs, entry.name);
     const config = json(runDirectory, portable(runDirectory, join(root, 'config.json')));
     const manifest = json(runDirectory, portable(runDirectory, join(root, 'manifest.json')));
     const output = json(runDirectory, portable(runDirectory, join(root, 'output.json')));
     const backend = typeof config?.backend === 'string' ? config.backend : null;
-    for (const path of files(join(root, 'agents'), (name) => name === 'result.json')) {
+    const status = typeof manifest?.status === 'string' ? manifest.status : 'unknown';
+    const manifestAgentCount = count(manifest?.agentCount);
+    const outputAgentCount = count(output?.agentCount);
+    const resultPaths = files(join(root, 'agents'), (name) => name === 'result.json');
+    if (backend === null || !TERMINAL_WORKFLOW_STATUSES.has(status)
+      || typeof manifest?.endedAt !== 'string' || !Number.isFinite(Date.parse(manifest.endedAt))
+      || manifestAgentCount === null || outputAgentCount === null
+      || manifestAgentCount !== outputAgentCount || resultPaths.length !== outputAgentCount) {
+      complete = false;
+    }
+    for (const path of resultPaths) {
       const result = json(runDirectory, portable(runDirectory, path));
-      if (typeof result?.sessionId === 'string' && typeof result.backend === 'string') {
-        backends.set(result.sessionId, result.backend);
+      const resultBackend = typeof result?.backend === 'string' ? result.backend : null;
+      const resultStatus = result?.status;
+      const cached = result?.cached === true;
+      const usage = result?.usage !== null && typeof result?.usage === 'object' && !Array.isArray(result.usage)
+        ? result.usage as Record<string, unknown>
+        : null;
+      const totalTokens = usage === null ? null : count(usage.totalTokens);
+      const session = typeof result?.sessionId === 'string' && result.sessionId.length > 0 ? result.sessionId : null;
+      if (!['ok', 'error', 'skip'].includes(typeof resultStatus === 'string' ? resultStatus : '')
+        || resultBackend === null || totalTokens === null
+        || (!cached && resultStatus !== 'skip' && totalTokens > 0 && session === null)) {
+        complete = false;
+      }
+      if (session !== null && resultBackend !== null) {
+        backends.set(session, resultBackend);
+        requiredSessionIds.add(session);
       }
     }
     workflows.push({
       scope: { taskId, arm },
       workflowId: entry.name,
-      status: typeof manifest?.status === 'string' ? manifest.status : 'unknown',
-      agentCount: number(output?.agentCount),
+      status,
+      agentCount: outputAgentCount ?? 0,
       failureCount: Array.isArray(output?.failures) ? output.failures.length : 0,
       workspacesKept: Array.isArray(output?.workspaces) ? output.workspaces.length : 0,
       backend,
       billingClass: backend === 'mock' ? 'mock' : backend === null ? 'unknown' : 'billable',
     });
   }
-  return { workflows, backends, complete: workflows.length > 0 };
+  return { workflows, backends, requiredSessionIds, complete };
 }
 
 function latestInferenceRoots(state: BenchRunState): Map<string, string[]> {
@@ -213,10 +248,12 @@ export function indexFeatureBenchMetrics(
         seenWorkflows.add(key);
       }
       const sessionPaths = files(join(attemptDirectory, 'codex_sessions'), (name) => /^rollout-.*\.jsonl$/.test(name));
+      const rolloutSessionIds = new Set(sessionPaths.map(sessionId).filter((id): id is string => id !== null));
       if (!hostEvidence.complete || sessionPaths.length === 0) {
         markIncomplete(execution.taskId, execution.arm, 'host-telemetry-missing');
       }
-      if (execution.arm === 'b' && !workflow.complete) {
+      if (execution.arm === 'b' && (!workflow.complete
+        || [...workflow.requiredSessionIds].some((id) => !rolloutSessionIds.has(id)))) {
         markIncomplete(execution.taskId, execution.arm, 'workflow-telemetry-missing');
       }
       for (const path of sessionPaths) {

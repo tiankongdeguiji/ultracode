@@ -44,7 +44,8 @@ The operator provisions a broker container and dedicated Docker network before
 - `FEATUREBENCH_CREDENTIAL_BROKER_URL` is an absolute HTTPS URL without
   userinfo, query, or fragment. Its hostname is the broker container name.
 - `FEATUREBENCH_RESTRICTED_NETWORK` names a Docker `--internal` network labeled
-  `ultracode.egress-policy=openai-via-credential-broker`.
+  `ultracode.egress-policy=openai-via-credential-broker`; it must be a local,
+  non-attachable, non-ingress `bridge` with the inspected name.
 - Before each native phase, the network must have exactly one endpoint: the
   named, running broker container. The broker must have immutable image identity
   and these exact labels: `ultracode.credential-broker=true`,
@@ -56,6 +57,8 @@ The operator provisions a broker container and dedicated Docker network before
 - Reusable host credentials and auth files are never mounted or forwarded to
   repository-controlled task containers. The broker is responsible for its
   own upstream egress, credential injection, scoping, and request validation.
+  It must expose an OpenAI/Codex Responses-compatible API at the configured
+  base URL for the selected model; task containers send no local broker auth.
 
 Only hashes of the public broker identity, public version, runtime
 configuration, and restricted-network policy enter host-owned manifests and
@@ -72,7 +75,9 @@ prevents concurrent FeatureBench runs from invalidating the broker-only
 host-wide network assertion. Cleanup discovers
 containers using the complete `ultracode.benchmark.*` ownership tuple,
 reinspects every label including task and purpose, and refuses ambiguous or
-unowned targets.
+unowned targets. Suite/toolchain mutation locks are released after the selected
+content-addressed inputs have been loaded and attested; they do not remain held
+through the potentially multi-day native run.
 
 ## Lifecycle and artifacts
 
@@ -108,8 +113,10 @@ resources are frozen directly; broker identity/version and pricing are frozen
 as public hashes or a pricing snapshot. Resume reconstructs the effective run
 configuration from that manifest and rejects conflicting CLI overrides. The
 operator's current public broker identity/version must still match the frozen
-hashes, while runtime broker URL and network names are resolved anew from the
-environment and re-attested on every launch. `--redo <task-id>` requires
+hashes. Runtime broker URL and network names are reread from the environment and
+re-attested on every launch, but their URL components, selected network, broker
+runtime, and network topology must reproduce the original
+`restrictedNetworkPolicySha256`; rotation requires a fresh run. `--redo <task-id>` requires
 `--resume` plus a non-null state-bound inference baseline. The baseline check
 precedes receipt/report invalidation. The native inference timeout remains a
 per-task limit, while the host watchdog scales it by the number of concurrency
