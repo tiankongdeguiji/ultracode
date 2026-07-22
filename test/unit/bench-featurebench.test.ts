@@ -44,6 +44,7 @@ import {
   FEATUREBENCH_DATASET_DOWNLOAD_SCRIPT,
   FEATUREBENCH_DATASET_MEMBERSHIP_SCRIPT,
   FEATUREBENCH_DATASET_PARQUET,
+  FEATUREBENCH_PREP_COMMAND_TIMEOUT_MS,
   featureBenchEnvironmentIdentity,
   makeFeatureBenchEnvironmentRelocatable,
   parseFeatureBenchDatasetMap,
@@ -106,6 +107,25 @@ function temporary(): string {
 
 function pinnedInventory(): PinnedInventoryFixture {
   return JSON.parse(readFileSync(INVENTORY_FIXTURE, 'utf8')) as PinnedInventoryFixture;
+}
+
+function addedPatchFile(patch: string, path: string): string {
+  const marker = `diff --git a/${path} b/${path}`;
+  const start = patch.indexOf(marker);
+  if (start < 0) throw new Error(`patch does not add ${path}`);
+  const next = patch.indexOf('\ndiff --git ', start + marker.length);
+  const section = patch.slice(start, next < 0 ? undefined : next);
+  if (!section.includes('\nnew file mode ')) throw new Error(`patch path is not a new file: ${path}`);
+  const output: string[] = [];
+  let inHunk = false;
+  for (const line of section.split('\n')) {
+    if (line.startsWith('@@ ')) {
+      inHunk = true;
+    } else if (inHunk && line.startsWith('+') && !line.startsWith('+++')) {
+      output.push(line.slice(1));
+    }
+  }
+  return `${output.join('\n')}\n`;
 }
 
 function projectFeatureBenchRows(rows: readonly unknown[]) {
@@ -396,8 +416,13 @@ describe('FeatureBench immutable inputs and host policy', () => {
   });
 
   it('accepts only a successful uv version probe', async () => {
-    await expect(preflightFeatureBenchUv(async () => ({ stdout: 'uv 0.8.3\n', stderr: '' }), '/bench'))
+    const timeouts: Array<number | undefined> = [];
+    await expect(preflightFeatureBenchUv(async (_command, _argv, options) => {
+      timeouts.push(options?.timeoutMs);
+      return { stdout: 'uv 0.8.3\n', stderr: '' };
+    }, '/bench'))
       .resolves.toBeUndefined();
+    expect(timeouts).toEqual([FEATUREBENCH_PREP_COMMAND_TIMEOUT_MS]);
     await expect(preflightFeatureBenchUv(async () => ({ stdout: '', stderr: '' }), '/bench'))
       .rejects.toThrow('FeatureBench prep requires uv on PATH');
   });
@@ -530,10 +555,18 @@ describe('FeatureBench immutable inputs and host policy', () => {
       brokerUrl: 'https://broker.test/v1',
       restrictedNetwork: 'featurebench-private',
     });
+    expect(loadFeatureBenchRuntimeBindings({
+      FEATUREBENCH_CREDENTIAL_BROKER_URL: 'https://broker.test:443/v1',
+      FEATUREBENCH_RESTRICTED_NETWORK: 'featurebench-private',
+    }).brokerUrl).toBe('https://broker.test/v1');
     expect(() => loadFeatureBenchRuntimeBindings({
       FEATUREBENCH_CREDENTIAL_BROKER_URL: 'https://user:secret@broker.test/v1',
       FEATUREBENCH_RESTRICTED_NETWORK: 'featurebench-private',
     })).toThrow(/without userinfo/);
+    expect(() => loadFeatureBenchRuntimeBindings({
+      FEATUREBENCH_CREDENTIAL_BROKER_URL: 'https://broker.test/\tpath',
+      FEATUREBENCH_RESTRICTED_NETWORK: 'featurebench-private',
+    })).toThrow(/control characters/);
   });
 
   it('requires the CPU quota to map to a positive safe Docker NanoCpus value', () => {
@@ -1868,14 +1901,67 @@ describe('FeatureBench state-bound telemetry', () => {
 
     const missing = indexFeatureBenchMetrics(telemetryManifest, runDirectory, state);
     expect(missing.pricingEvidenceIncomplete).toBe(true);
-    expect(missing.annotations).toEqual([{
-      code: 'host-telemetry-missing',
-      scope: { kind: 'task-arm', taskId: 'task-alpha', arm: 'b' },
-    }]);
+    expect(missing.annotations).toEqual([
+      {
+        code: 'host-telemetry-missing',
+        scope: { kind: 'task-arm', taskId: 'task-alpha', arm: 'b' },
+      },
+      {
+        code: 'workflow-telemetry-missing',
+        scope: { kind: 'task-arm', taskId: 'task-alpha', arm: 'b' },
+      },
+    ]);
 
     writeFileSync(join(attempt, 'codex_sessions'), 'not a directory\n');
     expect(() => indexFeatureBenchMetrics(telemetryManifest, runDirectory, state))
       .toThrow(/telemetry directory is unreadable/);
+
+    const corruptWorkflowRun = temporary();
+    const corruptAttempt = join(
+      corruptWorkflowRun,
+      'native',
+      TIMESTAMP,
+      'run_outputs',
+      'task-alpha',
+      'attempt-1',
+    );
+    mkdirSync(join(corruptAttempt, 'codex_sessions'), { recursive: true });
+    mkdirSync(join(corruptAttempt, 'ultracode'), { recursive: true });
+    writeFileSync(join(corruptAttempt, 'codex_events.jsonl'), `${JSON.stringify({
+      type: 'thread.started', thread_id: '11111111-1111-4111-8111-111111111111',
+    })}\n`);
+    writeFileSync(
+      join(corruptAttempt, 'codex_sessions', 'rollout-11111111-1111-4111-8111-111111111111.jsonl'),
+      '{}\n',
+    );
+    writeFileSync(join(corruptAttempt, 'ultracode', 'runs'), 'not a directory\n');
+    expect(() => indexFeatureBenchMetrics(telemetryManifest, corruptWorkflowRun, state))
+      .toThrow(/not a real directory/);
+
+    const rootless = indexFeatureBenchMetrics(telemetryManifest, temporary(), {
+      invocations: [],
+      attempts: [{
+        invocationId: '00000000-0000-4000-8000-000000000071',
+        phase: 'inference',
+        nativePath: null,
+        status: 'interrupted',
+        taskId: 'task-alpha',
+        arm: 'b',
+      }],
+    } as BenchRunState);
+    expect(rootless.pricingEvidenceIncomplete).toBe(true);
+    expect(rootless.annotations.map(({ code }) => code)).toContain('host-telemetry-missing');
+
+    const invocationOnly = indexFeatureBenchMetrics(telemetryManifest, temporary(), {
+      invocations: [{
+        invocationId: '00000000-0000-4000-8000-000000000072',
+        command: 'run',
+        endedAt: '2026-07-22T00:00:00.000Z',
+        failure: 'driver-interrupted',
+      }],
+      attempts: [],
+    } as BenchRunState);
+    expect(invocationOnly.pricingEvidenceIncomplete).toBe(true);
   });
 });
 
@@ -1888,12 +1974,78 @@ describe('FeatureBench owned assets', () => {
     expect(patch).toContain('FEATUREBENCH_EVALUATOR_NETWORK');
     expect(patch).toContain('No pinned evaluation image digest');
     expect(patch).toContain('pids_limit=pids_limit');
-    expect(patch).toContain('host_config.get("NanoCpus")');
-    expect(patch).toContain('host_config.get("Memory")');
+    expect(patch).toContain('attest_container_policy(container.attrs.get("HostConfig"), limits, "none")');
+    expect(patch).toContain('attest_container_policy(container.attrs.get("HostConfig"), limits)');
+    expect(patch).toContain('for source, relative_destination in output_copy_plan(');
     expect(patch).toContain("const recovery = new Set(['orphaned', 'cleanup-failed'])");
     expect(patch).toContain("mode === 'all'");
-    expect(patch).toContain('host=True, ultracode=False');
+    expect(patch).toContain('workflows_complete=False');
     expect(patch).not.toMatch(/ultracode\.external-run|FEATUREBENCH_RUN_OWNER/);
     expect(readFileSync('bench/suites/featurebench/.gitattributes', 'utf8')).toContain('codex-chatgpt.patch');
+  });
+
+  it('executes the patched trust policy against rejection and cleanup-failure cases', () => {
+    const patch = readFileSync('bench/suites/featurebench/codex-chatgpt.patch', 'utf8');
+    const modulePath = join(temporary(), 'ultracode_policy.py');
+    writeFileSync(modulePath, addedPatchFile(patch, 'featurebench/ultracode_policy.py'));
+    const driver = String.raw`
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("ultracode_policy", sys.argv[1])
+policy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(policy)
+limits = policy.container_limits({
+    "FB_CONTAINER_CPUS": "1.5",
+    "FB_CONTAINER_MEMORY": "2000000",
+    "FB_CONTAINER_PIDS": "64",
+}, "test")
+assert limits == (1500000000, 2000000, 64)
+host_config = {"NetworkMode": "none", "NanoCpus": 1500000000, "Memory": 2000000, "PidsLimit": 64}
+policy.attest_container_policy(host_config, limits, "none")
+for invalid in (
+    {**host_config, "NetworkMode": "bridge"},
+    {**host_config, "NanoCpus": 0},
+    {**host_config, "Memory": 1},
+    {**host_config, "PidsLimit": 1},
+):
+    try:
+        policy.attest_container_policy(invalid, limits, "none")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("runtime-policy drift was accepted")
+try:
+    policy.container_limits({
+        "FB_CONTAINER_CPUS": "0.0000000001",
+        "FB_CONTAINER_MEMORY": "2000000",
+        "FB_CONTAINER_PIDS": "64",
+    }, "test")
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("zero NanoCpus was accepted")
+model = 'provider/model"\\variant'
+assert json.loads(policy.toml_string(model)) == model
+failed_cleanup = policy.output_copy_plan("b", False)
+assert failed_cleanup == (
+    ("/agent-logs/codex_events.jsonl", "codex_events.jsonl"),
+    ("/root/.codex/sessions", "codex_sessions"),
+)
+assert policy.output_copy_plan("b", True)[-1] == ("/agent-logs/ultracode", "ultracode")
+`;
+    const executed = spawnSync('python3', ['-B', '-c', driver, modulePath], { encoding: 'utf8' });
+    expect(executed.status, executed.stderr).toBe(0);
+    const emitted = spawnSync('python3', ['-B', '-c', [
+      'import importlib.util, sys',
+      's = importlib.util.spec_from_file_location("p", sys.argv[1])',
+      'p = importlib.util.module_from_spec(s)',
+      's.loader.exec_module(p)',
+      'print(p.WORKFLOW_CLEANUP_SCRIPT)',
+    ].join(';'), modulePath], { encoding: 'utf8' });
+    expect(emitted.status, emitted.stderr).toBe(0);
+    const shell = spawnSync('bash', ['-n'], { input: emitted.stdout, encoding: 'utf8' });
+    expect(shell.status, shell.stderr).toBe(0);
   });
 });

@@ -40,6 +40,19 @@ function regularFileExists(path: string): boolean {
   }
 }
 
+function directoryExists(path: string): boolean {
+  try {
+    const info = lstatSync(path);
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error(`FeatureBench telemetry path is not a real directory: ${path}`);
+    }
+    return true;
+  } catch (error) {
+    if (missing(error)) return false;
+    throw error;
+  }
+}
+
 function files(root: string, predicate: (name: string) => boolean): string[] {
   const output: string[] = [];
   const walk = (directory: string): void => {
@@ -98,12 +111,10 @@ function workflowArtifacts(
   attemptDirectory: string,
   taskId: string,
   arm: 'a' | 'b',
-): { workflows: WorkflowArtifact[]; backends: Map<string, string> } {
+): { workflows: WorkflowArtifact[]; backends: Map<string, string>; complete: boolean } {
   const runs = join(attemptDirectory, 'ultracode', 'runs');
-  let entries: Dirent[];
-  try { entries = readdirSync(runs, { withFileTypes: true }); } catch {
-    return { workflows: [], backends: new Map() };
-  }
+  if (!directoryExists(runs)) return { workflows: [], backends: new Map(), complete: false };
+  const entries = directoryEntries(runs);
   const workflows: WorkflowArtifact[] = [];
   const backends = new Map<string, string>();
   for (const entry of entries.filter((candidate) => candidate.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
@@ -129,7 +140,7 @@ function workflowArtifacts(
       billingClass: backend === 'mock' ? 'mock' : backend === null ? 'unknown' : 'billable',
     });
   }
-  return { workflows, backends };
+  return { workflows, backends, complete: workflows.length > 0 };
 }
 
 function latestInferenceRoots(state: BenchRunState): Map<string, string[]> {
@@ -157,7 +168,29 @@ export function indexFeatureBenchMetrics(
   const seenRollouts = new Set<string>();
   const seenWorkflows = new Set<string>();
   const annotations: Annotation[] = [];
-  const missingHostTelemetry = new Set<string>();
+  const incompletePricingEvidence = new Set<string>();
+  const annotationKeys = new Set<string>();
+  const markIncomplete = (taskId: string, arm: 'a' | 'b', code: string): void => {
+    incompletePricingEvidence.add(`${taskId}\0${arm}`);
+    const key = `${taskId}\0${arm}\0${code}`;
+    if (annotationKeys.has(key)) return;
+    annotationKeys.add(key);
+    annotations.push({ code, scope: { kind: 'task-arm', taskId, arm } });
+  };
+  const inferenceInvocations = new Set<string>();
+  for (const attempt of state.attempts.filter((entry) => entry.phase === 'inference')) {
+    inferenceInvocations.add(attempt.invocationId);
+    if (attempt.status !== 'running' && attempt.nativePath === null) {
+      markIncomplete(attempt.taskId, attempt.arm, 'host-telemetry-missing');
+    }
+  }
+  if ((state.invocations ?? []).some((invocation) =>
+    invocation.command === 'run' && invocation.endedAt !== null && invocation.failure !== null
+    && !inferenceInvocations.has(invocation.invocationId))) {
+    for (const execution of manifest.artifacts.executions) {
+      markIncomplete(execution.taskId, execution.arm, 'host-telemetry-missing');
+    }
+  }
   const roots = latestInferenceRoots(state);
   for (const execution of manifest.artifacts.executions) {
     for (const nativeRoot of roots.get(execution.taskId) ?? []) {
@@ -181,14 +214,10 @@ export function indexFeatureBenchMetrics(
       }
       const sessionPaths = files(join(attemptDirectory, 'codex_sessions'), (name) => /^rollout-.*\.jsonl$/.test(name));
       if (!hostEvidence.complete || sessionPaths.length === 0) {
-        const key = `${execution.taskId}\0${execution.arm}`;
-        if (!missingHostTelemetry.has(key)) {
-          missingHostTelemetry.add(key);
-          annotations.push({
-            code: 'host-telemetry-missing',
-            scope: { kind: 'task-arm', taskId: execution.taskId, arm: execution.arm },
-          });
-        }
+        markIncomplete(execution.taskId, execution.arm, 'host-telemetry-missing');
+      }
+      if (execution.arm === 'b' && !workflow.complete) {
+        markIncomplete(execution.taskId, execution.arm, 'workflow-telemetry-missing');
       }
       for (const path of sessionPaths) {
         const relativePath = portable(runDirectory, path);
@@ -213,6 +242,6 @@ export function indexFeatureBenchMetrics(
     timings: [],
     annotations,
     failures: [],
-    pricingEvidenceIncomplete: missingHostTelemetry.size > 0,
+    pricingEvidenceIncomplete: incompletePricingEvidence.size > 0,
   };
 }

@@ -50,6 +50,7 @@ const CONTENT_MANIFEST = 'content-manifest.json';
 const PREPARED_IDENTITY = 'prepared-identity.json';
 export const FEATUREBENCH_DATASET_MAP = '.git/ultracode-benchmark-dataset-map.json';
 export const FEATUREBENCH_DATASET_PARQUET = '.git/ultracode-benchmark-dataset.parquet';
+export const FEATUREBENCH_PREP_COMMAND_TIMEOUT_MS = 30 * 60_000;
 
 export interface FeatureBenchExecOptions {
   cwd?: string;
@@ -161,7 +162,11 @@ async function command(
   cwd: string,
   env?: NodeJS.ProcessEnv,
 ): Promise<string> {
-  return (await executor(file, argv, { cwd, env })).stdout.trim();
+  return (await executor(file, argv, {
+    cwd,
+    env,
+    timeoutMs: FEATUREBENCH_PREP_COMMAND_TIMEOUT_MS,
+  })).stdout.trim();
 }
 
 /** Fail before preparation creates state or contacts Docker when uv is unavailable. */

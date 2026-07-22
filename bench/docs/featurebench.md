@@ -79,6 +79,9 @@ unowned targets.
 ```bash
 npm run bench -- --suite featurebench prep
 
+# Print every valid task ID from the prepared, byte-pinned inventory.
+node -e 'const fs=require("node:fs"),p=require("node:path"),r="bench/.cache/featurebench",c=JSON.parse(fs.readFileSync(p.join(r,"current.json"))),m=JSON.parse(fs.readFileSync(p.join(r,c.identity,"source/.git/ultracode-benchmark-dataset-map.json"))); process.stdout.write(Object.keys(m.tasks).sort().join("\n")+"\n")'
+
 FEATUREBENCH_CREDENTIAL_BROKER_URL=https://broker.internal/v1 \
 FEATUREBENCH_RESTRICTED_NETWORK=featurebench-private \
 npm run bench -- --suite featurebench run --run-id feature-a1 \
@@ -87,6 +90,10 @@ npm run bench -- --suite featurebench run --run-id feature-a1 \
 
 npm run bench -- --suite featurebench report --run-id feature-a1
 ```
+
+`bench/.cache/featurebench/current.json` is the authoritative pointer to the
+prepared identity. The command above reads that identity's audited dataset map;
+pass one or more printed keys with repeatable `--task-id`.
 
 The operator config in `bench/bench.config.json` supplies the complete run
 configuration. On a fresh run, the only configuration values that the CLI can

@@ -132,6 +132,9 @@ export function loadFeatureBenchRuntimeBindings(
 ): FeatureBenchRuntimeBindings {
   const brokerUrl = source.FEATUREBENCH_CREDENTIAL_BROKER_URL ?? '';
   const restrictedNetwork = source.FEATUREBENCH_RESTRICTED_NETWORK ?? '';
+  if (/[\u0000-\u001f\u007f]/u.test(brokerUrl)) {
+    throw new Error('FEATUREBENCH_CREDENTIAL_BROKER_URL must not contain control characters');
+  }
   let parsed: URL;
   try { parsed = new URL(brokerUrl); } catch {
     throw new Error('FEATUREBENCH_CREDENTIAL_BROKER_URL must be an absolute HTTPS URL');
@@ -141,7 +144,7 @@ export function loadFeatureBenchRuntimeBindings(
   }
   validatePortableComponent(parsed.hostname, 'FeatureBench broker hostname');
   validatePortableComponent(restrictedNetwork, 'FEATUREBENCH_RESTRICTED_NETWORK');
-  return { brokerUrl, restrictedNetwork };
+  return { brokerUrl: parsed.href, restrictedNetwork };
 }
 
 export const featureBenchCacheRoot = (roots: BenchPathRoots): string => join(roots.cacheRoot, 'featurebench');

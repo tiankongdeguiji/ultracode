@@ -1,25 +1,23 @@
 diff --git a/featurebench/harness/container.py b/featurebench/harness/container.py
-index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..4e8e21c164e1dd48c77c51ca69986b3cbe65bfe0 100644
+index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..b721face08d0dc5d5d826600f4a577bdae622d53 100644
 --- a/featurebench/harness/container.py
 +++ b/featurebench/harness/container.py
-@@ -216,6 +216,26 @@ class EvalContainerManager:
+@@ -21,6 +21,7 @@ from featurebench.harness.constants import (
+     DOCKER_WORKDIR,
+     UTF8,
+ )
++from featurebench.ultracode_policy import attest_container_policy, container_limits
+ 
+ # Docker host gateway IP (docker0 bridge network)
+ # In bridge mode, containers can access host services via this IP
+@@ -216,6 +217,16 @@ class EvalContainerManager:
              number_once = 1
          shm_size = docker_runtime_config.get("shm_size")
  
 +        if os.environ.get("FEATUREBENCH_CPU_ONLY") == "1" and need_gpu:
 +            raise RuntimeError("Unsupported runtime capability: this FeatureBench adapter is CPU-only")
-+        raw_cpus = os.environ.get("FB_CONTAINER_CPUS")
-+        nano_cpus = int(float(raw_cpus) * 1_000_000_000) if raw_cpus else None
-+        raw_memory = os.environ.get("FB_CONTAINER_MEMORY")
-+        memory_limit = int(raw_memory) if raw_memory else None
-+        raw_pids = os.environ.get("FB_CONTAINER_PIDS")
-+        pids_limit = int(raw_pids) if raw_pids else None
-+        if nano_cpus is None or nano_cpus <= 0:
-+            raise RuntimeError("A positive FeatureBench evaluator NanoCpus limit is required")
-+        if memory_limit is None or memory_limit <= 0:
-+            raise RuntimeError("A positive FeatureBench evaluator memory limit is required")
-+        if pids_limit is None or pids_limit <= 0:
-+            raise RuntimeError("A positive FeatureBench evaluator PID limit is required")
++        limits = container_limits(os.environ, "evaluator")
++        nano_cpus, memory_limit, pids_limit = limits
 +        evaluator_network = os.environ.get("FEATUREBENCH_EVALUATOR_NETWORK")
 +        if evaluator_network != "none":
 +            raise RuntimeError("FeatureBench evaluator containers must use Docker's none network")
@@ -29,7 +27,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..4e8e21c164e1dd48c77c51ca69986b3c
          # Sanitize instance_id: replace / and . with -
          sanitized_id = instance_id.replace("/", "-").replace(".", "-").replace("--", "-")
          # Add timestamp to avoid name conflicts in parallel execution
-@@ -269,19 +289,7 @@ class EvalContainerManager:
+@@ -269,19 +280,7 @@ class EvalContainerManager:
              environment.update(env_vars_from_config)
              self.logger.info(f"Added environment variables from config: {list(env_vars_from_config.keys())}")
  
@@ -50,7 +48,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..4e8e21c164e1dd48c77c51ca69986b3c
  
          if shm_size:
              self.logger.info(f"Using shared memory size: {shm_size}")
-@@ -299,9 +307,30 @@ class EvalContainerManager:
+@@ -299,9 +298,22 @@ class EvalContainerManager:
              environment=environment,
              network_mode=network_mode,
              shm_size=shm_size,
@@ -62,15 +60,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..4e8e21c164e1dd48c77c51ca69986b3c
  
 +        try:
 +            container.reload()
-+            host_config = container.attrs.get("HostConfig")
-+            if (
-+                not isinstance(host_config, dict)
-+                or host_config.get("NetworkMode") != "none"
-+                or host_config.get("NanoCpus") != nano_cpus
-+                or host_config.get("Memory") != memory_limit
-+                or host_config.get("PidsLimit") != pids_limit
-+            ):
-+                raise RuntimeError("FeatureBench evaluator runtime attestation failed")
++            attest_container_policy(container.attrs.get("HostConfig"), limits, "none")
 +        except Exception:
 +            try:
 +                container.remove(force=True)
@@ -81,7 +71,7 @@ index 5453ad1ea850c5bafa7dcd584ca4611b9eed4aaa..4e8e21c164e1dd48c77c51ca69986b3c
          # Check if GPU is available
          if need_gpu:
              exit_code, output = container.exec_run("nvidia-smi --list-gpus")
-@@ -368,4 +397,4 @@ class EvalContainerManager:
+@@ -368,4 +380,4 @@ class EvalContainerManager:
              container.remove()
              self.logger.info("Container removed successfully")
          except Exception as e:
@@ -182,10 +172,22 @@ index beb48fbb82384af44f5d18ce2b7d22a779699014..bee919dc77ded07ea115216158b1fbad
 \ No newline at end of file
 +    raise SystemExit(main())
 diff --git a/featurebench/infer/agents/codex.py b/featurebench/infer/agents/codex.py
-index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a7367a1c963 100644
+index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..cc2490090270a1234660658c47434ffd3f7b869c 100644
 --- a/featurebench/infer/agents/codex.py
 +++ b/featurebench/infer/agents/codex.py
-@@ -40,6 +40,13 @@ set -e
+@@ -11,6 +11,11 @@ import json
+ 
+ from featurebench.infer.agents.base import BaseAgent
+ from featurebench.infer.container import DOCKER_HOST_GATEWAY
++from featurebench.ultracode_policy import (
++    WORKFLOW_CLEANUP_SCRIPT,
++    output_copy_plan,
++    toml_string,
++)
+ 
+ 
+ class CodexAgent(BaseAgent):
+@@ -40,6 +45,13 @@ set -e
  
  echo "Installing Codex agent..."
  
@@ -199,7 +201,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
  if command -v codex >/dev/null 2>&1; then
      echo "codex already available; skipping installation"
      codex --version || true
-@@ -102,14 +109,149 @@ echo "Codex installation complete"
+@@ -102,14 +114,62 @@ echo "Codex installation complete"
  
          return True
  
@@ -209,89 +211,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
 +        if self.env_vars.get("FEATUREBENCH_ARM") != "b":
 +            return True
 +        wait_seconds = int(self.env_vars.get("FEATUREBENCH_WORKFLOW_WAIT_SECONDS", "3300"))
-+        script = r'''set -u
-+scan_runs() {
-+  result=$(ULTRACODE_SCAN_MODE="$1" /opt/bench/node-sel - <<'NODE'
-+const fs = require('node:fs');
-+const path = require('node:path');
-+const home = '/agent-logs/ultracode';
-+const verified = new Set(['completed', 'failed', 'stopped']);
-+const recovery = new Set(['orphaned', 'cleanup-failed']);
-+const mode = process.env.ULTRACODE_SCAN_MODE;
-+const runs = path.join(home, 'runs');
-+if (!fs.existsSync(runs)) process.exit(3);
-+const entries = fs.readdirSync(runs, { withFileTypes: true })
-+  .filter((entry) => entry.isDirectory());
-+if (entries.length === 0) process.exit(3);
-+for (const entry of entries) {
-+  const runId = entry.name;
-+  try {
-+    const manifest = JSON.parse(fs.readFileSync(path.join(runs, runId, 'manifest.json'), 'utf8'));
-+    const status = String(manifest.status);
-+    if (mode === 'all' || (mode === 'recovery' && recovery.has(status)) || (mode === 'active' && !verified.has(status))) {
-+      console.log(runId);
-+    }
-+  } catch { if (mode === 'active' || mode === 'all') console.log(runId); }
-+}
-+NODE
-+  )
-+  status=$?
-+  if [ "$status" -eq 3 ]; then
-+    printf '__no_ultracode_runs__\n' >&2
-+    return 1
-+  fi
-+  if [ "$status" -ne 0 ]; then
-+    printf '__workflow_scan_failed__\n' >&2
-+    return 1
-+  fi
-+  printf '%s' "$result"
-+}
-+stop_runs() {
-+  failed=0
-+  for run_id in $1; do
-+    ULTRACODE_HOME=/agent-logs/ultracode /opt/bench/node-sel \
-+      /opt/bench/ultracode/dist/cli/main.js stop "$run_id" >&2 || failed=1
-+  done
-+  [ "$failed" -eq 0 ]
-+}
-+recover_workflows() {
-+  recovery=$(scan_runs recovery) || return 1
-+  if [ -z "$recovery" ]; then return 0; fi
-+  printf 'recovering unverified workflows: %s\n' "$recovery" >&2
-+  stop_runs "$recovery" || return 1
-+  remaining_recovery=$(scan_runs recovery) || return 1
-+  [ -z "$remaining_recovery" ] || {
-+    printf 'workflow cleanup remains unverified: %s\n' "$remaining_recovery" >&2
-+    return 1
-+  }
-+}
-+recover_workflows || exit 1
-+stragglers=$(scan_runs active) || exit 1
-+deadline=$(( $(date +%s) + FEATUREBENCH_WORKFLOW_WAIT_SECONDS ))
-+while [ -n "$stragglers" ] && [ "$(date +%s)" -lt "$deadline" ]; do
-+  sleep 5
-+  recover_workflows || exit 1
-+  stragglers=$(scan_runs active) || exit 1
-+done
-+if [ -z "$stragglers" ]; then
-+  all_runs=$(scan_runs all) || exit 1
-+  printf 'verifying workflow process cleanup: %s\n' "$all_runs" >&2
-+  stop_runs "$all_runs" || exit 1
-+  recover_workflows || exit 1
-+  exit 0
-+fi
-+printf 'workflow wait expired; stopping: %s\n' "$stragglers" >&2
-+stop_runs "$stragglers" || exit 1
-+stop_deadline=$(( $(date +%s) + 120 ))
-+recover_workflows || exit 1
-+remaining=$(scan_runs active) || exit 1
-+while [ -n "$remaining" ] && [ "$(date +%s)" -lt "$stop_deadline" ]; do
-+  sleep 5
-+  recover_workflows || exit 1
-+  remaining=$(scan_runs active) || exit 1
-+done
-+[ -z "$remaining" ] || printf 'workflows did not stop: %s\n' "$remaining" >&2
-+exit 1'''
++        script = WORKFLOW_CLEANUP_SCRIPT
 +        result = container.exec_run(
 +            ["/bin/bash", "-lc", script],
 +            environment={"FEATUREBENCH_WORKFLOW_WAIT_SECONDS": str(wait_seconds)},
@@ -306,22 +226,17 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
 +        log_file,
 +        *,
 +        best_effort: bool,
-+        host: bool,
-+        ultracode: bool,
++        workflows_complete: bool,
 +    ) -> bool:
 +        """Persist Codex telemetry before FeatureBench removes the container."""
 +
 +        log_dir = Path(log_file).parent
-+        copies = []
-+        if host:
-+            copies.extend([
-+                ("/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl"),
-+                ("/root/.codex/sessions", log_dir / "codex_sessions"),
-+            ])
-+        if ultracode and self.env_vars.get("FEATUREBENCH_ARM") == "b":
-+            copies.append(("/agent-logs/ultracode", log_dir / "ultracode"))
 +        copied = True
-+        for source, destination in copies:
++        for source, relative_destination in output_copy_plan(
++            self.env_vars.get("FEATUREBENCH_ARM") or "a",
++            workflows_complete,
++        ):
++            destination = log_dir / relative_destination
 +            try:
 +                if not self.cm.copy_from_container(container, source, destination):
 +                    raise RuntimeError("container copy returned no artifacts")
@@ -340,20 +255,20 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
 -        except Exception:
 -            pass
 +        self._copy_outputs(
-+            container, log_file, best_effort=True, host=True, ultracode=False
++            container, log_file, best_effort=True, workflows_complete=False
 +        )
 +        workflows_complete = self._wait_for_workflows(container)
 +        if not workflows_complete:
 +            return False
 +        outputs_copied = self._copy_outputs(
-+            container, log_file, best_effort=False, host=True, ultracode=True
++            container, log_file, best_effort=False, workflows_complete=True
 +        )
 +        if not outputs_copied:
 +            return False
          # Validate the run finished cleanly: last JSONL event should be turn.completed with usage.
          try:
              events_path = log_dir / "codex_events.jsonl"
-@@ -153,18 +295,21 @@ echo "Codex installation complete"
+@@ -153,18 +213,21 @@ echo "Codex installation complete"
      def failure_hook(self, container, log_file: Path) -> None:
          """Collect outputs on failures (best-effort)."""
  
@@ -363,11 +278,11 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
 -        except Exception:
 -            pass
 +        self._copy_outputs(
-+            container, log_file, best_effort=True, host=True, ultracode=False
++            container, log_file, best_effort=True, workflows_complete=False
 +        )
 +        if self._wait_for_workflows(container):
 +            self._copy_outputs(
-+                container, log_file, best_effort=True, host=True, ultracode=True
++                container, log_file, best_effort=True, workflows_complete=True
 +            )
  
      def get_run_command(self, instruction: str) -> str:
@@ -381,7 +296,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
  
          model = self._kwargs.get("model")
          # Preserve provider-prefixed model names (e.g., "azure/<deployment>").
-@@ -179,7 +324,7 @@ echo "Codex installation complete"
+@@ -179,7 +242,7 @@ echo "Codex installation complete"
              # Preserve the exit code when piping JSONL to a file.
              "set -o pipefail; "
              f"codex exec "
@@ -390,7 +305,7 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
              f"--skip-git-repo-check "
              f"--json "
              f"{model_arg}"
-@@ -192,20 +337,21 @@ echo "Codex installation complete"
+@@ -192,20 +255,21 @@ echo "Codex installation complete"
          lines = ["#!/bin/bash", ""]
  
          api_key = self.env_vars.get("OPENAI_API_KEY")
@@ -418,8 +333,13 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
              env_settings["AZURE_OPENAI_API_KEY"] = self.env_vars.get("AZURE_OPENAI_API_KEY") or api_key
  
          # Optional settings
-@@ -262,7 +408,7 @@ echo "Codex installation complete"
-             reasoning_effort = reasoning_effort.replace("\\", "\\\\").replace('"', '\\"')
+@@ -257,12 +321,9 @@ echo "Codex installation complete"
+             or ""
+         )
+         reasoning_effort = str(reasoning_effort).strip()
+-        if reasoning_effort:
+-            # Basic escaping for TOML double-quoted string.
+-            reasoning_effort = reasoning_effort.replace("\\", "\\\\").replace('"', '\\"')
  
          # Azure: https://learn.microsoft.com/zh-cn/azure/ai-foundry/openai/how-to/codex?view=foundry-classic&tabs=npm
 -        if is_azure:
@@ -427,7 +347,27 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
              deployment = raw_model.split("/", 1)[1] if raw_model.startswith("azure/") else raw_model
  
              # Codex CLI Azure v1 requires /openai/v1 in the base URL.
-@@ -300,6 +446,63 @@ echo "Codex installation complete"
+@@ -283,23 +344,78 @@ echo "Codex installation complete"
+                     json.dumps({"OPENAI_API_KEY": api_key}, ensure_ascii=False),
+                     "CODEX_AUTH",
+                     "cat > \"$HOME/.codex/config.toml\" <<'CODEX_TOML'",
+-                    f'model = "{deployment}"',
++                    f'model = {toml_string(deployment)}',
+                     'model_provider = "azure"',
+                     *(
+-                        [f'model_reasoning_effort = "{reasoning_effort}"']
++                        [f'model_reasoning_effort = {toml_string(reasoning_effort)}']
+                         if reasoning_effort
+                         else []
+                     ),
+                     "",
+                     "[model_providers.azure]",
+                     'name = "Azure OpenAI"',
+-                    f'base_url = "{base}"',
++                    f'base_url = {toml_string(base)}',
+                     'env_key = "AZURE_OPENAI_API_KEY"',
+                     'wire_api = "responses"',
+                     "CODEX_TOML",
                  ]
              )
  
@@ -439,21 +379,19 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
 +            broker_url = self.env_vars.get("FEATUREBENCH_BROKER_BASE_URL") or ""
 +            if not broker_url.startswith("https://"):
 +                raise RuntimeError("FeatureBench credential broker URL must use HTTPS")
-+            broker_url = broker_url.replace("\\", "\\\\").replace('"', '\\"')
-+
 +            lines.extend(
 +                [
 +                    "",
 +                    "# Codex CLI config (FeatureBench credential broker)",
 +                    'mkdir -p "$HOME/.codex"',
 +                    "cat > \"$HOME/.codex/config.toml\" <<'CODEX_TOML'",
-+                    *([f'model = "{model_name}"'] if model_name else []),
-+                    *([f'model_reasoning_effort = "{reasoning_effort}"'] if reasoning_effort else []),
++                    *([f'model = {toml_string(model_name)}'] if model_name else []),
++                    *([f'model_reasoning_effort = {toml_string(reasoning_effort)}'] if reasoning_effort else []),
 +                    'model_provider = "featurebench_broker"',
 +                    "",
 +                    '[model_providers.featurebench_broker]',
 +                    'name = "FeatureBench credential broker"',
-+                    f'base_url = "{broker_url}"',
++                    f'base_url = {toml_string(broker_url)}',
 +                    'wire_api = "responses"',
 +                    'requires_openai_auth = false',
 +                ]
@@ -491,6 +429,26 @@ index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..723fe8348f8ab2144b97c0f014097a73
          # Non-Azure (OpenAI-compatible): write a Codex config following the user's preferred template.
          else:
              model_name = raw_model
+@@ -319,14 +435,14 @@ echo "Codex installation complete"
+                     json.dumps({"OPENAI_API_KEY": api_key}, ensure_ascii=False),
+                     "CODEX_AUTH",
+                     "cat > \"$HOME/.codex/config.toml\" <<'CODEX_TOML'",
+-                    f'model_provider = "{provider_id}"',
+-                    *([f'model = "{model_name}"'] if model_name else []),
+-                    *([f'model_reasoning_effort = "{reasoning_effort}"'] if reasoning_effort else []),
++                    f'model_provider = {toml_string(provider_id)}',
++                    *([f'model = {toml_string(model_name)}'] if model_name else []),
++                    *([f'model_reasoning_effort = {toml_string(reasoning_effort)}'] if reasoning_effort else []),
+                     "disable_response_storage = true",
+                     "",
+                     f"[model_providers.{provider_id}]",
+-                    f'name = "{provider_id}"',
+-                    *([f'base_url = "{base}"'] if base else []),
++                    f'name = {toml_string(provider_id)}',
++                    *([f'base_url = {toml_string(base)}'] if base else []),
+                     'wire_api = "responses"',
+                     "CODEX_TOML",
+                 ]
 diff --git a/featurebench/infer/config.py b/featurebench/infer/config.py
 index 796c784bee86b17e337fd4e47044cd5ce4ac04db..783769fad7c7a874a1a22fdad7c194be4c8e3998 100644
 --- a/featurebench/infer/config.py
@@ -521,32 +479,30 @@ index 796c784bee86b17e337fd4e47044cd5ce4ac04db..783769fad7c7a874a1a22fdad7c194be
              for item in dataset:
                  item_dict = dict(item)
 diff --git a/featurebench/infer/container.py b/featurebench/infer/container.py
-index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..aee11be8c2aacc094f2fb83e58e88cdcab64fae0 100644
+index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..4a062a13d258eb6d3d28bdad8defc53449275ea0 100644
 --- a/featurebench/infer/container.py
 +++ b/featurebench/infer/container.py
-@@ -190,6 +190,21 @@ class ContainerManager:
+@@ -19,6 +19,7 @@ import docker
+ from docker.models.containers import Container
+ 
+ import selectors
++from featurebench.ultracode_policy import attest_container_policy, container_limits
+ # Regex pattern to match ANSI escape sequences
+ ANSI_ESCAPE_PATTERN = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07')
+ 
+@@ -190,6 +191,11 @@ class ContainerManager:
          if not isinstance(number_once, int) or number_once <= 0:
              number_once = 1
          shm_size = docker_runtime_config.get("shm_size")
-+        raw_cpus = self.env_vars.get("FB_CONTAINER_CPUS")
-+        nano_cpus = int(float(raw_cpus) * 1_000_000_000) if raw_cpus else None
-+        raw_memory = self.env_vars.get("FB_CONTAINER_MEMORY")
-+        memory_limit = int(raw_memory) if raw_memory else None
-+        raw_pids = self.env_vars.get("FB_CONTAINER_PIDS")
-+        pids_limit = int(raw_pids) if raw_pids else None
-+        if nano_cpus is None or nano_cpus <= 0:
-+            raise RuntimeError("A positive FeatureBench inference NanoCpus limit is required")
-+        if memory_limit is None or memory_limit <= 0:
-+            raise RuntimeError("A positive FeatureBench inference memory limit is required")
-+        if pids_limit is None or pids_limit <= 0:
-+            raise RuntimeError("A positive FeatureBench inference PID limit is required")
++        limits = container_limits(self.env_vars, "inference")
++        nano_cpus, memory_limit, pids_limit = limits
 +        restricted_network = self.env_vars.get("FEATUREBENCH_RESTRICTED_NETWORK")
 +        if restricted_network in {None, "", "bridge", "host", "default", "none"}:
 +            raise RuntimeError("A dedicated restricted FeatureBench network is required")
  
          # Configure GPU access
          device_requests = None
-@@ -244,11 +259,30 @@ class ContainerManager:
+@@ -244,11 +250,23 @@ class ContainerManager:
                  volumes=volumes,
                  command="tail -f /dev/null",  # Keep container running
                  platform="linux/amd64",
@@ -561,14 +517,7 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..aee11be8c2aacc094f2fb83e58e88cdc
              )
 +            try:
 +                container.reload()
-+                host_config = container.attrs.get("HostConfig")
-+                if (
-+                    not isinstance(host_config, dict)
-+                    or host_config.get("NanoCpus") != nano_cpus
-+                    or host_config.get("Memory") != memory_limit
-+                    or host_config.get("PidsLimit") != pids_limit
-+                ):
-+                    raise RuntimeError("FeatureBench inference resource attestation failed")
++                attest_container_policy(container.attrs.get("HostConfig"), limits)
 +            except Exception:
 +                try:
 +                    container.remove(force=True)
@@ -578,7 +527,7 @@ index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..aee11be8c2aacc094f2fb83e58e88cdc
              
              # Check if GPU is available
              if need_gpu:
-@@ -662,4 +696,4 @@ class ContainerManager:
+@@ -662,4 +680,4 @@ class ContainerManager:
          try:
              return container.logs().decode("utf-8", errors="replace")
          except Exception as e:
@@ -739,3 +688,153 @@ index 594e8f6cd3e9b3436439ce879b7d1611edd04e00..71d7b1a08be64dba86e504e1778c8f75
 -    raise SystemExit(main())
 \ No newline at end of file
 +    raise SystemExit(main())
+diff --git a/featurebench/ultracode_policy.py b/featurebench/ultracode_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..09d08103109af0c730cec70f92c9d8baa44a7854
+--- /dev/null
++++ b/featurebench/ultracode_policy.py
+@@ -0,0 +1,144 @@
++"""Pure policy helpers injected by the Ultracode FeatureBench adapter."""
++
++import json
++from collections.abc import Mapping
++from typing import Any
++
++
++WORKFLOW_CLEANUP_SCRIPT = r'''set -u
++scan_runs() {
++  result=$(ULTRACODE_SCAN_MODE="$1" /opt/bench/node-sel - <<'NODE'
++const fs = require('node:fs');
++const path = require('node:path');
++const home = '/agent-logs/ultracode';
++const verified = new Set(['completed', 'failed', 'stopped']);
++const recovery = new Set(['orphaned', 'cleanup-failed']);
++const mode = process.env.ULTRACODE_SCAN_MODE;
++const runs = path.join(home, 'runs');
++if (!fs.existsSync(runs)) process.exit(3);
++const entries = fs.readdirSync(runs, { withFileTypes: true })
++  .filter((entry) => entry.isDirectory());
++if (entries.length === 0) process.exit(3);
++for (const entry of entries) {
++  const runId = entry.name;
++  try {
++    const manifest = JSON.parse(fs.readFileSync(path.join(runs, runId, 'manifest.json'), 'utf8'));
++    const status = String(manifest.status);
++    if (mode === 'all' || (mode === 'recovery' && recovery.has(status)) || (mode === 'active' && !verified.has(status))) {
++      console.log(runId);
++    }
++  } catch { if (mode === 'active' || mode === 'all') console.log(runId); }
++}
++NODE
++  )
++  status=$?
++  if [ "$status" -eq 3 ]; then
++    printf '__no_ultracode_runs__\n' >&2
++    return 1
++  fi
++  if [ "$status" -ne 0 ]; then
++    printf '__workflow_scan_failed__\n' >&2
++    return 1
++  fi
++  printf '%s' "$result"
++}
++stop_runs() {
++  failed=0
++  for run_id in $1; do
++    ULTRACODE_HOME=/agent-logs/ultracode /opt/bench/node-sel \
++      /opt/bench/ultracode/dist/cli/main.js stop "$run_id" >&2 || failed=1
++  done
++  [ "$failed" -eq 0 ]
++}
++recover_workflows() {
++  recovery=$(scan_runs recovery) || return 1
++  if [ -z "$recovery" ]; then return 0; fi
++  printf 'recovering unverified workflows: %s\n' "$recovery" >&2
++  stop_runs "$recovery" || return 1
++  remaining_recovery=$(scan_runs recovery) || return 1
++  [ -z "$remaining_recovery" ] || {
++    printf 'workflow cleanup remains unverified: %s\n' "$remaining_recovery" >&2
++    return 1
++  }
++}
++recover_workflows || exit 1
++stragglers=$(scan_runs active) || exit 1
++deadline=$(( $(date +%s) + FEATUREBENCH_WORKFLOW_WAIT_SECONDS ))
++while [ -n "$stragglers" ] && [ "$(date +%s)" -lt "$deadline" ]; do
++  sleep 5
++  recover_workflows || exit 1
++  stragglers=$(scan_runs active) || exit 1
++done
++if [ -z "$stragglers" ]; then
++  all_runs=$(scan_runs all) || exit 1
++  printf 'verifying workflow process cleanup: %s\n' "$all_runs" >&2
++  stop_runs "$all_runs" || exit 1
++  recover_workflows || exit 1
++  exit 0
++fi
++printf 'workflow wait expired; stopping: %s\n' "$stragglers" >&2
++stop_runs "$stragglers" || exit 1
++stop_deadline=$(( $(date +%s) + 120 ))
++recover_workflows || exit 1
++remaining=$(scan_runs active) || exit 1
++while [ -n "$remaining" ] && [ "$(date +%s)" -lt "$stop_deadline" ]; do
++  sleep 5
++  recover_workflows || exit 1
++  remaining=$(scan_runs active) || exit 1
++done
++[ -z "$remaining" ] || printf 'workflows did not stop: %s\n' "$remaining" >&2
++exit 1'''
++
++
++def toml_string(value: str) -> str:
++    """Encode one exact TOML basic string using JSON-compatible escapes."""
++
++    if not isinstance(value, str):
++        raise TypeError("TOML value must be a string")
++    return json.dumps(value, ensure_ascii=False)
++
++
++def container_limits(source: Mapping[str, str], purpose: str) -> tuple[int, int, int]:
++    """Parse mandatory Docker CPU, memory, and PID ceilings."""
++
++    try:
++        nano_cpus = int(float(source.get("FB_CONTAINER_CPUS") or "") * 1_000_000_000)
++        memory_limit = int(source.get("FB_CONTAINER_MEMORY") or "")
++        pids_limit = int(source.get("FB_CONTAINER_PIDS") or "")
++    except (OverflowError, TypeError, ValueError) as exc:
++        raise RuntimeError(f"Invalid FeatureBench {purpose} resource limits") from exc
++    if nano_cpus <= 0 or memory_limit <= 0 or pids_limit <= 0:
++        raise RuntimeError(f"Positive FeatureBench {purpose} resource limits are required")
++    return nano_cpus, memory_limit, pids_limit
++
++
++def attest_container_policy(
++    host_config: Any,
++    limits: tuple[int, int, int],
++    expected_network: str | None = None,
++) -> None:
++    """Require Docker to report the exact requested runtime policy."""
++
++    nano_cpus, memory_limit, pids_limit = limits
++    if (
++        not isinstance(host_config, dict)
++        or expected_network is not None and host_config.get("NetworkMode") != expected_network
++        or host_config.get("NanoCpus") != nano_cpus
++        or host_config.get("Memory") != memory_limit
++        or host_config.get("PidsLimit") != pids_limit
++    ):
++        raise RuntimeError("FeatureBench container runtime attestation failed")
++
++
++def output_copy_plan(arm: str, workflows_complete: bool) -> tuple[tuple[str, str], ...]:
++    """Keep host billing artifacts independent from mutable workflow output."""
++
++    if arm not in {"a", "b"}:
++        raise RuntimeError("Invalid FeatureBench arm")
++    copies = [
++        ("/agent-logs/codex_events.jsonl", "codex_events.jsonl"),
++        ("/root/.codex/sessions", "codex_sessions"),
++    ]
++    if arm == "b" and workflows_complete:
++        copies.append(("/agent-logs/ultracode", "ultracode"))
++    return tuple(copies)
