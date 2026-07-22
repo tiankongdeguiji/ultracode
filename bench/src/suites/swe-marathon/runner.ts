@@ -82,6 +82,7 @@ import { indexHarborEvidence, validateHarborResume, type HarborExecutionIdentity
 const TOOLCHAIN_CACHE_LOCK = '.locks/toolchain.lock';
 const SUITE_CACHE_LOCK = '.locks/swe-marathon.lock';
 const BRIDGE_CLASS = 'arm_b_codex:ArmBCodex';
+const SETTLEMENT_SCRIPT = 'settle-arm-b.mjs';
 const CLEANUP_DOCKER_TIMEOUT_MS = 30_000;
 
 interface PrepOptions { recoverStaleLock: boolean }
@@ -198,6 +199,7 @@ function policies(
     }))),
     bridgeSha256: sha256CanonicalJson({
       bridge: sha256File(join(roots.benchRoot, 'suites', 'swe-marathon', 'arm_b_codex.py')),
+      settlement: sha256File(join(roots.benchRoot, 'suites', 'swe-marathon', SETTLEMENT_SCRIPT)),
       prefix: sha256File(ARM_B_PREFIX_PATH),
       ownership: sha256File(join(roots.benchRoot, 'suites', 'swe-marathon', 'harbor-ownership.patch')),
       class: BRIDGE_CLASS,
@@ -235,6 +237,7 @@ function buildManifest(
   const controlPlane = currentControlPlaneHashes(roots);
   const nativeAssets = [
     'suites/swe-marathon/arm_b_codex.py',
+    `suites/swe-marathon/${SETTLEMENT_SCRIPT}`,
     'suites/swe-marathon/harbor-ownership.patch',
     relative(roots.benchRoot, ARM_B_PREFIX_PATH).split(sep).join('/'),
   ].map((path) => ({ path: validateRelativeArtifactPath(path), sha256: sha256File(join(roots.benchRoot, ...path.split('/'))) }));
@@ -492,7 +495,7 @@ async function finishInvocation(
 
 /** Build one native Harbor invocation; credentials never enter the plan or argv. */
 export function planHarborRun(
-  _roots: BenchPathRoots,
+  roots: BenchPathRoots,
   runDirectory: string,
   manifest: SweMarathonManifest,
   common: MarathonCommonAttestation,
@@ -515,6 +518,12 @@ export function planHarborRun(
         read_only: true,
       });
     }
+    mounts.push({
+      type: 'bind',
+      source: join(roots.benchRoot, 'suites', 'swe-marathon', SETTLEMENT_SCRIPT),
+      target: `/opt/bench/${SETTLEMENT_SCRIPT}`,
+      read_only: true,
+    });
   }
   const jobDirectory = join(runDirectory, ...execution.nativeRoot.split('/'));
   const argv = resume ? ['job', 'resume', '--path', jobDirectory] : [
@@ -731,6 +740,28 @@ export function shouldResumeHarborJob(jobDirectoryExists: boolean, redo: boolean
   return jobDirectoryExists && !redo;
 }
 
+/** Reject terminal native evidence unless every byte remains bound by the prior receipt. */
+export function assertTerminalHarborEvidencePinned(
+  identity: HarborExecutionIdentity,
+  current: readonly VerifierBinding[],
+  stored: readonly VerifierBinding[],
+): void {
+  const scoped = (bindings: readonly VerifierBinding[]): VerifierBinding[] => bindings
+    .filter((binding) => binding.scope.kind === 'task-arm'
+      && binding.scope.taskId === identity.taskId && binding.scope.arm === identity.arm)
+    .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  const currentScoped = scoped(current);
+  const storedScoped = scoped(stored);
+  const invocationIds = new Set(currentScoped.map((binding) => binding.invocationId));
+  const invocationId = invocationIds.size === 1 ? currentScoped[0]?.invocationId : undefined;
+  if (invocationId === undefined
+    || !hasCompleteHarborReceipt(currentScoped, invocationId, identity.taskId, identity.arm)
+    || !hasCompleteHarborReceipt(storedScoped, invocationId, identity.taskId, identity.arm)
+    || canonicalJson(currentScoped) !== canonicalJson(storedScoped)) {
+    throw new Error(`terminal Harbor evidence drifted for ${identity.taskId}/${identity.arm}; use --redo`);
+  }
+}
+
 async function updateReceipt(
   receipt: VerifierReceiptStore,
   identity: HarborExecutionIdentity,
@@ -822,6 +853,7 @@ async function runTask(
     );
     const existingEvidence = indexHarborEvidence(directory, identity, evidenceInvocationId);
     if (existingEvidence.nativeResult.verification === 'verified' || existingEvidence.terminalFailure !== null) {
+      assertTerminalHarborEvidencePinned(identity, existingEvidence.bindings, receipt.load().bindings);
       await updateReceipt(receipt, identity, existingEvidence.bindings);
       output(context, `${taskId} ${identity.arm}: already ${existingEvidence.terminalFailure ?? 'verified'}`);
       return;

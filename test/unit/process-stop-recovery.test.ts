@@ -1,10 +1,11 @@
 /** Deterministic bounded Darwin groups and unchanged Linux recovery visibility. */
 import { once } from 'node:events';
+import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { ProcessInspectionOptions } from '../../src/exec/procinfo.js';
+import { readProcessIdentity, type ProcessInspectionOptions } from '../../src/exec/procinfo.js';
 import { killActiveWorkers, spawnAgentProcess } from '../../src/exec/spawn.js';
 import { stopRun } from '../../src/exec/stop.js';
 import { workerRecordDir, workerRecordPath } from '../../src/exec/worker-record.js';
@@ -200,6 +201,27 @@ describe('persisted Darwin recovery', () => {
 });
 
 describe('persisted Linux recovery', () => {
+  it('terminates a live authenticated runner even when its manifest claims completion', async () => {
+    if (process.platform !== 'linux') return;
+    const run = stoppedRun('terminal-live-runner');
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60_000)']);
+    const identity = readProcessIdentity(child.pid!);
+    expect(identity).toBeDefined();
+    const manifest = readManifest(run.directory)!;
+    writeManifest(run.directory, {
+      ...manifest,
+      status: 'completed',
+      pid: child.pid!,
+      pidStart: identity!.starttime,
+    });
+
+    const exited = once(child, 'exit');
+    const result = await stopRun(run.root, run.runId);
+    await exited;
+
+    expect(result).toMatchObject({ ok: true, status: 'completed' });
+  });
+
   it('batches fatal token discovery once for workers in one scope', async () => {
     const discoveries: string[][] = [];
     let baselineSnapshots = 0;

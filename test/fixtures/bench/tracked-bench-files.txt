@@ -45,6 +45,7 @@ bench/src/suites/swebench-pro/verifier.ts
 bench/suites/shared/arm-b-prefix.txt
 bench/suites/swe-marathon/arm_b_codex.py
 bench/suites/swe-marathon/harbor-ownership.patch
+bench/suites/swe-marathon/settle-arm-b.mjs
 bench/suites/swebench-pro/Dockerfile
 bench/suites/swebench-pro/capture-git.sh
 bench/suites/swebench-pro/container-policy.json

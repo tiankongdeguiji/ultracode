@@ -489,7 +489,8 @@ export async function stopRun(
 ): Promise<StopResult> {
   const run = getRun(root, runId);
   if (!run) return { ok: false, status: 'unknown', message: `no run ${runId} under ${root}` };
-  if (isTerminal(run.effectiveStatus)) {
+  // A forged terminal manifest cannot bypass signaling a still-live authenticated runner.
+  if (isTerminal(run.effectiveStatus) && !isRunnerAlive(run.manifest)) {
     // A hard-stop can finalize as `stopped` immediately before process.exit(),
     // and a backend can leave setsid() descendants after any terminal outcome.
     // Stale records are therefore actionable for every terminal status.
@@ -525,9 +526,10 @@ export async function stopRun(
   const deadline = Date.now() + 7_000;
   while (Date.now() < deadline) {
     const m = readManifest(run.dir);
-    if (m && isTerminal(m.status)) {
+    if (!isRunnerAlive(run.manifest)) {
+      const settled = m && isTerminal(m.status) ? m.status : 'stopped';
       const cleanup = await cleanupWorkerGroupsUntilGone(run.dir, 100, inspection);
-      return persistCleanupOutcome(run.dir, m, m.status, m.status, cleanup);
+      return persistCleanupOutcome(run.dir, m ?? run.manifest, settled, settled, cleanup);
     }
     await sleep(200);
   }

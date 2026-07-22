@@ -140,7 +140,9 @@ export function indexSweMarathonMetrics(
       const hostSessionId = typeof lifecycle?.host_session_id === 'string' ? lifecycle.host_session_id : null;
       const workflow = workflowIndex(runDirectory, agentDirectory, execution.taskId, execution.arm);
       workflows.push(...workflow.workflows);
-      for (const path of files(join(agentDirectory, 'sessions'), (name) => /^rollout-.*\.jsonl$/.test(name))) {
+      const sessionPaths = ['sessions', 'worker-sessions'].flatMap((directory) =>
+        files(join(agentDirectory, directory), (name) => /^rollout-.*\.jsonl$/.test(name)));
+      for (const path of sessionPaths) {
         const id = sessionId(path);
         const host = execution.arm === 'a' || id === hostSessionId;
         const backend = host ? 'codex' : id === null ? null : workflow.sessionBackends.get(id) ?? null;

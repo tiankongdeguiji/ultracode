@@ -11,7 +11,6 @@ from typing import Any, override
 from harbor.agents.installed.codex import Codex
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
-from harbor.models.trial.paths import EnvironmentPaths
 
 
 ARM_B_PREFIX_PATH = Path(__file__).resolve().parents[1] / "shared" / "arm-b-prefix.txt"
@@ -21,8 +20,10 @@ ARM_B_PREFIX = ARM_B_PREFIX_PATH.read_text(encoding="utf-8")
 class ArmBCodex(Codex):
     """Arm B with canonical prompting, terminal waiting, and lifecycle evidence."""
 
-    _ULTRACODE_HOME = "/tmp/swe-marathon-ultracode"
+    _ULTRACODE_HOME = "/logs/agent/ultracode"
     _WORKER_CODEX_HOME = "/tmp/swe-marathon-worker-codex"
+    _WORKER_SESSIONS = "/logs/agent/worker-sessions"
+    _SETTLEMENT_SCRIPT = "/opt/bench/settle-arm-b.mjs"
 
     def __init__(
         self,
@@ -58,6 +59,8 @@ class ArmBCodex(Codex):
         return f'''set -e
 rm -rf {self._WORKER_CODEX_HOME}
 mkdir -p {self._WORKER_CODEX_HOME}
+mkdir -p {self._WORKER_SESSIONS}
+ln -s {self._WORKER_SESSIONS} {self._WORKER_CODEX_HOME}/sessions
 cp -L "$CODEX_HOME/auth.json" {self._WORKER_CODEX_HOME}/auth.json
 chmod 600 {self._WORKER_CODEX_HOME}/auth.json
 cat >{self._WORKER_CODEX_HOME}/config.toml <<'WORKER_TOML'
@@ -79,92 +82,36 @@ PATH = "/opt/bench:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin"
 HOME = "$HOME"
 TOML'''
 
-    async def _wait_for_workflows(self, environment: BaseEnvironment) -> None:
-        command = f'''/opt/bench/node-sel - <<'NODE'
-const fs = require('node:fs');
-const path = require('node:path');
-const home = {json.dumps(self._ULTRACODE_HOME)};
-const deadline = Date.now() + Number(process.env.MARATHON_WAIT_SECONDS) * 1000;
-function runIds() {{
-  const runs = path.join(home, 'runs');
-  if (!fs.existsSync(runs)) return [];
-  return fs.readdirSync(runs, {{ withFileTypes: true }})
-    .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
-}}
-(async () => {{
-  const {{ listRuns }} = await import('file:///opt/bench/ultracode/dist/store/runstore.js');
-  const {{ isResumableStatus }} = await import('file:///opt/bench/ultracode/dist/store/manifest.js');
-  function observed() {{
-    const summaries = new Map(listRuns(home).map((run) => [run.runId, run]));
-    return runIds().map((runId) => summaries.get(runId) ?? {{ runId, effectiveStatus: 'invalid' }});
-  }}
-  function unsettled() {{
-    return observed().filter((run) => !isResumableStatus(run.effectiveStatus));
-  }}
-  function unsafe() {{
-    return observed().filter((run) => ['orphaned', 'cleanup-failed'].includes(run.effectiveStatus));
-  }}
-  if (runIds().length === 0) {{
-    process.stderr.write('Arm B did not start an ultracode run\\n');
-    process.exitCode = 1;
-    return;
-  }}
-  while (unsettled().length > 0 && unsafe().length === 0 && Date.now() < deadline) {{
-    await new Promise((resolve) => setTimeout(resolve, 5_000));
-  }}
-  const expired = unsettled();
-  if (expired.length === 0) return;
-  const {{ spawn }} = require('node:child_process');
-  const stopDeadline = Date.now() + 120_000;
-  function stop(runId) {{
-    return new Promise((resolve) => {{
-      const child = spawn('/opt/bench/node-sel', ['/opt/bench/ultracode/dist/cli/main.js', 'stop', runId],
-        {{ stdio: 'inherit', env: {{ ...process.env, ULTRACODE_HOME: home }} }});
-      const timer = setTimeout(() => {{ child.kill('SIGKILL'); resolve(); }},
-        Math.max(1, Math.min(30_000, stopDeadline - Date.now())));
-      const finish = () => {{ clearTimeout(timer); resolve(); }};
-      child.once('error', finish);
-      child.once('close', finish);
-    }});
-  }}
-  await Promise.all(expired.map((run) => stop(run.runId)));
-  while (unsettled().length > 0 && Date.now() < stopDeadline) {{
-    await new Promise((resolve) => setTimeout(resolve, 5_000));
-  }}
-  if (unsettled().length > 0) process.stderr.write('Arm B could not verify workflow process absence\n');
-  process.exitCode = 1;
-}})();
-NODE'''
+    async def _wait_for_workflows(self, environment: BaseEnvironment) -> bool:
         self._wait_started_at = datetime.now(UTC).isoformat()
         started = monotonic()
         try:
             result = await self.exec_as_agent(
                 environment,
-                command,
-                env={"MARATHON_WAIT_SECONDS": str(self._workflow_wait_seconds)},
+                f"/opt/bench/node-sel {self._SETTLEMENT_SCRIPT}",
+                env={
+                    "MARATHON_WAIT_SECONDS": str(self._workflow_wait_seconds),
+                    "ULTRACODE_HOME": self._ULTRACODE_HOME,
+                },
                 timeout_sec=self._workflow_wait_seconds + 150,
             )
         finally:
             self._wait_elapsed_ms = round((monotonic() - started) * 1_000)
             self._wait_ended_at = datetime.now(UTC).isoformat()
-        if result.return_code != 0:
+        if result.return_code not in (0, 2):
             raise RuntimeError(
                 "Arm B workflow wait command failed with return code "
                 f"{result.return_code}"
             )
+        return result.return_code == 0
 
     async def _preserve_artifacts(self, environment: BaseEnvironment) -> None:
-        agent_dir = EnvironmentPaths.agent_dir.as_posix()
         result = await self.exec_as_agent(
             environment,
             f'''set -e
-test -d {self._WORKER_CODEX_HOME}/sessions
+test -d {self._WORKER_SESSIONS}
 test -d {self._ULTRACODE_HOME}/runs
-mkdir -p {agent_dir}/sessions
-cp -a {self._WORKER_CODEX_HOME}/sessions/. {agent_dir}/sessions/
 rm -f {self._WORKER_CODEX_HOME}/auth.json
-rm -rf {agent_dir}/ultracode
-cp -a {self._ULTRACODE_HOME} {agent_dir}/ultracode
 rm -rf {self._WORKER_CODEX_HOME}''',
         )
         if result.return_code != 0:
@@ -184,7 +131,7 @@ rm -rf {self._WORKER_CODEX_HOME}''',
             await super().run(ARM_B_PREFIX + instruction, environment, context)
         finally:
             try:
-                await self._wait_for_workflows(environment)
+                clean_lifecycle = await self._wait_for_workflows(environment)
             except BaseException as exc:
                 self.logger.exception(
                     "Ultracode workflows did not reach a safely settled state"
@@ -197,6 +144,8 @@ rm -rf {self._WORKER_CODEX_HOME}''',
             except BaseException:
                 self.logger.exception("Failed to preserve Arm B sessions and run store")
                 raise
+            if not clean_lifecycle:
+                raise RuntimeError("Arm B workflow lifecycle required forced settlement")
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:

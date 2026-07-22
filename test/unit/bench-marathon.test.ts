@@ -1,4 +1,5 @@
 /** Offline contracts for the suite-owned SWE-Marathon adapter. */
+import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
   cpSync,
@@ -45,6 +46,7 @@ import {
   type MarathonCommonAttestation,
 } from '../../bench/src/suites/swe-marathon/provenance.js';
 import {
+  assertTerminalHarborEvidencePinned,
   harborEvidenceInvocationId,
   hasCompleteHarborReceipt,
   marathonRunScope,
@@ -371,6 +373,25 @@ describe('native Harbor evidence', () => {
     expect(indexed.nativeResult).toMatchObject({ verification: 'verified', score: 0.75, resolved: false });
   });
 
+  it('accepts the provenance-documented Arm A Harbor 0.17.1 golden', () => {
+    const root = temporaryDirectory();
+    const taskId = 'zstd-decoder';
+    const jobRelativeRoot = `native/tasks/${artifactKey(taskId)}`;
+    cpSync(
+      resolve('test/fixtures/bench/swe-marathon/harbor-0.17.1-arm-a'),
+      join(root, ...jobRelativeRoot.split('/')),
+      { recursive: true },
+    );
+    const indexed = indexHarborEvidence(root, {
+      taskId,
+      arm: 'a',
+      model: 'openai/gpt-test',
+      requestedEffort: 'high',
+      jobRelativeRoot,
+    }, '5a9db8e2-7768-4f7e-8dad-cabfa11a48f8');
+    expect(indexed.nativeResult).toMatchObject({ verification: 'verified', score: 0.75, resolved: false });
+  });
+
   it('validates exact job fields rather than matching distractor strings', () => {
     const { identity } = nativeFixture();
     const exact = {
@@ -560,6 +581,21 @@ describe('native Harbor evidence', () => {
     expect(() => validateHarborResume(fixture.root, fixture.identity, [])).toThrow(/no prior receipt binding/);
   });
 
+  it('refuses to re-sign mutated terminal evidence during a no-op resume', () => {
+    const fixture = nativeFixture();
+    const invocationId = '11111111-1111-4111-8111-111111111111';
+    const stored = indexHarborEvidence(fixture.root, fixture.identity, invocationId).bindings;
+    expect(() => assertTerminalHarborEvidencePinned(fixture.identity, stored, stored)).not.toThrow();
+    put(join(fixture.trial, 'result.json'), `${JSON.stringify({
+      task_name: fixture.identity.taskId,
+      trial_name: 'trial-1',
+      verifier_result: { rewards: { reward: 1 } },
+    })}\n`);
+    const drifted = indexHarborEvidence(fixture.root, fixture.identity, invocationId).bindings;
+    expect(() => assertTerminalHarborEvidencePinned(fixture.identity, drifted, stored))
+      .toThrow(/terminal Harbor evidence drifted.*--redo/);
+  });
+
   it('ignores nested lookalikes and accepts resolved only for reward exactly one', () => {
     const fixture = nativeFixture(1);
     put(join(fixture.trial, 'nested', 'result.json'), `${JSON.stringify({
@@ -596,13 +632,36 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(plan.argv[plan.argv.indexOf('--job-name') + 1]).toBe(artifactKey(fixture.identity.taskId));
   });
 
+  it('keeps Arm A free of Arm-B-only mounts and workflow options', () => {
+    const fixture = nativeFixture();
+    const roots = { benchRoot: '/bench', cacheRoot: '/bench/.cache', resultsRoot: '/bench/results' };
+    const common = { prepared: {
+      harborBinary: '/prepared/environment/bin/harbor',
+      sourceDirectory: '/prepared/source',
+      toolchain: { directory: '/prepared/toolchain' },
+    } } as unknown as MarathonCommonAttestation;
+    const manifest = structuredClone(fixture.manifest);
+    manifest.experiment.arm = 'a';
+    manifest.artifacts.executions[0]!.arm = 'a';
+    const plan = planHarborRun(roots, fixture.root, manifest, common, fixture.identity.taskId, false);
+    expect(plan.argv[plan.argv.indexOf('--agent') + 1]).toBe('codex');
+    expect(plan.argv).not.toContain('--skill');
+    expect(plan.argv.some((value) => value.includes('workflow_wait_seconds'))).toBe(false);
+    expect(plan.mounts).toEqual([{
+      type: 'bind',
+      source: '/prepared/toolchain/codex',
+      target: '/usr/local/bin/codex',
+      read_only: true,
+    }]);
+  });
+
   it('indexes telemetry only beneath the validated trial root', () => {
     const fixture = nativeFixture();
     const host = '11111111-1111-4111-8111-111111111111';
     const worker = '22222222-2222-4222-8222-222222222222';
     put(join(fixture.trial, 'agent', 'arm_b_lifecycle.json'), `${JSON.stringify({ schema_version: 2, host_session_id: host })}\n`);
     put(join(fixture.trial, 'agent', 'sessions', `rollout-${host}.jsonl`), '{}\n');
-    put(join(fixture.trial, 'agent', 'sessions', `rollout-${worker}.jsonl`), '{}\n');
+    put(join(fixture.trial, 'agent', 'worker-sessions', `rollout-${worker}.jsonl`), '{}\n');
     put(join(fixture.trial, 'agent', 'ultracode', 'runs', 'wf-1', 'config.json'), '{"backend":"mock"}\n');
     put(join(fixture.trial, 'agent', 'ultracode', 'runs', 'wf-1', 'manifest.json'), '{"status":"completed"}\n');
     put(join(fixture.trial, 'agent', 'ultracode', 'runs', 'wf-1', 'output.json'), '{"agentCount":1}\n');
@@ -671,13 +730,11 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(bridge).toContain('ARM_B_PREFIX_PATH = Path(__file__).resolve().parents[1] / "shared" / "arm-b-prefix.txt"');
     expect(bridge).toContain('ARM_B_PREFIX + instruction');
     expect(bridge).toContain('arm_b_lifecycle.json');
-    expect(bridge).toContain("dist/store/runstore.js");
-    expect(bridge).toContain('isResumableStatus');
-    expect(bridge).toContain('run.effectiveStatus');
-    expect(bridge).not.toContain('manifest.status');
-    expect(bridge).toContain("['orphaned', 'cleanup-failed']");
-    expect(bridge).toContain('await Promise.all(expired.map((run) => stop(run.runId)))');
-    expect(bridge).not.toContain('spawnSync');
+    expect(bridge).toContain('_ULTRACODE_HOME = "/logs/agent/ultracode"');
+    expect(bridge).toContain('_WORKER_SESSIONS = "/logs/agent/worker-sessions"');
+    expect(bridge).toContain('ln -s {self._WORKER_SESSIONS}');
+    expect(bridge).toContain('_SETTLEMENT_SCRIPT = "/opt/bench/settle-arm-b.mjs"');
+    expect(bridge).not.toContain('cp -a');
     expect(bridge).not.toContain('wait_error');
     const wait = bridge.indexOf('await self._wait_for_workflows(environment)');
     const unsafeRaise = bridge.indexOf('Arm B workflow lifecycle did not finish cleanly', wait);
@@ -687,5 +744,12 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(bridge).not.toContain('arm_b_metrics.json');
     expect(bridge).not.toContain('total_token_usage');
     expect(ownership).toContain('ultracode.benchmark.ownership');
+
+    const settlement = resolve('bench/suites/swe-marathon/settle-arm-b.mjs');
+    expect(() => execFileSync(process.execPath, ['--check', settlement])).not.toThrow();
+    const settlementSource = readFileSync(settlement, 'utf8');
+    expect(settlementSource).toContain('isRunnerAlive');
+    expect(settlementSource).toContain("process.stderr.write('Arm B could not verify workflow process absence\\n')");
+    expect(settlementSource).toContain('await Promise.all(pending.map((runId) => stop(runId, deadline)))');
   });
 });
