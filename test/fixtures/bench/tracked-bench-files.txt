@@ -19,6 +19,13 @@ bench/src/shared/run-state-ledger.ts
 bench/src/shared/run-state.ts
 bench/src/shared/toolchain.ts
 bench/src/shared/verifier.ts
+bench/src/suites/featurebench/adapter.ts
+bench/src/suites/featurebench/config.ts
+bench/src/suites/featurebench/host.ts
+bench/src/suites/featurebench/prepare.ts
+bench/src/suites/featurebench/runner.ts
+bench/src/suites/featurebench/telemetry.ts
+bench/src/suites/featurebench/verifier.ts
 bench/src/suites/swe-marathon/adapter.ts
 bench/src/suites/swe-marathon/auth.ts
 bench/src/suites/swe-marathon/config.ts
@@ -42,6 +49,9 @@ bench/src/suites/swebench-pro/telemetry.ts
 bench/src/suites/swebench-pro/toolchain.ts
 bench/src/suites/swebench-pro/types.ts
 bench/src/suites/swebench-pro/verifier.ts
+bench/suites/featurebench/.gitattributes
+bench/suites/featurebench/codex-chatgpt.patch
+bench/suites/featurebench/dataset-pin.json
 bench/suites/shared/arm-b-prefix.txt
 bench/suites/swe-marathon/arm_b_codex.py
 bench/suites/swe-marathon/harbor-ownership.patch

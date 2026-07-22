@@ -46,6 +46,7 @@ export const BENCH_USAGE = `Usage:
 Suites:
   swebench-pro  fetch | prep | run | eval | report | status | clean
   swe-marathon  prep | run | report
+  featurebench  prep | run | report
 
 Results:
   bench/results/<suite>/<runId>/manifest.json`;

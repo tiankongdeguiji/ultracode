@@ -1,0 +1,28 @@
+{
+  "attempt_1": {
+    "n_attempt": 1,
+    "total_instances": 5,
+    "submitted_instances": 5,
+    "completed_instances": 5,
+    "resolved_instances": 4,
+    "unresolved_instances": 1,
+    "unsubmitted_instances": 0,
+    "incomplete_instances": 0,
+    "resolved_rate": 0.8,
+    "pass_rate": 0.951,
+    "submitted_ids": [
+      "runs/2026-07-19__13-00-41/run_outputs/task-alpha/attempt-1/infer.log",
+      "runs/2026-07-19__13-00-41/run_outputs/task-beta/attempt-1/infer.log",
+      "runs/2026-07-19__13-00-41/run_outputs/task-gamma/attempt-1/infer.log",
+      "runs/2026-07-19__13-00-41/run_outputs/task-delta/attempt-1/infer.log",
+      "runs/2026-07-19__13-00-41/run_outputs/task-epsilon/attempt-1/infer.log"
+    ],
+    "completed_ids": [
+      "runs/2026-07-19__13-00-41/run_outputs/task-alpha/attempt-1/infer.log",
+      "runs/2026-07-19__13-00-41/run_outputs/task-beta/attempt-1/infer.log",
+      "runs/2026-07-19__13-00-41/run_outputs/task-gamma/attempt-1/infer.log",
+      "runs/2026-07-19__13-00-41/run_outputs/task-delta/attempt-1/infer.log",
+      "runs/2026-07-19__13-00-41/run_outputs/task-epsilon/attempt-1/infer.log"
+    ]
+  }
+}

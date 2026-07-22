@@ -1,0 +1,8 @@
+{
+  "task-beta": {
+    "n_attempt": 1,
+    "featurebench_eval_completed": true,
+    "resolved": true,
+    "pass_rate": 1
+  }
+}

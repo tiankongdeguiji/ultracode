@@ -1,0 +1,506 @@
+diff --git a/featurebench/harness/run_evaluation.py b/featurebench/harness/run_evaluation.py
+index beb48fbb82384af44f5d18ce2b7d22a779699014..b619696e6c0904643551836df09855d287e07f13 100644
+--- a/featurebench/harness/run_evaluation.py
++++ b/featurebench/harness/run_evaluation.py
+@@ -767,9 +767,11 @@ def load_dataset_from_hf(
+         config_loader = InferConfigLoader(resolved_path)
+         env_vars = config_loader.env_vars
+         hf_token = env_vars.get("HF_TOKEN")
++        dataset_revision = env_vars.get("FEATUREBENCH_DATASET_REVISION") or None
+     except FileNotFoundError:
+         console.print("[yellow]Warning: config.toml not found, using defaults[/]")
+         hf_token = os.environ.get('HF_TOKEN', None)
++        dataset_revision = None
+ 
+     console.print(f"[bold blue]Loading dataset from HuggingFace...[/]")
+     console.print(f"[dim]Repository: {dataset}[/]")
+@@ -780,7 +782,12 @@ def load_dataset_from_hf(
+ 
+     try:
+         # Load the specified split
+-        hf_dataset = load_dataset(dataset, split=split, token=hf_token)
++        hf_dataset = load_dataset(
++            dataset,
++            split=split,
++            token=hf_token,
++            revision=dataset_revision,
++        )
+         df = pd.DataFrame(hf_dataset)
+ 
+         # Determine level from instance_id's last segment (e.g., "xxx.lv1" -> level 1)
+@@ -1221,4 +1228,4 @@ def main():
+ 
+ 
+ if __name__ == "__main__":
+-    raise SystemExit(main())
+\ No newline at end of file
++    raise SystemExit(main())
+diff --git a/featurebench/infer/agents/codex.py b/featurebench/infer/agents/codex.py
+index 8f9c4020913ec744b020d0ad03814c022cdb0d1e..b3d3c3b5b8ae0356fe803a69180b1db538ef48ae 100644
+--- a/featurebench/infer/agents/codex.py
++++ b/featurebench/infer/agents/codex.py
+@@ -40,6 +40,13 @@ set -e
+ 
+ echo "Installing Codex agent..."
+ 
++if [ -x /opt/featurebench-host/codex ]; then
++    install -m 0755 /opt/featurebench-host/codex /usr/local/bin/codex
++    codex --version
++    echo "Codex installation complete (host-pinned binary)"
++    exit 0
++fi
++
+ if command -v codex >/dev/null 2>&1; then
+     echo "codex already available; skipping installation"
+     codex --version || true
+@@ -102,14 +109,100 @@ echo "Codex installation complete"
+ 
+         return True
+ 
++    def _wait_for_workflows(self, container) -> bool:
++        """Wait for Arm B runs; stop stragglers and fail closed on expiry."""
++
++        if self.env_vars.get("FEATUREBENCH_ARM") != "b":
++            return True
++        wait_seconds = int(self.env_vars.get("FEATUREBENCH_WORKFLOW_WAIT_SECONDS", "3300"))
++        script = r'''set -u
++active_runs() {
++  result=$(/opt/bench/node-sel - <<'NODE'
++const fs = require('node:fs');
++const path = require('node:path');
++const home = '/agent-logs/ultracode';
++const terminal = new Set(['completed', 'failed', 'stopped', 'orphaned']);
++const runs = path.join(home, 'runs');
++if (!fs.existsSync(runs)) process.exit(3);
++const entries = fs.readdirSync(runs, { withFileTypes: true })
++  .filter((entry) => entry.isDirectory());
++if (entries.length === 0) process.exit(3);
++for (const entry of entries) {
++  const runId = entry.name;
++  try {
++    const manifest = JSON.parse(fs.readFileSync(path.join(runs, runId, 'manifest.json'), 'utf8'));
++    if (!terminal.has(String(manifest.status))) console.log(runId);
++  } catch { console.log(runId); }
++}
++NODE
++  )
++  status=$?
++  if [ "$status" -eq 3 ]; then
++    printf '__no_ultracode_runs__\n' >&2
++    return 1
++  fi
++  if [ "$status" -ne 0 ]; then
++    printf '__workflow_scan_failed__\n' >&2
++    return 1
++  fi
++  printf '%s' "$result"
++}
++stragglers=$(active_runs) || exit 1
++deadline=$(( $(date +%s) + FEATUREBENCH_WORKFLOW_WAIT_SECONDS ))
++while [ -n "$stragglers" ] && [ "$(date +%s)" -lt "$deadline" ]; do
++  sleep 5
++  stragglers=$(active_runs) || exit 1
++done
++if [ -z "$stragglers" ]; then exit 0; fi
++printf 'workflow wait expired; stopping: %s\n' "$stragglers" >&2
++for run_id in $stragglers; do
++  ULTRACODE_HOME=/agent-logs/ultracode /opt/bench/node-sel \
++    /opt/bench/ultracode/dist/cli/main.js stop "$run_id" >&2 || true
++done
++stop_deadline=$(( $(date +%s) + 120 ))
++remaining=$(active_runs) || exit 1
++while [ -n "$remaining" ] && [ "$(date +%s)" -lt "$stop_deadline" ]; do
++  sleep 5
++  remaining=$(active_runs) || exit 1
++done
++[ -z "$remaining" ] || printf 'workflows did not stop: %s\n' "$remaining" >&2
++exit 1'''
++        result = container.exec_run(
++            ["/bin/bash", "-lc", script],
++            environment={"FEATUREBENCH_WORKFLOW_WAIT_SECONDS": str(wait_seconds)},
++        )
++        if result.exit_code != 0:
++            return False
++        return True
++
++    def _copy_outputs(self, container, log_file, *, best_effort: bool) -> bool:
++        """Persist Codex telemetry before FeatureBench removes the container."""
++
++        log_dir = Path(log_file).parent
++        copies = [
++            ("/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl"),
++            ("/root/.codex/sessions", log_dir / "codex_sessions"),
++        ]
++        if self.env_vars.get("FEATUREBENCH_ARM") == "b":
++            copies.append(("/agent-logs/ultracode", log_dir / "ultracode"))
++        copied = True
++        for source, destination in copies:
++            try:
++                self.cm.copy_from_container(container, source, destination)
++            except Exception as e:
++                copied = False
++                log = self.logger.warning if best_effort else self.logger.error
++                log(f"Failed to copy Codex output {source}: {e}")
++        return copied
++
+     def post_run_hook(self, container, log_file) -> bool:
+         """Collect outputs and validate completion."""
+ 
+         log_dir = Path(log_file).parent
+-        try:
+-            self.cm.copy_from_container(container, "/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl")
+-        except Exception:
+-            pass
++        workflows_complete = self._wait_for_workflows(container)
++        outputs_copied = self._copy_outputs(container, log_file, best_effort=False)
++        if not workflows_complete or not outputs_copied:
++            return False
+         # Validate the run finished cleanly: last JSONL event should be turn.completed with usage.
+         try:
+             events_path = log_dir / "codex_events.jsonl"
+@@ -153,18 +246,16 @@ echo "Codex installation complete"
+     def failure_hook(self, container, log_file: Path) -> None:
+         """Collect outputs on failures (best-effort)."""
+ 
+-        log_dir = Path(log_file).parent
+-        try:
+-            self.cm.copy_from_container(container, "/agent-logs/codex_events.jsonl", log_dir / "codex_events.jsonl")
+-        except Exception:
+-            pass
++        self._wait_for_workflows(container)
++        self._copy_outputs(container, log_file, best_effort=True)
+ 
+     def get_run_command(self, instruction: str) -> str:
+         """Get the command to run Codex."""
+ #         instruction = """
+ # please create a hello-world.txt containing your self-introduction under testbed.     
+ # """
+-        escaped_instruction = shlex.quote(instruction)
++        prompt_prefix = self.env_vars.get("FEATUREBENCH_PROMPT_PREFIX") or ""
++        escaped_instruction = shlex.quote(f"{prompt_prefix}{instruction}")
+ 
+         model = self._kwargs.get("model")
+         # Preserve provider-prefixed model names (e.g., "azure/<deployment>").
+@@ -179,7 +270,7 @@ echo "Codex installation complete"
+             # Preserve the exit code when piping JSONL to a file.
+             "set -o pipefail; "
+             f"codex exec "
+-            f"--sandbox danger-full-access "
++            f"--dangerously-bypass-approvals-and-sandbox "
+             f"--skip-git-repo-check "
+             f"--json "
+             f"{model_arg}"
+@@ -192,20 +283,21 @@ echo "Codex installation complete"
+         lines = ["#!/bin/bash", ""]
+ 
+         api_key = self.env_vars.get("OPENAI_API_KEY")
+-        if not api_key:
+-            raise RuntimeError("OPENAI_API_KEY is required for codex agent")
++        broker_auth = self.env_vars.get("FEATUREBENCH_BROKER_AUTH") == "1"
++        if not api_key and not broker_auth:
++            raise RuntimeError("OPENAI_API_KEY or FeatureBench credential broker is required for codex agent")
+ 
+         raw_model = self._kwargs.get("model") or ""
+         base_url = self.env_vars.get("OPENAI_BASE_URL") or ""
+         is_azure = raw_model.startswith("azure/") or (".openai.azure.com" in base_url)
+ 
+-        env_settings: Dict[str, str] = {
+-            "OPENAI_API_KEY": api_key,
+-        }
++        env_settings: Dict[str, str] = {}
++        if api_key:
++            env_settings["OPENAI_API_KEY"] = api_key
+ 
+         # Only set the Azure-specific env var when we're actually on the Azure route.
+         # Codex CLI reads the key from the env var referenced by `env_key` in ~/.codex/config.toml.
+-        if is_azure:
++        if is_azure and api_key:
+             env_settings["AZURE_OPENAI_API_KEY"] = self.env_vars.get("AZURE_OPENAI_API_KEY") or api_key
+ 
+         # Optional settings
+@@ -262,7 +354,7 @@ echo "Codex installation complete"
+             reasoning_effort = reasoning_effort.replace("\\", "\\\\").replace('"', '\\"')
+ 
+         # Azure: https://learn.microsoft.com/zh-cn/azure/ai-foundry/openai/how-to/codex?view=foundry-classic&tabs=npm
+-        if is_azure:
++        if is_azure and api_key:
+             deployment = raw_model.split("/", 1)[1] if raw_model.startswith("azure/") else raw_model
+ 
+             # Codex CLI Azure v1 requires /openai/v1 in the base URL.
+@@ -300,6 +392,63 @@ echo "Codex installation complete"
+                 ]
+             )
+ 
++        # Broker auth: reusable credentials remain outside the repository container.
++        elif broker_auth:
++            model_name = raw_model
++            if model_name.startswith("openai/"):
++                model_name = model_name.split("/", 1)[1]
++            broker_url = self.env_vars.get("FEATUREBENCH_BROKER_BASE_URL") or ""
++            if not broker_url.startswith("https://"):
++                raise RuntimeError("FeatureBench credential broker URL must use HTTPS")
++            broker_url = broker_url.replace("\\", "\\\\").replace('"', '\\"')
++
++            lines.extend(
++                [
++                    "",
++                    "# Codex CLI config (FeatureBench credential broker)",
++                    'mkdir -p "$HOME/.codex"',
++                    "cat > \"$HOME/.codex/config.toml\" <<'CODEX_TOML'",
++                    *([f'model = "{model_name}"'] if model_name else []),
++                    *([f'model_reasoning_effort = "{reasoning_effort}"'] if reasoning_effort else []),
++                    'model_provider = "featurebench_broker"',
++                    "",
++                    '[model_providers.featurebench_broker]',
++                    'name = "FeatureBench credential broker"',
++                    f'base_url = "{broker_url}"',
++                    'wire_api = "responses"',
++                    'requires_openai_auth = false',
++                ]
++            )
++            if self.env_vars.get("FEATUREBENCH_ARM") == "b":
++                lines.extend(
++                    [
++                        "",
++                        "[mcp_servers.ultracode]",
++                        'command = "/opt/bench/node-sel"',
++                        'args = ["/opt/bench/ultracode/dist/cli/main.js", "mcp"]',
++                        "tool_timeout_sec = 3600",
++                        'default_tools_approval_mode = "approve"',
++                        "",
++                        "[mcp_servers.ultracode.env]",
++                        'CODEX_HOME = "/root/.codex"',
++                        'ULTRACODE_HOME = "/agent-logs/ultracode"',
++                        'ULTRACODE_CODEX_BIN = "/usr/local/bin/codex"',
++                        'PATH = "/usr/local/bin:/usr/bin:/bin"',
++                        'HOME = "/root"',
++                    ]
++                )
++            lines.extend(["", "[tools]", "web_search = false", "CODEX_TOML"])
++            if self.env_vars.get("FEATUREBENCH_ARM") == "b":
++                lines.extend(
++                    [
++                        'test -x /opt/bench/node-sel',
++                        'test -f /opt/bench/ultracode/dist/cli/main.js',
++                        'mkdir -p "$HOME/.agents"',
++                        'cp -a /opt/bench/agents-home-b/. "$HOME/.agents/"',
++                        'install -m 0644 /opt/bench/codex-home-b/AGENTS.md "$HOME/.codex/AGENTS.md"',
++                    ]
++                )
++
+         # Non-Azure (OpenAI-compatible): write a Codex config following the user's preferred template.
+         else:
+             model_name = raw_model
+diff --git a/featurebench/infer/config.py b/featurebench/infer/config.py
+index 796c784bee86b17e337fd4e47044cd5ce4ac04db..4bac9e7ede3431c246a015bf7eaae1a3a090fce5 100644
+--- a/featurebench/infer/config.py
++++ b/featurebench/infer/config.py
+@@ -194,6 +194,7 @@ class DatasetLoader:
+         
+         env_vars = self.config.env_vars
+         hf_token = env_vars.get("HF_TOKEN")
++        dataset_revision = env_vars.get("FEATUREBENCH_DATASET_REVISION") or None
+ 
+         dataset_name = str(dataset or "").strip()
+         if not dataset_name:
+@@ -208,7 +209,8 @@ class DatasetLoader:
+             dataset = load_dataset(
+                 dataset_name,
+                 split=split,
+-                token=hf_token
++                token=hf_token,
++                revision=dataset_revision,
+             )
+             
+             for item in dataset:
+diff --git a/featurebench/infer/container.py b/featurebench/infer/container.py
+index 7ccaa2f691e79ce02e3eab646b122e7f1fba00ed..07f2f9ccd67eac222ae1eb4d29a46da902c20d29 100644
+--- a/featurebench/infer/container.py
++++ b/featurebench/infer/container.py
+@@ -190,6 +190,12 @@ class ContainerManager:
+         if not isinstance(number_once, int) or number_once <= 0:
+             number_once = 1
+         shm_size = docker_runtime_config.get("shm_size")
++        raw_cpus = self.env_vars.get("FB_CONTAINER_CPUS")
++        nano_cpus = int(float(raw_cpus) * 1_000_000_000) if raw_cpus else None
++        mem_limit = self.env_vars.get("FB_CONTAINER_MEMORY") or None
++        restricted_network = self.env_vars.get("FEATUREBENCH_RESTRICTED_NETWORK")
++        if restricted_network in {None, "", "bridge", "host", "default", "none"}:
++            raise RuntimeError("A dedicated restricted FeatureBench network is required")
+ 
+         # Configure GPU access
+         device_requests = None
+@@ -244,9 +250,11 @@ class ContainerManager:
+                 volumes=volumes,
+                 command="tail -f /dev/null",  # Keep container running
+                 platform="linux/amd64",
+-                network_mode="host" if use_host_network else "bridge",
++                network_mode=restricted_network,
+                 device_requests=device_requests,
+                 shm_size=shm_size,
++                nano_cpus=nano_cpus,
++                mem_limit=mem_limit,
+                 labels=labels,
+             )
+             
+@@ -662,4 +670,4 @@ class ContainerManager:
+         try:
+             return container.logs().decode("utf-8", errors="replace")
+         except Exception as e:
+-            return f"Failed to get logs: {e}"
+\ No newline at end of file
++            return f"Failed to get logs: {e}"
+diff --git a/featurebench/infer/run_infer.py b/featurebench/infer/run_infer.py
+index 594e8f6cd3e9b3436439ce879b7d1611edd04e00..40d7a1a88502b94d4a509770dfa41bb0523af375 100644
+--- a/featurebench/infer/run_infer.py
++++ b/featurebench/infer/run_infer.py
+@@ -491,8 +491,51 @@ class InferenceRunner:
+             FEATUREBENCH_TASK_LABEL: str(task_id),
+             FEATUREBENCH_ATTEMPT_LABEL: str(attempt),
+             "featurebench.purpose": purpose,
++            **{f"ultracode.benchmark.{name}": os.environ[f"ULTRACODE_BENCHMARK_{name.upper()}"] for name in ("schema", "suite", "run", "arm", "ownership")}, "ultracode.benchmark.task": str(task_id), "ultracode.benchmark.purpose": "prep" if purpose == "warmup" else "session",
+         }
+ 
++    def _codex_host_volumes(self) -> Dict[str, Dict[str, str]]:
++        """Build trusted host mounts without persisting host paths in run config."""
++        if self.config.agent != "codex":
++            return {}
++        codex_bin = os.environ.get("FEATUREBENCH_CODEX_BIN_HOST_PATH")
++        if not codex_bin:
++            raise RuntimeError("FeatureBench Codex host binary mount is required")
++        volumes = {
++            str(Path(codex_bin).expanduser()): {
++                "bind": "/opt/featurebench-host/codex",
++                "mode": "ro",
++            },
++        }
++        if self.agent_env_vars.get("FEATUREBENCH_ARM") == "b":
++            toolchain = os.environ.get("FEATUREBENCH_TOOLCHAIN_HOST_PATH")
++            if not toolchain:
++                raise RuntimeError("FeatureBench arm b host toolchain mount is required")
++            volumes[str(Path(toolchain).expanduser())] = {
++                "bind": "/opt/bench",
++                "mode": "ro",
++            }
++        return volumes
++
++    def _reject_unsupported_runtime(self, docker_runtime_config: Dict[str, Any]) -> None:
++        if (
++            self.agent_env_vars.get("FEATUREBENCH_CPU_ONLY") == "1"
++            and docker_runtime_config.get("need_gpu")
++        ):
++            raise RuntimeError("Unsupported runtime capability: this FeatureBench adapter is CPU-only")
++
++    def _pinned_image(self, instance_id: str, image_name: str) -> str:
++        """Replace mutable dataset image names with the preflighted digest."""
++        raw = self.agent_env_vars.get("FEATUREBENCH_IMAGE_DIGESTS") or ""
++        try:
++            digests = json.loads(raw)
++        except json.JSONDecodeError as exc:
++            raise RuntimeError("FeatureBench image digest map is invalid") from exc
++        pinned = digests.get(instance_id) if isinstance(digests, dict) else None
++        if not isinstance(pinned, str) or "@sha256:" not in pinned:
++            raise RuntimeError(f"No pinned image digest for {instance_id}")
++        return pinned
++
+     def _register_container(self, container: Container) -> None:
+         container_id = getattr(container, "id", None)
+         if not container_id:
+@@ -765,7 +808,9 @@ class InferenceRunner:
+             image_name = self._get_image_name(instance)
+             
+             # Get docker runtime config from repo_settings
++            image_name = self._pinned_image(instance_id, image_name)
+             docker_runtime_config = instance.get_docker_runtime_config()
++            self._reject_unsupported_runtime(docker_runtime_config)
+             task_logger.info(f"Docker runtime config: need_gpu={docker_runtime_config.get('need_gpu')}, "
+                            f"shm_size={docker_runtime_config.get('shm_size')}, "
+                            f"number_once={docker_runtime_config.get('number_once')}, "
+@@ -815,14 +860,15 @@ class InferenceRunner:
+             task_logger.info(f"Creating container {container_name}...")
+ 
+             # Mount cache volume
+-            volumes = None
++            volumes = {}
+             if self.cache_dir:
+                 try:
+                     self.cache_dir.mkdir(parents=True, exist_ok=True)
+                 except Exception:
+                     pass
+                 # Bind host cache directory to /download inside container
+-                volumes = {str(self.cache_dir): {"bind": "/download", "mode": "rw"}}
++                volumes[str(self.cache_dir)] = {"bind": "/download", "mode": "rw"}
++            volumes.update(self._codex_host_volumes())
+             
+             container = cm.create_container(
+                 image_name=image_name,
+@@ -833,7 +879,7 @@ class InferenceRunner:
+                 proxy_port=self.config.proxy_port,
+                 gpu_ids=task_gpu_ids,
+                 docker_runtime_config=docker_runtime_config,
+-                volumes=volumes
++                volumes=volumes or None
+             )
+             self._register_container(container)
+             
+@@ -955,7 +1001,10 @@ class InferenceRunner:
+ 
+     def _warmup_cache(self, instance: TaskInstance) -> None:
+         """Run a single install to populate shared cache before parallel runs."""
+-        image_name = self._get_image_name(instance)
++        image_name = self._pinned_image(
++            instance.instance_id,
++            self._get_image_name(instance),
++        )
+         warmup_log = self.output_dir / "warmup.log"
+ 
+         # Minimal file logger for warmup
+@@ -974,15 +1023,17 @@ class InferenceRunner:
+             if self._shutdown_requested.is_set():
+                 return
+ 
+-            volumes = None
++            volumes = {}
+             if self.cache_dir:
+                 try:
+                     self.cache_dir.mkdir(parents=True, exist_ok=True)
+                 except Exception:
+                     pass
+-                volumes = {str(self.cache_dir): {"bind": "/download", "mode": "rw"}}
++                volumes[str(self.cache_dir)] = {"bind": "/download", "mode": "rw"}
++            volumes.update(self._codex_host_volumes())
+ 
+             docker_runtime_config = instance.get_docker_runtime_config()
++            self._reject_unsupported_runtime(docker_runtime_config)
+             task_gpu_ids = self.config.gpu_ids
+             if docker_runtime_config.get("need_gpu") and self._gpu_scheduler is not None:
+                 requested = docker_runtime_config.get("number_once", 1)
+@@ -1002,7 +1053,7 @@ class InferenceRunner:
+                 proxy_port=self.config.proxy_port,
+                 gpu_ids=task_gpu_ids,
+                 docker_runtime_config=docker_runtime_config,
+-                volumes=volumes
++                volumes=volumes or None
+             )
+             self._register_container(container)
+ 
+@@ -1193,6 +1244,12 @@ class InferenceRunner:
+         except Exception:
+             need_gpu_any = False
+ 
++        if self.agent_env_vars.get("FEATUREBENCH_CPU_ONLY") == "1" and need_gpu_any:
++            raise RuntimeError(
++                "Unsupported runtime capability: selected FeatureBench tasks require a GPU, "
++                "but this adapter is CPU-only"
++            )
++
+         if need_gpu_any:
+             gpu_pool: Optional[List[str]] = None
+             if self.config.gpu_ids:
+@@ -1946,4 +2003,4 @@ def main() -> int:
+ 
+ 
+ if __name__ == "__main__":
+-    raise SystemExit(main())
+\ No newline at end of file
++    raise SystemExit(main())

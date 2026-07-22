@@ -57,6 +57,21 @@ before wider access. Before verification, the bridge independently discovers and
 terminates matching live runners, invokes bounded worker-group cleanup for every
 run, and rejects any lifecycle whose process absence cannot be verified.
 
+### FeatureBench
+
+FeatureBench task containers receive no reusable host credential and run only
+on a dedicated internal Docker network. The sole pre-existing endpoint must be
+a separately managed, running, immutable-image HTTPS credential broker with the
+configured public identity and version labels. A host-wide policy lock covers
+cleanup, broker-only network preflight, inference, official evaluation, and
+final cleanup. Persistent artifacts contain public identity, version, and policy
+hashes, never the broker URL, Docker runtime names, credential material, or
+credential-file paths. The runtime-only broker URL is written under a private
+run/arm/nonce-marked home that normal finalization and the next exact run cleanup
+remove. The broker remains trusted to scope credentials, validate requests, and
+control its own upstream egress; compromise of that broker is outside the task
+container isolation guarantee.
+
 ### SWE-bench Pro
 
 Prepared evaluator sources, Python artifacts, dataset rows, task images,

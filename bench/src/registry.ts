@@ -6,6 +6,7 @@ import {
   type BenchSuite,
   type SuiteAdapter,
 } from './shared/contracts.js';
+import { featureBenchAdapter } from './suites/featurebench/adapter.js';
 import { sweMarathonAdapter } from './suites/swe-marathon/adapter.js';
 import { swebenchProAdapter } from './suites/swebench-pro/adapter.js';
 
@@ -46,6 +47,10 @@ export class SuiteRegistry {
       validateAdapter(adapter);
       this.adapters.set(adapter.suite, adapter);
     }
+    const missingSuites = BENCH_SUITES.filter((suite) => !this.adapters.has(suite));
+    if (missingSuites.length > 0) {
+      throw new Error(`suite registry is incomplete: missing ${missingSuites.join(', ')}`);
+    }
   }
 
   get<S extends BenchSuite>(suite: S): SuiteAdapter<S> {
@@ -66,8 +71,9 @@ export function createSuiteRegistry(entries: readonly AnySuiteAdapter[]): SuiteR
   return new SuiteRegistry(entries);
 }
 
-/** Production registry. Native runners remain behind command-level imports. */
+/** Complete production registry. Native runners remain behind command-level imports. */
 export const suiteRegistry = createSuiteRegistry([
   swebenchProAdapter,
   sweMarathonAdapter,
+  featureBenchAdapter,
 ]);
