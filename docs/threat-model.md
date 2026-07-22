@@ -45,7 +45,9 @@ markers include a canonical run-root scope, preventing equal run/task names in
 different worktrees from claiming one another's resources on a shared Docker
 daemon. Resume accepts only the exact native job config previously bound to the
 manifest-scoped receipt; redo starts from the immutable plan while retaining the
-old native tree for cumulative paid-usage accounting. Incomplete verifier output
+old native tree for cumulative available-telemetry accounting. Pricing can
+remain partial when worker backend evidence is absent, so `billableCost` is a
+verified subtotal rather than a guaranteed total. Incomplete verifier output
 never becomes score evidence, but an identity-valid trial config is sufficient
 to retain telemetry after a crash. Arm B writes untrusted, potentially sensitive
 workflow/session telemetry incrementally to Harbor's host-mounted agent

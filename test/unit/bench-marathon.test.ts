@@ -1,5 +1,5 @@
 /** Offline contracts for the suite-owned SWE-Marathon adapter. */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   cpSync,
@@ -78,6 +78,79 @@ function temporaryDirectory(): string {
 function put(path: string, value: string): void {
   mkdirSync(resolve(path, '..'), { recursive: true });
   writeFileSync(path, value);
+}
+
+function runSettlementScenario(scenario: string): { status: number | null; stops: number } {
+  const root = temporaryDirectory();
+  const home = join(root, 'home');
+  const countFile = join(root, 'stop-count.txt');
+  mkdirSync(join(home, 'runs', 'wf_abcdef'), { recursive: true });
+  const production = readFileSync(resolve('bench/suites/swe-marathon/settle-arm-b.mjs'), 'utf8');
+  const script = production
+    .replace("import { spawn } from 'node:child_process';", "import { spawn } from './stub.mjs';")
+    .replace(
+      "import { readProcStat } from '/opt/bench/ultracode/dist/exec/procinfo.js';",
+      "import { readProcStat } from './stub.mjs';",
+    )
+    .replace(
+      "import { isRunnerAlive, listRuns } from '/opt/bench/ultracode/dist/store/runstore.js';",
+      "import { isRunnerAlive, listRuns } from './stub.mjs';",
+    )
+    .replace(
+      "import { isResumableStatus } from '/opt/bench/ultracode/dist/store/manifest.js';",
+      "import { isResumableStatus } from './stub.mjs';",
+    );
+  put(join(root, 'settle.mjs'), script);
+  put(join(root, 'stub.mjs'), `
+import { EventEmitter } from 'node:events';
+import { appendFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
+let stopped = false;
+let stopCount = 0;
+export function readProcStat() { return undefined; }
+export function isRunnerAlive() { return false; }
+export function isResumableStatus(status) { return ['completed', 'failed', 'stopped'].includes(status); }
+export function listRuns(home) {
+  const ids = readdirSync(join(home, 'runs'), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+  const initial = process.env.TEST_SCENARIO === 'deadline' ? 'running'
+    : ['forced', 'stop-failure'].includes(process.env.TEST_SCENARIO) ? 'orphaned' : 'completed';
+  return ids.map((runId) => ({ runId, manifest: { pid: 0 }, effectiveStatus: stopped ? 'stopped' : initial }));
+}
+export function spawn() {
+  stopCount += 1;
+  appendFileSync(process.env.TEST_COUNT_FILE, '1\\n');
+  if (process.env.TEST_SCENARIO === 'late' && stopCount === 1) {
+    mkdirSync(join(process.env.ULTRACODE_HOME, 'runs', 'wf_ghijkl'));
+  }
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.kill = () => {};
+  setTimeout(() => {
+    stopped = true;
+    if (process.env.TEST_SCENARIO === 'worker-forced') {
+      child.stdout.write('wf_abcdef completed (+1 worker record(s))\\n');
+    }
+    child.stdout.end();
+    child.emit('close', process.env.TEST_SCENARIO === 'stop-failure' ? 1 : 0);
+  }, 0);
+  return child;
+}
+`);
+  const result = spawnSync(process.execPath, [join(root, 'settle.mjs')], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      MARATHON_WAIT_SECONDS: '1',
+      TEST_COUNT_FILE: countFile,
+      TEST_SCENARIO: scenario,
+      ULTRACODE_HOME: home,
+    },
+    timeout: 5_000,
+  });
+  const stops = existsSync(countFile) ? readFileSync(countFile, 'utf8').trim().split('\n').length : 0;
+  return { status: result.status, stops };
 }
 
 afterEach(() => {
@@ -320,6 +393,7 @@ describe('SWE-Marathon command and provenance boundaries', () => {
     expect(track).toBeLessThan(launch);
     expect(source.indexOf('tracked = true;', track)).toBeLessThan(launch);
     expect(fallback).toBeGreaterThan(launch);
+    expect(source).toContain("attempt.failures.includes('ownership-unsafe')");
   });
 });
 
@@ -479,10 +553,12 @@ describe('native Harbor evidence', () => {
 
     const source = readFileSync(resolve('bench/src/suites/swe-marathon/runner.ts'), 'utf8');
     const begin = source.indexOf('const attemptId = await beginAttempt(');
+    const runtime = source.indexOf('const runtime = createMarathonRuntimeHome(', begin);
     const launch = source.indexOf('await runBenchProcess(', begin);
     const outcomeAt = source.indexOf('const evidence = indexHarborEvidence(directory, identity, invocationId);');
     const outcomeBlock = source.slice(outcomeAt, source.indexOf('output(context,', outcomeAt));
     expect(begin).toBeGreaterThan(0);
+    expect(begin).toBeLessThan(runtime);
     expect(begin).toBeLessThan(launch);
     expect(outcomeAt).toBeGreaterThan(0);
     expect(outcomeBlock.indexOf('await updateReceipt(receipt, identity, evidence.bindings);')).toBeGreaterThan(0);
@@ -692,6 +768,13 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(indexed.workflows).toMatchObject([{ workflowId: 'wf-1', billingClass: 'mock' }]);
   });
 
+  it('fails reporting closed when a telemetry directory is unreadable', () => {
+    const fixture = nativeFixture();
+    put(join(fixture.trial, 'agent', 'worker-sessions'), 'not a directory\n');
+    expect(() => indexSweMarathonMetrics(fixture.manifest, fixture.root))
+      .toThrow(/telemetry directory is unreadable/);
+  });
+
   it('keeps interrupted and redo-archived paid attempts in cumulative telemetry', () => {
     const fixture = nativeFixture();
     const firstSession = '11111111-1111-4111-8111-111111111111';
@@ -754,6 +837,8 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(bridge).toContain('ln -s {self._WORKER_SESSIONS}');
     expect(bridge).toContain('_SETTLEMENT_SCRIPT = "/opt/bench/settle-arm-b.mjs"');
     expect(bridge).not.toContain('cp -a');
+    expect(bridge).toContain('with events.open(errors="replace") as handle:');
+    expect(bridge).not.toContain('events.read_text');
     expect(bridge).not.toContain('wait_error');
     const wait = bridge.indexOf('await self._wait_for_workflows(environment)');
     const unsafeRaise = bridge.indexOf('Arm B workflow lifecycle did not finish cleanly', wait);
@@ -773,5 +858,16 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(settlementSource).toContain('RUN_ID_PATTERN.test(runId)');
     expect(settlementSource).toContain("process.stderr.write('Arm B could not verify workflow process absence\\n')");
     expect(settlementSource).toContain('const results = await stopRuns(pending, deadline)');
+  });
+
+  it.each([
+    ['natural', 0, 1],
+    ['worker-forced', 2, 1],
+    ['forced', 2, 1],
+    ['stop-failure', 1, 1],
+    ['late', 0, 2],
+    ['deadline', 2, 1],
+  ] as const)('executes the %s settlement state-machine path', (scenario, status, stops) => {
+    expect(runSettlementScenario(scenario)).toEqual({ status, stops });
   });
 });

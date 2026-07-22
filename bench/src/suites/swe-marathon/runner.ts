@@ -431,7 +431,10 @@ async function loadRunStores(
     const state = new BenchRunStateStore(roots, 'swe-marathon', runId, manifestSha256, lease);
     state.migrateLegacyIfNeeded();
     await state.recoverPendingLifecycleProcesses(runDir(roots, 'swe-marathon', runId));
-    if (state.load().invocations.some((invocation) => invocation.endedAt === null)) {
+    const loadedState = state.load();
+    const hasOpenInvocation = loadedState.invocations.some((invocation) => invocation.endedAt === null);
+    const hasUnsafeOwnership = loadedState.attempts.some((attempt) => attempt.failures.includes('ownership-unsafe'));
+    if (hasOpenInvocation || hasUnsafeOwnership) {
       for (const taskId of manifest.experiment.taskIds) {
         await cleanupMarathonContainers(
           marathonRunScope(runDir(roots, 'swe-marathon', runId)),
@@ -440,7 +443,7 @@ async function loadRunStores(
           manifest.experiment.arm as Arm,
         );
       }
-      await state.closeInterruptedInvocations();
+      if (hasOpenInvocation) await state.closeInterruptedInvocations();
     }
     return {
       manifest,
@@ -925,13 +928,6 @@ async function runTask(
   }
   const runtimeNonce = randomBytes(32).toString('hex');
   const labels = labelEnvironment(rootScope, manifest.runId, taskId, identity.arm, runtimeNonce);
-  const runtime = createMarathonRuntimeHome(
-    config,
-    join(context.paths.benchRoot, 'suites', 'swe-marathon'),
-    labels,
-  );
-  runtime.environment.PATH = `${common.prepared.environmentDirectory}/bin${runtime.environment.PATH ? `:${runtime.environment.PATH}` : ''}`;
-  const activeKey = `${rootScope}\0${manifest.runId}\0${taskId}\0${identity.arm}\0${runtimeNonce}`;
   const startedAt = context.clock.now();
   const startedMs = performance.now();
   const attemptId = await beginAttempt(
@@ -941,10 +937,17 @@ async function runTask(
     startedAt,
     identity.jobRelativeRoot,
   );
+  const activeKey = `${rootScope}\0${manifest.runId}\0${taskId}\0${identity.arm}\0${runtimeNonce}`;
+  const runtime = createMarathonRuntimeHome(
+    config,
+    join(context.paths.benchRoot, 'suites', 'swe-marathon'),
+    labels,
+  );
   let failure: FailureCode | null = null;
   let tracked = false;
-  const lifecycle = state.lifecycleHooks(invocationId);
   try {
+    runtime.environment.PATH = `${common.prepared.environmentDirectory}/bin${runtime.environment.PATH ? `:${runtime.environment.PATH}` : ''}`;
+    const lifecycle = state.lifecycleHooks(invocationId);
     trackExecution(activeKey, {
       rootScope,
       runId: manifest.runId,

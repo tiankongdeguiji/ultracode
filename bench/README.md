@@ -105,8 +105,9 @@ SWE-Marathon uses a schema-v2 manifest for one arm and one native Harbor job per
 selected task. It freezes the prepared source/toolchain identity, task image
 digests, bridge and ownership assets, model/effort, timeouts, and pricing. Resume
 requires the prior receipt-bound native job config; redo archives the invalidated
-job so paid usage remains cumulative. See the suite guide for its distinct
-credential and native-evidence boundary.
+job so available usage telemetry remains cumulative. Pricing can be partial;
+`billableCost` is the verified subtotal and excludes unknown worker usage. See
+the suite guide for its distinct credential and native-evidence boundary.
 
 ## Model isolation
 

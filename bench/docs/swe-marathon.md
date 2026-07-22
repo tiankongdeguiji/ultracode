@@ -44,8 +44,10 @@ Resume requires the exact job config bytes previously bound into the
 manifest-scoped verifier receipt before using Harbor's native `job resume`.
 Redo invalidates that task's receipt bindings, moves its prior job into the
 attempt archive, and starts a fresh job from the immutable plan. Reports scan
-both current and archived jobs so interrupted and invalidated paid usage remains
-cumulative.
+available current and archived telemetry cumulatively. Unreadable or malformed
+telemetry aborts reporting; interrupted worker rollouts without backend evidence
+remain unknown, make pricing partial, and are excluded from `billableCost`.
+That field is therefore the verified billable subtotal, not a guaranteed total.
 
 Before execution, common prepared inputs are re-attested once. Each task TOML
 and Docker image identity is then re-attested immediately before that task is

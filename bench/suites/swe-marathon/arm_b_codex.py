@@ -158,18 +158,21 @@ rm -rf {self._WORKER_CODEX_HOME}''',
     def _host_session_id(self) -> str | None:
         events = self.logs_dir / self._OUTPUT_FILENAME
         try:
-            lines = events.read_text(errors="replace").splitlines()
+            with events.open(errors="replace") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        isinstance(record, dict)
+                        and record.get("type") == "thread.started"
+                    ):
+                        thread_id = record.get("thread_id")
+                        if isinstance(thread_id, str):
+                            return thread_id
         except OSError:
-            return None
-        for line in lines:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict) and record.get("type") == "thread.started":
-                thread_id = record.get("thread_id")
-                if isinstance(thread_id, str):
-                    return thread_id
+            pass
         return None
 
     def _workflow_lifecycle(self) -> list[dict[str, Any]]:

@@ -97,17 +97,22 @@ function requiresImmediateStop(runs) {
 function stop(runId, deadline) {
   return new Promise((resolve) => {
     let finished = false;
+    let stdout = '';
     const finish = (ok) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      resolve({ runId, ok });
+      resolve({ runId, ok, forced: /\(\+[1-9]\d* worker record\(s\)\)/u.test(stdout) });
     };
     const child = spawn(
       '/opt/bench/node-sel',
       ['/opt/bench/ultracode/dist/cli/main.js', 'stop', runId],
-      { stdio: 'inherit', env: { ...process.env, ULTRACODE_HOME: home } },
+      { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, ULTRACODE_HOME: home } },
     );
+    child.stdout.on('data', (chunk) => {
+      process.stdout.write(chunk);
+      stdout = `${stdout}${chunk.toString('utf8')}`.slice(-8_192);
+    });
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       finish(false);
@@ -143,7 +148,7 @@ if (runs.length === 0) {
 
 let clean = naturallySettled(runs);
 while (!clean && !requiresImmediateStop(runs) && Date.now() < waitDeadline) {
-  await sleep(5_000);
+  await sleep(Math.max(1, Math.min(5_000, waitDeadline - Date.now())));
   runs = observed();
   clean = naturallySettled(runs);
 }
@@ -168,6 +173,7 @@ while (Date.now() < deadline) {
     process.stderr.write('Arm B could not verify workflow worker-group cleanup\n');
     process.exit(1);
   }
+  if (results.some((result) => result.forced)) clean = false;
   for (const result of results) verified.add(result.runId);
 }
 
