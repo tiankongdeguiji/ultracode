@@ -106,4 +106,24 @@ describe('Docker network isolation attestation', () => {
       contract,
     )).toThrow(/unbound container inspection/u);
   });
+
+  it('permits an explicitly trusted infrastructure endpoint to retain upstream egress', () => {
+    const inspection = validInspection();
+    const rows = [{
+      Id: RUNNER_ID,
+      Name: '/runner',
+      HostConfig: { NetworkMode: contract.networkName },
+      NetworkSettings: { Networks: { [contract.networkName]: {} } },
+    }, {
+      Id: PROXY_ID,
+      Name: '/proxy',
+      HostConfig: { NetworkMode: 'upstream' },
+      NetworkSettings: { Networks: { [contract.networkName]: {}, upstream: {} } },
+    }];
+    expect(() => inspectInternalDockerNetwork(
+      JSON.stringify([inspection]),
+      JSON.stringify(rows),
+      { ...contract, allowAdditionalNetworkEndpointNames: new Set(['proxy']) },
+    )).not.toThrow();
+  });
 });

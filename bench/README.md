@@ -1,32 +1,59 @@
-# Shared benchmark foundation
+# SWE-bench Pro benchmark harness
 
-This directory contains the reusable control plane for Ultracode's software-
-engineering benchmarks. It deliberately does not expose a benchmark CLI or a
-working suite yet. SWE-bench Pro, SWE-Marathon, and FeatureBench adapters will
-land in follow-up changes on top of this foundation.
+This harness compares stock Codex (Arm A) with Codex plus Ultracode (Arm B)
+on a pinned SWE-bench Pro dataset and official evaluator. It builds on the
+shared benchmark foundation for immutable manifests, leases, hash-chained run
+state, process recovery, provenance, metrics, verifier receipts, and reports.
 
-## Shared contract
+## Requirements
 
-All suites use the same strict envelope for:
+- Node 20 or newer and dependencies installed with `npm ci`.
+- Git and Docker.
+- CPython 3.11 with pip 24.2 and `venv` on a reviewed Linux/glibc or macOS
+  target; it does not require `uv` or GNU `patch`.
+- A local standalone Linux-x64 Codex ELF selected by `toolchain.codexBinary`;
+  this is required on macOS too and is never fetched by preparation.
+- Network access while fetching pinned sources, Python artifacts, and task
+  images.
 
-- immutable, suite-versioned experiment manifests;
-- private result paths, leases, and atomic artifact publication;
-- hash-chained run-state history and crash recovery;
-- process ownership and descendant cleanup;
-- toolchain and source provenance;
-- normalized failures, metrics, verifier receipts, and reports.
+Copy `bench/bench.example.config.json` to the ignored, operator-owned
+`bench/bench.config.json`, fill in the model and public relay identity, and set
+its mode to `0600`. Runtime relay URLs and Docker network names are supplied
+through the environment and never belong in the config file.
 
-Suite adapters retain authority over native preparation, execution, and
-verification. A native verifier result enters a report only when a host-owned
-receipt binds its exact path, digest, invocation, scope, role, and native record
-key. Adapter-reported missing evidence remains unverified with null results.
-Malformed receipts, unknown invocations, artifact drift, and binding mismatches
-abort report generation.
+## CLI
 
-The future result layout is fixed now so adapters compose without migrations:
+The suite selector is explicit and must come first:
+
+```bash
+npm run bench -- --help
+npm run bench -- --suite swebench-pro --help
+npm run bench -- --suite swebench-pro <fetch|prep|run|eval|report|status|clean> [options]
+```
+
+A typical pilot is:
+
+```bash
+npm run bench -- --suite swebench-pro fetch
+npm run bench -- --suite swebench-pro prep
+SWEBENCH_PRO_MODEL_RELAY_URL=http://pro-relay:8080/v1 \
+SWEBENCH_PRO_RESTRICTED_NETWORK=swebench-pro-private \
+npm run bench -- --suite swebench-pro run --run-id pro-pilot \
+  --model <model> --effort <effort> --arm both --count 20 --seed 7
+npm run bench -- --suite swebench-pro eval --run-id pro-pilot --resume
+npm run bench -- --suite swebench-pro report --run-id pro-pilot
+```
+
+The native evaluator is the sole score authority. Agent success, a captured
+patch, or an output file without a matching host-owned receipt never becomes a
+verified result.
+
+## Persistent contract
+
+Each run uses the shared suite-scoped envelope:
 
 ```text
-bench/results/<suite>/<runId>/
+bench/results/swebench-pro/<runId>/
   manifest.json
   run-state.json
   run-state-ledger/
@@ -36,30 +63,66 @@ bench/results/<suite>/<runId>/
   native/
 ```
 
-`bench/.cache/`, `bench/results/`, and the operator-owned
-`bench/bench.config.json` are ignored. They may contain prepared inputs,
-runtime state, and private configuration and must never be committed.
+The schema-v3 manifest freezes the selected instances, arm order, requested
+model and effort, resource limits, prompt policy, prepared toolchain identity,
+dataset digest, evaluator revision, container policy, and public relay
+attestation hashes. Resume accepts only that exact identity and recovers
+token-bearing native descendants before launching more work.
+
+Preparation publishes content-addressed inputs. The evaluator environment uses
+a checked-in transitive artifact lock, reviewed platform provenance,
+hash-required binary-only installation, and the pinned patched evaluator tree.
+The dataset cache is published only after the complete canonical row digest
+matches the configured pin. The initial pin is explicitly marked as an
+unaudited local content digest and must be independently renewed before results
+are treated as publishable benchmark evidence.
+
+Task-image repositories are extracted from stopped containers and sanitized
+once per selected task by host Git before the COPY-only overlay build. The
+original image checkout is hidden by the trusted bootstrap, and Arm A and Arm B
+modify isolated container-layer copies of the same sanitized base closure.
+
+## Model isolation
+
+SWE-bench Pro has no direct ChatGPT/API-key mode. Task containers receive no
+provider key, auth file, generic proxy, or default/WAN attachment. They attach
+only to a dedicated internal non-attachable Docker bridge. The separately
+operated immutable-image model relay is the only infrastructure endpoint on
+that bridge and may retain its explicitly attested upstream attachment.
+
+The harness binds the full endpoint inventory, selected network, relay image,
+runtime command and mounts, public identity/version, fixed destination, model,
+and strict Responses-only contract. Each task is created stopped for complete
+container-policy inspection. Startup executes a pinned musl loader and BusyBox
+nonce gate; no task-image executable runs until the live attachment and
+topology pass reinspection. Drift invalidates the run.
+
+This proves the inspected Docker topology and the relay's declared contract;
+the Docker daemon, relay implementation, upstream egress, provider, and
+credential scope remain trusted operator components. See
+[the SWE-bench Pro security and provenance guide](docs/swebench-pro.md) for the
+precise boundary and pin-renewal procedure.
 
 ## Development
 
-Install dependencies once, then run the benchmark typecheck or the repository
-gate:
+The offline gate is:
 
 ```bash
-npm ci
 npm run bench:check
 npm run typecheck
 npm run lint
 npm test
 ```
 
-Tests are offline and deterministic. Process and signal-sensitive files run
-serially in the default test command; the remaining tests run in parallel.
+The live Docker parity test is opt-in, uses only an explicitly supplied local
+image, and never pulls:
 
-## Adapter boundary
+```bash
+UC_LIVE_TESTS=1 UC_DOCKER_PARITY_IMAGE=<already-local-image> \
+  npx vitest run --config vitest.live.config.ts test/live/bench-swebench-pro-docker.test.ts
+```
 
-Follow-up suite adapters implement `SuiteAdapter` from
-`bench/src/shared/contracts.ts` and provide their native runner plus analysis
-hook. Adapters may consume the shared control plane, but shared modules never
-import an adapter or native suite asset. This keeps the dependency direction
-acyclic and allows each suite to land in a focused pull request.
+Live benchmark runs can consume substantial compute, network access, and model
+tokens and are always manual. Do not commit `bench/.cache/`, `bench/results/`,
+`bench/bench.config.json`, prepared sources, runtime homes, credentials, or
+generated plugin bundles.

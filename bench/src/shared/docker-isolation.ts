@@ -8,6 +8,7 @@ export interface DockerNetworkInspection {
   Scope?: unknown;
   Attachable?: unknown;
   Ingress?: unknown;
+  EnableIPv6?: unknown;
   Labels?: unknown;
   Options?: unknown;
   IPAM?: unknown;
@@ -49,12 +50,15 @@ export interface InternalNetworkContract {
   policyLabel: string;
   expectedEndpointNames: ReadonlySet<string>;
   requiredEndpointNames?: ReadonlySet<string>;
+  /** Trusted infrastructure endpoints permitted to retain an upstream attachment. */
+  allowAdditionalNetworkEndpointNames?: ReadonlySet<string>;
   dedicatedLocalBridge?: boolean;
 }
 
 export interface InternalNetworkAttestation {
   inspection: DockerNetworkInspection;
   containers: Array<[string, Record<string, unknown>]>;
+  containerInspections: Array<[string, DockerContainerInspection]>;
   runtimeSha256: string;
 }
 
@@ -101,6 +105,7 @@ export function inspectInternalDockerNetwork(
   }
   const expectedIds = new Set(containers.map(([id]) => id));
   const inspectedIds = new Set<string>();
+  const containerInspections: Array<[string, DockerContainerInspection]> = [];
   for (const row of containerRows as DockerContainerInspection[]) {
     const id = row.Id;
     if (typeof id !== 'string' || !expectedIds.has(id) || inspectedIds.has(id)) {
@@ -115,15 +120,19 @@ export function inspectInternalDockerNetwork(
     const hostConfig = dockerObject(row.HostConfig);
     const networkSettings = dockerObject(row.NetworkSettings);
     const networks = dockerObject(networkSettings.Networks);
-    if (hostConfig.NetworkMode !== contract.networkName
-      || Object.keys(networks).length !== 1
-      || !Object.hasOwn(networks, contract.networkName)) {
+    const allowsAdditionalNetworks = name !== null
+      && contract.allowAdditionalNetworkEndpointNames?.has(name) === true;
+    if (!Object.hasOwn(networks, contract.networkName)
+      || (!allowsAdditionalNetworks && (hostConfig.NetworkMode !== contract.networkName
+        || Object.keys(networks).length !== 1))) {
       throw new Error(`${contract.description} container has an unattested network attachment`);
     }
+    containerInspections.push([id, row]);
   }
   return {
     inspection,
     containers,
+    containerInspections,
     runtimeSha256: sha256CanonicalJson({
       internal: inspection.Internal ?? null,
       driver: inspection.Driver ?? null,

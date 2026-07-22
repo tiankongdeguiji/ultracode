@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "kind": "ultracode-swebench-pro-container-policy",
+  "session": {
+    "pidsLimit": 1024,
+    "securityOpt": [
+      "no-new-privileges"
+    ],
+    "capDrop": [
+      "ALL"
+    ],
+    "capAdd": [
+      "CHOWN",
+      "DAC_OVERRIDE",
+      "SETGID",
+      "SETUID"
+    ],
+    "resources": "manifest-docker"
+  },
+  "evaluator": {
+    "pidsLimit": 1024,
+    "securityOpt": [
+      "no-new-privileges"
+    ],
+    "capDrop": [
+      "ALL"
+    ],
+    "capAdd": [],
+    "resources": "manifest-docker"
+  },
+  "reclamation": {
+    "pidsLimit": 64,
+    "securityOpt": [
+      "no-new-privileges"
+    ],
+    "capDrop": [
+      "ALL"
+    ],
+    "capAdd": [
+      "CHOWN",
+      "DAC_OVERRIDE",
+      "FOWNER"
+    ],
+    "resources": "manifest-docker",
+    "networkMode": "none",
+    "user": "0:0"
+  }
+}

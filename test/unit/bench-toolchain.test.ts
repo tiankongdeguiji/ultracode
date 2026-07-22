@@ -3,20 +3,25 @@ import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { createBenchPathRoots } from '../../bench/src/shared/paths.js';
+import { sha256Tree } from '../../bench/src/shared/provenance.js';
 import {
   dockerPullDigest,
   downloadCacheFilename,
   resolveCodexBin,
+  stageToolchainNativeAssets,
   stageVerifiedArchive,
   toolchainCacheKey,
   validateLinuxX64CodexExecutable,
@@ -84,6 +89,30 @@ describe('Codex toolchain resolution', () => {
       /checksum drifted/u,
     );
     expect(existsSync(join(root, 'bad.tar.xz'))).toBe(false);
+  });
+
+  it('stages suite-native Docker assets inside the payload-hashed build context', () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-toolchain-assets-'));
+    roots.push(root);
+    const buildContext = join(root, 'build-context');
+    const suite = join(root, 'suites/example');
+    mkdirSync(buildContext, { mode: 0o700 });
+    mkdirSync(suite, { recursive: true });
+    writeFileSync(join(suite, 'entrypoint.sh'), '#!/bin/sh\nexit 0\n');
+
+    const before = sha256Tree(buildContext);
+    stageToolchainNativeAssets(createBenchPathRoots(root), buildContext, [{
+      source: 'suites/example/entrypoint.sh',
+      destination: 'entrypoint.sh',
+    }]);
+
+    expect(readFileSync(join(buildContext, 'entrypoint.sh'), 'utf8')).toBe('#!/bin/sh\nexit 0\n');
+    expect(statSync(join(buildContext, 'entrypoint.sh')).mode & 0o777).toBe(0o500);
+    expect(sha256Tree(buildContext)).not.toBe(before);
+    expect(() => stageToolchainNativeAssets(createBenchPathRoots(root), buildContext, [{
+      source: 'suites/example/entrypoint.sh',
+      destination: '../escape.sh',
+    }])).toThrow(/invalid or duplicate/);
   });
 
   it('uses the immutable digest reported by the exact Docker pull', () => {

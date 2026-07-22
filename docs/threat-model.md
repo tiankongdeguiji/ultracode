@@ -20,6 +20,53 @@ The synchronous uncaught-exception monitor signals only worker identities held i
 
 These controls protect signaling decisions made from worker-writable records, but they are **not** a general boundary against arbitrary same-user code. In particular, **`resume` re-executes `script.js`/`config.json` from that worker-writable dir with no review gate** — so a poisoned prior run can influence a later resume (including its `permission`). Treat resuming an untrusted run as running its inputs. Two known replay caveats: a `pipeline()` whose later-stage dispatch order depends on completion timing can lose its cache prefix on resume, and fallback token estimates (no-usage backends) are approximate. Full isolation (control-plane outside the workspace and a separate-process sandbox) is future work.
 
+## SWE-bench Pro benchmark boundary
+
+The benchmark control plane treats task repositories, task containers, and
+native runner output as untrusted producers. Private host-owned manifests,
+hash-chained run state, and verifier receipts live outside task workspaces. A
+score is accepted only when a receipt binds the exact official-evaluator bytes,
+digest, invocation, task/arm scope, role, and native record key. A successful
+agent process or a lookalike output file is never score authority.
+
+Prepared evaluator sources, Python artifacts, dataset rows, task images,
+native patches, prompt policy, container policy, and control-plane sources are
+pinned or content-addressed and re-attested at launch. Dataset acquisition
+verifies the complete configured canonical-row digest before replacing the
+cache. The initial Pro pin records integrity against one local capture but has
+no retained upstream-commit or independent-reproduction evidence; it is not an
+audited provenance claim.
+The official evaluator remains trusted for score semantics, but missing,
+malformed, stale, or policy-invalid evidence remains unverified.
+
+Task sessions have no direct provider credential, auth file, generic proxy, or
+default/WAN network. Each container is created stopped so the host can verify
+its immutable image, labels, exact trusted gate command, user, mounts,
+capability/resource policy, healthcheck, sanitized environment, and configured
+network before startup. Docker then starts only a pinned musl loader and
+BusyBox gate; the host re-verifies the running attachment and complete internal
+topology before releasing its nonce. The only infrastructure endpoint on that
+bridge is a separately operated immutable-image Responses relay. The relay may
+retain an explicitly attested upstream attachment; task endpoints may not. A
+host-wide policy lock serializes transport inspection, sessions, recovery,
+evaluation, and cleanup across worktrees.
+
+The relay proof binds the inspected endpoint inventory, container identity,
+image, command, mounts, public identity/version, model, fixed destination, and
+strict request contract. It does not prove that the relay image truthfully
+implements its labels, that its upstream egress is correctly restricted, or
+that the provider returns a particular information source. The Docker daemon,
+host networking, relay implementation and credential scope, and provider are
+trusted operator components. Missing or drifted topology or identity fails the
+run closed.
+
+Session containers use `no-new-privileges`, bounded processes, manifest-bound
+CPU and memory, and a minimal immutable-setup capability tuple that is dropped
+before Codex or task code runs. Evaluator containers use the same resource and
+privilege bounds with no added capabilities. Container cleanup filters by the
+complete ownership label tuple and reinspects identity before deletion; it
+refuses ambiguous or unowned resources.
+
 ## Related reading
 
 - `docs/design/minimalist-risk.md` — the historical risk register the shipped mitigations grew from (parts superseded by this document).

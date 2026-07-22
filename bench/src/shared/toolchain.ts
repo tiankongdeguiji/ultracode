@@ -82,6 +82,34 @@ export interface PreparedToolchain {
   ultracodeVersion: string;
 }
 
+export interface ToolchainNativeAsset {
+  /** Bench-root-relative trusted source copied into the Docker build context. */
+  source: string;
+  /** Portable top-level filename consumed by the suite Dockerfile. */
+  destination: string;
+}
+
+/** Stage suite-owned scripts into the immutable, payload-hashed build context. */
+export function stageToolchainNativeAssets(
+  roots: BenchPathRoots,
+  directory: string,
+  nativeAssets: readonly ToolchainNativeAsset[],
+): void {
+  const destinations = new Set<string>();
+  for (const asset of nativeAssets) {
+    if (!/^[a-z0-9][a-z0-9.-]{0,127}$/u.test(asset.destination)
+      || destinations.has(asset.destination) || existsSync(join(directory, asset.destination))) {
+      throw new Error(`invalid or duplicate native toolchain asset destination: ${asset.destination}`);
+    }
+    destinations.add(asset.destination);
+    writeFileSync(
+      join(directory, asset.destination),
+      readRegularFileWithinRoot(roots.benchRoot, asset.source, 16 * 1_024 * 1_024),
+      { flag: 'wx', mode: 0o500 },
+    );
+  }
+}
+
 const NODE_MUSL_RUNTIME_ALPINE = '3.20';
 const MAX_CHECKSUM_MANIFEST_BYTES = 1_024 * 1_024;
 const MAX_NODE_ARCHIVE_BYTES = 512 * 1_024 * 1_024;
@@ -149,7 +177,7 @@ exit 127
 /** Bundle the C++ runtime used to build Node's musl tarball for old Alpine images. */
 async function prepareNodeMuslRuntime(dir: string, nodeVersion: string): Promise<string> {
   const image = `node:${nodeVersion}-alpine${NODE_MUSL_RUNTIME_ALPINE}`;
-  const pullOutput = await toolchainCommand('docker', ['pull', image], dir);
+  const pullOutput = await toolchainCommand('docker', ['pull', '--platform', 'linux/amd64', image], dir);
   const digest = dockerPullDigest(image, pullOutput);
   const imageId = await toolchainCommand(
     'docker',
@@ -165,6 +193,7 @@ async function prepareNodeMuslRuntime(dir: string, nodeVersion: string): Promise
     '--label', 'ultracode.benchmark.suite=shared-toolchain',
     '--label', 'ultracode.benchmark.purpose=musl-runtime',
     '--label', 'ultracode.benchmark.ownership=1',
+    '--platform', 'linux/amd64',
     digest,
   ], dir);
   if (!/^[a-f0-9]{64}$/.test(container)) throw new Error('Docker returned an invalid toolchain container id');
@@ -191,6 +220,20 @@ async function prepareNodeMuslRuntime(dir: string, nodeVersion: string): Promise
       `${container}:/usr/lib/libgcc_s.so.1`,
       join(runtimeDir, 'libgcc_s.so.1'),
     ], dir);
+    await toolchainCommand('docker', [
+      'cp',
+      '-L',
+      `${container}:/lib/ld-musl-x86_64.so.1`,
+      join(runtimeDir, 'ld-musl-x86_64.so.1'),
+    ], dir);
+    await toolchainCommand('docker', [
+      'cp',
+      '-L',
+      `${container}:/bin/busybox`,
+      join(runtimeDir, 'busybox'),
+    ], dir);
+    chmodSync(join(runtimeDir, 'ld-musl-x86_64.so.1'), 0o555);
+    chmodSync(join(runtimeDir, 'busybox'), 0o555);
   } finally {
     await toolchainCommand('docker', ['rm', '-f', container], dir);
   }
@@ -422,6 +465,7 @@ async function populateSharedToolchain(
   roots: BenchPathRoots,
   toolchains: string,
   dir: string,
+  nativeAssets: readonly ToolchainNativeAsset[],
 ): Promise<PreparedToolchain> {
   const { nodeVersion, nodeDistribution } = config;
   const normalizedNodeVersion = nodeVersion.replace(/^v/, '');
@@ -522,6 +566,8 @@ async function populateSharedToolchain(
     rmSync(tmpHome, { recursive: true, force: true });
   }
 
+  stageToolchainNativeAssets(roots, dir, nativeAssets);
+
   const ultracodeRevision = await toolchainCommand('git', ['rev-parse', 'HEAD'], resolve(roots.benchRoot, '..'));
   const payloadSha256 = sha256Tree(dir);
   const manifest: ToolchainContentManifest = {
@@ -563,12 +609,13 @@ async function populateSharedToolchain(
 export async function prepareSharedToolchain(
   config: ToolchainConfig,
   roots: BenchPathRoots,
+  nativeAssets: readonly ToolchainNativeAsset[] = [],
 ): Promise<PreparedToolchain> {
   const toolchains = ensureRealDirectoryWithin(roots.cacheRoot, join(roots.cacheRoot, 'toolchains'));
   const dir = join(toolchains, `.stage-${process.pid}-${randomBytes(12).toString('hex')}`);
   mkdirSync(dir, { mode: 0o700 });
   try {
-    return await populateSharedToolchain(config, roots, toolchains, dir);
+    return await populateSharedToolchain(config, roots, toolchains, dir, nativeAssets);
   } catch (error) {
     rmSync(dir, { recursive: true, force: true });
     throw error;

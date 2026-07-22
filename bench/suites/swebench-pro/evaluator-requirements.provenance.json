@@ -1,0 +1,403 @@
+{
+  "schemaVersion": 1,
+  "kind": "ultracode-swebench-pro-evaluator-dependencies",
+  "audit": {
+    "reviewedAt": "2026-07-21",
+    "primaryIndex": "https://pypi.org/",
+    "metadataUrlTemplate": "https://pypi.org/pypi/{name}/{version}/json",
+    "resolverPipVersion": "24.2"
+  },
+  "targets": [
+    {
+      "id": "cpython-3.11-macos-arm64-pip-24.2",
+      "implementation": "cpython",
+      "pythonMinor": "3.11",
+      "os": "macos",
+      "architecture": "arm64",
+      "pipVersion": "24.2",
+      "libc": "none",
+      "minimumOsVersion": "11.0"
+    },
+    {
+      "id": "cpython-3.11-macos-x64-pip-24.2",
+      "implementation": "cpython",
+      "pythonMinor": "3.11",
+      "os": "macos",
+      "architecture": "x64",
+      "pipVersion": "24.2",
+      "libc": "none",
+      "minimumOsVersion": "10.9"
+    },
+    {
+      "id": "cpython-3.11-linux-arm64-pip-24.2",
+      "implementation": "cpython",
+      "pythonMinor": "3.11",
+      "os": "linux",
+      "architecture": "arm64",
+      "pipVersion": "24.2",
+      "libc": "glibc",
+      "minimumOsVersion": "2.28"
+    },
+    {
+      "id": "cpython-3.11-linux-x64-pip-24.2",
+      "implementation": "cpython",
+      "pythonMinor": "3.11",
+      "os": "linux",
+      "architecture": "x64",
+      "pipVersion": "24.2",
+      "libc": "glibc",
+      "minimumOsVersion": "2.28"
+    }
+  ],
+  "roots": [
+    "docker",
+    "pandas",
+    "tqdm"
+  ],
+  "inactiveRequirements": [
+    {
+      "parent": "docker",
+      "name": "pywin32",
+      "specifier": ">=304",
+      "marker": "sys_platform == 'win32'"
+    },
+    {
+      "parent": "tqdm",
+      "name": "colorama",
+      "specifier": "*",
+      "marker": "platform_system == 'Windows'"
+    }
+  ],
+  "packages": [
+    {
+      "name": "certifi",
+      "version": "2025.6.15",
+      "source": "https://pypi.org/project/certifi/2025.6.15/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "certifi-2025.6.15-py3-none-any.whl",
+          "sha256": "2e0c7ce7cb5d8f8634ca55d2ba7e6ec2689a2fd6537d8dec1296a477a4910057",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "charset-normalizer",
+      "version": "3.4.2",
+      "source": "https://pypi.org/project/charset-normalizer/3.4.2/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "charset_normalizer-3.4.2-cp311-cp311-macosx_10_9_universal2.whl",
+          "sha256": "be1e352acbe3c78727a16a455126d9ff83ea2dfdcbc83148d2982305a04714c2",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2"
+          ]
+        },
+        {
+          "filename": "charset_normalizer-3.4.2-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+          "sha256": "aa88ca0b1932e93f2d961bf3addbb2db902198dca337d88c89e1559e066e7645",
+          "targets": [
+            "cpython-3.11-linux-arm64-pip-24.2"
+          ]
+        },
+        {
+          "filename": "charset_normalizer-3.4.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "sha256": "fdb20a30fe1175ecabed17cbf7812f7b804b8a315a25f24678bcdf120a90077f",
+          "targets": [
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "docker",
+      "version": "7.1.0",
+      "source": "https://pypi.org/project/docker/7.1.0/",
+      "requires": [
+        {
+          "name": "requests",
+          "specifier": ">=2.26.0"
+        },
+        {
+          "name": "urllib3",
+          "specifier": ">=1.26.0"
+        }
+      ],
+      "artifacts": [
+        {
+          "filename": "docker-7.1.0-py3-none-any.whl",
+          "sha256": "c96b93b7f0a746f9e77d325bcfb87422a3d8bd4f03136ae8a85b37f1898d5fc0",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "idna",
+      "version": "3.15",
+      "source": "https://pypi.org/project/idna/3.15/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "idna-3.15-py3-none-any.whl",
+          "sha256": "048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "numpy",
+      "version": "2.3.1",
+      "source": "https://pypi.org/project/numpy/2.3.1/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "numpy-2.3.1-cp311-cp311-macosx_10_9_x86_64.whl",
+          "sha256": "6ea9e48336a402551f52cd8f593343699003d2353daa4b72ce8d34f66b722070",
+          "targets": [
+            "cpython-3.11-macos-x64-pip-24.2"
+          ]
+        },
+        {
+          "filename": "numpy-2.3.1-cp311-cp311-macosx_11_0_arm64.whl",
+          "sha256": "5ccb7336eaf0e77c1635b232c141846493a588ec9ea777a7c24d7166bb8533ae",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2"
+          ]
+        },
+        {
+          "filename": "numpy-2.3.1-cp311-cp311-manylinux_2_28_aarch64.whl",
+          "sha256": "467db865b392168ceb1ef1ffa6f5a86e62468c43e0cfb4ab6da667ede10e58db",
+          "targets": [
+            "cpython-3.11-linux-arm64-pip-24.2"
+          ]
+        },
+        {
+          "filename": "numpy-2.3.1-cp311-cp311-manylinux_2_28_x86_64.whl",
+          "sha256": "afed2ce4a84f6b0fc6c1ce734ff368cbf5a5e24e8954a338f3bdffa0718adffb",
+          "targets": [
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "pandas",
+      "version": "2.3.1",
+      "source": "https://pypi.org/project/pandas/2.3.1/",
+      "requires": [
+        {
+          "name": "numpy",
+          "specifier": ">=1.23.2"
+        },
+        {
+          "name": "python-dateutil",
+          "specifier": ">=2.8.2"
+        },
+        {
+          "name": "pytz",
+          "specifier": ">=2020.1"
+        },
+        {
+          "name": "tzdata",
+          "specifier": ">=2022.7"
+        }
+      ],
+      "artifacts": [
+        {
+          "filename": "pandas-2.3.1-cp311-cp311-macosx_10_9_x86_64.whl",
+          "sha256": "2b0540963d83431f5ce8870ea02a7430adca100cec8a050f0811f8e31035541b",
+          "targets": [
+            "cpython-3.11-macos-x64-pip-24.2"
+          ]
+        },
+        {
+          "filename": "pandas-2.3.1-cp311-cp311-macosx_11_0_arm64.whl",
+          "sha256": "fe7317f578c6a153912bd2292f02e40c1d8f253e93c599e82620c7f69755c74f",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2"
+          ]
+        },
+        {
+          "filename": "pandas-2.3.1-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+          "sha256": "e6723a27ad7b244c0c79d8e7007092d7c8f0f11305770e2f4cd778b3ad5f9f85",
+          "targets": [
+            "cpython-3.11-linux-arm64-pip-24.2"
+          ]
+        },
+        {
+          "filename": "pandas-2.3.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+          "sha256": "3462c3735fe19f2638f2c3a40bd94ec2dc5ba13abbb032dd2fa1f540a075509d",
+          "targets": [
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "python-dateutil",
+      "version": "2.9.0.post0",
+      "source": "https://pypi.org/project/python-dateutil/2.9.0.post0/",
+      "requires": [
+        {
+          "name": "six",
+          "specifier": ">=1.5"
+        }
+      ],
+      "artifacts": [
+        {
+          "filename": "python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+          "sha256": "a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "pytz",
+      "version": "2025.2",
+      "source": "https://pypi.org/project/pytz/2025.2/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "pytz-2025.2-py2.py3-none-any.whl",
+          "sha256": "5ddf76296dd8c44c26eb8f4b6f35488f3ccbf6fbbd7adee0b7262d43f0ec2f00",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "requests",
+      "version": "2.33.0",
+      "source": "https://pypi.org/project/requests/2.33.0/",
+      "requires": [
+        {
+          "name": "certifi",
+          "specifier": ">=2023.5.7"
+        },
+        {
+          "name": "charset-normalizer",
+          "specifier": ">=2,<4"
+        },
+        {
+          "name": "idna",
+          "specifier": ">=2.5,<4"
+        },
+        {
+          "name": "urllib3",
+          "specifier": ">=1.26,<3"
+        }
+      ],
+      "artifacts": [
+        {
+          "filename": "requests-2.33.0-py3-none-any.whl",
+          "sha256": "3324635456fa185245e24865e810cecec7b4caf933d7eb133dcde67d48cee69b",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "six",
+      "version": "1.17.0",
+      "source": "https://pypi.org/project/six/1.17.0/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "six-1.17.0-py2.py3-none-any.whl",
+          "sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tqdm",
+      "version": "4.67.1",
+      "source": "https://pypi.org/project/tqdm/4.67.1/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "tqdm-4.67.1-py3-none-any.whl",
+          "sha256": "26445eca388f82e72884e0d580d5464cd801a3ea01e63e5601bdff9ba6a48de2",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tzdata",
+      "version": "2025.2",
+      "source": "https://pypi.org/project/tzdata/2025.2/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "tzdata-2025.2-py2.py3-none-any.whl",
+          "sha256": "1a403fada01ff9221ca8044d701868fa132215d84beb92242d9acd2147f667a8",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "urllib3",
+      "version": "2.7.0",
+      "source": "https://pypi.org/project/urllib3/2.7.0/",
+      "requires": [],
+      "artifacts": [
+        {
+          "filename": "urllib3-2.7.0-py3-none-any.whl",
+          "sha256": "9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897",
+          "targets": [
+            "cpython-3.11-macos-arm64-pip-24.2",
+            "cpython-3.11-macos-x64-pip-24.2",
+            "cpython-3.11-linux-arm64-pip-24.2",
+            "cpython-3.11-linux-x64-pip-24.2"
+          ]
+        }
+      ]
+    }
+  ]
+}
