@@ -1,9 +1,10 @@
-# SWE-bench Pro benchmark harness
+# Benchmark harness
 
 This harness compares stock Codex (Arm A) with Codex plus Ultracode (Arm B)
-on a pinned SWE-bench Pro dataset and official evaluator. It builds on the
-shared benchmark foundation for immutable manifests, leases, hash-chained run
-state, process recovery, provenance, metrics, verifier receipts, and reports.
+on pinned software-engineering suites and their native verifiers. SWE-bench Pro
+and SWE-Marathon share the benchmark foundation for immutable manifests,
+leases, hash-chained run state, process recovery, provenance, metrics, verifier
+receipts, and reports.
 
 ## Requirements
 
@@ -11,6 +12,8 @@ state, process recovery, provenance, metrics, verifier receipts, and reports.
 - Git and Docker.
 - CPython 3.11 with pip 24.2 and `venv` on a reviewed Linux/glibc or macOS
   target; it does not require `uv` or GNU `patch`.
+- SWE-Marathon preparation requires Linux x64 with a Linux amd64 Docker daemon,
+  plus `uv` and GNU `patch`.
 - A local standalone Linux-x64 Codex ELF selected by `toolchain.codexBinary`;
   this is required on macOS too and is never fetched by preparation.
 - Network access while fetching pinned sources, Python artifacts, and task
@@ -29,6 +32,7 @@ The suite selector is explicit and must come first:
 npm run bench -- --help
 npm run bench -- --suite swebench-pro --help
 npm run bench -- --suite swebench-pro <fetch|prep|run|eval|report|status|clean> [options]
+npm run bench -- --suite swe-marathon <prep|run|report> [options]
 ```
 
 A typical pilot is:
@@ -44,6 +48,16 @@ npm run bench -- --suite swebench-pro eval --run-id pro-pilot --resume
 npm run bench -- --suite swebench-pro report --run-id pro-pilot
 ```
 
+A SWE-Marathon pilot freezes exactly one arm per run:
+
+```bash
+npm run bench -- --suite swe-marathon prep
+CODEX_AUTH_JSON_PATH=/path/to/auth.json \
+npm run bench -- --suite swe-marathon run --run-id marathon-a1 \
+  --model <model> --effort <effort> --arm a --task-id zstd-decoder
+npm run bench -- --suite swe-marathon report --run-id marathon-a1
+```
+
 The native evaluator is the sole score authority. Agent success, a captured
 patch, or an output file without a matching host-owned receipt never becomes a
 verified result.
@@ -53,7 +67,7 @@ verified result.
 Each run uses the shared suite-scoped envelope:
 
 ```text
-bench/results/swebench-pro/<runId>/
+bench/results/<suite>/<runId>/
   manifest.json
   run-state.json
   run-state-ledger/
@@ -102,6 +116,17 @@ the Docker daemon, relay implementation, upstream egress, provider, and
 credential scope remain trusted operator components. See
 [the SWE-bench Pro security and provenance guide](docs/swebench-pro.md) for the
 precise boundary and pin-renewal procedure.
+
+## SWE-Marathon boundary
+
+SWE-Marathon uses the pinned Harbor runner and accepts only the owned
+direct-child trial reward bound by the verifier receipt. ChatGPT mode reads the
+private `CODEX_AUTH_JSON_PATH` file contract; API-key mode uses `OPENAI_API_KEY`.
+Credentials stay in an ephemeral runtime home, but task code
+shares their security domain, so benchmark accounts must be disposable,
+narrowly scoped, and protected by independently restricted egress. See the
+[SWE-Marathon guide](docs/swe-marathon.md) for pins, lifecycle rules, and native
+evidence requirements.
 
 ## Development
 

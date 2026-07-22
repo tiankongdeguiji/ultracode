@@ -6,6 +6,7 @@ import {
   type BenchSuite,
   type SuiteAdapter,
 } from './shared/contracts.js';
+import { sweMarathonAdapter } from './suites/swe-marathon/adapter.js';
 import { swebenchProAdapter } from './suites/swebench-pro/adapter.js';
 
 function validateAdapter(adapter: AnySuiteAdapter): void {
@@ -68,4 +69,5 @@ export function createSuiteRegistry(entries: readonly AnySuiteAdapter[]): SuiteR
 /** Production registry. Native runners remain behind command-level imports. */
 export const suiteRegistry = createSuiteRegistry([
   swebenchProAdapter,
+  sweMarathonAdapter,
 ]);

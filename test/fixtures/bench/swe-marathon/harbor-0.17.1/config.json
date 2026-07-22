@@ -1,0 +1,15 @@
+{
+  "agent": {
+    "kwargs": {
+      "reasoning_effort": "high",
+      "web_search": "disabled"
+    },
+    "model_name": "openai/gpt-test",
+    "name": "arm_b_codex:ArmBCodex"
+  },
+  "max_retries": 0,
+  "n_attempts": 1,
+  "task": {
+    "path": "tasks/zstd-decoder"
+  }
+}

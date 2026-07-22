@@ -29,6 +29,12 @@ score is accepted only when a receipt binds the exact official-evaluator bytes,
 digest, invocation, task/arm scope, role, and native record key. A successful
 agent process or a lookalike output file is never score authority.
 
+SWE-Marathon repository-controlled task code shares a security domain with the
+reusable Codex credential needed for that session. Its harness keeps credential
+material out of persistent result trees, but cannot prevent malicious task code
+from reading or exfiltrating a live credential. Operators must use disposable,
+narrowly scoped benchmark accounts and independently restricted egress.
+
 Prepared evaluator sources, Python artifacts, dataset rows, task images,
 native patches, prompt policy, container policy, and control-plane sources are
 pinned or content-addressed and re-attested at launch. Dataset acquisition
