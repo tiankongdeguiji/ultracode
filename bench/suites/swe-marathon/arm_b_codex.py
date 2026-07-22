@@ -93,33 +93,45 @@ function runIds() {{
 }}
 (async () => {{
   const {{ listRuns }} = await import('file:///opt/bench/ultracode/dist/store/runstore.js');
-  const {{ isTerminal }} = await import('file:///opt/bench/ultracode/dist/store/manifest.js');
-  function active() {{
+  const {{ isResumableStatus }} = await import('file:///opt/bench/ultracode/dist/store/manifest.js');
+  function observed() {{
     const summaries = new Map(listRuns(home).map((run) => [run.runId, run]));
-    return runIds().filter((runId) => {{
-      const run = summaries.get(runId);
-      return run === undefined || !isTerminal(run.effectiveStatus);
-    }});
+    return runIds().map((runId) => summaries.get(runId) ?? {{ runId, effectiveStatus: 'invalid' }});
+  }}
+  function unsettled() {{
+    return observed().filter((run) => !isResumableStatus(run.effectiveStatus));
+  }}
+  function unsafe() {{
+    return observed().filter((run) => ['orphaned', 'cleanup-failed'].includes(run.effectiveStatus));
   }}
   if (runIds().length === 0) {{
     process.stderr.write('Arm B did not start an ultracode run\\n');
     process.exitCode = 1;
     return;
   }}
-  while (active().length > 0 && Date.now() < deadline) {{
+  while (unsettled().length > 0 && unsafe().length === 0 && Date.now() < deadline) {{
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }}
-  const expired = active();
+  const expired = unsettled();
   if (expired.length === 0) return;
-  const {{ spawnSync }} = require('node:child_process');
-  for (const runId of expired) {{
-    spawnSync('/opt/bench/node-sel', ['/opt/bench/ultracode/dist/cli/main.js', 'stop', runId],
-      {{ stdio: 'inherit', env: {{ ...process.env, ULTRACODE_HOME: home }} }});
-  }}
+  const {{ spawn }} = require('node:child_process');
   const stopDeadline = Date.now() + 120_000;
-  while (active().length > 0 && Date.now() < stopDeadline) {{
+  function stop(runId) {{
+    return new Promise((resolve) => {{
+      const child = spawn('/opt/bench/node-sel', ['/opt/bench/ultracode/dist/cli/main.js', 'stop', runId],
+        {{ stdio: 'inherit', env: {{ ...process.env, ULTRACODE_HOME: home }} }});
+      const timer = setTimeout(() => {{ child.kill('SIGKILL'); resolve(); }},
+        Math.max(1, Math.min(30_000, stopDeadline - Date.now())));
+      const finish = () => {{ clearTimeout(timer); resolve(); }};
+      child.once('error', finish);
+      child.once('close', finish);
+    }});
+  }}
+  await Promise.all(expired.map((run) => stop(run.runId)));
+  while (unsettled().length > 0 && Date.now() < stopDeadline) {{
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }}
+  if (unsettled().length > 0) process.stderr.write('Arm B could not verify workflow process absence\n');
   process.exitCode = 1;
 }})();
 NODE'''
@@ -171,23 +183,20 @@ rm -rf {self._WORKER_CODEX_HOME}''',
         try:
             await super().run(ARM_B_PREFIX + instruction, environment, context)
         finally:
-            wait_error: BaseException | None = None
             try:
                 await self._wait_for_workflows(environment)
             except BaseException as exc:
-                wait_error = exc
                 self.logger.exception(
-                    "Ultracode workflows did not reach terminal state before verification"
+                    "Ultracode workflows did not reach a safely settled state"
                 )
+                raise RuntimeError(
+                    "Arm B workflow lifecycle did not finish cleanly"
+                ) from exc
             try:
                 await self._preserve_artifacts(environment)
             except BaseException:
                 self.logger.exception("Failed to preserve Arm B sessions and run store")
                 raise
-            if wait_error is not None:
-                raise RuntimeError(
-                    "Arm B workflow lifecycle did not finish cleanly"
-                ) from wait_error
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:

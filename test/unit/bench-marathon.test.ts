@@ -133,6 +133,10 @@ describe('SWE-Marathon configuration and preparation', () => {
     expect(guide).toContain('preflights both before\nnetwork access, cache staging');
     expect(guide).toContain('set `OPENAI_API_KEY`');
     expect(guide).toContain('singly-linked\n  regular file no larger than 4 MiB');
+    expect(guide).toContain('secret-scan or otherwise handle logs and\nresults as sensitive');
+    expect(guide).toContain('export CODEX_AUTH_JSON_PATH=/path/to/auth.json');
+    expect(readme).toContain('### SWE-bench Pro persistence');
+    expect(readme).toContain('### SWE-Marathon persistence');
     const proPreparation = readFileSync(resolve('bench/src/suites/swebench-pro/toolchain.ts'), 'utf8');
     expect(proPreparation).not.toMatch(/(?:command|runBenchProcess)\(['"]uv['"]/u);
   });
@@ -299,6 +303,19 @@ describe('SWE-Marathon command and provenance boundaries', () => {
     expect(marathonRunScope(first)).not.toBe(marathonRunScope(second));
     const ownership = readFileSync(resolve('bench/suites/swe-marathon/harbor-ownership.patch'), 'utf8');
     expect(ownership).toContain('ultracode.benchmark.root');
+  });
+
+  it('keeps a nonce-scoped runtime cleanup fallback before native launch', () => {
+    const source = readFileSync(resolve('bench/src/suites/swe-marathon/runner.ts'), 'utf8');
+    const key = source.indexOf('const activeKey = `${rootScope}');
+    const track = source.indexOf('trackExecution(activeKey,', key);
+    const launch = source.indexOf('await runBenchProcess(', track);
+    const fallback = source.indexOf('else runtime.cleanup();', launch);
+    expect(key).toBeGreaterThan(0);
+    expect(source.slice(key, source.indexOf(';', key))).toContain('runtimeNonce');
+    expect(track).toBeLessThan(launch);
+    expect(source.indexOf('tracked = true;', track)).toBeLessThan(launch);
+    expect(fallback).toBeGreaterThan(launch);
   });
 });
 
@@ -655,8 +672,18 @@ describe('Harbor plan, telemetry, and bridge assets', () => {
     expect(bridge).toContain('ARM_B_PREFIX + instruction');
     expect(bridge).toContain('arm_b_lifecycle.json');
     expect(bridge).toContain("dist/store/runstore.js");
+    expect(bridge).toContain('isResumableStatus');
     expect(bridge).toContain('run.effectiveStatus');
     expect(bridge).not.toContain('manifest.status');
+    expect(bridge).toContain("['orphaned', 'cleanup-failed']");
+    expect(bridge).toContain('await Promise.all(expired.map((run) => stop(run.runId)))');
+    expect(bridge).not.toContain('spawnSync');
+    expect(bridge).not.toContain('wait_error');
+    const wait = bridge.indexOf('await self._wait_for_workflows(environment)');
+    const unsafeRaise = bridge.indexOf('Arm B workflow lifecycle did not finish cleanly', wait);
+    const preserve = bridge.indexOf('await self._preserve_artifacts(environment)', wait);
+    expect(wait).toBeGreaterThan(0);
+    expect(unsafeRaise).toBeLessThan(preserve);
     expect(bridge).not.toContain('arm_b_metrics.json');
     expect(bridge).not.toContain('total_token_usage');
     expect(ownership).toContain('ultracode.benchmark.ownership');

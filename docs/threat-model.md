@@ -32,10 +32,12 @@ agent process or a lookalike output file is never score authority.
 ### SWE-Marathon
 
 SWE-Marathon repository-controlled task code shares a security domain with the
-reusable Codex credential needed for that session. Its harness keeps credential
-material out of persistent result trees, but cannot prevent malicious task code
-from reading or exfiltrating a live credential. Operators must use disposable,
-narrowly scoped benchmark accounts and independently restricted egress.
+reusable Codex credential needed for that session. The harness does not
+intentionally serialize its credential source, but cannot prevent malicious task
+code from reading, exfiltrating, logging, or persisting a live credential.
+Operators must use disposable, narrowly scoped benchmark accounts and
+independently restricted egress, then revoke credentials and treat all streamed
+output and retained artifacts as sensitive until scanned.
 
 Prepared Harbor and native bridge assets are content-addressed and must match
 their tracked hashes at launch. Container labels and ephemeral credential-home
@@ -45,8 +47,10 @@ daemon. Resume accepts only the exact native job config previously bound to the
 manifest-scoped receipt; redo starts from the immutable plan while retaining the
 old native tree for cumulative paid-usage accounting. Incomplete verifier output
 never becomes score evidence, but an identity-valid trial config is sufficient
-to retain telemetry after a crash. Arm B waits on the engine's effective run
-status, including orphan and cleanup-failed terminal states.
+to retain telemetry after a crash. Arm B uses the engine's effective status and
+copies artifacts only after every run reaches a resumable terminal state;
+orphaned or cleanup-failed runs trigger bounded stop/recovery instead of being
+treated as settled.
 
 ### SWE-bench Pro
 

@@ -59,9 +59,11 @@ as `driver-watchdog`, not as a native verifier timeout.
 Arm A uses Harbor's built-in `codex` agent. Arm B uses
 `bench/suites/swe-marathon/arm_b_codex.py`, the same exact prefix asset used by
 other suites, and the read-only shared toolchain. The bridge chooses neither
-model nor effort. It waits for detached workflows, preserves worker rollouts
-using Ultracode's effective status (including dead-runner detection), preserves
-worker rollouts and the run store, and writes only `arm_b_lifecycle.json`. Shared TypeScript
+model nor effort. It waits for detached workflows using Ultracode's effective
+status and requires a resumable terminal state. Orphaned or cleanup-failed runs
+trigger concurrent bounded stops; artifacts are not copied until worker absence
+is verified. It then preserves worker rollouts and the run store and writes only
+`arm_b_lifecycle.json`. Shared TypeScript
 metrics code is the sole public token aggregator.
 
 Reporting indexes only the manifest-declared job and its single direct-child
@@ -87,10 +89,13 @@ Choose the configured authentication mechanism on every run:
   regular file no larger than 4 MiB with mode `0600`.
 - `api-key`: set `OPENAI_API_KEY`.
 
-Credentials are copied or forwarded only into an ephemeral `0700` runtime home
-and never enter argv, manifests, reports, or the persistent run directory.
-Task code shares the credential's security domain, so use a disposable,
-narrowly scoped account with restricted egress.
+The harness supplies the credential through an ephemeral `0700` runtime home
+and does not intentionally serialize the source secret into argv, manifests, or
+reports. This is not a non-disclosure boundary: task code shares the credential's
+security domain and can copy secrets into streamed output, sessions, or other
+persistent artifacts. Use a disposable, narrowly scoped account with restricted
+egress, revoke it after the run, and secret-scan or otherwise handle logs and
+results as sensitive before publication.
 
 Harbor containers receive the complete benchmark ownership label tuple from
 the pinned patch, including a hash of the canonical run root. Runtime-home
@@ -101,7 +106,7 @@ refuses to remove anything that does not match exactly.
 ```bash
 npm run bench -- --suite swe-marathon prep
 
-CODEX_AUTH_JSON_PATH=/path/to/auth.json \
+export CODEX_AUTH_JSON_PATH=/path/to/auth.json
 npm run bench -- --suite swe-marathon run --run-id marathon-a1 \
   --model <model> --effort <effort> --arm a \
   --task-id zstd-decoder

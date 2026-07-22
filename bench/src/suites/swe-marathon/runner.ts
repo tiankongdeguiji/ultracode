@@ -827,17 +827,19 @@ async function runTask(
       return;
     }
   }
-  const labels = labelEnvironment(rootScope, manifest.runId, taskId, identity.arm, randomBytes(32).toString('hex'));
+  const runtimeNonce = randomBytes(32).toString('hex');
+  const labels = labelEnvironment(rootScope, manifest.runId, taskId, identity.arm, runtimeNonce);
   const runtime = createMarathonRuntimeHome(
     config,
     join(context.paths.benchRoot, 'suites', 'swe-marathon'),
     labels,
   );
   runtime.environment.PATH = `${common.prepared.environmentDirectory}/bin${runtime.environment.PATH ? `:${runtime.environment.PATH}` : ''}`;
-  const activeKey = `${manifest.runId}\0${taskId}\0${identity.arm}`;
+  const activeKey = `${rootScope}\0${manifest.runId}\0${taskId}\0${identity.arm}\0${runtimeNonce}`;
   const startedAt = context.clock.now();
   const startedMs = performance.now();
   let failure: FailureCode | null = null;
+  let tracked = false;
   const lifecycle = state.lifecycleHooks(invocationId);
   try {
     trackExecution(activeKey, {
@@ -847,6 +849,7 @@ async function runTask(
       arm: identity.arm,
       cleanupRuntime: runtime.cleanup,
     });
+    tracked = true;
     await runBenchProcess(plan.command, plan.argv, {
       cwd: plan.cwd,
       env: runtime.environment,
@@ -868,7 +871,10 @@ async function runTask(
         : 'native-runner-failed';
   } finally {
     let cleanupFailure: unknown;
-    try { await cleanupTrackedExecution(activeKey); }
+    try {
+      if (tracked) await cleanupTrackedExecution(activeKey);
+      else runtime.cleanup();
+    }
     catch (error) {
       failure = 'ownership-unsafe';
       cleanupFailure = error;

@@ -10,8 +10,8 @@ receipts, and reports.
 
 - Node 20 or newer and dependencies installed with `npm ci`.
 - Git and Docker.
-- CPython 3.11 with pip 24.2 and `venv` on a reviewed Linux/glibc or macOS
-  target; it does not require `uv` or GNU `patch`.
+- SWE-bench Pro preparation requires CPython 3.11 with pip 24.2 and `venv` on a
+  reviewed Linux/glibc or macOS target; it does not require `uv` or GNU `patch`.
 - SWE-Marathon preparation requires Linux x64 with a Linux amd64 Docker daemon,
   plus `uv` and GNU `patch`.
 - A local standalone Linux-x64 Codex ELF selected by `toolchain.codexBinary`;
@@ -20,9 +20,10 @@ receipts, and reports.
   images.
 
 Copy `bench/bench.example.config.json` to the ignored, operator-owned
-`bench/bench.config.json`, fill in the model and public relay identity, and set
-its mode to `0600`. Runtime relay URLs and Docker network names are supplied
-through the environment and never belong in the config file.
+`bench/bench.config.json`, fill in the selected suite's model, authentication,
+and public infrastructure identity fields, and set its mode to `0600`.
+SWE-bench Pro runtime relay URLs and Docker network names are supplied through
+the environment and never belong in the config file.
 
 ## CLI
 
@@ -77,7 +78,9 @@ bench/results/<suite>/<runId>/
   native/
 ```
 
-The schema-v3 manifest freezes the selected instances, arm order, requested
+### SWE-bench Pro persistence
+
+For SWE-bench Pro, the schema-v3 manifest freezes the selected instances, arm order, requested
 model and effort, resource limits, prompt policy, prepared toolchain identity,
 dataset digest, evaluator revision, container policy, and public relay
 attestation hashes. Resume accepts only that exact identity and recovers
@@ -95,6 +98,15 @@ Task-image repositories are extracted from stopped containers and sanitized
 once per selected task by host Git before the COPY-only overlay build. The
 original image checkout is hidden by the trusted bootstrap, and Arm A and Arm B
 modify isolated container-layer copies of the same sanitized base closure.
+
+### SWE-Marathon persistence
+
+SWE-Marathon uses a schema-v2 manifest for one arm and one native Harbor job per
+selected task. It freezes the prepared source/toolchain identity, task image
+digests, bridge and ownership assets, model/effort, timeouts, and pricing. Resume
+requires the prior receipt-bound native job config; redo archives the invalidated
+job so paid usage remains cumulative. See the suite guide for its distinct
+credential and native-evidence boundary.
 
 ## Model isolation
 
@@ -122,9 +134,10 @@ precise boundary and pin-renewal procedure.
 SWE-Marathon uses the pinned Harbor runner and accepts only the owned
 direct-child trial reward bound by the verifier receipt. ChatGPT mode reads the
 private `CODEX_AUTH_JSON_PATH` file contract; API-key mode uses `OPENAI_API_KEY`.
-Credentials stay in an ephemeral runtime home, but task code
-shares their security domain, so benchmark accounts must be disposable,
-narrowly scoped, and protected by independently restricted egress. See the
+The harness supplies credentials from an ephemeral runtime home, but task code
+shares their security domain and can persist them in output or artifacts, so
+benchmark accounts must be disposable, narrowly scoped, and protected by
+independently restricted egress. Treat retained output as sensitive. See the
 [SWE-Marathon guide](docs/swe-marathon.md) for pins, lifecycle rules, and native
 evidence requirements.
 
