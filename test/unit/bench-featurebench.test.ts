@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -183,15 +184,20 @@ function stagedFeatureBenchEnvironment(stage: string): { environment: string; fb
   const bin = join(environment, 'bin');
   mkdirSync(bin, { recursive: true });
   const python = join(bin, 'python');
-  writeFileSync(python, `#!/bin/sh
-MOCK_ADJACENT_PYTHON="$0" exec python3 "$@"
-`);
-  chmodSync(python, 0o755);
+  const systemPython = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], {
+    encoding: 'utf8',
+  });
+  if (systemPython.status !== 0 || systemPython.stdout.trim().length === 0) {
+    throw new Error(systemPython.error?.message ?? systemPython.stderr);
+  }
+  const systemPythonPath = systemPython.stdout.trim();
+  symlinkSync(systemPythonPath, python);
+  writeFileSync(join(environment, 'pyvenv.cfg'), `home = ${dirname(systemPythonPath)}\n`);
   const fb = join(bin, 'fb');
   writeFileSync(fb, `#!${python}
 import os
 import sys
-print(f"interpreter={os.environ['MOCK_ADJACENT_PYTHON']}")
+print(f"interpreter={sys.executable}")
 print(f"entrypoint={sys.argv[0]}")
 print(f"argument={sys.argv[1]}")
 print(f"working={os.getcwd()}")
@@ -388,7 +394,10 @@ describe('FeatureBench immutable inputs and host policy', () => {
     const oldStage = join(root, 'old-stage');
     const oldEnvironment = stagedFeatureBenchEnvironment(oldStage);
     const beforeMove = spawnSync(oldEnvironment.fb, ['--help'], { cwd: root, encoding: 'utf8' });
-    expect(beforeMove.status, beforeMove.stderr).toBe(0);
+    expect(
+      beforeMove.status,
+      beforeMove.error?.message ?? beforeMove.signal ?? beforeMove.stderr,
+    ).toBe(0);
     const oldFinal = join(root, sha256Tree(oldStage));
     renameSync(oldStage, oldFinal);
     const broken = spawnSync(join(oldFinal, 'source', '.venv', 'bin', 'fb'), ['--help'], {
@@ -419,10 +428,12 @@ describe('FeatureBench immutable inputs and host policy', () => {
     const publishedFb = join(final, 'source', '.venv', 'bin', 'fb');
     const result = spawnSync(publishedFb, ['--help'], { cwd: root, encoding: 'utf8' });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain(`interpreter=${join(final, 'source', '.venv', 'bin', 'python')}`);
+    expect(result.stdout).toContain(`interpreter=${join(
+      realpathSync(final), 'source', '.venv', 'bin', 'python',
+    )}`);
     expect(result.stdout).toContain(`entrypoint=${publishedFb}`);
     expect(result.stdout).toContain('argument=--help');
-    expect(result.stdout).toContain(`working=${root}`);
+    expect(result.stdout).toContain(`working=${realpathSync(root)}`);
   });
 
   it('removes Python bytecode before hashing and rejects it on every load boundary', () => {
