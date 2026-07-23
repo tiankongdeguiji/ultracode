@@ -69,6 +69,16 @@ describe('KeyChain', () => {
     expect(new Set(keys).size).toBe(variants.length);
   });
 
+  it('adapter execution revisions invalidate pre-upgrade replay keys', () => {
+    const seed = seedKey(null);
+    for (const backend of ['claude', 'qoder']) {
+      const request = spec({ backend, effort: 'high' });
+      const legacy = new KeyChain(seed, ROOT, {}).next(request);
+      const current = new KeyChain(seed, ROOT).next(request);
+      expect(current).not.toBe(legacy);
+    }
+  });
+
   it('cwd equal to the run root is omitted from the hash', () => {
     const seed = seedKey(null);
     const atRoot = new KeyChain(seed, ROOT).next(spec({ cwd: ROOT }));

@@ -89,6 +89,9 @@ export function lintWorkflowSource(source: string): LintFinding[] {
           if (key === 'effort') {
             findings.push({ level: 'warning', line, message: `agent option 'effort' is not portable to Qoder native — route effort via an agentType definition` });
           }
+          if (key === 'contextWindow') {
+            findings.push({ level: 'warning', line, message: `agent option 'contextWindow' is ultracode-engine-only (not portable to Claude Code / Qoder native)` });
+          }
           if (key === 'schema') {
             const schema = literalValue(prop.value);
             if (schema && typeof schema === 'object') {

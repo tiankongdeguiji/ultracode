@@ -4,7 +4,8 @@
  *
  *   key_0 = "u1:" + sha256("ultracode-seed\0" + stableStringify(args) + "\0" + permission)
  *   key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0" +
- *           stableStringify({agentType, isolation, model, effort, contextWindow, schema, backend, cwd?}))
+ *           stableStringify({agentType, isolation, model, effort, contextWindow,
+ *                            executionRevision, schema, backend, cwd?}))
  *
  * The seed deliberately EXCLUDES the script hash: editing the script and
  * resuming must replay the unchanged prefix of agent() calls (the calls
@@ -26,6 +27,14 @@ import { openAppendFdNoFollow } from '../exec/safe-write.js';
 import type { AgentSpec } from '../backends/types.js';
 
 export const KEY_PREFIX = 'u1:';
+
+// Increment a backend revision whenever an adapter change can alter output
+// without changing AgentSpec. This prevents pre-upgrade results from replaying
+// under new CLI semantics; absent entries preserve compatible backend caches.
+const BACKEND_EXECUTION_REVISIONS: Readonly<Record<string, number>> = {
+  claude: 2,
+  qoder: 2,
+};
 
 export function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
@@ -57,7 +66,11 @@ export function argsHash(args: unknown): string {
 export class KeyChain {
   private last: string;
 
-  constructor(seed: string, private readonly rootCwd: string) {
+  constructor(
+    seed: string,
+    private readonly rootCwd: string,
+    private readonly executionRevisions: Readonly<Record<string, number>> = BACKEND_EXECUTION_REVISIONS,
+  ) {
     this.last = seed;
   }
 
@@ -68,6 +81,7 @@ export class KeyChain {
       model: spec.model,
       effort: spec.effort,
       contextWindow: spec.contextWindow,
+      executionRevision: this.executionRevisions[spec.backend],
       schema: spec.schema,
       backend: spec.backend,
       cwd: spec.cwd === this.rootCwd ? undefined : spec.cwd,
