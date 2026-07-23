@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +33,39 @@ async function runCli(project: string, store: string, home: string, extra: strin
 }
 
 describe('CLI layered subagent config', () => {
+  it('requires a backend for live runs but keeps backendless dry-run on mock', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-config-cli-'));
+    const project = join(root, 'project');
+    const home = join(root, 'home');
+    const store = join(root, 'store');
+    mkdirSync(project, { recursive: true });
+    writeFileSync(
+      join(project, 'test.workflow.js'),
+      `export const meta = { name: 'backend-required', description: 'd' }
+return agent('MOCK:ok done', { label: 'worker' })`,
+    );
+
+    const live = await exec(
+      process.execPath,
+      ['--import', tsxLoader, mainTs, 'run', 'test.workflow.js', '--yes', '--detach', '--home', store],
+      { cwd: project, env: { ...process.env, HOME: home } },
+    ).then(
+      () => undefined,
+      (error: { stderr?: string }) => error,
+    );
+    expect(live?.stderr).toContain('run requires --backend or subagent.backend');
+    expect(existsSync(store)).toBe(false);
+
+    const dry = await exec(
+      process.execPath,
+      ['--import', tsxLoader, mainTs, 'run', 'test.workflow.js', '--yes', '--dry-run', '--home', store],
+      { cwd: project, env: { ...process.env, HOME: home } },
+    );
+    expect(dry.stderr).toContain('dry run (mock backend');
+    expect(dry.stdout).toContain('"result": "done"');
+    expect(existsSync(store)).toBe(false);
+  });
+
   it('persists config defaults and lets explicit flags override them', async () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-config-cli-'));
     const project = join(root, 'project');

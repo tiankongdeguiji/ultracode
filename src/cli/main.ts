@@ -19,7 +19,7 @@ program
   .argument('<script>', 'workflow script file (*.workflow.js)')
   .description('run a workflow (detached runner; foreground attach by default)')
   .option('--args <json>', 'workflow args (JSON or plain string)')
-  .option('--backend <id>', 'default backend for agents (config or mock when omitted)')
+  .option('--backend <id>', 'default backend for agents (required unless configured or --dry-run)')
   .option('--model <id>', 'default model for agents')
   .option('--effort <level>', 'default reasoning effort for agents')
   .option('--context-window <n>', 'default Qoder context window in tokens')

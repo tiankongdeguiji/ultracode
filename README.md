@@ -142,7 +142,7 @@ Set user-wide defaults in `~/.ultracode/config.json`, then override individual f
 }
 ```
 
-`agent()` overrides CLI/MCP, project, user, then built-ins. CLI defaults to `mock`; MCP requires a backend.
+`agent()` overrides CLI/MCP, project, user, then built-ins. CLI/MCP runs require a backend from flags or config; `--dry-run` uses `mock`.
 
 ### Build from source
 

@@ -55,7 +55,14 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
     process.stderr.write(`ultracode: ${(err as Error).message}\n`);
     return 1;
   }
-  const backend = opts.backend ?? defaults.backend ?? 'mock';
+  const backend = opts.backend ?? defaults.backend ?? (opts.dryRun ? 'mock' : undefined);
+  if (backend === undefined) {
+    process.stderr.write(
+      `ultracode: run requires --backend or subagent.backend in ultracode config ` +
+        `(use --dry-run for a mock rehearsal)\n`,
+    );
+    return 1;
+  }
   if (!IMPLEMENTED_BACKENDS.has(backend)) {
     process.stderr.write(
       `ultracode: backend '${backend}' is not implemented yet (available: ${[...IMPLEMENTED_BACKENDS].join(', ')})\n`,

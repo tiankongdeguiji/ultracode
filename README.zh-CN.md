@@ -142,7 +142,7 @@ ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journ
 }
 ```
 
-`agent()` 覆盖 CLI/MCP、项目、用户、内置。CLI 默认 `mock`；MCP 必须指定 backend。
+`agent()` 覆盖 CLI/MCP、项目、用户、内置。CLI/MCP 必须通过参数或配置指定 backend；`--dry-run` 使用 `mock`。
 
 ### 从源码构建
 
