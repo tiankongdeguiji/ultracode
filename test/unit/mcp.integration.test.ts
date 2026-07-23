@@ -128,6 +128,8 @@ describe('MCP triad', () => {
     writeFileSync(configPath, JSON.stringify({
       subagent: { backend: 'mock', model: 'configured-model', effort: 'high', context_window: 200_000 },
     }));
+    let runId: string | undefined;
+    let terminal = false;
     try {
       const start = (await client.callTool({
         name: 'workflow_start',
@@ -143,6 +145,7 @@ describe('MCP triad', () => {
         };
         isError?: boolean;
       };
+      runId = start.structuredContent?.runId;
       expect(start.isError).toBeFalsy();
       expect(start.structuredContent).toMatchObject({
         backend: 'mock',
@@ -161,13 +164,22 @@ describe('MCP triad', () => {
       for (let i = 0; i < 20; i++) {
         const status = (await client.callTool({
           name: 'workflow_status',
-          arguments: { runId: start.structuredContent!.runId!, waitSeconds: 2, sinceEventOffset: offset },
+          arguments: { runId, waitSeconds: 2, sinceEventOffset: offset },
         })) as { structuredContent?: { terminal?: boolean; nextEventOffset?: number } };
         offset = status.structuredContent!.nextEventOffset ?? offset;
-        if (status.structuredContent!.terminal) break;
+        terminal = status.structuredContent!.terminal ?? false;
+        if (terminal) break;
       }
+      expect(terminal).toBe(true);
     } finally {
       rmSync(configPath, { force: true });
+      if (runId && !terminal) {
+        try {
+          await client.callTool({ name: 'workflow_stop', arguments: { runId } });
+        } catch {
+          /* cleanup is best-effort after a failed assertion */
+        }
+      }
     }
   }, 45_000);
 

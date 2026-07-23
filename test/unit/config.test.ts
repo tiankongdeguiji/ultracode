@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadSubagentConfig } from '../../src/config.js';
+import { loadSubagentConfig, MAX_CONFIG_BYTES } from '../../src/config.js';
 
 function put(path: string, value: unknown): void {
   mkdirSync(join(path, '.ultracode'), { recursive: true });
@@ -54,5 +55,30 @@ describe('layered subagent config', () => {
     expect(() => loadSubagentConfig(project, { userHome: join(root, 'home') })).toThrow(
       new RegExp(`invalid ultracode config .*${project.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
     );
+  });
+
+  it('rejects oversized, symlinked, and non-regular project config files', () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-config-'));
+    const home = join(root, 'home');
+
+    const oversized = join(root, 'oversized');
+    mkdirSync(join(oversized, '.ultracode'), { recursive: true });
+    writeFileSync(join(oversized, '.ultracode', 'config.json'), ' '.repeat(MAX_CONFIG_BYTES + 1));
+    expect(() => loadSubagentConfig(oversized, { userHome: home })).toThrow(/exceeds 65536 bytes/);
+
+    const linked = join(root, 'linked');
+    mkdirSync(join(linked, '.ultracode'), { recursive: true });
+    const target = join(root, 'target.json');
+    writeFileSync(target, JSON.stringify({ subagent: { backend: 'mock' } }));
+    symlinkSync(target, join(linked, '.ultracode', 'config.json'));
+    expect(() => loadSubagentConfig(linked, { userHome: home })).toThrow(/invalid ultracode config/);
+
+    const fifoProject = join(root, 'fifo');
+    mkdirSync(join(fifoProject, '.ultracode'), { recursive: true });
+    const fifo = join(fifoProject, '.ultracode', 'config.json');
+    const mk = spawnSync('mkfifo', [fifo]);
+    if (mk.status === 0) {
+      expect(() => loadSubagentConfig(fifoProject, { userHome: home })).toThrow(/must be a regular file/);
+    }
   });
 });

@@ -3,7 +3,7 @@
  * Files are read once at fresh-run admission; resolved values are persisted in
  * the run store so detached execution and resume never depend on mutable config.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { z } from 'zod';
@@ -20,6 +20,9 @@ const configSchema = z.object({
   subagent: subagentSchema.optional(),
 }).strict();
 
+/** Maximum size of either layered configuration file. */
+export const MAX_CONFIG_BYTES = 64 * 1024;
+
 export interface SubagentDefaults {
   backend?: ImplementedBackendId;
   model?: string;
@@ -33,10 +36,40 @@ export interface LoadSubagentConfigOptions {
   userHome?: string;
 }
 
-function readConfigFile(path: string): SubagentDefaults {
+function readConfigSource(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    try {
+      fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error('must be a regular file');
+    if (stat.size > MAX_CONFIG_BYTES) throw new Error(`exceeds ${MAX_CONFIG_BYTES} bytes`);
+
+    const buffer = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const finalStat = fstatSync(fd);
+    if (!finalStat.isFile() || finalStat.size !== stat.size) throw new Error('changed while being read');
+    return buffer.toString('utf8', 0, offset);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function readConfigFile(path: string): SubagentDefaults | undefined {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(path, 'utf8'));
+    const source = readConfigSource(path);
+    if (source === undefined) return undefined;
+    raw = JSON.parse(source);
   } catch (error) {
     throw new Error(`invalid ultracode config ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -70,9 +103,10 @@ export function loadSubagentConfig(
   const seen = new Set<string>();
   for (const path of paths) {
     const absolute = resolve(path);
-    if (seen.has(absolute) || !existsSync(absolute)) continue;
+    if (seen.has(absolute)) continue;
     seen.add(absolute);
-    Object.assign(defaults, readConfigFile(absolute));
+    const config = readConfigFile(absolute);
+    if (config) Object.assign(defaults, config);
   }
   return defaults;
 }
