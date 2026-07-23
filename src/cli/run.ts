@@ -152,7 +152,7 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
       executor: new MockExecutor(),
       args,
       budgetTotal,
-      defaultBackend: 'mock',
+      defaultBackend: backend,
       defaultModel: model,
       defaultEffort: effort,
       defaultContextWindow: contextWindow,

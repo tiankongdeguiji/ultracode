@@ -20,7 +20,7 @@ import {
   WorkflowBudgetError,
   errorMessage,
 } from './errors.js';
-import { Semaphore } from './semaphore.js';
+import { isPositiveInt, Semaphore } from './semaphore.js';
 import type { AgentExecutor, AgentSpec, JsonSchema } from '../backends/types.js';
 import type { BudgetAccount } from '../budget/account.js';
 import type { WorkflowMeta } from './meta.js';
@@ -224,10 +224,7 @@ function roundTrip(value: unknown): unknown {
 }
 
 export function createHostApi(opts: HostApiOptions): HostApi {
-  if (
-    opts.defaultContextWindow !== undefined &&
-    (!Number.isSafeInteger(opts.defaultContextWindow) || opts.defaultContextWindow <= 0)
-  ) {
+  if (opts.defaultContextWindow !== undefined && !isPositiveInt(opts.defaultContextWindow)) {
     throw new TypeError('defaultContextWindow must be a positive integer');
   }
   const {
@@ -318,7 +315,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     const backend = o.backend ?? opts.defaultBackend;
     if (
       o.contextWindow !== undefined &&
-      (typeof o.contextWindow !== 'number' || !Number.isSafeInteger(o.contextWindow) || o.contextWindow <= 0)
+      (typeof o.contextWindow !== 'number' || !isPositiveInt(o.contextWindow))
     ) {
       throw new TypeError('agent() contextWindow must be a positive integer');
     }

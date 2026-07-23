@@ -52,8 +52,11 @@ describe('subagent CLI option guards', () => {
     expect(readContextWindowOpt('200000')).toEqual({ ok: true, value: 200_000 });
     const err = captureStderr();
     expect(readContextWindowOpt('1.5')).toEqual({ ok: false });
+    expect(readContextWindowOpt(String(Number.MAX_SAFE_INTEGER + 1))).toEqual({ ok: false });
     err.restore();
-    expect(err.chunks.join('')).toBe('ultracode: --context-window must be a positive integer\n');
+    expect(err.chunks.join('')).toBe(
+      'ultracode: --context-window must be a positive integer\n'.repeat(2),
+    );
   });
 
   it('trims model/effort and rejects empty values', () => {

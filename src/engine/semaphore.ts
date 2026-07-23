@@ -2,7 +2,7 @@ import os from 'node:os';
 
 /** The one validation rule for every concurrency surface (flag, env, stored config). */
 export function isPositiveInt(n: number): boolean {
-  return Number.isInteger(n) && n > 0;
+  return Number.isSafeInteger(n) && n > 0;
 }
 
 /** Engine default: min(10, max(2, cores - 2)); ULTRACODE_MAX_CONCURRENCY (a strict

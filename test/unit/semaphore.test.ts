@@ -7,6 +7,7 @@ describe('Semaphore', () => {
     expect(() => new Semaphore(0)).toThrow(/positive integer/);
     expect(() => new Semaphore(-1)).toThrow(/positive integer/);
     expect(() => new Semaphore(1.5)).toThrow(/positive integer/);
+    expect(() => new Semaphore(Number.MAX_SAFE_INTEGER + 1)).toThrow(/positive integer/);
   });
 
   it('caps concurrency at `permits` and tracks active/waiting', async () => {

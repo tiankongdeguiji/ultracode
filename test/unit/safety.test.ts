@@ -258,6 +258,27 @@ describe('CLI nesting guard (ULTRACODE_INSIDE_RUN)', () => {
     }
   });
 
+  it('run --dry-run keeps the logical backend for backend-specific dialect validation', async () => {
+    const { runCommand } = await import('../../src/cli/run.js');
+    const dir = mkdtempSync(join(tmpdir(), 'uc-qoderdry-'));
+    const file = join(dir, 't.workflow.js');
+    writeFileSync(
+      file,
+      `export const meta = { name: 'qoder-dry', description: 'd' }
+return agent('MOCK:ok done', { contextWindow: 200000 })`,
+    );
+    const home = join(dir, 'store');
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(await runCommand(file, { yes: true, backend: 'qoder', home, dryRun: true })).toBe(0);
+      expect(existsSync(home)).toBe(false);
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
   it('run --allow-nested passes the guard (reaches source resolution, not the refusal)', async () => {
     // No detached runner: a nonexistent workflow fails at resolution — AFTER the
     // guard — which proves the override without spawning a process (the guard's
