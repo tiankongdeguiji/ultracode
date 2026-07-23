@@ -11,7 +11,7 @@ One script text should run on Claude Code native, Qoder native, and the ultracod
    ```js
    const budgetTokens = (budget && budget.total) ?? (args && args.budgetTokens) ?? null
    ```
-5. **No per-call `effort`** (ultracode-engine-only): route effort via `agentType` definitions where the host supports them, or `model`.
+5. **No per-call `effort` or `contextWindow`** (ultracode-engine-only): route effort via `agentType` definitions where the host supports them, or `model`; there is no portable native equivalent for `contextWindow`.
 6. **No `backend:` option** in scripts meant for Claude Code / Qoder native (ultracode-engine-only concept). Use it only in engine-targeted scripts.
 7. **Self-contained prompts** (rule #1 of authoring): subagents share no context with you or each other. Inline the facts; never write "as discussed above".
 8. **Don't branch on completion order**; resume replay reproduces dispatch order, not completion order.

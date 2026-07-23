@@ -565,6 +565,65 @@ describe('detached runner', () => {
     }
   }, 40_000);
 
+  it('threads Qoder model controls through argv, events, journal, and result artifacts', async () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'uc-fakeqoder-'));
+    const fake = join(binDir, 'fake-qoder.sh');
+    const argvFile = join(binDir, 'argv.txt');
+    const terminal = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'done',
+      session_id: 'qoder-config-session',
+      usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 },
+    });
+    writeFileSync(
+      fake,
+      `#!/bin/sh
+printf '%s\n' "$@" > '${argvFile}'
+printf '%s\n' '${terminal}'
+`,
+      { mode: 0o755 },
+    );
+    const previous = process.env.ULTRACODE_QODER_BIN;
+    process.env.ULTRACODE_QODER_BIN = fake;
+    try {
+      const source = `export const meta = { name: 'qoder-config', description: 'd' }
+return agent('work', { label: 'worker' })`;
+      const { dir } = makeRun(source, {
+        backend: 'qoder',
+        model: 'coder',
+        effort: 'xhigh',
+        contextWindow: 200_000,
+      });
+      await launchRunner(dir);
+      expect(await waitTerminal(dir)).toBe('completed');
+
+      const argv = readFileSync(argvFile, 'utf8').split('\n');
+      expect(argv).toEqual(expect.arrayContaining([
+        '--model', 'coder',
+        '--reasoning-effort', 'xhigh',
+        '--context-window', '200000',
+      ]));
+      expect(readFileSync(join(dir, 'events.jsonl'), 'utf8')).toContain('"contextWindow":200000');
+      expect(readJournal(join(dir, 'journal.jsonl')).find((record) => record.t === 'agent')).toMatchObject({
+        backend: 'qoder',
+        model: 'coder',
+        effort: 'xhigh',
+        contextWindow: 200_000,
+      });
+      expect(JSON.parse(readFileSync(join(dir, 'agents/0000-worker/result.json'), 'utf8'))).toMatchObject({
+        backend: 'qoder',
+        model: 'coder',
+        effort: 'xhigh',
+        contextWindow: 200_000,
+      });
+    } finally {
+      if (previous === undefined) delete process.env.ULTRACODE_QODER_BIN;
+      else process.env.ULTRACODE_QODER_BIN = previous;
+    }
+  }, 40_000);
+
   it('junk in worker-writable config fails closed: bogus permission → safe, non-int wallClockMs → loud uncapped', async () => {
     // The fake binary records its argv so the sandbox flag the executor
     // actually passed is observable.

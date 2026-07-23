@@ -21,6 +21,25 @@ export function readMaxConcurrencyOpt(raw: string | undefined): { ok: true; valu
   return readPositiveIntOpt(raw, '--max-concurrency');
 }
 
+/** `--context-window` guard for Qoder worker defaults. */
+export function readContextWindowOpt(raw: string | undefined): { ok: true; value?: number } | { ok: false } {
+  return readPositiveIntOpt(raw, '--context-window');
+}
+
+/** Non-empty string guard for model/effort CLI overrides. */
+export function readNonEmptyOpt(
+  raw: string | undefined,
+  flag: '--model' | '--effort',
+): { ok: true; value?: string } | { ok: false } {
+  if (raw === undefined) return { ok: true };
+  const value = raw.trim();
+  if (value.length === 0) {
+    process.stderr.write(`ultracode: ${flag} must be a non-empty string\n`);
+    return { ok: false };
+  }
+  return { ok: true, value };
+}
+
 /** `--count` guard for `list`. */
 export function readCountOpt(raw: string | undefined): { ok: true; value?: number } | { ok: false } {
   return readPositiveIntOpt(raw, '--count');

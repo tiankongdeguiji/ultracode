@@ -106,16 +106,47 @@ describe('QoderAdapter', () => {
     expect(a.classifyExit(41, null, [], 'auth failed')).toMatchObject({ ok: false, errorKind: 'auth', retryable: false });
   });
 
-  it('builds --print --json-schema, agent routing, and -w cwd', () => {
-    const plan = a.buildSpawn(req({ schema: { type: 'object' }, agentType: 'uc-xhigh' }));
+  it('builds --print --json-schema, agent routing, model controls, and -w cwd', () => {
+    const plan = a.buildSpawn(req({
+      schema: { type: 'object' },
+      agentType: 'uc-xhigh',
+      model: 'coder',
+      effort: 'xhigh',
+      contextWindow: 200_000,
+    }));
     expect(plan.argv).toContain('--print');
     expect(plan.argv).toContain('--json-schema');
     expect(plan.argv).toEqual(expect.arrayContaining(['--agent', 'uc-xhigh', '-w', '/w']));
+    expect(plan.argv).toEqual(expect.arrayContaining([
+      '--model', 'coder',
+      '--reasoning-effort', 'xhigh',
+      '--context-window', '200000',
+    ]));
   });
 
-  it('resume pins the SAME permission-mode/model/agent as spawn', () => {
-    const argv = a.buildResume('sid', 'continue', req({ permission: 'safe', model: 'm1', agentType: 'uc-xhigh' }))!.argv;
-    expect(argv).toEqual(expect.arrayContaining(['-r', 'sid', '--permission-mode', 'dont_ask', '--model', 'm1', '--agent', 'uc-xhigh']));
+  it('resume pins the SAME permission-mode/model/effort/context-window/agent as spawn', () => {
+    const argv = a.buildResume('sid', 'continue', req({
+      permission: 'safe',
+      model: 'm1',
+      effort: 'high',
+      contextWindow: 100_000,
+      agentType: 'uc-xhigh',
+    }))!.argv;
+    expect(argv).toEqual(expect.arrayContaining([
+      '-r', 'sid',
+      '--permission-mode', 'dont_ask',
+      '--model', 'm1',
+      '--reasoning-effort', 'high',
+      '--context-window', '100000',
+      '--agent', 'uc-xhigh',
+    ]));
+  });
+
+  it('omits Qoder model controls when none were requested', () => {
+    const argv = a.buildSpawn(req()).argv;
+    expect(argv).not.toContain('--model');
+    expect(argv).not.toContain('--reasoning-effort');
+    expect(argv).not.toContain('--context-window');
   });
 });
 

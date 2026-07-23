@@ -127,6 +127,23 @@ ultracode run my.workflow.js --backend codex    # 前台显示实时面板；使
 ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journal 前缀
 ```
 
+### Subagent 默认配置
+
+在 `~/.ultracode/config.json` 中设置用户级默认值，再由 `<cwd>/.ultracode/config.json` 按字段覆盖项目级差异：
+
+```json
+{
+  "subagent": {
+    "backend": "qoder",
+    "model": "auto",
+    "effort": "high",
+    "context_window": 200000
+  }
+}
+```
+
+优先级为：`agent()` 单次参数 → CLI/MCP 启动参数 → 项目配置 → 用户配置 → 内置默认值。CLI 提供 `--backend`、`--model`、`--effort` 和仅供 Qoder 使用的 `--context-window`；MCP 对应 `backend`、`model`、`effort`、`contextWindow`。`context_window` 只会被 Qoder agent 继承，并可用 `agent({ contextWindow })` 单独覆盖。新 run 会把解析后的默认值冻结在 run 目录中，因此外部配置变化不会影响 resume 的可重放性。
+
 ### 从源码构建
 
 如需参与开发 ultracode，可从源码构建：

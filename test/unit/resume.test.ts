@@ -166,6 +166,62 @@ return r`;
 });
 
 describe('runner-level resume (detached processes)', () => {
+  it('freezes layered subagent defaults at fresh start and ignores later config edits on resume', async () => {
+    const { startDetachedRun } = await import('../../src/exec/start.js');
+    const root = mkdtempSync(join(tmpdir(), 'uc-resume-config-'));
+    const projectConfigDir = join(root, '.ultracode');
+    mkdirSync(projectConfigDir, { recursive: true });
+    const configPath = join(projectConfigDir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      subagent: { backend: 'mock', model: 'configured-v1', effort: 'high', context_window: 200_000 },
+    }));
+    const source = `export const meta = { name: 'configured', description: 'd' }
+return agent('MOCK:ok configured', { label: 'one' })`;
+
+    const first = await startDetachedRun({ script: source, cwd: root, home: root, requireBackend: true });
+    expect(first).toMatchObject({
+      backend: 'mock',
+      model: 'configured-v1',
+      effort: 'high',
+      contextWindow: 200_000,
+    });
+    expect(readRunConfig(first.dir)).toMatchObject({
+      backend: 'mock',
+      model: 'configured-v1',
+      effort: 'high',
+      contextWindow: 200_000,
+    });
+    await waitTerminal(first.dir);
+
+    writeFileSync(configPath, JSON.stringify({
+      subagent: { backend: 'qoder', model: 'configured-v2', effort: 'low', context_window: 100_000 },
+    }));
+    const resumed = await startDetachedRun({ resumeFromRunId: first.runId, cwd: root, home: root, requireBackend: true });
+    expect(readRunConfig(resumed.dir)).toMatchObject({
+      backend: 'mock',
+      model: 'configured-v1',
+      effort: 'high',
+      contextWindow: 200_000,
+    });
+    await waitTerminal(resumed.dir);
+
+    const overridden = await startDetachedRun({
+      resumeFromRunId: first.runId,
+      cwd: root,
+      home: root,
+      model: 'explicit',
+      effort: 'xhigh',
+      contextWindow: 300_000,
+    });
+    expect(readRunConfig(overridden.dir)).toMatchObject({
+      backend: 'mock',
+      model: 'explicit',
+      effort: 'xhigh',
+      contextWindow: 300_000,
+    });
+    await waitTerminal(overridden.dir);
+  }, 40_000);
+
   it('rejects CLI and execution-API resume until incomplete cleanup is verified', async () => {
     const { resumeCommand } = await import('../../src/cli/resume.js');
     const { startDetachedRun } = await import('../../src/exec/start.js');
@@ -310,9 +366,23 @@ return await agent('MOCK:ok v', { label: 'one' })`;
     try {
       // (1) explicit override lands in the resumed run's config.json
       outs.length = 0;
-      expect(await resumeCommand(firstId, { home: root, detach: true, maxConcurrency: '5' })).toBe(0);
+      expect(
+        await resumeCommand(firstId, {
+          home: root,
+          detach: true,
+          maxConcurrency: '5',
+          model: 'resume-model',
+          effort: 'high',
+          contextWindow: '200000',
+        }),
+      ).toBe(0);
       const overrideDir = join(root, 'runs', outs.join('').trim().split('\n')[0]!);
       expect(readRunConfig(overrideDir).maxConcurrency).toBe(5);
+      expect(readRunConfig(overrideDir)).toMatchObject({
+        model: 'resume-model',
+        effort: 'high',
+        contextWindow: 200_000,
+      });
       await waitTerminal(overrideDir);
 
       // (2) no flag → the value frozen at creation is inherited untouched

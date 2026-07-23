@@ -53,7 +53,7 @@ describe('KeyChain', () => {
     expect(k3a).not.toBe(k3b); // chain, not per-call hash
   });
 
-  it('backend, model, effort, schema, agentType all affect the key', () => {
+  it('backend, model, effort, contextWindow, schema, agentType all affect the key', () => {
     const seed = seedKey(null);
     const base = spec({ prompt: 'x' });
     const variants: Partial<AgentSpec>[] = [
@@ -61,6 +61,7 @@ describe('KeyChain', () => {
       { backend: 'codex' },
       { model: 'big' },
       { effort: 'high' },
+      { contextWindow: 200_000 },
       { schema: { type: 'object' } },
       { agentType: 'explorer' },
     ];

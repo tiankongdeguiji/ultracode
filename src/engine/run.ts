@@ -37,6 +37,10 @@ export interface ExecuteOptions {
   logCap?: number;
   signal?: AbortSignal;
   defaultBackend?: string;
+  defaultModel?: string;
+  defaultEffort?: string;
+  /** Default applied only to agents whose resolved backend is Qoder. */
+  defaultContextWindow?: number;
   cwd?: string;
   syncTimeoutMs?: number;
   onEvent?: (ev: RunEvent) => void;
@@ -110,6 +114,9 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
         base: {
           executor: opts.executor,
           defaultBackend: opts.defaultBackend ?? 'mock',
+          defaultModel: opts.defaultModel,
+          defaultEffort: opts.defaultEffort,
+          defaultContextWindow: opts.defaultContextWindow,
           cwd: opts.cwd ?? process.cwd(),
           onEvent,
           onAgentStarted: opts.onAgentStarted,
@@ -132,6 +139,9 @@ export async function executeWorkflow(source: string, opts: ExecuteOptions): Pro
     budget,
     signal: abort.signal,
     defaultBackend: opts.defaultBackend ?? 'mock',
+    defaultModel: opts.defaultModel,
+    defaultEffort: opts.defaultEffort,
+    defaultContextWindow: opts.defaultContextWindow,
     cwd: opts.cwd ?? process.cwd(),
     maxConcurrency: opts.maxConcurrency ?? defaultConcurrency(),
     maxAgents: opts.maxAgents,

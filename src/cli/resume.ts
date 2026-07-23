@@ -8,11 +8,16 @@ import { isResumableStatus, isTerminal } from '../store/manifest.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { attachForeground, printOutput } from './lifecycle.js';
-import { readMaxConcurrencyOpt, refuseInsideWorker } from './options.js';
+import { readContextWindowOpt, readMaxConcurrencyOpt, readNonEmptyOpt, refuseInsideWorker } from './options.js';
+import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
 
 export interface ResumeCliOptions {
   script?: string;
   args?: string;
+  backend?: string;
+  model?: string;
+  effort?: string;
+  contextWindow?: string;
   maxConcurrency?: string;
   yes?: boolean;
   detach?: boolean;
@@ -37,6 +42,16 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
   const mcOpt = readMaxConcurrencyOpt(opts.maxConcurrency);
   if (!mcOpt.ok) return 1;
   const maxConcurrencyOverride = mcOpt.value;
+  const modelOpt = readNonEmptyOpt(opts.model, '--model');
+  const effortOpt = readNonEmptyOpt(opts.effort, '--effort');
+  const contextWindowOpt = readContextWindowOpt(opts.contextWindow);
+  if (!modelOpt.ok || !effortOpt.ok || !contextWindowOpt.ok) return 1;
+  if (opts.backend !== undefined && !IMPLEMENTED_BACKENDS.has(opts.backend)) {
+    process.stderr.write(
+      `ultracode: backend '${opts.backend}' is not implemented yet (available: ${[...IMPLEMENTED_BACKENDS].join(', ')})\n`,
+    );
+    return 1;
+  }
 
   const root = ultracodeRoot(process.cwd(), opts.home);
   let prior = getRun(root, runId);
@@ -96,6 +111,10 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
 
   const config = readRunConfig(prior.dir);
   config.resumeFromRunId = runId;
+  if (opts.backend !== undefined) config.backend = opts.backend;
+  if (modelOpt.value !== undefined) config.model = modelOpt.value;
+  if (effortOpt.value !== undefined) config.effort = effortOpt.value;
+  if (contextWindowOpt.value !== undefined) config.contextWindow = contextWindowOpt.value;
 
   // The stored maxConcurrency is frozen at run creation; this is the explicit
   // way to change it for a resume (ULTRACODE_MAX_CONCURRENCY only seeds new runs).
@@ -121,7 +140,9 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
     process.stderr.write(`resumed from ${runId}; monitor: ultracode watch ${newId}\n`);
     return 0;
   }
-  process.stderr.write(`▶ ${newId} (resumed from ${runId})\n`);
+  process.stderr.write(
+    `▶ ${newId} (resumed from ${runId}; backend=${config.backend} model=${config.model ?? 'default'} effort=${config.effort ?? 'default'} contextWindow=${config.contextWindow ?? 'default'})\n`,
+  );
   const { exitCode } = await attachForeground(dir, { quiet: opts.json, plain: opts.plain, noColor: opts.noColor });
   if (opts.json) printOutput(dir);
   return exitCode;

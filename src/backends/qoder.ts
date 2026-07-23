@@ -66,6 +66,8 @@ export class QoderAdapter implements BackendAdapter {
       req.cwd,
     ];
     if (req.model) argv.push('--model', req.model);
+    if (req.effort) argv.push('--reasoning-effort', req.effort);
+    if (req.contextWindow) argv.push('--context-window', String(req.contextWindow));
     if (req.agentType) argv.push('--agent', req.agentType);
     if (req.schema) argv.push('--json-schema', JSON.stringify(req.schema));
     return { bin: this.bin, argv, env: req.env, stdinData: req.prompt };
@@ -87,6 +89,8 @@ export class QoderAdapter implements BackendAdapter {
       req.cwd,
     ];
     if (req.model) argv.push('--model', req.model);
+    if (req.effort) argv.push('--reasoning-effort', req.effort);
+    if (req.contextWindow) argv.push('--context-window', String(req.contextWindow));
     if (req.agentType) argv.push('--agent', req.agentType);
     if (req.schema) argv.push('--json-schema', JSON.stringify(req.schema));
     return { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };

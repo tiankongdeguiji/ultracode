@@ -127,6 +127,23 @@ ultracode run my.workflow.js --backend codex    # foreground live panel; --detac
 ultracode resume <runId> [--script edited.js]   # unchanged journal prefix replays free
 ```
 
+### Subagent defaults
+
+Set user-wide defaults in `~/.ultracode/config.json`, then override individual fields per project in `<cwd>/.ultracode/config.json`:
+
+```json
+{
+  "subagent": {
+    "backend": "qoder",
+    "model": "auto",
+    "effort": "high",
+    "context_window": 200000
+  }
+}
+```
+
+Precedence is `agent()` options → CLI/MCP launch options → project config → user config → built-ins. The CLI exposes `--backend`, `--model`, `--effort`, and Qoder-only `--context-window`; MCP uses `backend`, `model`, `effort`, and `contextWindow`. `context_window` is inherited only by Qoder agents, and can be overridden per call with `agent({ contextWindow })`. Fresh runs freeze the resolved defaults in their run directory, so resume remains reproducible even if the external config changes.
+
 ### Build from source
 
 If you need to develop ultracode, build from source:

@@ -6,17 +6,23 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseWorkflowScript } from '../engine/meta.js';
 import { validateArgsAgainstInputSchema } from '../engine/run.js';
-import { defaultConcurrency } from '../engine/semaphore.js';
+import { defaultConcurrency, isPositiveInt } from '../engine/semaphore.js';
 import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir, getRun } from '../store/runstore.js';
 import { isResumableStatus, isTerminal } from '../store/manifest.js';
 import { launchRunner } from './daemonize.js';
+import { IMPLEMENTED_BACKENDS } from '../backends/ids.js';
+import { loadSubagentConfig, type SubagentDefaults } from '../config.js';
 
 export interface StartRunInput {
   script?: string;
   scriptPath?: string;
   args?: unknown;
   backend?: string;
+  model?: string;
+  effort?: string;
+  /** Default Qoder context window, in tokens. */
+  contextWindow?: number;
   budgetTotal?: number | null;
   maxAgents?: number;
   maxConcurrency?: number;
@@ -28,15 +34,21 @@ export interface StartRunInput {
   resumeFromRunId?: string;
   cwd?: string;
   home?: string;
+  /** Fresh starts must resolve a backend without using the mock fallback. */
+  requireBackend?: boolean;
 }
 
 export interface StartRunResult {
   runId: string;
   dir: string;
   name: string;
+  backend: string;
+  model?: string;
+  effort?: string;
+  contextWindow?: number;
 }
 
-export const IMPLEMENTED_BACKENDS = new Set(['mock', 'codex', 'qoder', 'claude', 'gemini']);
+export { IMPLEMENTED_BACKENDS } from '../backends/ids.js';
 
 /** Timeout caps are opt-in and resume-inherited; 0 is the explicit "clear the
  *  inherited cap" value (an undefined key never overrides a stored one). */
@@ -48,10 +60,21 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
   const cwd = input.cwd ?? process.cwd();
   const root = ultracodeRoot(cwd, input.home);
 
+  const defaults: SubagentDefaults = input.resumeFromRunId ? {} : loadSubagentConfig(cwd);
+  if (!input.resumeFromRunId && input.requireBackend && input.backend === undefined && defaults.backend === undefined) {
+    throw new Error(
+      'workflow_start requires an explicit backend or subagent.backend in ultracode config ' +
+        '(mock|codex|qoder|claude|gemini)',
+    );
+  }
+
   let source = input.script;
   let args = input.args ?? null;
   let config = {
-    backend: input.backend ?? 'mock',
+    backend: input.backend ?? defaults.backend ?? 'mock',
+    model: input.model ?? defaults.model,
+    effort: input.effort ?? defaults.effort,
+    contextWindow: input.contextWindow ?? defaults.contextWindow,
     cwd,
     maxAgents: input.maxAgents,
     maxConcurrency: input.maxConcurrency ?? defaultConcurrency(),
@@ -89,6 +112,9 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     const priorConfig = JSON.parse(readFileSync(join(prior.dir, 'config.json'), 'utf8'));
     config = { ...priorConfig, resumeFromRunId: input.resumeFromRunId };
     if (input.backend !== undefined) config.backend = input.backend;
+    if (input.model !== undefined) config.model = input.model;
+    if (input.effort !== undefined) config.effort = input.effort;
+    if (input.contextWindow !== undefined) config.contextWindow = input.contextWindow;
     if (input.maxAgents !== undefined) config.maxAgents = input.maxAgents;
     if (input.maxConcurrency !== undefined) config.maxConcurrency = input.maxConcurrency;
     if (input.budgetTotal !== undefined) config.budgetTotal = input.budgetTotal;
@@ -103,6 +129,15 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
   if (!IMPLEMENTED_BACKENDS.has(config.backend)) {
     throw new Error(`backend '${config.backend}' is not implemented yet (available: ${[...IMPLEMENTED_BACKENDS].join(', ')})`);
   }
+  if (config.model !== undefined && (typeof config.model !== 'string' || config.model.trim().length === 0)) {
+    throw new Error('model must be a non-empty string');
+  }
+  if (config.effort !== undefined && (typeof config.effort !== 'string' || config.effort.trim().length === 0)) {
+    throw new Error('effort must be a non-empty string');
+  }
+  if (config.contextWindow !== undefined && !isPositiveInt(config.contextWindow)) {
+    throw new Error('contextWindow must be a positive integer');
+  }
 
   const parsed = parseWorkflowScript(source);
   validateArgsAgainstInputSchema(parsed, args ?? undefined);
@@ -110,5 +145,13 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
   const runId = newRunId();
   const dir = createRunDir(root, { runId, name: parsed.meta.name, source, args, config, resumedFrom });
   await launchRunner(dir);
-  return { runId, dir, name: parsed.meta.name };
+  return {
+    runId,
+    dir,
+    name: parsed.meta.name,
+    backend: config.backend,
+    model: config.model,
+    effort: config.effort,
+    contextWindow: config.contextWindow,
+  };
 }

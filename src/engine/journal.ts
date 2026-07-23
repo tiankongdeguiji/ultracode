@@ -4,7 +4,7 @@
  *
  *   key_0 = "u1:" + sha256("ultracode-seed\0" + stableStringify(args) + "\0" + permission)
  *   key_n = "u1:" + sha256(key_{n-1} + "\0" + prompt + "\0" +
- *           stableStringify({agentType, isolation, model, effort, schema, backend, cwd?}))
+ *           stableStringify({agentType, isolation, model, effort, contextWindow, schema, backend, cwd?}))
  *
  * The seed deliberately EXCLUDES the script hash: editing the script and
  * resuming must replay the unchanged prefix of agent() calls (the calls
@@ -67,6 +67,7 @@ export class KeyChain {
       isolation: spec.isolation,
       model: spec.model,
       effort: spec.effort,
+      contextWindow: spec.contextWindow,
       schema: spec.schema,
       backend: spec.backend,
       cwd: spec.cwd === this.rootCwd ? undefined : spec.cwd,
@@ -94,6 +95,8 @@ export type JournalRecord =
       phase?: string;
       backend: string;
       model?: string;
+      effort?: string;
+      contextWindow?: number;
       cached?: boolean;
       sessionId?: string;
       totalTokens: number;
