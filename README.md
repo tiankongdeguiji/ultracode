@@ -142,7 +142,7 @@ Set user-wide defaults in `~/.ultracode/config.json`, then override individual f
 }
 ```
 
-`agent()` overrides CLI/MCP, project, user, then built-ins. CLI/MCP runs require a backend from flags or config; `--dry-run` uses `mock`.
+Per-call parameters on workflow `agent()` override CLI/MCP, project-level, and user-level parameters. CLI/MCP must specify a backend through an argument or configuration; `--dry-run` uses the `mock` backend.
 
 ### Build from source
 
