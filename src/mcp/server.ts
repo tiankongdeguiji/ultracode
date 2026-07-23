@@ -97,7 +97,7 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Launch a workflow (fire-and-forget; returns runId in <1s). Provide script (inline dialect text) ' +
         'or scriptPath, or resumeFromRunId to resume a terminal run (completed agents replay free). ' +
-        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend is one of mock|codex|qoder|claude|gemini and may come from layered ultracode config; without either source a fresh start is rejected. mock returns fabricated stubs (rehearsal only), so use a real backend for real work. model/effort set run defaults; contextWindow is a positive-integer Qoder-only default. ' +
+        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend is one of mock|codex|qoder|claude|gemini and may come from layered ultracode config; without either source a fresh start is rejected. mock returns fabricated stubs (rehearsal only), so use a real backend for real work. model/effort set run defaults; Gemini ignores effort with a warning. contextWindow is a positive-integer Qoder-only default; Qoder effort/contextWindow require qodercli 1.1.1+. ' +
         'wallClockMs (run wall-clock cap) and attemptTimeoutMs (per-attempt agent timeout; per-call opts.timeoutMs still wins) are unclamped and default to UNLIMITED — pass them ONLY when the user explicitly asked for a time limit, and never invent one. On resume an omitted cap inherits the prior run\'s value; pass 0 to clear an inherited cap back to unlimited.',
       inputSchema: {
         script: z.string().optional(),
