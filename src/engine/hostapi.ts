@@ -313,6 +313,8 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     const timeoutMs = typeof o.timeoutMs === 'number' && Number.isFinite(o.timeoutMs) && o.timeoutMs > 0 ? o.timeoutMs : undefined;
     const phaseTitle = o.phase !== undefined ? ensurePhase(String(o.phase)) : currentPhase;
     const backend = o.backend ?? opts.defaultBackend;
+    const label = o.label ?? `#${seq}`;
+    const effort = o.effort ?? opts.defaultEffort;
     if (
       o.contextWindow !== undefined &&
       (typeof o.contextWindow !== 'number' || !isPositiveInt(o.contextWindow))
@@ -322,14 +324,17 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     if (o.contextWindow !== undefined && backend !== 'qoder') {
       throw new TypeError(`agent() contextWindow is supported only by the qoder backend, got ${JSON.stringify(backend)}`);
     }
+    if (effort !== undefined && backend === 'gemini') {
+      pushLog(`agent[${seq}] ${label}: effort is unsupported by the gemini backend — using the backend default`);
+    }
     return {
       seq,
       prompt,
-      label: o.label ?? `#${seq}`,
+      label,
       phase: phaseTitle,
       schema: o.schema ? (JSON.parse(JSON.stringify(o.schema)) as JsonSchema) : undefined,
       model: o.model ?? opts.defaultModel,
-      effort: o.effort ?? opts.defaultEffort,
+      effort: backend === 'gemini' ? undefined : effort,
       contextWindow:
         backend === 'qoder'
           ? (o.contextWindow ?? opts.defaultContextWindow)

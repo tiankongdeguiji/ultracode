@@ -142,7 +142,7 @@ Set user-wide defaults in `~/.ultracode/config.json`, then override individual f
 }
 ```
 
-Precedence is `agent()` options → CLI/MCP launch options → project config → user config → built-ins. The CLI exposes `--backend`, `--model`, `--effort`, and Qoder-only `--context-window`; MCP uses `backend`, `model`, `effort`, and `contextWindow`. `context_window` is inherited only by Qoder agents, and can be overridden per call with `agent({ contextWindow })`. Fresh runs freeze the resolved defaults in their run directory, so resume remains reproducible even if the external config changes.
+Precedence is `agent()` options → CLI/MCP launch options → project config → user config → built-ins. The CLI's built-in backend is `mock`; a fresh MCP start deliberately has no backend fallback and is rejected unless the request or layered config selects one. The CLI exposes `--backend`, `--model`, `--effort`, and Qoder-only `--context-window`; MCP uses `backend`, `model`, `effort`, and `contextWindow`. Effort is forwarded by Codex, Qoder, and Claude; Gemini logs a warning and uses its backend default because its CLI has no effort option. `context_window` is inherited only by Qoder agents, and can be overridden per call with `agent({ contextWindow })`. Fresh runs freeze the resolved defaults in their run directory, so resume remains reproducible even if the external config changes.
 
 ### Build from source
 

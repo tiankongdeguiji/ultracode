@@ -132,6 +132,27 @@ return 1`,
       'contextWindow is supported only by the qoder backend',
     );
   });
+
+  it('warns and removes effort from Gemini execution identity', async () => {
+    class SpecCapture extends MockExecutor {
+      specs: AgentSpec[] = [];
+      override execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (progress: AgentProgress) => void) {
+        this.specs.push({ ...spec });
+        return super.execute(spec, signal, onProgress);
+      }
+    }
+    const executor = new SpecCapture();
+    const { output } = await run(`return agent('MOCK:ok done', { label: 'gem' })`, {
+      executor,
+      defaultBackend: 'gemini',
+      defaultEffort: 'high',
+    });
+    expect(output.result).toBe('done');
+    expect(executor.specs[0]!.effort).toBeUndefined();
+    expect(output.logs).toContain(
+      'agent[0] gem: effort is unsupported by the gemini backend — using the backend default',
+    );
+  });
 });
 
 describe('parallel()', () => {

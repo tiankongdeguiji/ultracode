@@ -66,13 +66,16 @@ describe('ClaudeAdapter', () => {
     expect(a.extractUsage(events)).toMatchObject({ inputTokens: 280, outputTokens: 85, cachedInputTokens: 1200 });
   });
 
-  it('builds --json-schema and stdin prompt; resume targets the session', () => {
-    const plan = a.buildSpawn(req({ schema: { type: 'object' }, model: 'sonnet' }));
+  it('builds model/effort/schema controls and stdin prompt; resume targets the session', () => {
+    const plan = a.buildSpawn(req({ schema: { type: 'object' }, model: 'sonnet', effort: 'high' }));
     expect(plan.argv).toContain('--json-schema');
     expect(plan.argv).toContain('{"type":"object"}');
     expect(plan.argv).toContain('stream-json');
+    expect(plan.argv).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));
     expect(plan.stdinData).toBe('p');
-    expect(a.buildResume('sid', 'fix it', req())!.argv).toContain('sid');
+    expect(a.buildResume('sid', 'fix it', req({ effort: 'low' }))!.argv).toEqual(
+      expect.arrayContaining(['sid', '--effort', 'low']),
+    );
   });
 
   it('permission maps to permission-mode', () => {
