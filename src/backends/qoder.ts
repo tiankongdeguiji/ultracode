@@ -88,8 +88,11 @@ export class QoderAdapter implements BackendAdapter {
     return { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
   }
 
-  createParser() {
-    return createStreamJsonParser();
+  createParser(req?: AgentRequest) {
+    return createStreamJsonParser({
+      estimateContextUsage: true,
+      contextWindow: req?.contextWindow,
+    });
   }
 
   classifyExit(code: number | null, signal: NodeJS.Signals | null, events: AgentEvent[], stderrTail: string): ExitClass {

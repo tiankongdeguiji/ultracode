@@ -10,6 +10,9 @@ issue trackers, SDK message envelopes, decompiled Qoder internals — plus docs/
 - qoder/{success-structured,error-max-turns}.jsonl — SDKMessage envelope,
   including a legacy native structured_output result retained as parser
   compatibility coverage; current worker requests use the emulated schema loop
+- qoder/context-usage.jsonl — sanitized from a live qodercli 1.1.4 stream:
+  token counters remain zero while each completed model request carries a
+  request_id and context_usage_ratio only on its final content block
 - gemini/{success-json,success-plain}.jsonl — init/message/tool_use/tool_result/result
 - claude/streaming-usage.jsonl — multi-assistant-message transcript in the
   claude/success-hello.jsonl envelope (per-API-call `message.usage` on assistant

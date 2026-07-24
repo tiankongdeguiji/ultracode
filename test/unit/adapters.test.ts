@@ -8,8 +8,8 @@ import type { AgentEvent, AgentRequest, BackendAdapter } from '../../src/backend
 
 const FIX = join(__dirname, '../fixtures');
 
-function replay(adapter: BackendAdapter, fixture: string): AgentEvent[] {
-  const parser = adapter.createParser();
+function replay(adapter: BackendAdapter, fixture: string, request?: AgentRequest): AgentEvent[] {
+  const parser = adapter.createParser(request);
   const events: AgentEvent[] = [];
   for (const line of readFileSync(join(FIX, fixture), 'utf8').split('\n')) {
     if (line.trim()) events.push(...parser.push(line));
@@ -109,6 +109,53 @@ describe('QoderAdapter', () => {
     // qoder's assistant lines omit usage → no interim ticks (graceful degradation)
     expect(events.some((e) => e.kind === 'usage' && e.interim)).toBe(false);
     expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: true });
+  });
+
+  it('estimates cumulative model throughput from per-request context occupancy', () => {
+    const events = replay(a, 'qoder/context-usage.jsonl', req({ contextWindow: 200_000 }));
+    const interim = events.filter(
+      (event): event is Extract<AgentEvent, { kind: 'usage' }> =>
+        event.kind === 'usage' && event.interim === true,
+    );
+    // request-1 spans two content blocks but counts once. Each snapshot is the
+    // complete context processed by that model call, so 10% + 25% of 200k.
+    expect(interim.map((event) => event.usage)).toEqual([
+      expect.objectContaining({ inputTokens: 20_000, estimated: true }),
+      expect.objectContaining({ inputTokens: 50_000, estimated: true }),
+    ]);
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 70_000,
+      totalTokens: 70_000,
+      estimated: true,
+    });
+  });
+
+  it('does not invent a context estimate when the denominator is unknown', () => {
+    const events = replay(a, 'qoder/context-usage.jsonl');
+    expect(events.some((event) => event.kind === 'usage' && event.interim)).toBe(false);
+    expect(a.extractUsage(events)).toMatchObject({ totalTokens: 0, estimated: false });
+  });
+
+  it('prefers authoritative token counters when Qoder supplies them', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = parser.push(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'done',
+      usage: {
+        input_tokens: 800,
+        output_tokens: 20,
+        request_id: 'reported-request',
+        context_usage_ratio: 0.5,
+      },
+    }));
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 800,
+      outputTokens: 20,
+      totalTokens: 820,
+      estimated: false,
+    });
   });
 
   it('maps error_max_turns and exit 41 auth', () => {

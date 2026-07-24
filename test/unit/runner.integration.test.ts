@@ -575,7 +575,14 @@ describe('detached runner', () => {
       is_error: false,
       result: 'done',
       session_id: 'qoder-config-session',
-      usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 },
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        request_id: 'qoder-request-1',
+        context_usage_ratio: 0.01,
+      },
+      modelUsage: { coder: { inputTokens: 0, outputTokens: 0, contextWindow: 0 } },
     });
     writeFileSync(
       fake,
@@ -605,7 +612,9 @@ return agent('work', { label: 'worker' })`;
         '--reasoning-effort', 'xhigh',
         '--context-window', '200000',
       ]));
-      expect(readFileSync(join(dir, 'events.jsonl'), 'utf8')).toContain('"contextWindow":200000');
+      const events = readFileSync(join(dir, 'events.jsonl'), 'utf8');
+      expect(events).toContain('"contextWindow":200000');
+      expect(events).toContain('"type":"agent_usage","seq":0,"totalTokens":2000,"estimated":true');
       expect(readJournal(join(dir, 'journal.jsonl')).find((record) => record.t === 'agent')).toMatchObject({
         backend: 'qoder',
         model: 'coder',
@@ -617,6 +626,7 @@ return agent('work', { label: 'worker' })`;
         model: 'coder',
         effort: 'xhigh',
         contextWindow: 200_000,
+        usage: { totalTokens: 2_000, estimated: true },
       });
     } finally {
       if (previous === undefined) delete process.env.ULTRACODE_QODER_BIN;

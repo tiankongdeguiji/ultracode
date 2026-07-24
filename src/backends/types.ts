@@ -33,7 +33,7 @@ export interface NormalizedUsage {
   /** input + output + reasoning + round(0.1 × cached) — see usage.ts */
   totalTokens: number;
   costUSD?: number;
-  /** true when derived from a chars/4 estimate because the backend omitted usage */
+  /** true when the backend omitted authoritative usage and the value was inferred */
   estimated: boolean;
 }
 
@@ -187,7 +187,7 @@ export interface BackendAdapter {
   buildSpawn(req: AgentRequest): SpawnPlan;
   buildResume(sessionId: string, followupPrompt: string, req: AgentRequest): SpawnPlan | null;
   /** stateful NDJSON parser; push() per line, end() at EOF */
-  createParser(): { push(line: string): AgentEvent[]; end(): AgentEvent[] };
+  createParser(req?: AgentRequest): { push(line: string): AgentEvent[]; end(): AgentEvent[] };
   classifyExit(
     code: number | null,
     signal: NodeJS.Signals | null,

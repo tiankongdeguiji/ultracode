@@ -254,7 +254,7 @@ export class AgentCallExecutor implements AgentExecutor {
         outputTokens: (prior?.outputTokens ?? 0) + (current?.outputTokens ?? 0),
         cachedInputTokens: (prior?.cachedInputTokens ?? 0) + (current?.cachedInputTokens ?? 0),
         reasoningTokens: (prior?.reasoningTokens ?? 0) + (current?.reasoningTokens ?? 0),
-        estimated: prior?.estimated ?? false,
+        estimated: (prior?.estimated ?? false) || (current?.estimated ?? false),
       });
       // Strictly increasing, even when forced: a failed attempt's chars/4
       // estimate can undershoot interim sums already shown, and a downward
@@ -282,6 +282,7 @@ export class AgentCallExecutor implements AgentExecutor {
               outputTokens: (acc?.outputTokens ?? 0) + (ev.usage.outputTokens ?? 0),
               cachedInputTokens: (acc?.cachedInputTokens ?? 0) + (ev.usage.cachedInputTokens ?? 0),
               reasoningTokens: (acc?.reasoningTokens ?? 0) + (ev.usage.reasoningTokens ?? 0),
+              estimated: (acc?.estimated ?? false) || ev.usage.estimated === true,
             };
           } else if (!ev.interim && !ev.threadCumulative) {
             acc = { ...ev.usage };
@@ -445,7 +446,8 @@ export class AgentCallExecutor implements AgentExecutor {
     for (const { a, at } of counted) {
       const u = this.adapter.extractUsage(a.events);
       if (u.totalTokens > 0) {
-        realAny = true;
+        if (u.estimated) estimatedAny = true;
+        else realAny = true;
         input += u.inputTokens;
         output += u.outputTokens;
         cached += u.cachedInputTokens;
@@ -534,7 +536,7 @@ export class AgentCallExecutor implements AgentExecutor {
     }
 
     const events: AgentEvent[] = [];
-    const parser = this.adapter.createParser();
+    const parser = this.adapter.createParser(this.toRequest(spec));
     const splitter = new NdjsonSplitter();
     const stderrTail = new TailBuffer();
     let finalText: string | undefined;

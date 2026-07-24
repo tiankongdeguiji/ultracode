@@ -11,6 +11,17 @@
 import type { AgentEvent, ErrorKind, NormalizedUsage } from './types.js';
 import { parseJsonLine } from './ndjson.js';
 
+interface StreamJsonParserOptions {
+  /**
+   * Qoder reports a context-window occupancy ratio for each model request but
+   * currently leaves every token counter at zero. When enabled, convert those
+   * per-request snapshots into cumulative model-throughput estimates.
+   */
+  estimateContextUsage?: boolean;
+  /** Requested context window used as the ratio denominator. */
+  contextWindow?: number;
+}
+
 const RESULT_ERROR_KIND: Record<string, ErrorKind> = {
   error_max_turns: 'max-turns',
   error_max_budget_usd: 'budget',
@@ -27,11 +38,63 @@ const ASSISTANT_ERROR_KIND: Record<string, ErrorKind> = {
   server_error: 'infra',
 };
 
-export function createStreamJsonParser(): { push(line: string): AgentEvent[]; end(): AgentEvent[] } {
+export function createStreamJsonParser(
+  options: StreamJsonParserOptions = {},
+): { push(line: string): AgentEvent[]; end(): AgentEvent[] } {
   // The CLI emits one assistant line PER CONTENT BLOCK of an API call (same
   // message.id, byte-identical usage repeated) — deduped here or a text+tool_use
   // turn would count its usage twice in interim accumulation.
-  let lastUsageMessageId: string | undefined;
+  const reportedUsageMessages = new Set<string>();
+  let contextWindow = positiveContextWindow(options.contextWindow);
+  const contextRatios = new Map<string, number>();
+  let contextRatioSum = 0;
+  let lastContextRatio: number | undefined;
+
+  const observeContextRatio = (
+    usage: Record<string, any> | undefined,
+    fallbackKey: string | undefined,
+    terminal: boolean,
+  ): number => {
+    if (!options.estimateContextUsage || !usage) return 0;
+    const ratio = usage.context_usage_ratio;
+    if (typeof ratio !== 'number' || !Number.isFinite(ratio) || ratio <= 0 || ratio > 1) return 0;
+    const requestKey =
+      typeof usage.request_id === 'string'
+        ? `request:${usage.request_id}`
+        : fallbackKey !== undefined
+          ? `message:${fallbackKey}`
+          : undefined;
+    // A terminal result repeats the final assistant request. Older streams may
+    // omit request_id, so identical adjacent ratios are the only safe fallback.
+    if (requestKey === undefined) {
+      if (terminal && lastContextRatio === ratio) return 0;
+      contextRatioSum += ratio;
+      lastContextRatio = ratio;
+      return ratio;
+    }
+    const previous = contextRatios.get(requestKey);
+    if (previous !== undefined && ratio <= previous) return 0;
+    contextRatios.set(requestKey, ratio);
+    const delta = ratio - (previous ?? 0);
+    contextRatioSum += delta;
+    lastContextRatio = ratio;
+    return delta;
+  };
+
+  const estimatedContextUsage = (ratio: number): Partial<NormalizedUsage> | undefined => {
+    if (contextWindow === undefined || ratio <= 0) return undefined;
+    return {
+      // The snapshot covers the entire request context, including hidden
+      // instructions, tool schemas/results, conversation history, and the
+      // generated assistant turn. Keep it in one bucket to avoid double count.
+      inputTokens: Math.max(1, Math.round(ratio * contextWindow)),
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+      estimated: true,
+    };
+  };
+
   return {
     push(line: string): AgentEvent[] {
       const obj = parseJsonLine(line) as Record<string, any> | undefined;
@@ -39,11 +102,14 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
       const out: AgentEvent[] = [];
 
       switch (obj.type) {
-        case 'system':
+        case 'system': {
+          const reportedWindow = contextWindowFromObject(obj);
+          if (reportedWindow !== undefined) contextWindow = reportedWindow;
           if (typeof obj.session_id === 'string') {
             out.push({ kind: 'session', sessionId: obj.session_id, model: typeof obj.model === 'string' ? obj.model : undefined });
           }
           break;
+        }
         case 'assistant': {
           if (typeof obj.session_id === 'string') out.push({ kind: 'session', sessionId: obj.session_id });
           const content = obj.message?.content;
@@ -57,9 +123,18 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
           // surfaced as interim ticks for live progress, never for accounting.
           if (obj.message?.usage && typeof obj.message.usage === 'object') {
             const messageId = typeof obj.message.id === 'string' ? obj.message.id : undefined;
-            if (messageId === undefined || messageId !== lastUsageMessageId) {
-              lastUsageMessageId = messageId;
-              out.push({ kind: 'usage', usage: usageFromResult({ usage: obj.message.usage }), interim: true });
+            const reported = usageFromResult({ usage: obj.message.usage });
+            const ratioDelta = observeContextRatio(obj.message.usage, messageId, false);
+            if (hasTokenUsage(reported)) {
+              if (messageId === undefined || !reportedUsageMessages.has(messageId)) {
+                if (messageId !== undefined) reportedUsageMessages.add(messageId);
+                out.push({ kind: 'usage', usage: reported, interim: true });
+              }
+            } else {
+              // Unlike Claude's byte-identical blocks, Qoder 1.1.4 adds the
+              // ratio only on the final tool/end block of the same message.
+              const estimated = estimatedContextUsage(ratioDelta);
+              if (estimated) out.push({ kind: 'usage', usage: estimated, interim: true });
             }
           }
           if (typeof obj.error === 'string') {
@@ -69,7 +144,15 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
         }
         case 'result': {
           if (typeof obj.session_id === 'string') out.push({ kind: 'session', sessionId: obj.session_id });
-          out.push({ kind: 'usage', usage: usageFromResult(obj) });
+          const reportedWindow = contextWindowFromModelUsage(obj.modelUsage);
+          if (reportedWindow !== undefined) contextWindow = reportedWindow;
+          observeContextRatio(obj.usage, undefined, true);
+          const reported = usageFromResult(obj);
+          const estimated = estimatedContextUsage(contextRatioSum);
+          out.push({
+            kind: 'usage',
+            usage: hasTokenUsage(reported) || estimated === undefined ? reported : estimated,
+          });
           const isError = obj.is_error === true || (typeof obj.subtype === 'string' && obj.subtype.startsWith('error'));
           out.push({
             kind: 'result',
@@ -93,6 +176,37 @@ export function createStreamJsonParser(): { push(line: string): AgentEvent[]; en
       return [];
     },
   };
+}
+
+function positiveContextWindow(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function contextWindowFromObject(obj: Record<string, any>): number | undefined {
+  return (
+    positiveContextWindow(obj.context_window) ??
+    positiveContextWindow(obj.contextWindow) ??
+    positiveContextWindow(obj.model_context_window)
+  );
+}
+
+function contextWindowFromModelUsage(modelUsage: unknown): number | undefined {
+  if (!modelUsage || typeof modelUsage !== 'object') return undefined;
+  const windows = new Set<number>();
+  for (const value of Object.values(modelUsage as Record<string, any>)) {
+    const window = positiveContextWindow(value?.contextWindow);
+    if (window !== undefined) windows.add(window);
+  }
+  return windows.size === 1 ? windows.values().next().value : undefined;
+}
+
+function hasTokenUsage(usage: Partial<NormalizedUsage>): boolean {
+  return (
+    (usage.inputTokens ?? 0) > 0 ||
+    (usage.outputTokens ?? 0) > 0 ||
+    (usage.cachedInputTokens ?? 0) > 0 ||
+    (usage.reasoningTokens ?? 0) > 0
+  );
 }
 
 function usageFromResult(obj: Record<string, any>): Partial<NormalizedUsage> {
