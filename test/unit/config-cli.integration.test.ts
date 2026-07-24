@@ -74,7 +74,7 @@ return agent('MOCK:ok done', { label: 'worker' })`,
     mkdirSync(join(project, '.ultracode'), { recursive: true });
     writeFileSync(
       join(project, '.ultracode', 'config.json'),
-      JSON.stringify({ subagent: { backend: 'mock', model: 'configured', effort: 'high', context_window: 200_000 } }),
+      JSON.stringify({ subagent: { backend: 'mock', model: 'configured', effort: 'high' } }),
     );
     writeFileSync(
       join(project, 'test.workflow.js'),
@@ -88,7 +88,6 @@ return agent('MOCK:ok done', { label: 'worker' })`,
       backend: 'mock',
       model: 'configured',
       effort: 'high',
-      contextWindow: 200_000,
     });
     await waitTerminal(configuredDir);
 
@@ -96,15 +95,118 @@ return agent('MOCK:ok done', { label: 'worker' })`,
       '--backend', 'mock',
       '--model', 'explicit',
       '--effort', 'low',
-      '--context-window', '100000',
     ]);
     const overrideDir = join(store, 'runs', overrideId);
     expect(JSON.parse(readFileSync(join(overrideDir, 'config.json'), 'utf8'))).toMatchObject({
       backend: 'mock',
       model: 'explicit',
       effort: 'low',
-      contextWindow: 100_000,
     });
     await waitTerminal(overrideDir);
+  }, 40_000);
+
+  it('warns when a project backend discards user-profile controls', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-config-cli-layers-'));
+    const project = join(root, 'project');
+    const home = join(root, 'home');
+    const store = join(root, 'store');
+    mkdirSync(join(project, '.ultracode'), { recursive: true });
+    mkdirSync(join(home, '.ultracode'), { recursive: true });
+    writeFileSync(
+      join(home, '.ultracode', 'config.json'),
+      JSON.stringify({
+        subagent: {
+          backend: 'qoder',
+          model: 'Qwen3.8-Max-Preview',
+          effort: 'xhigh',
+          context_window: 1_000_000,
+        },
+      }),
+    );
+    writeFileSync(
+      join(project, '.ultracode', 'config.json'),
+      JSON.stringify({ subagent: { backend: 'mock' } }),
+    );
+    writeFileSync(
+      join(project, 'test.workflow.js'),
+      `export const meta = { name: 'layer-switch-warning', description: 'd' }
+return agent('MOCK:ok done', { label: 'worker' })`,
+    );
+
+    const { stdout, stderr } = await exec(
+      process.execPath,
+      ['--import', tsxLoader, mainTs, 'run', 'test.workflow.js', '--yes', '--detach', '--home', store],
+      { cwd: project, env: { ...process.env, HOME: home } },
+    );
+    const runId = stdout.trim().split('\n')[0]!;
+    const dir = join(store, 'runs', runId);
+    expect(stderr).toContain(
+      "backend override 'mock' differs from configured backend 'qoder'; " +
+      'not inheriting configured model, effort, contextWindow',
+    );
+    expect(JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'))).toMatchObject({
+      backend: 'mock',
+    });
+    expect(JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'))).not.toHaveProperty('model');
+    await waitTerminal(dir);
+  }, 40_000);
+
+  it('starts a fresh profile when an explicit CLI backend differs from config', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-config-cli-switch-'));
+    const project = join(root, 'project');
+    const home = join(root, 'home');
+    const store = join(root, 'store');
+    mkdirSync(join(project, '.ultracode'), { recursive: true });
+    writeFileSync(
+      join(project, '.ultracode', 'config.json'),
+      JSON.stringify({
+        subagent: {
+          backend: 'qoder',
+          model: 'Qwen3.8-Max-Preview',
+          effort: 'xhigh',
+          context_window: 1_000_000,
+        },
+      }),
+    );
+    writeFileSync(
+      join(project, 'test.workflow.js'),
+      `export const meta = { name: 'configured-cli-switch', description: 'd' }
+return agent('MOCK:ok done', { label: 'worker' })`,
+    );
+
+    const { stdout, stderr } = await exec(
+      process.execPath,
+      [
+        '--import', tsxLoader, mainTs, 'run', 'test.workflow.js', '--yes', '--detach',
+        '--home', store, '--backend', 'mock',
+      ],
+      { cwd: project, env: { ...process.env, HOME: home } },
+    );
+    const runId = stdout.trim().split('\n')[0]!;
+    const dir = join(store, 'runs', runId);
+    const config = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
+    expect(config.backend).toBe('mock');
+    expect(config).not.toHaveProperty('model');
+    expect(config).not.toHaveProperty('effort');
+    expect(config).not.toHaveProperty('contextWindow');
+    expect(stderr).toContain(
+      "backend override 'mock' differs from configured backend 'qoder'; " +
+      'not inheriting configured model, effort, contextWindow',
+    );
+    await waitTerminal(dir);
+
+    const incompatible = await exec(
+      process.execPath,
+      [
+        '--import', tsxLoader, mainTs, 'run', 'test.workflow.js', '--yes', '--detach',
+        '--home', join(root, 'bad-store'), '--backend', 'mock', '--context-window', '200000',
+      ],
+      { cwd: project, env: { ...process.env, HOME: home } },
+    ).then(
+      () => undefined,
+      (error: { stderr?: string }) => error,
+    );
+    expect(incompatible?.stderr).toContain('contextWindow is supported only by the qoder backend');
+    expect(existsSync(join(root, 'bad-store'))).toBe(false);
   }, 40_000);
 });

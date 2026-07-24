@@ -8,8 +8,8 @@ import type { AgentEvent, AgentRequest, BackendAdapter } from '../../src/backend
 
 const FIX = join(__dirname, '../fixtures');
 
-function replay(adapter: BackendAdapter, fixture: string): AgentEvent[] {
-  const parser = adapter.createParser();
+function replay(adapter: BackendAdapter, fixture: string, request?: AgentRequest): AgentEvent[] {
+  const parser = adapter.createParser(request);
   const events: AgentEvent[] = [];
   for (const line of readFileSync(join(FIX, fixture), 'utf8').split('\n')) {
     if (line.trim()) events.push(...parser.push(line));
@@ -93,6 +93,14 @@ describe('ClaudeAdapter', () => {
 describe('QoderAdapter', () => {
   const a = new QoderAdapter();
 
+  it('emulates structured output without unsupported schema flags', () => {
+    expect(a.structuredOutput).toBe('emulated');
+    const spawn = a.buildSpawn(req({ schema: { type: 'object' } }));
+    const resume = a.buildResume('sid', 'fix it', req({ schema: { type: 'object' } }))!;
+    expect(spawn.argv).not.toContain('--json-schema');
+    expect(resume.argv).not.toContain('--json-schema');
+  });
+
   it('parses structured_output from the terminal result line', () => {
     const events = replay(a, 'qoder/success-structured.jsonl');
     const result = events.find((e) => e.kind === 'result');
@@ -103,13 +111,301 @@ describe('QoderAdapter', () => {
     expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: true });
   });
 
+  it('estimates cumulative model throughput from per-request context occupancy', () => {
+    const events = replay(a, 'qoder/context-usage.jsonl', req({ contextWindow: 200_000 }));
+    const interim = events.filter(
+      (event): event is Extract<AgentEvent, { kind: 'usage' }> =>
+        event.kind === 'usage' && event.interim === true,
+    );
+    // request-1 spans two content blocks but counts once. Each snapshot is the
+    // complete context processed by that model call, so 10% + 25% of 200k.
+    expect(interim.map((event) => event.usage)).toEqual([
+      expect.objectContaining({ inputTokens: 20_000, estimated: true }),
+      expect.objectContaining({ inputTokens: 50_000, estimated: true }),
+    ]);
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 70_000,
+      totalTokens: 70_000,
+      estimated: true,
+    });
+  });
+
+  it('does not invent a context estimate when the denominator is unknown', () => {
+    const events = replay(a, 'qoder/context-usage.jsonl');
+    expect(events.some((event) => event.kind === 'usage' && event.interim)).toBe(false);
+    expect(a.extractUsage(events)).toMatchObject({ totalTokens: 0, estimated: false });
+  });
+
+  it('settles observed context usage when the stream ends without a result', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = parser.push(JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'message-1',
+        content: [{ type: 'text', text: 'partial' }],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          request_id: 'request-1',
+          context_usage_ratio: 0.25,
+        },
+      },
+    }));
+    events.push(...parser.end());
+    expect(events.filter((event) => event.kind === 'usage')).toEqual([
+      expect.objectContaining({ interim: true, usage: expect.objectContaining({ inputTokens: 50_000 }) }),
+      expect.objectContaining({ usage: expect.objectContaining({ inputTokens: 50_000, estimated: true }) }),
+    ]);
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 50_000,
+      totalTokens: 50_000,
+      estimated: true,
+    });
+  });
+
+  it('settles authoritative assistant usage ahead of a ratio estimate at EOF', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = parser.push(JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'message-1',
+        content: [{ type: 'text', text: 'partial' }],
+        usage: {
+          input_tokens: 800,
+          output_tokens: 20,
+          request_id: 'request-1',
+          context_usage_ratio: 0.25,
+        },
+      },
+    }));
+    events.push(...parser.end());
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 800,
+      outputTokens: 20,
+      totalTokens: 820,
+      estimated: false,
+    });
+  });
+
+  it('combines per-request counters and ratio estimates when terminal counters are zero', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = [
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-1',
+          content: [{ type: 'text', text: 'first' }],
+          usage: {
+            input_tokens: 800,
+            output_tokens: 20,
+            request_id: 'request-1',
+            context_usage_ratio: 0.1,
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-2',
+          content: [{ type: 'text', text: 'second' }],
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            request_id: 'request-2',
+            context_usage_ratio: 0.25,
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'done',
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          request_id: 'request-2',
+          context_usage_ratio: 0.25,
+        },
+      })),
+    ];
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 50_800,
+      outputTokens: 20,
+      totalTokens: 50_820,
+      estimated: true,
+    });
+  });
+
+  it('adds request-scoped terminal counters without dropping earlier requests', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = [
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-1',
+          content: [{ type: 'text', text: 'first' }],
+          usage: {
+            input_tokens: 800,
+            output_tokens: 20,
+            request_id: 'request-1',
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-2',
+          content: [{ type: 'text', text: 'second' }],
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            request_id: 'request-2',
+            context_usage_ratio: 0.25,
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'done',
+        usage: {
+          input_tokens: 900,
+          output_tokens: 30,
+          request_id: 'request-2',
+          context_usage_ratio: 0.25,
+        },
+      })),
+    ];
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 1_700,
+      outputTokens: 50,
+      totalTokens: 1_750,
+      estimated: false,
+    });
+  });
+
+  it('marks mixed counters and ratios incomplete when the context window is unknown', () => {
+    const parser = a.createParser();
+    const events = [
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-1',
+          content: [{ type: 'text', text: 'first' }],
+          usage: {
+            input_tokens: 800,
+            output_tokens: 20,
+            request_id: 'request-1',
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-2',
+          content: [{ type: 'text', text: 'second' }],
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            request_id: 'request-2',
+            context_usage_ratio: 0.25,
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'done',
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          request_id: 'request-2',
+          context_usage_ratio: 0.25,
+        },
+      })),
+    ];
+    expect(events.find(
+      (event) => event.kind === 'usage' && !event.interim,
+    )).toMatchObject({
+      telemetryIncomplete: true,
+      usage: { inputTokens: 800, outputTokens: 20 },
+    });
+  });
+
+  it('covers a message-keyed ratio when terminal counters omit a request ID', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = [
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-1',
+          content: [{ type: 'text', text: 'done' }],
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            context_usage_ratio: 0.25,
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'done',
+        usage: {
+          input_tokens: 800,
+          output_tokens: 20,
+          context_usage_ratio: 0.25,
+        },
+      })),
+    ];
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 800,
+      outputTokens: 20,
+      totalTokens: 820,
+      estimated: false,
+    });
+  });
+
+  it('prefers authoritative token counters when Qoder supplies them', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = parser.push(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'done',
+      usage: {
+        input_tokens: 800,
+        output_tokens: 20,
+        request_id: 'reported-request',
+        context_usage_ratio: 0.5,
+      },
+    }));
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 800,
+      outputTokens: 20,
+      totalTokens: 820,
+      estimated: false,
+    });
+  });
+
   it('maps error_max_turns and exit 41 auth', () => {
     const events = replay(a, 'qoder/error-max-turns.jsonl');
     expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: false, errorKind: 'max-turns' });
     expect(a.classifyExit(41, null, [], 'auth failed')).toMatchObject({ ok: false, errorKind: 'auth', retryable: false });
   });
 
-  it('builds --print --json-schema, agent routing, model controls, and -w cwd', () => {
+  it('keeps a successful terminal result authoritative over incidental stderr', () => {
+    const events = replay(a, 'qoder/success-structured.jsonl');
+    expect(a.classifyExit(0, null, events, 'warning: unknown option mentioned in tool output')).toMatchObject({
+      ok: true,
+    });
+  });
+
+  it('builds --print, agent routing, model controls, and -w cwd', () => {
     const plan = a.buildSpawn(req({
       schema: { type: 'object' },
       agentType: 'uc-xhigh',
@@ -118,7 +414,6 @@ describe('QoderAdapter', () => {
       contextWindow: 200_000,
     }));
     expect(plan.argv).toContain('--print');
-    expect(plan.argv).toContain('--json-schema');
     expect(plan.argv).toEqual(expect.arrayContaining(['--agent', 'uc-xhigh', '-w', '/w']));
     expect(plan.argv).toEqual(expect.arrayContaining([
       '--model', 'coder',
@@ -150,6 +445,15 @@ describe('QoderAdapter', () => {
     expect(argv).not.toContain('--model');
     expect(argv).not.toContain('--reasoning-effort');
     expect(argv).not.toContain('--context-window');
+  });
+
+  it('does not retry unsupported CLI options', () => {
+    expect(a.classifyExit(1, null, [], "error: unknown option '--future-flag'")).toMatchObject({
+      ok: false,
+      errorKind: 'infra',
+      retryable: false,
+      message: expect.stringContaining("unknown option '--future-flag'"),
+    });
   });
 });
 

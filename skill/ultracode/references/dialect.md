@@ -29,7 +29,7 @@ export const meta = {
 | `phase` | progress group; use inside pipeline/parallel stages to avoid races on the global `phase()` pointer |
 | `schema` | JSON Schema → subagent forced through structured output; `agent()` returns the **validated object** |
 | `model` | per-call model override (omit to inherit — usually correct) |
-| `effort` | reasoning effort override for Codex/Qoder/Claude (ultracode engine; Gemini logs and uses its default; NOT portable to Qoder native — use agentType there) |
+| `effort` | reasoning effort override for Codex/Qoder/Claude (ultracode engine; rejected for Gemini before dispatch; NOT portable to Qoder native — use agentType there) |
 | `contextWindow` | positive-integer Qoder CLI context window; ultracode engine only, and rejected on non-Qoder agents |
 | `agentType` | subagent type from the host's registry |
 | `isolation: 'worktree'` | fresh git worktree — ONLY for parallel file mutation that would conflict |
@@ -67,7 +67,7 @@ Progress grouping (seeded from `meta.phases`, matched by exact title) and narrat
 
 ## Caps (engine-enforced, loudly reported)
 
-Concurrency default `min(10, max(2, cores−2))` — `--max-concurrency`, `ULTRACODE_MAX_CONCURRENCY`, or `workflow_start`'s `maxConcurrency` override it (FIFO queue beyond the cap; the env var seeds fresh runs only — resumes inherit the stored value unless explicitly overridden); lifetime 1000 agents hard / 50 soft default (`--max-agents`); 4096 items per parallel/pipeline call. Subagent backend/model/effort and Qoder context-window defaults can come from `~/.ultracode/config.json`, project `.ultracode/config.json`, or launch options; per-call agent options win, and resolved defaults are frozen for resume. Timeouts are user-opt-in and default to UNLIMITED, like budgets: per-attempt via per-call `timeoutMs` (wins) or `workflow_start`'s `attemptTimeoutMs`; run wall-clock via `--timeout <minutes>` or `workflow_start`'s `wallClockMs`. Set them only when the user explicitly asked for a time limit; without one a wedged worker runs until stopped (`stallMs` is the opt-in liveness guard).
+Concurrency default `min(10, max(2, cores−2))` — `--max-concurrency`, `ULTRACODE_MAX_CONCURRENCY`, or `workflow_start`'s `maxConcurrency` override it (FIFO queue beyond the cap; the env var seeds fresh runs only — resumes inherit the stored value unless explicitly overridden); lifetime 1000 agents hard / 50 soft default (`--max-agents`); 4096 items per parallel/pipeline call. Subagent backend/model/effort and Qoder context-window defaults can come from `~/.ultracode/config.json`, project `.ultracode/config.json`, or launch options; per-call agent options win, and resolved defaults are frozen for resume. An explicit backend that differs from the inherited backend starts a fresh profile: model, effort, and contextWindow inherit only when the backend is unchanged. Timeouts are user-opt-in and default to UNLIMITED, like budgets: per-attempt via per-call `timeoutMs` (wins) or `workflow_start`'s `attemptTimeoutMs`; run wall-clock via `--timeout <minutes>` or `workflow_start`'s `wallClockMs`. Set them only when the user explicitly asked for a time limit; without one a wedged worker runs until stopped (`stallMs` is the opt-in liveness guard).
 
 ## Failure-handling idioms
 

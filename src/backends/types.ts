@@ -33,7 +33,7 @@ export interface NormalizedUsage {
   /** input + output + reasoning + round(0.1 × cached) — see usage.ts */
   totalTokens: number;
   costUSD?: number;
-  /** true when derived from a chars/4 estimate because the backend omitted usage */
+  /** true when any portion was inferred because authoritative telemetry was unavailable for it */
   estimated: boolean;
 }
 
@@ -134,8 +134,16 @@ export type AgentEvent =
   | { kind: 'tool'; name: string; status: 'started' | 'completed' | 'failed' | 'declined' }
   /** interim: a mid-run snapshot (per API call) — excluded from usage accounting.
    *  threadCumulative: the figure is the session's running total, not this
-   *  attempt's own (codex turn.completed) — resumed attempts repeat the prefix. */
-  | { kind: 'usage'; usage: Partial<NormalizedUsage>; interim?: boolean; threadCumulative?: boolean }
+   *  attempt's own (codex turn.completed) — resumed attempts repeat the prefix.
+   *  telemetryIncomplete: the reported counters cover only part of this
+   *  attempt, and the adapter could not quantify the uncovered portion. */
+  | {
+      kind: 'usage';
+      usage: Partial<NormalizedUsage>;
+      interim?: boolean;
+      threadCumulative?: boolean;
+      telemetryIncomplete?: boolean;
+    }
   | {
       kind: 'result';
       text?: string;
@@ -187,7 +195,7 @@ export interface BackendAdapter {
   buildSpawn(req: AgentRequest): SpawnPlan;
   buildResume(sessionId: string, followupPrompt: string, req: AgentRequest): SpawnPlan | null;
   /** stateful NDJSON parser; push() per line, end() at EOF */
-  createParser(): { push(line: string): AgentEvent[]; end(): AgentEvent[] };
+  createParser(req?: AgentRequest): { push(line: string): AgentEvent[]; end(): AgentEvent[] };
   classifyExit(
     code: number | null,
     signal: NodeJS.Signals | null,

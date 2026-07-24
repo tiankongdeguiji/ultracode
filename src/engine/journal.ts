@@ -33,7 +33,7 @@ export const KEY_PREFIX = 'u1:';
 // under new CLI semantics; absent entries preserve compatible backend caches.
 const BACKEND_EXECUTION_REVISIONS: Readonly<Record<string, number>> = {
   claude: 2,
-  qoder: 2,
+  qoder: 3,
 };
 
 export function stableStringify(value: unknown): string {

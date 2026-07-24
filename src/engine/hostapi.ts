@@ -26,6 +26,7 @@ import type { BudgetAccount } from '../budget/account.js';
 import type { WorkflowMeta } from './meta.js';
 import type { WorktreeManager } from '../exec/worktree.js';
 import type { RunOutput } from './run.js';
+import { backendOverrideWarning, resolveSubagentProfile, validateSubagentProfile } from '../config.js';
 
 /**
  * State shared across a parent workflow and its one level of nested
@@ -87,7 +88,7 @@ type RunEventBody =
       /** resolved from a prior run's journal (prefix replay) — consumed zero tokens */
       cached?: boolean;
       totalTokens: number;
-      /** the total contains chars/4 estimates (backend omitted usage) */
+      /** the total includes an inferred portion whose authoritative telemetry was unavailable */
       estimated?: boolean;
       /** authoritative tool-call count (started ticks); absent on skip/cached */
       toolCalls?: number;
@@ -312,33 +313,42 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     // no run-level attemptTimeoutMs the result is the unlimited default.
     const timeoutMs = typeof o.timeoutMs === 'number' && Number.isFinite(o.timeoutMs) && o.timeoutMs > 0 ? o.timeoutMs : undefined;
     const phaseTitle = o.phase !== undefined ? ensurePhase(String(o.phase)) : currentPhase;
-    const backend = o.backend ?? opts.defaultBackend;
     const label = o.label ?? `#${seq}`;
-    const effort = o.effort ?? opts.defaultEffort;
     if (
       o.contextWindow !== undefined &&
       (typeof o.contextWindow !== 'number' || !isPositiveInt(o.contextWindow))
     ) {
       throw new TypeError('agent() contextWindow must be a positive integer');
     }
-    if (o.contextWindow !== undefined && backend !== 'qoder') {
-      throw new TypeError(`agent() contextWindow is supported only by the qoder backend, got ${JSON.stringify(backend)}`);
+    const defaults = {
+      backend: opts.defaultBackend,
+      model: opts.defaultModel,
+      effort: opts.defaultEffort,
+      contextWindow: opts.defaultContextWindow,
+    };
+    const resolvedProfile = resolveSubagentProfile(defaults, {
+      backend: o.backend,
+      model: o.model,
+      effort: o.effort,
+      contextWindow: o.contextWindow,
+    });
+    const backend = resolvedProfile.profile.backend ?? opts.defaultBackend;
+    try {
+      validateSubagentProfile({ ...resolvedProfile.profile, backend }, 'agent() profile');
+    } catch (error) {
+      throw new TypeError(error instanceof Error ? error.message : String(error));
     }
-    if (effort !== undefined && backend === 'gemini') {
-      pushLog(`agent[${seq}] ${label}: effort is unsupported by the gemini backend — using the backend default`);
-    }
+    const warning = backendOverrideWarning(defaults, resolvedProfile);
+    if (warning) pushLog(`agent[${seq}] ${label}: ${warning}`);
     return {
       seq,
       prompt,
       label,
       phase: phaseTitle,
       schema: o.schema ? (JSON.parse(JSON.stringify(o.schema)) as JsonSchema) : undefined,
-      model: o.model ?? opts.defaultModel,
-      effort: backend === 'gemini' ? undefined : effort,
-      contextWindow:
-        backend === 'qoder'
-          ? (o.contextWindow ?? opts.defaultContextWindow)
-          : undefined,
+      model: resolvedProfile.profile.model,
+      effort: resolvedProfile.profile.effort,
+      contextWindow: resolvedProfile.profile.contextWindow,
       agentType: o.agentType ?? o.type ?? o.subagent_type,
       isolation: o.isolation as 'worktree' | undefined,
       backend,

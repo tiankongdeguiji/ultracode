@@ -142,7 +142,7 @@ Set user-wide defaults in `~/.ultracode/config.json`, then override individual f
 }
 ```
 
-Per-call parameters on workflow `agent()` override CLI/MCP, project-level, and user-level parameters. CLI/MCP must specify a backend through an argument or configuration; `--dry-run` uses the `mock` backend.
+Per-call parameters on workflow `agent()` override CLI/MCP, project-level, and user-level parameters. CLI/MCP must specify a backend through an argument or configuration; `--dry-run` uses the `mock` backend. An explicit backend override starts a fresh backend profile: model, effort, and context-window defaults configured for a different backend are not inherited.
 
 ### Build from source
 

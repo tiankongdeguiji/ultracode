@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { AgentCallExecutor } from '../../src/engine/agentcall.js';
+import { AgentCallExecutor, resumeContinuationPrompt } from '../../src/engine/agentcall.js';
 import { SCHEMA_REPAIR_LIMIT } from '../../src/backends/structured.js';
 import { parseJsonLine } from '../../src/backends/ndjson.js';
 import { usageFromEvents } from '../../src/backends/usage.js';
@@ -62,7 +62,13 @@ class FakeAdapter implements BackendAdapter {
         if (typeof obj.text === 'string') return [{ kind: 'message', text: obj.text }];
         if (obj.done) {
           const out: AgentEvent[] = [];
-          if (obj.usage) out.push({ kind: 'usage', usage: obj.usage as object });
+          if (obj.usage) {
+            out.push({
+              kind: 'usage',
+              usage: obj.usage as object,
+              ...(obj.incomplete === true ? { telemetryIncomplete: true } : {}),
+            });
+          }
           out.push({ kind: 'result', isError: false });
           return out;
         }
@@ -149,6 +155,58 @@ describe('AgentCallExecutor progress', () => {
     expect(totals[0]).toBe(44);
     for (let i = 1; i < totals.length; i++) expect(totals[i]).toBeGreaterThan(totals[i - 1]!);
     expect(totals.at(-1)).toBeGreaterThanOrEqual(88); // attempt 2 real usage + attempt 1 estimate
+  });
+
+  it('includes retained session context when estimating a resumed retry', async () => {
+    class ResumableFallbackAdapter extends FakeAdapter {
+      override buildResume(_sessionId: string, prompt: string, req: AgentRequest): SpawnPlan {
+        return this.buildSpawn({ ...req, prompt });
+      }
+    }
+    const originalPrompt = 'inspect the complete performance report';
+    const firstOutput = 'partial analysis';
+    const finalOutput = 'done';
+    const adapter = new ResumableFallbackAdapter('native', [
+      { lines: [{ session: 'same-session' }, { text: firstOutput }], exit: 1 },
+      { lines: [{ session: 'same-session' }, { text: finalOutput }, { done: true }] },
+    ]);
+    const outcome = await new AgentCallExecutor(adapter).execute(
+      spec({ prompt: originalPrompt, retries: 1 }),
+      signal,
+    );
+    const continuation = resumeContinuationPrompt('exit 1');
+    expect(outcome.ok).toBe(true);
+    expect(outcome.usage.inputTokens).toBe(
+      Math.ceil(originalPrompt.length / 4) +
+      Math.ceil((originalPrompt.length + firstOutput.length + continuation.length) / 4),
+    );
+    expect(outcome.usage.outputTokens).toBe(
+      Math.ceil(firstOutput.length / 4) + Math.ceil(finalOutput.length / 4),
+    );
+    expect(outcome.usage.estimated).toBe(true);
+  });
+
+  it('adds a fallback when authoritative counters cover only part of an attempt', async () => {
+    const prompt = 'analyze all requests in this tool-heavy turn';
+    const output = 'partial output';
+    const adapter = new FakeAdapter('native', [
+      {
+        lines: [
+          { text: output },
+          {
+            done: true,
+            usage: { inputTokens: 800, outputTokens: 20 },
+            incomplete: true,
+          },
+        ],
+      },
+    ]);
+    const outcome = await new AgentCallExecutor(adapter).execute(spec({ prompt }), signal);
+    expect(outcome.usage).toMatchObject({
+      inputTokens: 800 + Math.ceil(prompt.length / 4),
+      outputTokens: 20 + Math.ceil(output.length / 4),
+      estimated: true,
+    });
   });
 
   it('schema repair emits schema-repair retry progress', async () => {

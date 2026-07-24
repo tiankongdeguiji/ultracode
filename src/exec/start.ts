@@ -12,7 +12,13 @@ import { createRunDir, getRun } from '../store/runstore.js';
 import { isResumableStatus, isTerminal } from '../store/manifest.js';
 import { launchRunner } from './daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../backends/ids.js';
-import { loadSubagentConfig, type SubagentDefaults } from '../config.js';
+import {
+  backendOverrideWarning,
+  loadSubagentConfigWithWarnings,
+  resolveSubagentProfile,
+  validateSubagentProfile,
+  type SubagentDefaults,
+} from '../config.js';
 
 export interface StartRunInput {
   script?: string;
@@ -46,6 +52,7 @@ export interface StartRunResult {
   model?: string;
   effort?: string;
   contextWindow?: number;
+  warnings: string[];
 }
 
 export { IMPLEMENTED_BACKENDS } from '../backends/ids.js';
@@ -60,7 +67,13 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
   const cwd = input.cwd ?? process.cwd();
   const root = ultracodeRoot(cwd, input.home);
 
-  const defaults: SubagentDefaults = input.resumeFromRunId ? {} : loadSubagentConfig(cwd);
+  let defaults: SubagentDefaults = {};
+  let warnings: string[] = [];
+  if (!input.resumeFromRunId) {
+    const loaded = loadSubagentConfigWithWarnings(cwd);
+    defaults = loaded.defaults;
+    warnings = loaded.warnings;
+  }
   if (!input.resumeFromRunId && input.requireBackend && input.backend === undefined && defaults.backend === undefined) {
     throw new Error(
       'workflow_start requires an explicit backend or subagent.backend in ultracode config ' +
@@ -70,11 +83,19 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
 
   let source = input.script;
   let args = input.args ?? null;
+  const freshProfile = resolveSubagentProfile(defaults, {
+    backend: input.backend,
+    model: input.model,
+    effort: input.effort,
+    contextWindow: input.contextWindow,
+  });
+  const freshWarning = backendOverrideWarning(defaults, freshProfile);
+  if (freshWarning && !warnings.includes(freshWarning)) warnings.push(freshWarning);
   let config = {
-    backend: input.backend ?? defaults.backend ?? 'mock',
-    model: input.model ?? defaults.model,
-    effort: input.effort ?? defaults.effort,
-    contextWindow: input.contextWindow ?? defaults.contextWindow,
+    backend: freshProfile.profile.backend ?? 'mock',
+    model: freshProfile.profile.model,
+    effort: freshProfile.profile.effort,
+    contextWindow: freshProfile.profile.contextWindow,
     cwd,
     maxAgents: input.maxAgents,
     maxConcurrency: input.maxConcurrency ?? defaultConcurrency(),
@@ -110,11 +131,19 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     // backend is part of the cache key, that silently reruns everything on mock
     // instead of resuming. (cwd stays the prior run's for cache-key stability.)
     const priorConfig = JSON.parse(readFileSync(join(prior.dir, 'config.json'), 'utf8'));
-    config = { ...priorConfig, resumeFromRunId: input.resumeFromRunId };
-    if (input.backend !== undefined) config.backend = input.backend;
-    if (input.model !== undefined) config.model = input.model;
-    if (input.effort !== undefined) config.effort = input.effort;
-    if (input.contextWindow !== undefined) config.contextWindow = input.contextWindow;
+    const resumedProfile = resolveSubagentProfile(priorConfig, {
+      backend: input.backend,
+      model: input.model,
+      effort: input.effort,
+      contextWindow: input.contextWindow,
+    });
+    const resumedWarning = backendOverrideWarning(priorConfig, resumedProfile);
+    warnings = resumedWarning ? [resumedWarning] : [];
+    config = {
+      ...priorConfig,
+      ...resumedProfile.profile,
+      resumeFromRunId: input.resumeFromRunId,
+    };
     if (input.maxAgents !== undefined) config.maxAgents = input.maxAgents;
     if (input.maxConcurrency !== undefined) config.maxConcurrency = input.maxConcurrency;
     if (input.budgetTotal !== undefined) config.budgetTotal = input.budgetTotal;
@@ -138,6 +167,7 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
   if (config.contextWindow !== undefined && !isPositiveInt(config.contextWindow)) {
     throw new Error('contextWindow must be a positive integer');
   }
+  validateSubagentProfile(config, 'workflow defaults');
 
   const parsed = parseWorkflowScript(source);
   validateArgsAgainstInputSchema(parsed, args ?? undefined);
@@ -153,5 +183,6 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     model: config.model,
     effort: config.effort,
     contextWindow: config.contextWindow,
+    warnings,
   };
 }

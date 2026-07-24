@@ -11,7 +11,13 @@ import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
-import { loadSubagentConfig, type SubagentDefaults } from '../config.js';
+import {
+  backendOverrideWarning,
+  loadSubagentConfigWithWarnings,
+  resolveSubagentProfile,
+  validateSubagentProfile,
+  type SubagentDefaults,
+} from '../config.js';
 import { attachForeground, printOutput } from './lifecycle.js';
 import { readContextWindowOpt, readMaxConcurrencyOpt, readNonEmptyOpt, refuseInsideWorker } from './options.js';
 import { validateScript } from './validate.js';
@@ -49,13 +55,24 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
   if (!opts.dryRun && refuseInsideWorker('start a run', opts.allowNested)) return 1;
 
   let defaults: SubagentDefaults;
+  let configWarnings: string[];
   try {
-    defaults = loadSubagentConfig(process.cwd());
+    ({ defaults, warnings: configWarnings } = loadSubagentConfigWithWarnings(process.cwd()));
   } catch (err) {
     process.stderr.write(`ultracode: ${(err as Error).message}\n`);
     return 1;
   }
-  const backend = opts.backend ?? defaults.backend ?? (opts.dryRun ? 'mock' : undefined);
+  const modelOpt = readNonEmptyOpt(opts.model, '--model');
+  const effortOpt = readNonEmptyOpt(opts.effort, '--effort');
+  const contextWindowOpt = readContextWindowOpt(opts.contextWindow);
+  if (!modelOpt.ok || !effortOpt.ok || !contextWindowOpt.ok) return 1;
+  const resolvedProfile = resolveSubagentProfile(defaults, {
+    backend: opts.backend,
+    model: modelOpt.value,
+    effort: effortOpt.value,
+    contextWindow: contextWindowOpt.value,
+  });
+  const backend = resolvedProfile.profile.backend ?? (opts.dryRun ? 'mock' : undefined);
   if (backend === undefined) {
     process.stderr.write(
       `ultracode: run requires --backend or subagent.backend in ultracode config ` +
@@ -69,13 +86,18 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
     );
     return 1;
   }
-  const modelOpt = readNonEmptyOpt(opts.model, '--model');
-  const effortOpt = readNonEmptyOpt(opts.effort, '--effort');
-  const contextWindowOpt = readContextWindowOpt(opts.contextWindow);
-  if (!modelOpt.ok || !effortOpt.ok || !contextWindowOpt.ok) return 1;
-  const model = modelOpt.value ?? defaults.model;
-  const effort = effortOpt.value ?? defaults.effort;
-  const contextWindow = contextWindowOpt.value ?? defaults.contextWindow;
+  const profile = { ...resolvedProfile.profile, backend };
+  try {
+    validateSubagentProfile(profile, 'workflow defaults');
+  } catch (err) {
+    process.stderr.write(`ultracode: ${(err as Error).message}\n`);
+    return 1;
+  }
+  const warning = backendOverrideWarning(defaults, resolvedProfile);
+  for (const message of new Set([...configWarnings, ...(warning ? [warning] : [])])) {
+    process.stderr.write(`ultracode: warning: ${message}\n`);
+  }
+  const { model, effort, contextWindow } = profile;
 
   let source: string;
   try {

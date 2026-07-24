@@ -1,8 +1,7 @@
 /**
- * qodercli --print worker adapter. Native structured output via the
- * undocumented --json-schema flag (SDK-source-proven) → structured_output on
- * the terminal result line; the engine ALWAYS revalidates with ajv, so if
- * the flag ever drops, correctness is unaffected (more repair turns only).
+ * qodercli --print worker adapter. Qoder has no supported schema CLI flag, so
+ * structured output uses the engine's prompt contract and local ajv repair
+ * loop instead of relying on an unstable command-line surface.
  *
  * exit 41 = auth (terminal); PAT auth is stateless and parallel-safe, but a
  * stored /login credential silently overrides the env PAT.
@@ -13,7 +12,6 @@ import type {
   BackendAdapter,
   BackendProbe,
   ExitClass,
-  JsonSchema,
   NormalizedUsage,
   SpawnPlan,
 } from './types.js';
@@ -31,7 +29,7 @@ export const QODER_AUTH_EXIT = 41;
 
 export class QoderAdapter implements BackendAdapter {
   readonly id = 'qoder' as const;
-  readonly structuredOutput = 'native' as const;
+  readonly structuredOutput = 'emulated' as const;
 
   constructor(private readonly bin = process.env.ULTRACODE_QODER_BIN ?? 'qodercli') {}
 
@@ -51,10 +49,6 @@ export class QoderAdapter implements BackendAdapter {
     });
   }
 
-  checkSchema(schema: JsonSchema): { ok: true; wireSchema: JsonSchema } {
-    return { ok: true, wireSchema: schema };
-  }
-
   buildSpawn(req: AgentRequest): SpawnPlan {
     const argv = [
       '--print',
@@ -69,7 +63,6 @@ export class QoderAdapter implements BackendAdapter {
     if (req.effort) argv.push('--reasoning-effort', req.effort);
     if (req.contextWindow) argv.push('--context-window', String(req.contextWindow));
     if (req.agentType) argv.push('--agent', req.agentType);
-    if (req.schema) argv.push('--json-schema', JSON.stringify(req.schema));
     return { bin: this.bin, argv, env: req.env, stdinData: req.prompt };
   }
 
@@ -92,12 +85,14 @@ export class QoderAdapter implements BackendAdapter {
     if (req.effort) argv.push('--reasoning-effort', req.effort);
     if (req.contextWindow) argv.push('--context-window', String(req.contextWindow));
     if (req.agentType) argv.push('--agent', req.agentType);
-    if (req.schema) argv.push('--json-schema', JSON.stringify(req.schema));
     return { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
   }
 
-  createParser() {
-    return createStreamJsonParser();
+  createParser(req?: AgentRequest) {
+    return createStreamJsonParser({
+      estimateContextUsage: true,
+      contextWindow: req?.contextWindow,
+    });
   }
 
   classifyExit(code: number | null, signal: NodeJS.Signals | null, events: AgentEvent[], stderrTail: string): ExitClass {
@@ -110,6 +105,14 @@ export class QoderAdapter implements BackendAdapter {
     const result = events.filter((e): e is Extract<AgentEvent, { kind: 'result' }> => e.kind === 'result').pop();
     if (code === 0 && result && result.kind === 'result' && !result.isError) {
       return { ok: true, retryable: false, message: 'ok' };
+    }
+    if (/\bunknown option\b/i.test(stderrTail)) {
+      return {
+        ok: false,
+        errorKind: 'infra',
+        retryable: false,
+        message: `qodercli rejected an unsupported CLI option: ${stderrTail.slice(-300)}`,
+      };
     }
     if (result && result.kind === 'result' && result.isError) {
       const kind = result.errorKind ?? 'infra';

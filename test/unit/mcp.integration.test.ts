@@ -83,6 +83,14 @@ describe('MCP triad', () => {
       // augmented calls no host makes. Neither may ever appear.
       expect(support === undefined || support === 'forbidden').toBe(true);
     }
+    const start = tools.tools.find((t) => t.name === 'workflow_start')!;
+    expect(start.description).toContain(
+      'if either exists, omit backend/model/effort/contextWindow so config wins',
+    );
+    expect(start.description).toContain(
+      'only if both are absent, infer the current Codex/Qoder/Gemini host and pass backend alone',
+    );
+    expect(start.description).toContain('Never infer model/effort/contextWindow');
   });
 
   it('start → status(poll) → result: full round trip on the mock backend', async () => {
@@ -126,7 +134,7 @@ describe('MCP triad', () => {
 
     const configPath = join(projectDir, '.ultracode', 'config.json');
     writeFileSync(configPath, JSON.stringify({
-      subagent: { backend: 'mock', model: 'configured-model', effort: 'high', context_window: 200_000 },
+      subagent: { backend: 'mock', model: 'configured-model', effort: 'high' },
     }));
     let runId: string | undefined;
     let terminal = false;
@@ -141,7 +149,6 @@ describe('MCP triad', () => {
           backend?: string;
           model?: string;
           effort?: string;
-          contextWindow?: number;
         };
         isError?: boolean;
       };
@@ -151,13 +158,11 @@ describe('MCP triad', () => {
         backend: 'mock',
         model: 'configured-model',
         effort: 'high',
-        contextWindow: 200_000,
       });
       expect(JSON.parse(readFileSync(join(start.structuredContent!.runDir!, 'config.json'), 'utf8'))).toMatchObject({
         backend: 'mock',
         model: 'configured-model',
         effort: 'high',
-        contextWindow: 200_000,
       });
 
       let offset = 0;
@@ -180,6 +185,180 @@ describe('MCP triad', () => {
           /* cleanup is best-effort after a failed assertion */
         }
       }
+    }
+  }, 45_000);
+
+  it('does not inherit configured controls when workflow_start switches backends', async () => {
+    const configPath = join(projectDir, '.ultracode', 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      subagent: {
+        backend: 'qoder',
+        model: 'Qwen3.8-Max-Preview',
+        effort: 'xhigh',
+        context_window: 1_000_000,
+      },
+    }));
+    const runIds: string[] = [];
+    try {
+      const switched = (await client.callTool({
+        name: 'workflow_start',
+        arguments: { script: HELLO, backend: 'mock' },
+      })) as {
+        structuredContent?: {
+          runId?: string;
+          runDir?: string;
+          backend?: string;
+          model?: string;
+          effort?: string;
+          contextWindow?: number;
+          warnings?: string[];
+        };
+        isError?: boolean;
+      };
+      expect(switched.isError).toBeFalsy();
+      runIds.push(switched.structuredContent!.runId!);
+      expect(switched.structuredContent).toMatchObject({
+        backend: 'mock',
+        warnings: [
+          "backend override 'mock' differs from configured backend 'qoder'; " +
+          'not inheriting configured model, effort, contextWindow',
+        ],
+      });
+      expect(switched.structuredContent).not.toHaveProperty('model');
+      expect(switched.structuredContent).not.toHaveProperty('effort');
+      expect(switched.structuredContent).not.toHaveProperty('contextWindow');
+      const switchedConfig = JSON.parse(readFileSync(join(switched.structuredContent!.runDir!, 'config.json'), 'utf8'));
+      expect(switchedConfig.backend).toBe('mock');
+      expect(switchedConfig).not.toHaveProperty('model');
+      expect(switchedConfig).not.toHaveProperty('effort');
+      expect(switchedConfig).not.toHaveProperty('contextWindow');
+
+      const explicit = (await client.callTool({
+        name: 'workflow_start',
+        arguments: {
+          script: HELLO,
+          backend: 'mock',
+          model: 'explicit-model',
+          effort: 'low',
+        },
+      })) as {
+        structuredContent?: {
+          runId?: string;
+          runDir?: string;
+          warnings?: string[];
+        };
+        isError?: boolean;
+      };
+      expect(explicit.isError).toBeFalsy();
+      runIds.push(explicit.structuredContent!.runId!);
+      expect(JSON.parse(readFileSync(join(explicit.structuredContent!.runDir!, 'config.json'), 'utf8'))).toMatchObject({
+        backend: 'mock',
+        model: 'explicit-model',
+        effort: 'low',
+      });
+      expect(explicit.structuredContent!.warnings).toEqual([
+        "backend override 'mock' differs from configured backend 'qoder'; not inheriting configured contextWindow",
+      ]);
+
+      const incompatible = (await client.callTool({
+        name: 'workflow_start',
+        arguments: { script: HELLO, backend: 'mock', contextWindow: 200_000 },
+      })) as { content: { text: string }[]; isError?: boolean };
+      expect(incompatible.isError).toBe(true);
+      expect(incompatible.content[0]!.text).toContain(
+        'contextWindow is supported only by the qoder backend',
+      );
+
+      for (const runId of runIds) {
+        let terminal = false;
+        let offset = 0;
+        for (let i = 0; i < 20; i++) {
+          const status = (await client.callTool({
+            name: 'workflow_status',
+            arguments: { runId, waitSeconds: 2, sinceEventOffset: offset },
+          })) as { structuredContent?: { terminal?: boolean; nextEventOffset?: number } };
+          offset = status.structuredContent!.nextEventOffset ?? offset;
+          terminal = status.structuredContent!.terminal ?? false;
+          if (terminal) break;
+        }
+        expect(terminal).toBe(true);
+      }
+    } finally {
+      rmSync(configPath, { force: true });
+      for (const runId of runIds) {
+        try {
+          await client.callTool({ name: 'workflow_stop', arguments: { runId } });
+        } catch {
+          /* cleanup is best-effort after a failed assertion */
+        }
+      }
+    }
+  }, 60_000);
+
+  it('returns warnings when project config switches the user backend profile', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-mcp-config-layers-'));
+    const home = join(root, 'home');
+    const project = join(root, 'project');
+    mkdirSync(join(home, '.ultracode'), { recursive: true });
+    mkdirSync(join(project, '.ultracode'), { recursive: true });
+    writeFileSync(join(home, '.ultracode', 'config.json'), JSON.stringify({
+      subagent: {
+        backend: 'qoder',
+        model: 'Qwen3.8-Max-Preview',
+        effort: 'xhigh',
+        context_window: 1_000_000,
+      },
+    }));
+    writeFileSync(join(project, '.ultracode', 'config.json'), JSON.stringify({
+      subagent: { backend: 'mock' },
+    }));
+
+    const layeredClient = new Client({ name: 'layered-config-client', version: '0.0.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', tsxLoader, mainTs, 'mcp'],
+      cwd: project,
+      env: childEnv(home),
+    });
+    let runId: string | undefined;
+    try {
+      await layeredClient.connect(transport);
+      const start = (await layeredClient.callTool({
+        name: 'workflow_start',
+        arguments: { script: HELLO },
+      })) as {
+        structuredContent?: {
+          runId?: string;
+          runDir?: string;
+          backend?: string;
+          warnings?: string[];
+        };
+        isError?: boolean;
+      };
+      expect(start.isError).toBeFalsy();
+      runId = start.structuredContent!.runId!;
+      expect(start.structuredContent).toMatchObject({
+        backend: 'mock',
+        warnings: [
+          "backend override 'mock' differs from configured backend 'qoder'; " +
+          'not inheriting configured model, effort, contextWindow',
+        ],
+      });
+      expect(start.structuredContent).not.toHaveProperty('model');
+      expect(start.structuredContent).not.toHaveProperty('effort');
+      expect(start.structuredContent).not.toHaveProperty('contextWindow');
+      const stored = JSON.parse(readFileSync(join(start.structuredContent!.runDir!, 'config.json'), 'utf8'));
+      expect(stored.backend).toBe('mock');
+      expect(stored).not.toHaveProperty('model');
+    } finally {
+      if (runId !== undefined) {
+        try {
+          await layeredClient.callTool({ name: 'workflow_stop', arguments: { runId } });
+        } catch {
+          /* cleanup is best-effort after a failed assertion */
+        }
+      }
+      await layeredClient.close();
     }
   }, 45_000);
 

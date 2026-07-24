@@ -79,6 +79,14 @@ describe('KeyChain', () => {
     }
   });
 
+  it('Qoder schema emulation diverges from revision-2 replay keys', () => {
+    const seed = seedKey(null);
+    const request = spec({ backend: 'qoder', schema: { type: 'object' } });
+    const nativeSchemaKey = new KeyChain(seed, ROOT, { qoder: 2 }).next(request);
+    const emulatedSchemaKey = new KeyChain(seed, ROOT).next(request);
+    expect(emulatedSchemaKey).not.toBe(nativeSchemaKey);
+  });
+
   it('cwd equal to the run root is omitted from the hash', () => {
     const seed = seedKey(null);
     const atRoot = new KeyChain(seed, ROOT).next(spec({ cwd: ROOT }));

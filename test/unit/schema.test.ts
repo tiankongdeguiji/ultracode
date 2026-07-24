@@ -114,6 +114,7 @@ class FakeAdapter implements BackendAdapter {
   readonly id = 'mock' as const;
   spawnCount = 0;
   resumeCount = 0;
+  inputPrompts: string[] = [];
 
   constructor(
     readonly structuredOutput: 'native' | 'emulated',
@@ -130,21 +131,24 @@ class FakeAdapter implements BackendAdapter {
     return { ok: true as const, wireSchema: schema };
   }
 
-  private planFor(lines: string[]): SpawnPlan {
+  private planFor(lines: string[], prompt: string): SpawnPlan {
     const script = lines.map((l) => `console.log(${JSON.stringify(l)})`).join(';');
-    return { bin: process.execPath, argv: ['-e', script], env: {} };
+    this.inputPrompts.push(prompt);
+    return { bin: process.execPath, argv: ['-e', script], env: {}, stdinData: prompt };
   }
 
-  buildSpawn(_req: AgentRequest): SpawnPlan {
+  buildSpawn(req: AgentRequest): SpawnPlan {
     const lines = this.scripts[Math.min(this.spawnCount, this.scripts.length - 1)]!;
     this.spawnCount++;
-    return this.planFor(lines);
+    return this.planFor(lines, req.prompt);
   }
 
-  buildResume(_sessionId: string, _prompt: string, req: AgentRequest): SpawnPlan | null {
+  buildResume(_sessionId: string, prompt: string, _req: AgentRequest): SpawnPlan | null {
     if (!this.withSession) return null;
     this.resumeCount++;
-    return this.buildSpawn(req);
+    const lines = this.scripts[Math.min(this.spawnCount, this.scripts.length - 1)]!;
+    this.spawnCount++;
+    return this.planFor(lines, prompt);
   }
 
   createParser() {
@@ -206,8 +210,9 @@ describe('AgentCallExecutor structured-output pipeline', () => {
   });
 
   it('invalid answer repaired via resume: buildResume used once, validated object returned', async () => {
+    const firstOutput = '{"count": "three"}';
     const adapter = new FakeAdapter('native', [
-      [JSON.stringify({ session: 's1' }), JSON.stringify({ text: '{"count": "three"}' }), JSON.stringify({ done: 1 })],
+      [JSON.stringify({ session: 's1' }), JSON.stringify({ text: firstOutput }), JSON.stringify({ done: 1 })],
       [JSON.stringify({ text: '{"count": 3}' }), JSON.stringify({ done: 1 })],
     ]);
     const ex = new AgentCallExecutor(adapter);
@@ -216,6 +221,10 @@ describe('AgentCallExecutor structured-output pipeline', () => {
     expect(outcome.value).toEqual({ count: 3 });
     expect(adapter.resumeCount).toBe(1);
     expect(adapter.spawnCount).toBe(2);
+    expect(outcome.usage.inputTokens).toBe(
+      Math.ceil('task'.length / 4) +
+      Math.ceil(('task'.length + firstOutput.length + adapter.inputPrompts[1]!.length) / 4),
+    );
   });
 
   it('persistently invalid: fails after exactly 2 repairs with structured-output-retries', async () => {
@@ -243,6 +252,11 @@ describe('AgentCallExecutor structured-output pipeline', () => {
     expect(outcome.value).toEqual({ count: 7 });
     expect(adapter.resumeCount).toBe(0);
     expect(adapter.spawnCount).toBe(2);
+    expect(outcome.usage.inputTokens).toBe(
+      adapter.inputPrompts.reduce((sum, prompt) => sum + Math.ceil(prompt.length / 4), 0),
+    );
+    expect(adapter.inputPrompts[0]).toContain('Respond with ONLY a single JSON value');
+    expect(adapter.inputPrompts[1]).toContain('failed JSON Schema validation');
   });
 
   it('schema failures do not consume task retries (retries:5 still fails after 2 repairs)', async () => {

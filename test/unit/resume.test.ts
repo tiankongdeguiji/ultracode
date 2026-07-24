@@ -173,7 +173,7 @@ describe('runner-level resume (detached processes)', () => {
     mkdirSync(projectConfigDir, { recursive: true });
     const configPath = join(projectConfigDir, 'config.json');
     writeFileSync(configPath, JSON.stringify({
-      subagent: { backend: 'mock', model: 'configured-v1', effort: 'high', context_window: 200_000 },
+      subagent: { backend: 'mock', model: 'configured-v1', effort: 'high' },
     }));
     const source = `export const meta = { name: 'configured', description: 'd' }
 return agent('MOCK:ok configured', { label: 'one' })`;
@@ -183,13 +183,11 @@ return agent('MOCK:ok configured', { label: 'one' })`;
       backend: 'mock',
       model: 'configured-v1',
       effort: 'high',
-      contextWindow: 200_000,
     });
     expect(readRunConfig(first.dir)).toMatchObject({
       backend: 'mock',
       model: 'configured-v1',
       effort: 'high',
-      contextWindow: 200_000,
     });
     await waitTerminal(first.dir);
 
@@ -201,7 +199,6 @@ return agent('MOCK:ok configured', { label: 'one' })`;
       backend: 'mock',
       model: 'configured-v1',
       effort: 'high',
-      contextWindow: 200_000,
     });
     await waitTerminal(resumed.dir);
 
@@ -211,15 +208,52 @@ return agent('MOCK:ok configured', { label: 'one' })`;
       home: root,
       model: 'explicit',
       effort: 'xhigh',
-      contextWindow: 300_000,
     });
     expect(readRunConfig(overridden.dir)).toMatchObject({
       backend: 'mock',
       model: 'explicit',
       effort: 'xhigh',
-      contextWindow: 300_000,
     });
     await waitTerminal(overridden.dir);
+  }, 40_000);
+
+  it('does not inherit stored model controls when resume switches backends', async () => {
+    const { startDetachedRun } = await import('../../src/exec/start.js');
+    const root = mkdtempSync(join(tmpdir(), 'uc-resume-profile-switch-'));
+    const source = `export const meta = { name: 'profile-switch', description: 'd' }
+return agent('MOCK:ok done', { label: 'one' })`;
+    const prior = await startDetachedRun({
+      script: source,
+      cwd: root,
+      home: root,
+      backend: 'mock',
+      requireBackend: true,
+    });
+    await waitTerminal(prior.dir);
+
+    writeFileSync(join(prior.dir, 'config.json'), JSON.stringify({
+      ...readRunConfig(prior.dir),
+      backend: 'qoder',
+      model: 'Qwen3.8-Max-Preview',
+      effort: 'xhigh',
+      contextWindow: 1_000_000,
+    }));
+    const resumed = await startDetachedRun({
+      resumeFromRunId: prior.runId,
+      cwd: root,
+      home: root,
+      backend: 'mock',
+      requireBackend: true,
+    });
+    expect(readRunConfig(resumed.dir)).toMatchObject({ backend: 'mock' });
+    expect(readRunConfig(resumed.dir)).not.toHaveProperty('model');
+    expect(readRunConfig(resumed.dir)).not.toHaveProperty('effort');
+    expect(readRunConfig(resumed.dir)).not.toHaveProperty('contextWindow');
+    expect(resumed.warnings).toEqual([
+      "backend override 'mock' differs from configured backend 'qoder'; " +
+      'not inheriting configured model, effort, contextWindow',
+    ]);
+    await waitTerminal(resumed.dir);
   }, 40_000);
 
   it('rejects CLI and execution-API resume until incomplete cleanup is verified', async () => {
@@ -373,7 +407,6 @@ return await agent('MOCK:ok v', { label: 'one' })`;
           maxConcurrency: '5',
           model: 'resume-model',
           effort: 'high',
-          contextWindow: '200000',
         }),
       ).toBe(0);
       const overrideDir = join(root, 'runs', outs.join('').trim().split('\n')[0]!);
@@ -381,7 +414,6 @@ return await agent('MOCK:ok v', { label: 'one' })`;
       expect(readRunConfig(overrideDir)).toMatchObject({
         model: 'resume-model',
         effort: 'high',
-        contextWindow: 200_000,
       });
       await waitTerminal(overrideDir);
 

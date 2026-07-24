@@ -23,17 +23,96 @@ const configSchema = z.object({
 /** Maximum size of either layered configuration file. */
 export const MAX_CONFIG_BYTES = 64 * 1024;
 
-export interface SubagentDefaults {
-  backend?: ImplementedBackendId;
+export interface SubagentProfile {
+  backend?: string;
   model?: string;
   effort?: string;
   /** Qoder-only context window, in tokens. */
   contextWindow?: number;
 }
 
+export interface SubagentDefaults extends SubagentProfile {
+  backend?: ImplementedBackendId;
+}
+
+export type BackendScopedDefault = 'model' | 'effort' | 'contextWindow';
+
+export interface ResolvedSubagentProfile {
+  profile: SubagentProfile;
+  /** Configured controls intentionally dropped after switching backends. */
+  ignoredDefaults: BackendScopedDefault[];
+}
+
 export interface LoadSubagentConfigOptions {
   /** Test seam; production defaults to the operating-system home directory. */
   userHome?: string;
+}
+
+export interface LoadedSubagentConfig {
+  defaults: SubagentDefaults;
+  /** Backend-profile controls discarded while overlaying config layers. */
+  warnings: string[];
+}
+
+/**
+ * Resolves launch or per-agent overrides without leaking one backend's controls
+ * into another backend. An explicit backend switch starts a fresh profile;
+ * otherwise unspecified controls continue to inherit normally.
+ */
+export function resolveSubagentProfile(
+  defaults: SubagentProfile,
+  overrides: SubagentProfile,
+): ResolvedSubagentProfile {
+  const switchesBackend =
+    overrides.backend !== undefined &&
+    defaults.backend !== undefined &&
+    overrides.backend !== defaults.backend;
+  const ignoredDefaults: BackendScopedDefault[] = [];
+  const inherited = <K extends BackendScopedDefault>(key: K): SubagentProfile[K] => {
+    if (!switchesBackend) return overrides[key] ?? defaults[key];
+    if (overrides[key] !== undefined) return overrides[key];
+    if (defaults[key] !== undefined) ignoredDefaults.push(key);
+    return undefined;
+  };
+
+  return {
+    profile: {
+      backend: overrides.backend ?? defaults.backend,
+      model: inherited('model'),
+      effort: inherited('effort'),
+      contextWindow: inherited('contextWindow'),
+    },
+    ignoredDefaults,
+  };
+}
+
+/** Human-readable warning for controls dropped by an explicit backend switch. */
+export function backendOverrideWarning(
+  defaults: SubagentProfile,
+  resolved: ResolvedSubagentProfile,
+): string | undefined {
+  if (resolved.ignoredDefaults.length === 0) return undefined;
+  return (
+    `backend override ${diagnosticValue(resolved.profile.backend)} differs from configured backend ` +
+    `${diagnosticValue(defaults.backend)}; ` +
+    `not inheriting configured ${resolved.ignoredDefaults.join(', ')}`
+  );
+}
+
+function diagnosticValue(value: unknown): string {
+  const escaped = JSON.stringify(String(value)).slice(1, -1).replaceAll("'", "\\'");
+  const bounded = escaped.length > 160 ? `${escaped.slice(0, 157)}...` : escaped;
+  return `'${bounded}'`;
+}
+
+/** Rejects controls that the selected backend is known not to support. */
+export function validateSubagentProfile(profile: SubagentProfile, subject = 'subagent profile'): void {
+  if (profile.contextWindow !== undefined && profile.backend !== 'qoder') {
+    throw new Error(`${subject}: contextWindow is supported only by the qoder backend, got ${JSON.stringify(profile.backend)}`);
+  }
+  if (profile.effort !== undefined && profile.backend === 'gemini') {
+    throw new Error(`${subject}: effort is unsupported by the gemini backend; omit it to use the backend default`);
+  }
 }
 
 function readConfigSource(path: string): string | undefined {
@@ -90,23 +169,50 @@ function readConfigFile(path: string): SubagentDefaults | undefined {
   };
 }
 
-/** User defaults are overlaid field-by-field by project defaults. */
+/**
+ * User defaults are overlaid by project defaults as backend profiles. A
+ * project-level backend switch drops backend-scoped controls from the user
+ * profile instead of leaking them into the new backend.
+ */
 export function loadSubagentConfig(
   cwd: string,
   opts: LoadSubagentConfigOptions = {},
 ): SubagentDefaults {
+  return loadSubagentConfigWithWarnings(cwd, opts).defaults;
+}
+
+/**
+ * Loads the layered profile together with diagnostics for controls discarded
+ * by a backend switch between the user and project configuration files.
+ */
+export function loadSubagentConfigWithWarnings(
+  cwd: string,
+  opts: LoadSubagentConfigOptions = {},
+): LoadedSubagentConfig {
   const paths = [
     join(opts.userHome ?? homedir(), '.ultracode', 'config.json'),
     join(resolve(cwd), '.ultracode', 'config.json'),
   ];
-  const defaults: SubagentDefaults = {};
+  let defaults: SubagentDefaults = {};
+  const warnings: string[] = [];
   const seen = new Set<string>();
   for (const path of paths) {
     const absolute = resolve(path);
     if (seen.has(absolute)) continue;
     seen.add(absolute);
     const config = readConfigFile(absolute);
-    if (config) Object.assign(defaults, config);
+    if (config) {
+      const resolved = resolveSubagentProfile(defaults, config);
+      const warning = backendOverrideWarning(defaults, resolved);
+      if (warning) warnings.push(warning);
+      const { profile } = resolved;
+      defaults = {
+        ...(profile.backend !== undefined ? { backend: profile.backend as ImplementedBackendId } : {}),
+        ...(profile.model !== undefined ? { model: profile.model } : {}),
+        ...(profile.effort !== undefined ? { effort: profile.effort } : {}),
+        ...(profile.contextWindow !== undefined ? { contextWindow: profile.contextWindow } : {}),
+      };
+    }
   }
-  return defaults;
+  return { defaults, warnings };
 }
