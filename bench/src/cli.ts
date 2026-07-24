@@ -47,6 +47,7 @@ Suites:
   swebench-pro  fetch | prep | run | eval | report | status | clean
   swe-marathon  prep | run | report
   featurebench  prep | run | report
+  workflow-authoring  generate | report
 
 Results:
   bench/results/<suite>/<runId>/manifest.json`;

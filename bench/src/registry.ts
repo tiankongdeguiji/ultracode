@@ -9,6 +9,7 @@ import {
 import { featureBenchAdapter } from './suites/featurebench/adapter.js';
 import { sweMarathonAdapter } from './suites/swe-marathon/adapter.js';
 import { swebenchProAdapter } from './suites/swebench-pro/adapter.js';
+import { workflowAuthoringAdapter } from './suites/workflow-authoring/adapter.js';
 
 function validateAdapter(adapter: AnySuiteAdapter): void {
   const expected = new Set<string>(SUITE_COMMANDS[adapter.suite]);
@@ -76,4 +77,5 @@ export const suiteRegistry = createSuiteRegistry([
   swebenchProAdapter,
   sweMarathonAdapter,
   featureBenchAdapter,
+  workflowAuthoringAdapter,
 ]);

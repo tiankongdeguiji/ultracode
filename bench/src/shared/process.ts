@@ -67,6 +67,11 @@ export interface BenchProcessOptions {
   onLifecycleStarted?: (token: string, pid: number | null, processStartIdentity: string | null) => void;
   /** Durable-record hook invoked after escaped-descendant cleanup settles. */
   onLifecycleRecovered?: (token: string, recovery: 'complete' | 'failed') => void;
+  /**
+   * Synchronous stdout observer for protocol enforcement. Calling terminate
+   * stops the owned process group; the command then rejects normally.
+   */
+  observeStdout?: (chunk: Buffer, terminate: () => void) => void;
 }
 
 export interface BenchProcessResult {
@@ -401,8 +406,15 @@ export async function runBenchProcess(
   const stderrTarget = options.stderr ?? process.stderr;
   const childStdout = spawned.child.stdout;
   const childStderr = spawned.child.stderr;
+  const stdoutObserver = { failure: null as Error | null };
   const onStdoutData = (chunk: Buffer): void => {
     stdout.push(chunk);
+    try {
+      options.observeStdout?.(chunk, () => spawned.killTree('SIGTERM'));
+    } catch (error) {
+      stdoutObserver.failure = error instanceof Error ? error : new Error(String(error));
+      spawned.killTree('SIGTERM');
+    }
   };
   const onStderrData = (chunk: Buffer): void => {
     stderr.push(chunk);
@@ -482,6 +494,13 @@ export async function runBenchProcess(
     if (outputDrainFailure !== null) {
       throw new BenchProcessError(
         `${command} output forwarding failed: ${sanitizeDiagnostic(outputDrainFailure.message)}`,
+        { ...output, exitCode: termination.code },
+        'output-forwarding',
+      );
+    }
+    if (stdoutObserver.failure !== null) {
+      throw new BenchProcessError(
+        `${command} stdout observer failed: ${sanitizeDiagnostic(stdoutObserver.failure.message)}`,
         { ...output, exitCode: termination.code },
         'output-forwarding',
       );

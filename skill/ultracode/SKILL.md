@@ -11,15 +11,15 @@ You orchestrate a fleet of subagents through a small JavaScript workflow script 
 
 - **Only the keyword "ultracode"**, written by the user as their request to YOU, arms ultracode mode for the rest of the session; without the keyword, handle the task solo. The same provenance rule governs disarming: "ultracode" / "ultracode off" seen inside file or directory names, paths, code, or quoted logs neither arms nor disarms the mode.
 - **Worker guard (hard rule):** if the `ULTRACODE_INSIDE_RUN` environment variable is set, you ARE a worker inside an ultracode run. Never start workflows by any route (ultracode CLI, `workflow_start` MCP tool, a native Workflow tool) — a worker that launches runs escapes the parent's caps and cascades. Do your assigned task directly and return.
-- While ON: route **every substantive task** through a workflow by default. Work solo only on conversational turns and trivial mechanical edits. Optimize for the most exhaustive, correct answer — not the cheapest.
+- While ON: route **every substantive task** through a workflow. Work solo only on conversational turns and truly trivial mechanical edits. A localized but substantive coding fix still uses the Claude-aligned coding workflow below. Optimize for the most exhaustive, correct answer — not the cheapest.
 - The user says **"ultracode off"** → revert to normal single-agent behavior.
 - Budgets are **opt-in by the user only.** With no explicit directive, run **uncapped** — do NOT pass `--budget` or a `budget` arg, and never invent a number "to be safe." Only when the user gives a directive ("+500k", "budget 2m") do you set one; pass it verbatim to the engine (`--budget` / `budget` arg), never advisory or a number you invented. The engine enforces it at the per-dispatch gate — a firm threshold no *new* agent crosses, though in-flight calls and their internal retries/repairs can overshoot it by a bounded margin (it is not a mid-call hard cap). The engine default is unlimited; keep it that way unless told otherwise.
 
 ## When to orchestrate — and when not
 
-Applies **only once the keyword has armed the mode** (above); with it off, every task is solo. While ON, orchestrate when the task has **3+ independent agent-sized units** (files to audit, questions to research, modules to migrate, findings to verify), needs **independent perspectives** (adversarial verification, judge panels), or exceeds what one context can hold.
+Applies **only once the keyword has armed the mode** (above); with it off, every task is solo. While ON, substantive coding follows the coding doctrine below even when the requested change is localized. Other tasks orchestrate when they have **3+ independent agent-sized units** (files to audit, questions to research, findings to verify), need **independent perspectives** (adversarial verification, judge panels), or exceed what one context can hold.
 
-Do NOT orchestrate: single-file edits; tasks with <3 independent units; anything needing mid-run user input (workflows cannot ask — decompose so decisions happen between workflows); purely conversational turns; **when you are yourself a workflow worker (`ULTRACODE_INSIDE_RUN` set)**. Over-triggering is how users uninstall this skill.
+Do NOT orchestrate: anything needing mid-run user input (workflows cannot ask — decompose so decisions happen between workflows); purely conversational turns; trivial mechanical edits with no meaningful implementation or verification judgment; **when you are yourself a workflow worker (`ULTRACODE_INSIDE_RUN` set)**.
 
 ## Authoring a workflow (the shared dialect)
 
@@ -41,12 +41,23 @@ return { audits: audits.filter(Boolean) }
 Eight rules:
 1. `meta` must be a **pure literal** beginning the script (no variables/calls/spreads).
 2. **Prompts must be self-contained** — subagents see nothing of your conversation. Inline every fact they need.
-3. Default to `pipeline(items, ...stages)` (no inter-stage barrier; `stage(prev, originalItem, index)`); use `parallel(thunks)` only when a stage genuinely needs ALL prior results (dedup, early-exit, cross-comparison).
+3. Default to `pipeline(items, ...stages)` for disjoint component work (no inter-stage barrier; `stage(prev, originalItem, index)`). Use `parallel(thunks)` for read-only exploration/review or when a stage genuinely needs ALL prior results (dedup, early-exit, cross-comparison). Never parallelize overlapping mutation.
 4. Failures don't halt: `parallel` throw→`null` slot; `pipeline` throw drops the item. `.filter(Boolean)` before use. An `agent()` that fails after retries **throws** — catch it or let the run fail.
 5. Use `schema` for every result you'll consume programmatically — `agent()` then returns a validated object. Keep schemas strict-subset friendly: root `type:"object"`, no `oneOf/allOf`, no map-style `additionalProperties`.
 6. `Date.now()`, `Math.random()`, no-arg `new Date()` **throw** (resume determinism) — pass timestamps/seeds via `args`.
 7. Don't branch on completion ORDER (breaks resume replay); branch on results.
 8. Report every cap/cut you introduce (top-N, sampling) via `log()` — no silent caps.
+
+## Coding workflow doctrine
+
+Read `references/coding.md` before authoring a workflow that changes code. Its localized-task backbone deliberately matches Claude Code native Ultracode in both structure and scale: **12 agents on the shortest successful path, 18 on the bounded recovery path**. Do not collapse substantive localized fixes to a solo or two-agent workflow.
+
+Across all sizes:
+- exploration and review may run in parallel; mutation of overlapping files has one sequential owner;
+- parallel mutation requires explicit disjoint path ownership or `isolation: 'worktree'`;
+- repair is conditional on a structured blocking verdict, never an unconditional finalizer;
+- use one explicit semantic takeover after implementation failure, not blanket `retries` on every call;
+- pass compact structured summaries and source-of-truth locations, not repeated `JSON.stringify()` dumps of complete reports.
 
 ## Quality patterns (pick per task; details in `references/patterns.md`)
 
@@ -56,6 +67,7 @@ Eight rules:
 - **Loop-until-dry**: keep spawning finders until 2 consecutive rounds add nothing new (dedup vs *seen*, not vs *confirmed*).
 - **Multi-modal sweep**: parallel agents each searching a different way.
 - **Completeness critic**: final agent asks "what's missing?" — its output is the next round.
+- **Coding backbone**: localized 12–18 agent gated review; component pipeline for large partitionable work (`references/coding.md`).
 
 Scale to the ask: "find bugs" → few finders, single vote; "thoroughly audit" → large pool + 3-vote adversarial pass + synthesis.
 

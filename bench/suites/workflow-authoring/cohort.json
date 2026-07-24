@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "kind": "ultracode-workflow-authoring-cohort",
+  "tasks": [
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_ansible__ansible-1c06c46cc14324df35ac4f39a45fb3ccd602195d-v0f01c69f1e2528b935359cfe578530722bca2c59"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_ansible__ansible-622a493ae03bd5e5cf517d336fc426e9d12208c7-v906c969b551b346ef54a2c0b41e04f632b7b73c2"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_ansible__ansible-6cc97447aac5816745278f3735af128afb255c81-v0f01c69f1e2528b935359cfe578530722bca2c59"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_ansible__ansible-d9f1866249756efc264b00ff7497e92c11a9885f-v0f01c69f1e2528b935359cfe578530722bca2c59"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_ansible__ansible-f8ef34672b961a95ec7282643679492862c688ec-vba6da65a0f3baefda7a058ebbd0a8dcafb8512f5"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_element-hq__element-web-4c6b0d35add7ae8d58f71ea1711587e31081444b-vnan"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_flipt-io__flipt-36e62baffae2132f78f9d34dc300a9baa2d7ae0e"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_future-architect__vuls-139f3a81b66c47e6d8f70ce6c4afe7a9196a6ea8"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_future-architect__vuls-4a72295de7b91faa59d90a5bee91535bbe76755d"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_gravitational__teleport-2b15263e49da5625922581569834eec4838a9257-vee9b09fb20c43af7e520f57e9239bbcf46b7113d"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_gravitational__teleport-37c3724d0d6637e959e39408ee351565d73afe71-vee9b09fb20c43af7e520f57e9239bbcf46b7113d"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_gravitational__teleport-629dc432eb191ca479588a8c49205debb83e80e2"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_gravitational__teleport-65438e6e44b6ce51458d09b7bb028a2797cfb0ea-vce94f93ad1030e3136852817f2423c1b3ac37bc4"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_gravitational__teleport-cb712e3f0b06dadc679f895daef8072cae400c26-vee9b09fb20c43af7e520f57e9239bbcf46b7113d"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_protonmail__webclients-09fcf0dbdb87fa4f4a27700800ee4a3caed8b413"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_protonmail__webclients-0d0267c4438cf378bda90bc85eed3a3615871ac4"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_protonmail__webclients-cfd7571485186049c10c822f214d474f1edde8d1"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_qutebrowser__qutebrowser-1af602b258b97aaba69d2585ed499d95e2303ac2-v2ef375ac784985212b1805e1d0431dc8f1b3c171"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_qutebrowser__qutebrowser-8d05f0282a271bfd45e614238bd1b555c58b3fc1-v35616345bb8052ea303186706cec663146f0f184"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_tutao__tutanota-b4934a0f3c34d9d7649e944b183137e8fad3e859-vbc0d9ba8f0071fbe982809910959a6ff8884dbbf"
+    },
+    {
+      "suite": "swe-marathon",
+      "taskId": "kubernetes-rust-rewrite"
+    }
+  ]
+}
