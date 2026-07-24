@@ -795,47 +795,59 @@ export function signalTrackedWorkerProcesses(
   options: ProcessInspectionOptions = {},
 ): WorkerSignalResult {
   const processesToSignal = [...tracked];
-  const platform = inspectionPlatform(options);
   const signaledTokens = new Set<string>();
   const signaledIdentities = new Set<string>();
   let processes = 0;
   const signalProcess = options.signalProcess ?? ((pid: number, sent: NodeJS.Signals | 0) => {
     process.kill(pid, sent);
   });
-  if (platform === 'linux') {
-    for (const proc of processesToSignal) {
-      const live = options.readIdentitySnapshot === undefined
-        ? linuxProcessIdentity(proc.pid, options)
-        : readProcessIdentitySnapshot([proc.pid], options).identities.get(proc.pid);
-      if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
+  const snapshot = readProcessIdentitySnapshot(
+    processesToSignal.map((proc) => proc.pid),
+    options,
+  );
+  const validated = processesToSignal.filter((proc) => {
+    const live = snapshot.identities.get(proc.pid);
+    return live?.starttime === proc.starttime && live.pgrp === proc.pgrp;
+  });
+  const byGroup = new Map<number, TrackedWorkerProcess[]>();
+  for (const proc of validated) {
+    const group = byGroup.get(proc.pgrp) ?? [];
+    group.push(proc);
+    byGroup.set(proc.pgrp, group);
+  }
+  const recordSignal = (proc: TrackedWorkerProcess): void => {
+    processes++;
+    signaledTokens.add(proc.token);
+    signaledIdentities.add(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`);
+  };
+  const signalIndividually = (group: TrackedWorkerProcess[], recheck: boolean): void => {
+    for (const proc of group) {
+      if (recheck) {
+        const live = readProcessIdentity(proc.pid, options);
+        if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
+      }
       try {
-        signalProcess(proc.pgrp === proc.pid ? -proc.pid : proc.pid, signal);
-        processes++;
-        signaledTokens.add(proc.token);
-        signaledIdentities.add(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`);
+        signalProcess(proc.pid, signal);
+        recordSignal(proc);
       } catch {
         /* raced with exit */
       }
     }
-    return { processes, tokens: signaledTokens, identities: signaledIdentities };
-  }
-  const liveIdentities = readProcessIdentities(
-    processesToSignal.map((proc) => proc.pid),
-    options,
-  );
-  for (const proc of processesToSignal) {
-    const live = liveIdentities.get(proc.pid);
-    if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
+  };
+  for (const group of byGroup.values()) {
+    const leader = group.find((proc) => proc.pid === proc.pgrp);
+    if (leader === undefined) {
+      signalIndividually(group, false);
+      continue;
+    }
     try {
       // An authenticated session leader may have same-group descendants that
       // deliberately replaced their environment. Cover those children without
       // extending group signaling to a marked process inside another PGID.
-      signalProcess(proc.pgrp === proc.pid ? -proc.pid : proc.pid, signal);
-      processes++;
-      signaledTokens.add(proc.token);
-      signaledIdentities.add(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`);
+      signalProcess(-leader.pid, signal);
+      for (const proc of group) recordSignal(proc);
     } catch {
-      /* raced with exit */
+      signalIndividually(group, true);
     }
   }
   return { processes, tokens: signaledTokens, identities: signaledIdentities };

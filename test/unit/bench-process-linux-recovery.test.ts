@@ -22,6 +22,7 @@ import {
 import {
   discoverWorkerProcessesForTokens,
   signal0Status,
+  signalTrackedWorkerProcesses,
   signalWorkerProcessTokensUntilGone,
   snapshotLinuxProcessIdentities,
   type ProcessInspectionOptions,
@@ -339,7 +340,88 @@ describe('Linux worker-token publication', () => {
     exposeTokenMatch = false;
     allowSignal = true;
     await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
-    expect(signals).toEqual(['SIGKILL', 'SIGTERM']);
+    expect(signals).toEqual(['SIGKILL', 'SIGKILL', 'SIGTERM']);
+  });
+
+  it('retires a latched identity after it becomes a zombie', async () => {
+    let clock = 0;
+    let identityReads = 0;
+    let observations = 0;
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      processInspection: {
+        platform: 'linux',
+        listLinuxProcessIds: () => [],
+        discoverWorkerProcesses: (tokens) => ({
+          processes: observations++ === 0 ? [{ ...PROCESS, token: tokens[0]! }] : [],
+          complete: true,
+        }),
+        readIdentitySnapshot: (pids) => ({
+          identities: new Map(pids.includes(PROCESS.pid)
+            ? [[PROCESS.pid, {
+                state: identityReads++ === 0 ? 'S' : 'Z',
+                pgrp: PROCESS.pgrp,
+                starttime: PROCESS.starttime,
+              }]]
+            : []),
+          complete: true,
+        }),
+        signalProcess: (_pid, signal) => {
+          if (signal === 0) throw noSuchProcess();
+          throw new Error('a zombie must not be signaled');
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    });
+
+    await once(spawned.child, 'close');
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+  });
+});
+
+describe('Linux tracked worker signaling', () => {
+  const leader = { pid: 301, pgrp: 301, starttime: 'leader-start', token: TOKEN };
+  const child = { pid: 302, pgrp: 301, starttime: 'child-start', token: 'c'.repeat(32) };
+  const identitySnapshot = () => ({
+    identities: new Map([
+      [leader.pid, { pgrp: leader.pgrp, starttime: leader.starttime }],
+      [child.pid, { pgrp: child.pgrp, starttime: child.starttime }],
+    ]),
+    complete: true,
+  });
+
+  it('coalesces an authenticated group leader and child into one signal', () => {
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const result = signalTrackedWorkerProcesses([leader, child], 'SIGTERM', {
+      platform: 'linux',
+      readIdentitySnapshot: identitySnapshot,
+      signalProcess: (pid, signal) => { signals.push([pid, signal as NodeJS.Signals]); },
+    });
+
+    expect(signals).toEqual([[-leader.pid, 'SIGTERM']]);
+    expect(result.processes).toBe(2);
+    expect(result.tokens).toEqual(new Set([leader.token, child.token]));
+  });
+
+  it('falls back to rechecked individual PIDs when the group signal fails', () => {
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const result = signalTrackedWorkerProcesses([leader, child], 'SIGTERM', {
+      platform: 'linux',
+      readIdentitySnapshot: identitySnapshot,
+      signalProcess: (pid, signal) => {
+        signals.push([pid, signal as NodeJS.Signals]);
+        if (pid < 0) throw noSuchProcess();
+      },
+    });
+
+    expect(signals).toEqual([
+      [-leader.pid, 'SIGTERM'],
+      [leader.pid, 'SIGTERM'],
+      [child.pid, 'SIGTERM'],
+    ]);
+    expect(result.processes).toBe(2);
   });
 });
 

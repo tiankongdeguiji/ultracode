@@ -222,7 +222,7 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     const processes: TrackedWorkerProcess[] = [];
     for (const [key, candidate] of authenticatedWorkers) {
       const live = snapshot.identities.get(candidate.pid);
-      if (live?.starttime === candidate.starttime) {
+      if (live?.starttime === candidate.starttime && live.state !== 'Z') {
         const refreshed = { pid: candidate.pid, token: candidate.token, ...live };
         authenticatedWorkers.set(key, refreshed);
         processes.push(refreshed);
