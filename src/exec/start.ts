@@ -94,7 +94,7 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
       throw new Error(`run ${input.resumeFromRunId} is still ${prior.effectiveStatus} — stop it first`);
     }
     if (!isResumableStatus(prior.effectiveStatus)) {
-      throw new Error(`run ${input.resumeFromRunId} cannot resume before verified worker cleanup`);
+      throw new Error(`run ${input.resumeFromRunId} cannot resume before the worker cleanup scan settles`);
     }
     resumedFrom = input.resumeFromRunId;
     config.resumeFromRunId = input.resumeFromRunId;

@@ -795,37 +795,45 @@ export function signalTrackedWorkerProcesses(
   options: ProcessInspectionOptions = {},
 ): WorkerSignalResult {
   const processesToSignal = [...tracked];
+  const platform = inspectionPlatform(options);
   const signaledTokens = new Set<string>();
   const signaledIdentities = new Set<string>();
   let processes = 0;
   const signalProcess = options.signalProcess ?? ((pid: number, sent: NodeJS.Signals | 0) => {
     process.kill(pid, sent);
   });
-  const snapshot = readProcessIdentitySnapshot(
-    processesToSignal.map((proc) => proc.pid),
-    options,
-  );
-  const validated = processesToSignal.filter((proc) => {
-    const live = snapshot.identities.get(proc.pid);
-    return live?.starttime === proc.starttime && live.pgrp === proc.pgrp;
-  });
-  const byGroup = new Map<number, TrackedWorkerProcess[]>();
-  for (const proc of validated) {
-    const group = byGroup.get(proc.pgrp) ?? [];
-    group.push(proc);
-    byGroup.set(proc.pgrp, group);
-  }
   const recordSignal = (proc: TrackedWorkerProcess): void => {
     processes++;
     signaledTokens.add(proc.token);
     signaledIdentities.add(`${proc.pid}:${proc.starttime}:${proc.pgrp}:${proc.token}`);
   };
-  const signalIndividually = (group: TrackedWorkerProcess[], recheck: boolean): void => {
-    for (const proc of group) {
-      if (recheck) {
-        const live = readProcessIdentity(proc.pid, options);
-        if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
+  if (platform !== 'linux') {
+    const liveIdentities = readProcessIdentities(
+      processesToSignal.map((proc) => proc.pid),
+      options,
+    );
+    for (const proc of processesToSignal) {
+      const live = liveIdentities.get(proc.pid);
+      if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
+      try {
+        signalProcess(proc.pgrp === proc.pid ? -proc.pid : proc.pid, signal);
+        recordSignal(proc);
+      } catch {
+        /* raced with exit */
       }
+    }
+    return { processes, tokens: signaledTokens, identities: signaledIdentities };
+  }
+  const byGroup = new Map<number, TrackedWorkerProcess[]>();
+  for (const proc of processesToSignal) {
+    const group = byGroup.get(proc.pgrp) ?? [];
+    group.push(proc);
+    byGroup.set(proc.pgrp, group);
+  }
+  const signalIndividually = (group: TrackedWorkerProcess[]): void => {
+    for (const proc of group) {
+      const live = readProcessIdentity(proc.pid, options);
+      if (!live || live.starttime !== proc.starttime || live.pgrp !== proc.pgrp) continue;
       try {
         signalProcess(proc.pid, signal);
         recordSignal(proc);
@@ -837,7 +845,16 @@ export function signalTrackedWorkerProcesses(
   for (const group of byGroup.values()) {
     const leader = group.find((proc) => proc.pid === proc.pgrp);
     if (leader === undefined) {
-      signalIndividually(group, false);
+      signalIndividually(group);
+      continue;
+    }
+    const liveLeader = readProcessIdentity(leader.pid, options);
+    if (
+      !liveLeader
+      || liveLeader.starttime !== leader.starttime
+      || liveLeader.pgrp !== leader.pgrp
+    ) {
+      signalIndividually(group);
       continue;
     }
     try {
@@ -845,9 +862,11 @@ export function signalTrackedWorkerProcesses(
       // deliberately replaced their environment. Cover those children without
       // extending group signaling to a marked process inside another PGID.
       signalProcess(-leader.pid, signal);
-      for (const proc of group) recordSignal(proc);
+      // Only the revalidated leader is known to have remained in this PGID at
+      // the signal boundary. Keep snapshotted children eligible for retries.
+      recordSignal(leader);
     } catch {
-      signalIndividually(group, true);
+      signalIndividually(group);
     }
   }
   return { processes, tokens: signaledTokens, identities: signaledIdentities };

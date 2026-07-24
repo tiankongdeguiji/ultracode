@@ -392,7 +392,7 @@ describe('Linux tracked worker signaling', () => {
     complete: true,
   });
 
-  it('coalesces an authenticated group leader and child into one signal', () => {
+  it('coalesces an authenticated group while retaining children for later retries', () => {
     const signals: Array<[number, NodeJS.Signals]> = [];
     const result = signalTrackedWorkerProcesses([leader, child], 'SIGTERM', {
       platform: 'linux',
@@ -401,8 +401,8 @@ describe('Linux tracked worker signaling', () => {
     });
 
     expect(signals).toEqual([[-leader.pid, 'SIGTERM']]);
-    expect(result.processes).toBe(2);
-    expect(result.tokens).toEqual(new Set([leader.token, child.token]));
+    expect(result.processes).toBe(1);
+    expect(result.tokens).toEqual(new Set([leader.token]));
   });
 
   it('falls back to rechecked individual PIDs when the group signal fails', () => {
@@ -422,6 +422,43 @@ describe('Linux tracked worker signaling', () => {
       [child.pid, 'SIGTERM'],
     ]);
     expect(result.processes).toBe(2);
+  });
+
+  it('rechecks each group leader immediately before signaling it', () => {
+    const reused = {
+      pid: 303,
+      pgrp: 303,
+      starttime: 'second-start',
+      token: 'd'.repeat(32),
+    };
+    let secondReused = false;
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const identities = new Map([
+      [leader.pid, { pgrp: leader.pgrp, starttime: leader.starttime }],
+      [reused.pid, { pgrp: reused.pgrp, starttime: reused.starttime }],
+    ]);
+    const result = signalTrackedWorkerProcesses([leader, reused], 'SIGTERM', {
+      platform: 'linux',
+      readIdentitySnapshot: (pids) => ({
+        identities: new Map(pids.flatMap((pid) => {
+          const identity = identities.get(pid);
+          if (identity === undefined) return [];
+          if (pid === reused.pid && secondReused) {
+            return [[pid, { ...identity, starttime: 'replacement-start' }]];
+          }
+          return [[pid, identity]];
+        })),
+        complete: true,
+      }),
+      signalProcess: (pid, signal) => {
+        signals.push([pid, signal as NodeJS.Signals]);
+        if (pid === -leader.pid) secondReused = true;
+      },
+    });
+
+    expect(signals).toEqual([[-leader.pid, 'SIGTERM']]);
+    expect(result.processes).toBe(1);
+    expect(result.tokens).toEqual(new Set([leader.token]));
   });
 });
 
@@ -1098,6 +1135,74 @@ describe('Linux token discovery completeness', () => {
 });
 
 describe('Linux live process settlement', () => {
+  it('retries a child that survives an authenticated group signal', async () => {
+    const groupLeader = {
+      pid: 301,
+      pgrp: 301,
+      starttime: 'leader-start',
+      token: TOKEN,
+    };
+    const groupChild = {
+      pid: 302,
+      pgrp: 301,
+      starttime: 'child-start',
+      token: 'c'.repeat(32),
+    };
+    let leaderLive = true;
+    let childLive = true;
+    let clock = 0;
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const result = await signalWorkerProcessTokensUntilGone(
+      [groupLeader.token, groupChild.token],
+      'SIGTERM',
+      '/worker-scope',
+      50,
+      {
+        platform: 'linux',
+        discoverWorkerProcesses: () => ({
+          processes: [
+            ...(leaderLive ? [groupLeader] : []),
+            ...(childLive ? [groupChild] : []),
+          ],
+          complete: true,
+        }),
+        readIdentitySnapshot: (pids) => ({
+          identities: new Map(pids.flatMap((pid) => {
+            if (pid === groupLeader.pid && leaderLive) {
+              return [[pid, {
+                pgrp: groupLeader.pgrp,
+                starttime: groupLeader.starttime,
+              }]];
+            }
+            if (pid === groupChild.pid && childLive) {
+              return [[pid, {
+                pgrp: groupChild.pgrp,
+                starttime: groupChild.starttime,
+              }]];
+            }
+            return [];
+          })),
+          complete: true,
+        }),
+        signalProcess: (pid, signal) => {
+          if (signal === 0) throw noSuchProcess();
+          signals.push([pid, signal]);
+          if (pid === -groupLeader.pid) leaderLive = false;
+          if (pid === groupChild.pid) childLive = false;
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    );
+
+    expect(result.settled).toBe(true);
+    expect(result.processes).toBe(2);
+    expect(signals).toEqual([
+      [-groupLeader.pid, 'SIGTERM'],
+      [groupChild.pid, 'SIGTERM'],
+    ]);
+  });
+
   it('does not count an incomplete empty observation and signals a later live process', async () => {
     let clock = 0;
     let observations = 0;
