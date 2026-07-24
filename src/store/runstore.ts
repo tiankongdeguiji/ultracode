@@ -18,6 +18,10 @@ import { readProcStat } from '../exec/procinfo.js';
 
 export interface RunConfig {
   backend: string;
+  model?: string;
+  effort?: string;
+  /** Default Qoder context window, in tokens. */
+  contextWindow?: number;
   cwd: string;
   maxAgents?: number;
   maxConcurrency?: number;

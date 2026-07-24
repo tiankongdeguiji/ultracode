@@ -25,7 +25,7 @@ export interface ChildRunnerDeps {
   keyChain?: { next(spec: never): string };
   base: Pick<
     ExecuteOptions,
-    'executor' | 'defaultBackend' | 'cwd' | 'onEvent' | 'onAgentStarted' | 'onAgentSettled' | 'cacheLookup' | 'maxAgents' | 'logCap'
+    'executor' | 'defaultBackend' | 'defaultModel' | 'defaultEffort' | 'defaultContextWindow' | 'cwd' | 'onEvent' | 'onAgentStarted' | 'onAgentSettled' | 'cacheLookup' | 'maxAgents' | 'logCap'
   >;
   /** resolve a child by name → source text (registry lookup lives in the runner/CLI) */
   resolveName?: (name: string) => string;

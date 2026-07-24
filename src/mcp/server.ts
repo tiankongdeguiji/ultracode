@@ -97,13 +97,16 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Launch a workflow (fire-and-forget; returns runId in <1s). Provide script (inline dialect text) ' +
         'or scriptPath, or resumeFromRunId to resume a terminal run (completed agents replay free). ' +
-        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend (REQUIRED for a fresh start) is one of mock|codex|qoder|claude|gemini — mock returns fabricated stubs (rehearsal only), so pass a real backend for real work. ' +
+        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend is one of mock|codex|qoder|claude|gemini and may come from layered ultracode config; without either source a fresh start is rejected. mock returns fabricated stubs (rehearsal only), so use a real backend for real work. model/effort set run defaults; Gemini ignores effort with a warning. contextWindow is a positive-integer Qoder-only default; Qoder effort/contextWindow require qodercli 1.1.1+. ' +
         'wallClockMs (run wall-clock cap) and attemptTimeoutMs (per-attempt agent timeout; per-call opts.timeoutMs still wins) are unclamped and default to UNLIMITED — pass them ONLY when the user explicitly asked for a time limit, and never invent one. On resume an omitted cap inherits the prior run\'s value; pass 0 to clear an inherited cap back to unlimited.',
       inputSchema: {
         script: z.string().optional(),
         scriptPath: z.string().optional(),
         args: z.unknown().optional(),
         backend: z.string().optional(),
+        model: z.string().trim().min(1).optional(),
+        effort: z.string().trim().min(1).optional(),
+        contextWindow: z.number().int().positive().optional(),
         budget: z.string().optional(),
         maxAgents: z.number().int().positive().optional(),
         maxConcurrency: z.number().int().positive().optional(),
@@ -128,22 +131,15 @@ export function createServer(baseCwd: string): McpServer {
       if (process.env.ULTRACODE_INSIDE_RUN) {
         return fail('workflow_start refused: already inside an ultracode run (recursion guard). Use in-script workflow() for nesting.');
       }
-      // Require an explicit backend for a fresh start. Defaulting to 'mock' would
-      // silently run real review/research work on the mock backend — which
-      // returns plausible fabricated stubs without touching the repo, so a fake
-      // run looks successful. (Resume inherits the prior run's backend.)
-      if (!input.resumeFromRunId && !input.backend) {
-        return fail(
-          'workflow_start requires an explicit backend (mock|codex|qoder|claude|gemini). ' +
-            '"mock" returns fabricated stub output — pass it only to rehearse the dialect, never for real work.',
-        );
-      }
       try {
         const result = await startDetachedRun({
           script: input.script,
           scriptPath: input.scriptPath,
           args: input.args,
           backend: input.backend,
+          model: input.model,
+          effort: input.effort,
+          contextWindow: input.contextWindow,
           budgetTotal: input.budget ? parseBudget(input.budget) : null,
           maxAgents: input.maxAgents,
           maxConcurrency: input.maxConcurrency,
@@ -152,11 +148,16 @@ export function createServer(baseCwd: string): McpServer {
           attemptTimeoutMs: input.attemptTimeoutMs,
           resumeFromRunId: input.resumeFromRunId,
           cwd: input.cwd ?? baseCwd,
+          requireBackend: true,
         });
         return ok({
           runId: result.runId,
           name: result.name,
           runDir: result.dir,
+          backend: result.backend,
+          ...(result.model !== undefined ? { model: result.model } : {}),
+          ...(result.effort !== undefined ? { effort: result.effort } : {}),
+          ...(result.contextWindow !== undefined ? { contextWindow: result.contextWindow } : {}),
           monitor: `call workflow_status {runId: '${result.runId}', until: 'terminal', waitSeconds: 3300}; 3300 assumes \`ultracode install codex\` pinned a 3600s tool timeout — else use your MCP tool timeout − 60; re-issue until terminal and park silently between wakes ('phase' wakes per milestone if commentary is wanted)`,
         });
       } catch (err) {

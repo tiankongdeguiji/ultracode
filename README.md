@@ -127,6 +127,23 @@ ultracode run my.workflow.js --backend codex    # foreground live panel; --detac
 ultracode resume <runId> [--script edited.js]   # unchanged journal prefix replays free
 ```
 
+### Subagent defaults
+
+Set user-wide defaults in `~/.ultracode/config.json`, then override individual fields per project in `<cwd>/.ultracode/config.json`:
+
+```json
+{
+  "subagent": {
+    "backend": "qoder",
+    "model": "auto",
+    "effort": "high",
+    "context_window": 200000
+  }
+}
+```
+
+Per-call parameters on workflow `agent()` override CLI/MCP, project-level, and user-level parameters. CLI/MCP must specify a backend through an argument or configuration; `--dry-run` uses the `mock` backend.
+
 ### Build from source
 
 If you need to develop ultracode, build from source:

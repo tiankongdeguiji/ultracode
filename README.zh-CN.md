@@ -127,6 +127,23 @@ ultracode run my.workflow.js --backend codex    # 前台显示实时面板；使
 ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journal 前缀
 ```
 
+### Subagent 默认配置
+
+在 `~/.ultracode/config.json` 中设置用户级默认值，再由 `<cwd>/.ultracode/config.json` 按字段覆盖项目级差异：
+
+```json
+{
+  "subagent": {
+    "backend": "qoder",
+    "model": "auto",
+    "effort": "high",
+    "context_window": 200000
+  }
+}
+```
+
+workflow 中的 `agent()` 单次参数会覆盖 CLI/MCP、项目级、用户级参数。CLI/MCP 必须通过参数或配置指定 backend；`--dry-run` 会使用 `mock` backend。
+
 ### 从源码构建
 
 如需参与开发 ultracode，可从源码构建：

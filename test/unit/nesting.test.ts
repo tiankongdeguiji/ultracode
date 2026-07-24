@@ -54,6 +54,32 @@ return 'parent-done'`;
     expect(r.childOut).toEqual(['child-0', 'child-1', 'child-2']);
   });
 
+  it('propagates model controls into child agents', async () => {
+    const events: RunEvent[] = [];
+    const out = await executeWorkflow(PARENT, {
+      executor: new MockExecutor(),
+      resolveChild,
+      maxConcurrency: 4,
+      defaultBackend: 'qoder',
+      defaultModel: 'coder',
+      defaultEffort: 'xhigh',
+      defaultContextWindow: 200_000,
+      onEvent: (event) => events.push(event),
+    });
+    expect(out.error).toBeUndefined();
+    const childStarts = events.filter(
+      (event): event is Extract<RunEvent, { type: 'agent_started' }> =>
+        event.type === 'agent_started' && event.childId === 0,
+    );
+    expect(childStarts).toHaveLength(3);
+    expect(childStarts).toEqual(childStarts.map(() => expect.objectContaining({
+      backend: 'qoder',
+      model: 'coder',
+      effort: 'xhigh',
+      contextWindow: 200_000,
+    })));
+  });
+
   it('shares the agent counter and budget with the child (cap counts child agents)', async () => {
     const executor = new MockExecutor();
     // parent: pa + (child: 3) + pb = 5 agents. maxAgents 4 → cap trips inside.

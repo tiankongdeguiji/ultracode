@@ -3,7 +3,7 @@
  * launches real detached runners on the mock backend. No network.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -21,9 +21,10 @@ const tsxLoader = createRequire(import.meta.url).resolve('tsx');
 // Spawned MCP servers must resolve their store from cwd, not an inherited
 // $ULTRACODE_HOME (ultracodeRoot prefers the override) — else the isolated-store
 // and restart tests would read a different store than they wrote.
-function childEnv(): Record<string, string> {
+function childEnv(home?: string): Record<string, string> {
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
   delete env.ULTRACODE_HOME;
+  if (home) env.HOME = home;
   return env;
 }
 
@@ -48,7 +49,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: childEnv(),
+      env: childEnv(projectDir),
     });
     await client.connect(transport);
   }, 30_000);
@@ -114,6 +115,73 @@ describe('MCP triad', () => {
     expect(result.structuredContent!.logs).toEqual(['done']);
     expect(result.structuredContent!.artifacts.runDir).toContain(runId);
   }, 180_000);
+
+  it('uses layered config when backend is omitted, but still rejects an unconfigured fresh start', async () => {
+    const missing = (await client.callTool({
+      name: 'workflow_start',
+      arguments: { script: HELLO },
+    })) as { isError?: boolean; content: { text: string }[] };
+    expect(missing.isError).toBe(true);
+    expect(missing.content[0]!.text).toContain('explicit backend or subagent.backend');
+
+    const configPath = join(projectDir, '.ultracode', 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      subagent: { backend: 'mock', model: 'configured-model', effort: 'high', context_window: 200_000 },
+    }));
+    let runId: string | undefined;
+    let terminal = false;
+    try {
+      const start = (await client.callTool({
+        name: 'workflow_start',
+        arguments: { script: HELLO },
+      })) as {
+        structuredContent?: {
+          runId?: string;
+          runDir?: string;
+          backend?: string;
+          model?: string;
+          effort?: string;
+          contextWindow?: number;
+        };
+        isError?: boolean;
+      };
+      runId = start.structuredContent?.runId;
+      expect(start.isError).toBeFalsy();
+      expect(start.structuredContent).toMatchObject({
+        backend: 'mock',
+        model: 'configured-model',
+        effort: 'high',
+        contextWindow: 200_000,
+      });
+      expect(JSON.parse(readFileSync(join(start.structuredContent!.runDir!, 'config.json'), 'utf8'))).toMatchObject({
+        backend: 'mock',
+        model: 'configured-model',
+        effort: 'high',
+        contextWindow: 200_000,
+      });
+
+      let offset = 0;
+      for (let i = 0; i < 20; i++) {
+        const status = (await client.callTool({
+          name: 'workflow_status',
+          arguments: { runId, waitSeconds: 2, sinceEventOffset: offset },
+        })) as { structuredContent?: { terminal?: boolean; nextEventOffset?: number } };
+        offset = status.structuredContent!.nextEventOffset ?? offset;
+        terminal = status.structuredContent!.terminal ?? false;
+        if (terminal) break;
+      }
+      expect(terminal).toBe(true);
+    } finally {
+      rmSync(configPath, { force: true });
+      if (runId && !terminal) {
+        try {
+          await client.callTool({ name: 'workflow_stop', arguments: { runId } });
+        } catch {
+          /* cleanup is best-effort after a failed assertion */
+        }
+      }
+    }
+  }, 45_000);
 
   it('workflow_start passes wallClockMs/attemptTimeoutMs through unclamped; omitting them leaves config bare', async () => {
     const start = (await client.callTool({
@@ -686,7 +754,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: { ...childEnv(), ULTRACODE_INSIDE_RUN: '1' },
+      env: { ...childEnv(projectDir), ULTRACODE_INSIDE_RUN: '1' },
     });
     await inside.connect(transport);
     try {
@@ -782,7 +850,7 @@ describe('MCP triad', () => {
       command: process.execPath,
       args: ['--import', tsxLoader, mainTs, 'mcp'],
       cwd: projectDir,
-      env: childEnv(),
+      env: childEnv(projectDir),
     });
     await second.connect(transport);
     try {

@@ -237,6 +237,22 @@ export async function runnerMain(
         ? config.permission
         : 'safe';
 
+  const defaultModel =
+    typeof config.model === 'string' && config.model.trim().length > 0 ? config.model : undefined;
+  const defaultEffort =
+    typeof config.effort === 'string' && config.effort.trim().length > 0 ? config.effort : undefined;
+  const defaultContextWindow =
+    config.contextWindow !== undefined && isPositiveInt(config.contextWindow) ? config.contextWindow : undefined;
+  if (config.model !== undefined && defaultModel === undefined) {
+    events.write({ type: 'workflow_log', message: 'stored default model is invalid — using the backend default' });
+  }
+  if (config.effort !== undefined && defaultEffort === undefined) {
+    events.write({ type: 'workflow_log', message: 'stored default effort is invalid — using the backend default' });
+  }
+  if (config.contextWindow !== undefined && defaultContextWindow === undefined) {
+    events.write({ type: 'workflow_log', message: 'stored Qoder context window is invalid — using the model default' });
+  }
+
   let spentTotal = 0;
   const output = await executeWorkflow(source, {
     executor: makeExecutorMux(dir, permission, attemptTimeoutMs),
@@ -253,6 +269,9 @@ export async function runnerMain(
     logCap: config.logCap,
     signal: abort.signal,
     defaultBackend: config.backend,
+    defaultModel,
+    defaultEffort,
+    defaultContextWindow,
     cwd: config.cwd,
     keyChain: chain,
     onEvent: (ev) => {
@@ -321,6 +340,8 @@ export async function runnerMain(
             sessionId: record.sessionId,
             backend: record.spec.backend,
             model: record.spec.model,
+            effort: record.spec.effort,
+            contextWindow: record.spec.contextWindow,
             cached: record.cached ?? false,
           },
           null,
@@ -336,6 +357,8 @@ export async function runnerMain(
         phase: record.spec.phase,
         backend: record.spec.backend,
         model: record.spec.model,
+        effort: record.spec.effort,
+        contextWindow: record.spec.contextWindow,
         cached: record.cached,
         sessionId: record.sessionId,
         totalTokens: record.usage.totalTokens,

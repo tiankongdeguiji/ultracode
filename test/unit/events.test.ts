@@ -44,12 +44,18 @@ return 1`);
     ]);
   });
 
-  it('agent_started carries the requested model/effort/agentType; agent_model reports the resolved one', async () => {
+  it('agent_started carries requested model/effort/contextWindow/agentType; agent_model reports the resolved one', async () => {
     const { ofType } = await run(`export const meta = { name: 't', description: 'd' }
-await agent('MOCK:ok x', { label: 'm', model: 'sonnet', effort: 'low', agentType: 'reviewer' })
+await agent('MOCK:ok x', { label: 'm', backend: 'qoder', model: 'coder', effort: 'low', contextWindow: 200000, agentType: 'reviewer' })
 return 1`);
-    expect(ofType('agent_started')[0]).toMatchObject({ model: 'sonnet', effort: 'low', agentType: 'reviewer' });
-    expect(ofType('agent_model')).toEqual([expect.objectContaining({ seq: 0, model: 'sonnet' })]);
+    expect(ofType('agent_started')[0]).toMatchObject({
+      backend: 'qoder',
+      model: 'coder',
+      effort: 'low',
+      contextWindow: 200_000,
+      agentType: 'reviewer',
+    });
+    expect(ofType('agent_model')).toEqual([expect.objectContaining({ seq: 0, model: 'coder' })]);
   });
 
   it('MOCK:tools emits paired agent_tool events before completion; agent_completed carries the count', async () => {

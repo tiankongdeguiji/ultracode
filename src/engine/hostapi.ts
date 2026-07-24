@@ -20,7 +20,7 @@ import {
   WorkflowBudgetError,
   errorMessage,
 } from './errors.js';
-import { Semaphore } from './semaphore.js';
+import { isPositiveInt, Semaphore } from './semaphore.js';
 import type { AgentExecutor, AgentSpec, JsonSchema } from '../backends/types.js';
 import type { BudgetAccount } from '../budget/account.js';
 import type { WorkflowMeta } from './meta.js';
@@ -58,6 +58,7 @@ type RunEventBody =
       backend: string;
       model?: string;
       effort?: string;
+      contextWindow?: number;
       agentType?: string;
     }
   /** throttled live token tick (cumulative per agent); display-only — budget accounting stays on agent_completed */
@@ -145,6 +146,10 @@ export interface HostApiOptions {
   budget: BudgetAccount;
   signal: AbortSignal;
   defaultBackend: string;
+  defaultModel?: string;
+  defaultEffort?: string;
+  /** Default applied only to agents whose resolved backend is Qoder. */
+  defaultContextWindow?: number;
   cwd: string;
   maxConcurrency: number;
   /** effective soft cap; the hard 1000 ceiling always applies on top */
@@ -181,6 +186,7 @@ interface AgentOptions {
   schema?: JsonSchema;
   model?: string;
   effort?: string;
+  contextWindow?: number;
   agentType?: string;
   type?: string;
   subagent_type?: string;
@@ -218,6 +224,9 @@ function roundTrip(value: unknown): unknown {
 }
 
 export function createHostApi(opts: HostApiOptions): HostApi {
+  if (opts.defaultContextWindow !== undefined && !isPositiveInt(opts.defaultContextWindow)) {
+    throw new TypeError('defaultContextWindow must be a positive integer');
+  }
   const {
     executor,
     meta,
@@ -303,17 +312,36 @@ export function createHostApi(opts: HostApiOptions): HostApi {
     // no run-level attemptTimeoutMs the result is the unlimited default.
     const timeoutMs = typeof o.timeoutMs === 'number' && Number.isFinite(o.timeoutMs) && o.timeoutMs > 0 ? o.timeoutMs : undefined;
     const phaseTitle = o.phase !== undefined ? ensurePhase(String(o.phase)) : currentPhase;
+    const backend = o.backend ?? opts.defaultBackend;
+    const label = o.label ?? `#${seq}`;
+    const effort = o.effort ?? opts.defaultEffort;
+    if (
+      o.contextWindow !== undefined &&
+      (typeof o.contextWindow !== 'number' || !isPositiveInt(o.contextWindow))
+    ) {
+      throw new TypeError('agent() contextWindow must be a positive integer');
+    }
+    if (o.contextWindow !== undefined && backend !== 'qoder') {
+      throw new TypeError(`agent() contextWindow is supported only by the qoder backend, got ${JSON.stringify(backend)}`);
+    }
+    if (effort !== undefined && backend === 'gemini') {
+      pushLog(`agent[${seq}] ${label}: effort is unsupported by the gemini backend — using the backend default`);
+    }
     return {
       seq,
       prompt,
-      label: o.label ?? `#${seq}`,
+      label,
       phase: phaseTitle,
       schema: o.schema ? (JSON.parse(JSON.stringify(o.schema)) as JsonSchema) : undefined,
-      model: o.model,
-      effort: o.effort,
+      model: o.model ?? opts.defaultModel,
+      effort: backend === 'gemini' ? undefined : effort,
+      contextWindow:
+        backend === 'qoder'
+          ? (o.contextWindow ?? opts.defaultContextWindow)
+          : undefined,
       agentType: o.agentType ?? o.type ?? o.subagent_type,
       isolation: o.isolation as 'worktree' | undefined,
-      backend: o.backend ?? opts.defaultBackend,
+      backend,
       cwd: o.cwd ?? opts.cwd,
       retries,
       stallMs: o.stallMs,
@@ -407,6 +435,7 @@ export function createHostApi(opts: HostApiOptions): HostApi {
         backend: spec.backend,
         model: spec.model,
         effort: spec.effort,
+        contextWindow: spec.contextWindow,
         agentType: spec.agentType,
       });
       onAgentStarted?.(spec);

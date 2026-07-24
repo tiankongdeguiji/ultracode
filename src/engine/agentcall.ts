@@ -482,6 +482,7 @@ export class AgentCallExecutor implements AgentExecutor {
       schema: spec.schema,
       model: spec.model,
       effort: spec.effort,
+      contextWindow: spec.contextWindow,
       agentType: spec.agentType,
       cwd: spec.cwd,
       permission: this.opts.permission ?? 'auto',

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { executeWorkflow, type ExecuteOptions } from '../../src/engine/run.js';
 import { MOCK_TOOLS_CAP, MockExecutor } from '../../src/backends/mock.js';
+import type { AgentProgress, AgentSpec } from '../../src/backends/types.js';
 
 const META = `export const meta = { name: 'test', description: 'dialect semantics test' }\n`;
 
@@ -88,6 +89,69 @@ return [a, b, c]`,
     );
     expect(output.result).toEqual(['one', 'two', 'three']);
     expect(executor.specs.map((s) => (s as { timeoutMs?: number }).timeoutMs)).toEqual([undefined, undefined, 1500]);
+  });
+
+  it('applies run defaults, lets agent options override them, and scopes contextWindow to Qoder', async () => {
+    class SpecCapture extends MockExecutor {
+      specs: AgentSpec[] = [];
+      override execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (progress: AgentProgress) => void) {
+        this.specs.push({ ...spec });
+        return super.execute(spec, signal, onProgress);
+      }
+    }
+    const executor = new SpecCapture();
+    const { output } = await run(
+      `await agent('MOCK:ok one', { label: 'defaults' })
+await agent('MOCK:ok two', { label: 'override', model: 'm2', effort: 'low', contextWindow: 100000 })
+await agent('MOCK:ok three', { label: 'mixed', backend: 'codex' })
+return 1`,
+      {
+        executor,
+        defaultBackend: 'qoder',
+        defaultModel: 'm1',
+        defaultEffort: 'high',
+        defaultContextWindow: 200_000,
+      },
+    );
+    expect(output.error).toBeUndefined();
+    expect(executor.specs.map(({ backend, model, effort, contextWindow }) => ({ backend, model, effort, contextWindow }))).toEqual([
+      { backend: 'qoder', model: 'm1', effort: 'high', contextWindow: 200_000 },
+      { backend: 'qoder', model: 'm2', effort: 'low', contextWindow: 100_000 },
+      { backend: 'codex', model: 'm1', effort: 'high', contextWindow: undefined },
+    ]);
+  });
+
+  it('rejects invalid or explicitly non-Qoder contextWindow values', async () => {
+    await expect(run(`return agent('x')`, { defaultContextWindow: 0 })).rejects.toThrow(
+      'defaultContextWindow must be a positive integer',
+    );
+    expect((await run(`return agent('x', { backend: 'qoder', contextWindow: 0 })`)).output.error).toBe(
+      'agent() contextWindow must be a positive integer',
+    );
+    expect((await run(`return agent('x', { backend: 'codex', contextWindow: 100000 })`)).output.error).toContain(
+      'contextWindow is supported only by the qoder backend',
+    );
+  });
+
+  it('warns and removes effort from Gemini execution identity', async () => {
+    class SpecCapture extends MockExecutor {
+      specs: AgentSpec[] = [];
+      override execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (progress: AgentProgress) => void) {
+        this.specs.push({ ...spec });
+        return super.execute(spec, signal, onProgress);
+      }
+    }
+    const executor = new SpecCapture();
+    const { output } = await run(`return agent('MOCK:ok done', { label: 'gem' })`, {
+      executor,
+      defaultBackend: 'gemini',
+      defaultEffort: 'high',
+    });
+    expect(output.result).toBe('done');
+    expect(executor.specs[0]!.effort).toBeUndefined();
+    expect(output.logs).toContain(
+      'agent[0] gem: effort is unsupported by the gemini backend — using the backend default',
+    );
   });
 });
 

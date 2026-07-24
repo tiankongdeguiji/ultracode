@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { readCountOpt, readMaxConcurrencyOpt } from '../../src/cli/options.js';
+import { readContextWindowOpt, readCountOpt, readMaxConcurrencyOpt, readNonEmptyOpt } from '../../src/cli/options.js';
 
 function captureStderr(): { chunks: string[]; restore: () => void } {
   const chunks: string[] = [];
@@ -43,5 +43,28 @@ describe('readMaxConcurrencyOpt (shares the same guard, distinct flag)', () => {
     expect(readMaxConcurrencyOpt('0')).toEqual({ ok: false });
     err.restore();
     expect(err.chunks.join('')).toBe('ultracode: --max-concurrency must be a positive integer\n');
+  });
+});
+
+describe('subagent CLI option guards', () => {
+  it('validates and parses context-window', () => {
+    expect(readContextWindowOpt(undefined)).toEqual({ ok: true });
+    expect(readContextWindowOpt('200000')).toEqual({ ok: true, value: 200_000 });
+    const err = captureStderr();
+    expect(readContextWindowOpt('1.5')).toEqual({ ok: false });
+    expect(readContextWindowOpt(String(Number.MAX_SAFE_INTEGER + 1))).toEqual({ ok: false });
+    err.restore();
+    expect(err.chunks.join('')).toBe(
+      'ultracode: --context-window must be a positive integer\n'.repeat(2),
+    );
+  });
+
+  it('trims model/effort and rejects empty values', () => {
+    expect(readNonEmptyOpt(' model ', '--model')).toEqual({ ok: true, value: 'model' });
+    expect(readNonEmptyOpt(' high ', '--effort')).toEqual({ ok: true, value: 'high' });
+    const err = captureStderr();
+    expect(readNonEmptyOpt('  ', '--effort')).toEqual({ ok: false });
+    err.restore();
+    expect(err.chunks.join('')).toBe('ultracode: --effort must be a non-empty string\n');
   });
 });

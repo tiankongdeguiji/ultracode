@@ -53,7 +53,7 @@ describe('KeyChain', () => {
     expect(k3a).not.toBe(k3b); // chain, not per-call hash
   });
 
-  it('backend, model, effort, schema, agentType all affect the key', () => {
+  it('backend, model, effort, contextWindow, schema, agentType all affect the key', () => {
     const seed = seedKey(null);
     const base = spec({ prompt: 'x' });
     const variants: Partial<AgentSpec>[] = [
@@ -61,11 +61,22 @@ describe('KeyChain', () => {
       { backend: 'codex' },
       { model: 'big' },
       { effort: 'high' },
+      { contextWindow: 200_000 },
       { schema: { type: 'object' } },
       { agentType: 'explorer' },
     ];
     const keys = variants.map((v) => new KeyChain(seed, ROOT).next(spec({ ...base, ...v })));
     expect(new Set(keys).size).toBe(variants.length);
+  });
+
+  it('adapter execution revisions invalidate pre-upgrade replay keys', () => {
+    const seed = seedKey(null);
+    for (const backend of ['claude', 'qoder']) {
+      const request = spec({ backend, effort: 'high' });
+      const legacy = new KeyChain(seed, ROOT, {}).next(request);
+      const current = new KeyChain(seed, ROOT).next(request);
+      expect(current).not.toBe(legacy);
+    }
   });
 
   it('cwd equal to the run root is omitted from the hash', () => {

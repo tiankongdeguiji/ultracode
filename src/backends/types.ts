@@ -55,6 +55,8 @@ export interface AgentSpec {
   schema?: JsonSchema;
   model?: string;
   effort?: string;
+  /** Requested Qoder context window, in tokens. */
+  contextWindow?: number;
   agentType?: string;
   isolation?: 'worktree';
   backend: string;
@@ -105,6 +107,8 @@ export interface AgentRequest {
   schema?: JsonSchema;
   model?: string;
   effort?: string;
+  /** Requested Qoder context window, in tokens. */
+  contextWindow?: number;
   agentType?: string;
   /** resolved working directory (worktree path when isolation:'worktree') */
   cwd: string;

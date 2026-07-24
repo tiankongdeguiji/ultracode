@@ -50,6 +50,7 @@ export class ClaudeAdapter implements BackendAdapter {
       PERMISSION_MODE[req.permission],
     ];
     if (req.model) argv.push('--model', req.model);
+    if (req.effort) argv.push('--effort', req.effort);
     if (req.schema) argv.push('--json-schema', JSON.stringify(req.schema));
     return { bin: this.bin, argv, env: req.env, stdinData: req.prompt };
   }
@@ -69,6 +70,7 @@ export class ClaudeAdapter implements BackendAdapter {
       sessionId,
     ];
     if (req.model) argv.push('--model', req.model);
+    if (req.effort) argv.push('--effort', req.effort);
     if (req.schema) argv.push('--json-schema', JSON.stringify(req.schema));
     return { bin: this.bin, argv, env: req.env, stdinData: followupPrompt };
   }

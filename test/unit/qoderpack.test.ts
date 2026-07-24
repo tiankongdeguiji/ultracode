@@ -156,10 +156,11 @@ describe('lint portability findings', () => {
   });
 
   it('warns on engine-only agent options with line numbers', () => {
-    const src = BASE.replace('NAME', 'uc-x') + `return agent('p', { backend: 'codex', effort: 'high' })`;
+    const src = BASE.replace('NAME', 'uc-x') + `return agent('p', { backend: 'qoder', effort: 'high', contextWindow: 200000 })`;
     const f = lintWorkflowSource(src);
     expect(f.find((x) => x.message.includes("'backend'"))!.line).toBe(2);
     expect(f.some((x) => x.message.includes("'effort'"))).toBe(true);
+    expect(f.some((x) => x.message.includes("'contextWindow'"))).toBe(true);
   });
 
   it('warns on non-strict schemas', () => {

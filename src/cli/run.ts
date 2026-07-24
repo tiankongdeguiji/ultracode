@@ -11,13 +11,17 @@ import { newRunId, ultracodeRoot } from '../store/layout.js';
 import { createRunDir } from '../store/runstore.js';
 import { launchRunner } from '../exec/daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
+import { loadSubagentConfig, type SubagentDefaults } from '../config.js';
 import { attachForeground, printOutput } from './lifecycle.js';
-import { readMaxConcurrencyOpt, refuseInsideWorker } from './options.js';
+import { readContextWindowOpt, readMaxConcurrencyOpt, readNonEmptyOpt, refuseInsideWorker } from './options.js';
 import { validateScript } from './validate.js';
 
 export interface RunCliOptions {
   args?: string;
   backend?: string;
+  model?: string;
+  effort?: string;
+  contextWindow?: string;
   maxAgents?: string;
   maxConcurrency?: string;
   budget?: string;
@@ -44,13 +48,34 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
   // legitimate task.
   if (!opts.dryRun && refuseInsideWorker('start a run', opts.allowNested)) return 1;
 
-  const backend = opts.backend ?? 'mock';
+  let defaults: SubagentDefaults;
+  try {
+    defaults = loadSubagentConfig(process.cwd());
+  } catch (err) {
+    process.stderr.write(`ultracode: ${(err as Error).message}\n`);
+    return 1;
+  }
+  const backend = opts.backend ?? defaults.backend ?? (opts.dryRun ? 'mock' : undefined);
+  if (backend === undefined) {
+    process.stderr.write(
+      `ultracode: run requires --backend or subagent.backend in ultracode config ` +
+        `(use --dry-run for a mock rehearsal)\n`,
+    );
+    return 1;
+  }
   if (!IMPLEMENTED_BACKENDS.has(backend)) {
     process.stderr.write(
       `ultracode: backend '${backend}' is not implemented yet (available: ${[...IMPLEMENTED_BACKENDS].join(', ')})\n`,
     );
     return 1;
   }
+  const modelOpt = readNonEmptyOpt(opts.model, '--model');
+  const effortOpt = readNonEmptyOpt(opts.effort, '--effort');
+  const contextWindowOpt = readContextWindowOpt(opts.contextWindow);
+  if (!modelOpt.ok || !effortOpt.ok || !contextWindowOpt.ok) return 1;
+  const model = modelOpt.value ?? defaults.model;
+  const effort = effortOpt.value ?? defaults.effort;
+  const contextWindow = contextWindowOpt.value ?? defaults.contextWindow;
 
   let source: string;
   try {
@@ -134,7 +159,10 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
       executor: new MockExecutor(),
       args,
       budgetTotal,
-      defaultBackend: 'mock',
+      defaultBackend: backend,
+      defaultModel: model,
+      defaultEffort: effort,
+      defaultContextWindow: contextWindow,
       maxAgents: opts.maxAgents ? Number(opts.maxAgents) : undefined,
       maxConcurrency: maxConcurrencyOpt,
     });
@@ -156,7 +184,8 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
           (report.callCounts?.parallel || report.callCounts?.pipeline
             ? ` (+ dynamic fan-out via ${['parallel', 'pipeline'].filter((f) => report.callCounts?.[f]).join('/')})`
             : ''),
-        `  backend: ${backend}  permission: ${permission}  budget: ${budgetTotal ?? 'unlimited'}  concurrency: ${maxConcurrency}`,
+        `  backend: ${backend}  model: ${model ?? 'default'}  effort: ${effort ?? 'default'}  contextWindow: ${contextWindow ?? 'default'}`,
+        `  permission: ${permission}  budget: ${budgetTotal ?? 'unlimited'}  concurrency: ${maxConcurrency}`,
       ].join('\n') + '\n',
     );
     if (!process.stdin.isTTY) {
@@ -181,6 +210,9 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
     args,
     config: {
       backend,
+      model,
+      effort,
+      contextWindow,
       cwd: process.cwd(),
       maxAgents: opts.maxAgents ? Number(opts.maxAgents) : undefined,
       maxConcurrency,
