@@ -85,9 +85,12 @@ describe('MCP triad', () => {
     }
     const start = tools.tools.find((t) => t.name === 'workflow_start')!;
     expect(start.description).toContain(
-      'Omit backend/model/effort/contextWindow unless the user explicitly requested overrides',
+      'if either exists, omit backend/model/effort/contextWindow so config wins',
     );
-    expect(start.description).toContain('never infer a worker backend from the current host');
+    expect(start.description).toContain(
+      'only if both are absent, infer the current Codex/Qoder/Gemini host and pass backend alone',
+    );
+    expect(start.description).toContain('Never infer model/effort/contextWindow');
   });
 
   it('start → status(poll) → result: full round trip on the mock backend', async () => {

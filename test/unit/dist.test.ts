@@ -55,9 +55,12 @@ describe('plugin bundles', () => {
     expect(readFileSync(join(root, 'dist-qoder/LICENSE'), 'utf8')).toBe(readFileSync(join(root, 'LICENSE'), 'utf8'));
   });
 
-  it('bundled skill preserves configured backend choices', () => {
+  it('bundled skill preserves config precedence and host-only fallback inference', () => {
     const canonical = readFileSync(join(root, 'skill/ultracode/SKILL.md'), 'utf8');
-    expect(canonical).toContain('Never infer the worker backend from the current Codex/Qoder/Gemini host');
+    expect(canonical).toContain('Only when both files are absent, infer the worker backend');
+    expect(canonical).toContain('never infer `model`, `effort`, or `contextWindow`');
+    expect(canonical).toContain('If a config file exists but does not resolve a backend, stop and ask the user');
+    expect(canonical).not.toContain('Never infer the worker backend from the current Codex/Qoder/Gemini host');
     expect(canonical).not.toContain('ultracode run script.workflow.js --backend codex --yes');
     for (const path of [
       'dist-codex/skills/ultracode/SKILL.md',
