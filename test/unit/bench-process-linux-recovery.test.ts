@@ -22,6 +22,7 @@ import {
 import {
   discoverWorkerProcessesForTokens,
   signal0Status,
+  signalTrackedWorkerProcesses,
   signalWorkerProcessTokensUntilGone,
   snapshotLinuxProcessIdentities,
   type ProcessInspectionOptions,
@@ -32,7 +33,7 @@ import { spawnAgentProcess } from '../../src/exec/spawn.js';
 import { stopRun } from '../../src/exec/stop.js';
 import { workerRecordDir, workerRecordPath } from '../../src/exec/worker-record.js';
 import { newRunId } from '../../src/store/layout.js';
-import { readManifest, writeManifest } from '../../src/store/manifest.js';
+import { isResumableStatus, readManifest, writeManifest } from '../../src/store/manifest.js';
 import { createRunDir, getRun } from '../../src/store/runstore.js';
 
 const HASH = 'a'.repeat(64);
@@ -138,6 +139,326 @@ describe('Linux worker-token publication', () => {
     expect(order.slice(0, 2)).toEqual(['snapshot', 'publish']);
     await once(spawned.child, 'close');
     await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+  });
+
+  it('signals a latched escaped identity after its marker disappears', async () => {
+    let clock = 0;
+    let discoveries = 0;
+    let escapedLive = true;
+    let workerToken = '';
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      onWorkerToken: (token) => { workerToken = token; },
+      processInspection: {
+        platform: 'linux',
+        listLinuxProcessIds: () => [],
+        discoverWorkerProcesses: () => ({
+          processes: discoveries++ === 0
+            ? [{ ...PROCESS, token: workerToken }]
+            : [],
+          complete: true,
+        }),
+        readIdentitySnapshot: (pids) => ({
+          identities: new Map(
+            escapedLive && pids.includes(PROCESS.pid)
+              ? [[PROCESS.pid, { pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }]]
+              : [],
+          ),
+          complete: true,
+        }),
+        signalProcess: (pid, signal) => {
+          if (signal === 0) throw noSuchProcess();
+          signals.push([pid, signal]);
+          escapedLive = false;
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    });
+
+    await once(spawned.child, 'close');
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+    expect(signals).toEqual([[-PROCESS.pid, 'SIGTERM']]);
+  });
+
+  it('does not duplicate SIGTERM for a token match in the worker group', async () => {
+    let exposeTokenMatch = true;
+    let groupLive = true;
+    let groupPid = 0;
+    let tokenMatchLive = true;
+    let clock = 0;
+    const duplicateSignals: Array<[number, NodeJS.Signals]> = [];
+    const spawned = spawnAgentProcess(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1e9)'],
+      {
+        cwd: process.cwd(),
+        env: {},
+        processInspection: {
+          platform: 'linux',
+          listLinuxProcessIds: () => [],
+          discoverWorkerProcesses: (tokens) => ({
+            processes: exposeTokenMatch
+              ? [{ pid: groupPid, pgrp: groupPid, starttime: 'worker-start', token: tokens[0]! }]
+              : [],
+            complete: true,
+          }),
+          readIdentitySnapshot: (pids) => ({
+            identities: new Map(tokenMatchLive && pids.includes(groupPid)
+              ? [[groupPid, { pgrp: groupPid, starttime: 'worker-start' }]]
+              : []),
+            complete: true,
+          }),
+          signalProcess: (pid, signal) => {
+            if (signal === 0) {
+              if (!groupLive) throw noSuchProcess();
+              return;
+            }
+            duplicateSignals.push([pid, signal]);
+          },
+          observationNow: () => clock,
+          observationWait: async (delayMs) => { clock += delayMs; },
+        },
+      },
+    );
+    groupPid = spawned.child.pid!;
+
+    spawned.killTree('SIGTERM');
+    exposeTokenMatch = false;
+    await once(spawned.child, 'close');
+    groupLive = false;
+    tokenMatchLive = false;
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+    expect(duplicateSignals).toEqual([]);
+  });
+
+  it('retains a pre-signal identity from killTree across a PGID change and marker removal', async () => {
+    let clock = 0;
+    let groupLive = true;
+    let groupPid = 0;
+    let workerEscaped = false;
+    let workerLive = true;
+    let exposeTokenMatch = true;
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const spawned = spawnAgentProcess(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1e9)'],
+      {
+        cwd: process.cwd(),
+        env: {},
+        processInspection: {
+          platform: 'linux',
+          listLinuxProcessIds: () => [],
+          discoverWorkerProcesses: (tokens) => ({
+            processes: exposeTokenMatch
+              ? [{
+                  pid: PROCESS.pid,
+                  pgrp: groupPid,
+                  starttime: PROCESS.starttime,
+                  token: tokens[0]!,
+                }]
+              : [],
+            complete: true,
+          }),
+          readIdentitySnapshot: (pids) => ({
+            identities: new Map(
+              workerLive && pids.includes(PROCESS.pid)
+                ? [[PROCESS.pid, {
+                    pgrp: workerEscaped ? PROCESS.pid : groupPid,
+                    starttime: PROCESS.starttime,
+                  }]]
+                : [],
+            ),
+            complete: true,
+          }),
+          signalProcess: (pid, signal) => {
+            if (signal === 0) {
+              if (!groupLive) throw noSuchProcess();
+              return;
+            }
+            signals.push([pid, signal]);
+            workerLive = false;
+          },
+          observationNow: () => clock,
+          observationWait: async (delayMs) => { clock += delayMs; },
+        },
+      },
+    );
+    groupPid = spawned.child.pid!;
+    const closed = once(spawned.child, 'close');
+
+    spawned.killTree('SIGTERM');
+    exposeTokenMatch = false;
+    groupLive = false;
+    workerEscaped = true;
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+    await closed;
+    expect(signals).toEqual([[-PROCESS.pid, 'SIGTERM']]);
+  });
+
+  it('retains an authenticated identity across a failed cleanup retry', async () => {
+    let clock = 0;
+    let exposeTokenMatch = true;
+    let workerLive = true;
+    let allowSignal = false;
+    const signals: NodeJS.Signals[] = [];
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      processInspection: {
+        platform: 'linux',
+        listLinuxProcessIds: () => [],
+        discoverWorkerProcesses: (tokens) => ({
+          processes: exposeTokenMatch
+            ? [{ ...PROCESS, token: tokens[0]! }]
+            : [],
+          complete: true,
+        }),
+        readIdentitySnapshot: (pids) => ({
+          identities: new Map(
+            workerLive && pids.includes(PROCESS.pid)
+              ? [[PROCESS.pid, { pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }]]
+              : [],
+          ),
+          complete: true,
+        }),
+        signalProcess: (_pid, signal) => {
+          if (signal === 0) throw noSuchProcess();
+          signals.push(signal);
+          if (!allowSignal) throw new Error('survivor');
+          workerLive = false;
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    });
+
+    await once(spawned.child, 'close');
+    await expect(spawned.cleanupEscaped(0)).resolves.toBeGreaterThan(0);
+    exposeTokenMatch = false;
+    allowSignal = true;
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+    expect(signals).toEqual(['SIGKILL', 'SIGKILL', 'SIGTERM']);
+  });
+
+  it('retires a latched identity after it becomes a zombie', async () => {
+    let clock = 0;
+    let identityReads = 0;
+    let observations = 0;
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      processInspection: {
+        platform: 'linux',
+        listLinuxProcessIds: () => [],
+        discoverWorkerProcesses: (tokens) => ({
+          processes: observations++ === 0 ? [{ ...PROCESS, token: tokens[0]! }] : [],
+          complete: true,
+        }),
+        readIdentitySnapshot: (pids) => ({
+          identities: new Map(pids.includes(PROCESS.pid)
+            ? [[PROCESS.pid, {
+                state: identityReads++ === 0 ? 'S' : 'Z',
+                pgrp: PROCESS.pgrp,
+                starttime: PROCESS.starttime,
+              }]]
+            : []),
+          complete: true,
+        }),
+        signalProcess: (_pid, signal) => {
+          if (signal === 0) throw noSuchProcess();
+          throw new Error('a zombie must not be signaled');
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    });
+
+    await once(spawned.child, 'close');
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+  });
+});
+
+describe('Linux tracked worker signaling', () => {
+  const leader = { pid: 301, pgrp: 301, starttime: 'leader-start', token: TOKEN };
+  const child = { pid: 302, pgrp: 301, starttime: 'child-start', token: 'c'.repeat(32) };
+  const identitySnapshot = () => ({
+    identities: new Map([
+      [leader.pid, { pgrp: leader.pgrp, starttime: leader.starttime }],
+      [child.pid, { pgrp: child.pgrp, starttime: child.starttime }],
+    ]),
+    complete: true,
+  });
+
+  it('coalesces an authenticated group while retaining children for later retries', () => {
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const result = signalTrackedWorkerProcesses([leader, child], 'SIGTERM', {
+      platform: 'linux',
+      readIdentitySnapshot: identitySnapshot,
+      signalProcess: (pid, signal) => { signals.push([pid, signal as NodeJS.Signals]); },
+    });
+
+    expect(signals).toEqual([[-leader.pid, 'SIGTERM']]);
+    expect(result.processes).toBe(1);
+    expect(result.tokens).toEqual(new Set([leader.token]));
+  });
+
+  it('falls back to rechecked individual PIDs when the group signal fails', () => {
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const result = signalTrackedWorkerProcesses([leader, child], 'SIGTERM', {
+      platform: 'linux',
+      readIdentitySnapshot: identitySnapshot,
+      signalProcess: (pid, signal) => {
+        signals.push([pid, signal as NodeJS.Signals]);
+        if (pid < 0) throw noSuchProcess();
+      },
+    });
+
+    expect(signals).toEqual([
+      [-leader.pid, 'SIGTERM'],
+      [leader.pid, 'SIGTERM'],
+      [child.pid, 'SIGTERM'],
+    ]);
+    expect(result.processes).toBe(2);
+  });
+
+  it('rechecks each group leader immediately before signaling it', () => {
+    const reused = {
+      pid: 303,
+      pgrp: 303,
+      starttime: 'second-start',
+      token: 'd'.repeat(32),
+    };
+    let secondReused = false;
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const identities = new Map([
+      [leader.pid, { pgrp: leader.pgrp, starttime: leader.starttime }],
+      [reused.pid, { pgrp: reused.pgrp, starttime: reused.starttime }],
+    ]);
+    const result = signalTrackedWorkerProcesses([leader, reused], 'SIGTERM', {
+      platform: 'linux',
+      readIdentitySnapshot: (pids) => ({
+        identities: new Map(pids.flatMap((pid) => {
+          const identity = identities.get(pid);
+          if (identity === undefined) return [];
+          if (pid === reused.pid && secondReused) {
+            return [[pid, { ...identity, starttime: 'replacement-start' }]];
+          }
+          return [[pid, identity]];
+        })),
+        complete: true,
+      }),
+      signalProcess: (pid, signal) => {
+        signals.push([pid, signal as NodeJS.Signals]);
+        if (pid === -leader.pid) secondReused = true;
+      },
+    });
+
+    expect(signals).toEqual([[-leader.pid, 'SIGTERM']]);
+    expect(result.processes).toBe(1);
+    expect(result.tokens).toEqual(new Set([leader.token]));
   });
 });
 
@@ -356,16 +677,17 @@ describe('Linux token discovery completeness', () => {
     expect(signal0Status(-PROCESS.pgrp, { signalProcess: () => { throw error('EINVAL'); } })).toBe('unknown');
   });
 
-  it('marks a persistently unreadable live environment incomplete', () => {
+  it('accepts a stable same-EUID unreadable environment in the non-root sweep', () => {
     const discovery = discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, {
       platform: 'linux',
+      readLinuxEffectiveUid: () => 2_000,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
-      readLinuxProcessOwner: () => process.getuid!(),
+      readLinuxProcessOwner: () => 2_000,
       readLinuxProcessIdentity: () => ({ pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }),
       readLinuxProcessEnvironment: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
       signalProcess: () => {},
     });
-    expect(discovery).toEqual({ processes: [], complete: false });
+    expect(discovery).toEqual({ processes: [], complete: true });
   });
 
   it('accepts a procfs read race only after ESRCH proves the candidate exited', () => {
@@ -379,21 +701,27 @@ describe('Linux token discovery completeness', () => {
     expect(discovery).toEqual({ processes: [], complete: true });
   });
 
-  it('keeps unreadable live candidates completeness-relevant regardless of UID', async () => {
+  it('skips unreadable different-EUID processes without blocking settlement', async () => {
     const effectiveUid = 2_000;
+    let environmentReads = 0;
     const inspection = (uid: number): ProcessInspectionOptions => ({
       platform: 'linux',
       readLinuxEffectiveUid: () => effectiveUid,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: () => ({ pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }),
       readLinuxProcessOwner: () => uid,
-      readLinuxProcessEnvironment: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
+      readLinuxProcessEnvironment: () => {
+        environmentReads++;
+        throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      },
       signalProcess: () => {},
     });
     expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, inspection(effectiveUid + 1)))
-      .toEqual({ processes: [], complete: false });
+      .toEqual({ processes: [], complete: true });
+    expect(environmentReads).toBe(0);
     expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, inspection(effectiveUid)))
-      .toEqual({ processes: [], complete: false });
+      .toEqual({ processes: [], complete: true });
+    expect(environmentReads).toBe(1);
 
     let clock = 0;
     await expect(signalWorkerProcessTokensUntilGone(
@@ -403,10 +731,10 @@ describe('Linux token discovery completeness', () => {
         observationNow: () => clock,
         observationWait: async (delayMs) => { clock += delayMs; },
       },
-    )).resolves.toMatchObject({ settled: false, processes: 0 });
+    )).resolves.toMatchObject({ settled: true, processes: 0 });
   });
 
-  it('marks hidepid enumeration incomplete for non-root but authoritative for effective root', () => {
+  it('accepts hidepid enumeration for the same-EUID non-root scope', () => {
     const inspection = (effectiveUid: number): ProcessInspectionOptions => ({
       platform: 'linux',
       readLinuxEffectiveUid: () => effectiveUid,
@@ -415,15 +743,24 @@ describe('Linux token discovery completeness', () => {
     });
 
     expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, inspection(1_000)))
-      .toEqual({ processes: [], complete: false });
+      .toEqual({ processes: [], complete: true });
     expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, inspection(0)))
       .toEqual({ processes: [], complete: true });
+  });
+
+  it.each(['4', 'ptraceable'])('rejects hidepid=%s as an incomplete process listing', (mode) => {
+    expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, {
+      platform: 'linux',
+      readLinuxEffectiveUid: () => 1_000,
+      listLinuxProcessIds: () => [],
+      readLinuxProcMountInfo: () => procMountInfo(`rw,hidepid=${mode}`),
+    })).toEqual({ processes: [], complete: false });
   });
 
   it('fails closed when non-root procfs visibility cannot be identified', () => {
     const inspect = (
       mountInfo: string,
-      effectiveUid: number | undefined = 1_000,
+      effectiveUid: number | undefined,
     ): ProcessInspectionOptions => ({
       platform: 'linux',
       readLinuxEffectiveUid: () => effectiveUid,
@@ -432,10 +769,10 @@ describe('Linux token discovery completeness', () => {
     });
 
     expect(discoverWorkerProcessesForTokens(
-      [TOKEN], '/worker-scope', undefined, inspect(procMountInfo('rw,hidepid=off')),
+      [TOKEN], '/worker-scope', undefined, inspect(procMountInfo('rw,hidepid=off'), 1_000),
     )).toEqual({ processes: [], complete: true });
     expect(discoverWorkerProcessesForTokens(
-      [TOKEN], '/worker-scope', undefined, inspect('malformed mountinfo\n'),
+      [TOKEN], '/worker-scope', undefined, inspect('malformed mountinfo\n', 1_000),
     )).toEqual({ processes: [], complete: false });
     expect(discoverWorkerProcessesForTokens(
       [TOKEN], '/worker-scope', undefined, inspect(procMountInfo('rw,hidepid=2'), undefined),
@@ -463,9 +800,10 @@ describe('Linux token discovery completeness', () => {
     )).toEqual({ processes: [], complete: false });
   });
 
-  it('uses the effective-UID seam without excluding a readable real-UID owner', () => {
+  it('does not inspect a readable process owned by another EUID', () => {
     const scope = '/worker-scope';
     let effectiveUidReads = 0;
+    let environmentReads = 0;
     const discovery = discoverWorkerProcessesForTokens([TOKEN], scope, undefined, {
       platform: 'linux',
       readLinuxEffectiveUid: () => {
@@ -475,23 +813,27 @@ describe('Linux token discovery completeness', () => {
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: () => ({ pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }),
       readLinuxProcessOwner: () => 1_000,
-      readLinuxProcessEnvironment: () => [
-        `ULTRACODE_WORKER_TOKEN=${TOKEN}`,
-        `ULTRACODE_WORKER_SCOPE=${workerScopeValue(scope)}`,
-      ].join('\0'),
+      readLinuxProcessEnvironment: () => {
+        environmentReads++;
+        return [
+          `ULTRACODE_WORKER_TOKEN=${TOKEN}`,
+          `ULTRACODE_WORKER_SCOPE=${workerScopeValue(scope)}`,
+        ].join('\0');
+      },
     });
     expect(effectiveUidReads).toBe(1);
-    expect(discovery).toEqual({ processes: [PROCESS], complete: true });
+    expect(environmentReads).toBe(0);
+    expect(discovery).toEqual({ processes: [], complete: true });
   });
 
-  it('discovers an inspectable root-owned worker descendant', () => {
+  it('retains the host-wide sweep when ultracode runs as root', () => {
     const scope = '/worker-scope';
     const discovery = discoverWorkerProcessesForTokens([TOKEN], scope, undefined, {
       platform: 'linux',
-      readLinuxEffectiveUid: () => 1_000,
+      readLinuxEffectiveUid: () => 0,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: () => ({ pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }),
-      readLinuxProcessOwner: () => 0,
+      readLinuxProcessOwner: () => 1_000,
       readLinuxProcessEnvironment: () => [
         `ULTRACODE_WORKER_TOKEN=${TOKEN}`,
         `ULTRACODE_WORKER_SCOPE=${workerScopeValue(scope)}`,
@@ -500,24 +842,29 @@ describe('Linux token discovery completeness', () => {
     expect(discovery).toEqual({ processes: [PROCESS], complete: true });
   });
 
-  it('does not let unavailable owner metadata hide an inspectable descendant', () => {
+  it('fails closed when non-root owner metadata is unavailable', () => {
     const scope = '/worker-scope';
+    let environmentReads = 0;
     const discovery = discoverWorkerProcessesForTokens([TOKEN], scope, undefined, {
       platform: 'linux',
       readLinuxEffectiveUid: () => 1_000,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: () => ({ pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }),
       readLinuxProcessOwner: () => undefined,
-      readLinuxProcessEnvironment: () => [
-        `ULTRACODE_WORKER_TOKEN=${TOKEN}`,
-        `ULTRACODE_WORKER_SCOPE=${workerScopeValue(scope)}`,
-      ].join('\0'),
+      readLinuxProcessEnvironment: () => {
+        environmentReads++;
+        return [
+          `ULTRACODE_WORKER_TOKEN=${TOKEN}`,
+          `ULTRACODE_WORKER_SCOPE=${workerScopeValue(scope)}`,
+        ].join('\0');
+      },
       signalProcess: () => {},
     });
-    expect(discovery).toEqual({ processes: [PROCESS], complete: true });
+    expect(environmentReads).toBe(0);
+    expect(discovery).toEqual({ processes: [], complete: false });
   });
 
-  it('excludes only exact pre-spawn Linux identities from completeness', () => {
+  it('does not require a pre-spawn baseline for stable same-EUID unreadable processes', () => {
     const baseline = snapshotLinuxProcessIdentities({
       platform: 'linux',
       listLinuxProcessIds: () => [String(PROCESS.pid)],
@@ -526,16 +873,17 @@ describe('Linux token discovery completeness', () => {
     const inspection = (starttime: string): ProcessInspectionOptions => ({
       platform: 'linux',
       excludedLinuxProcessIdentities: baseline,
+      readLinuxEffectiveUid: () => 2_000,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: () => ({ pgrp: PROCESS.pgrp, starttime }),
-      readLinuxProcessOwner: () => process.getuid!(),
+      readLinuxProcessOwner: () => 2_000,
       readLinuxProcessEnvironment: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
       signalProcess: () => {},
     });
     expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, inspection('100')))
       .toEqual({ processes: [], complete: true });
     expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, inspection('101')))
-      .toEqual({ processes: [], complete: false });
+      .toEqual({ processes: [], complete: true });
   });
 
   it.each([
@@ -571,8 +919,10 @@ describe('Linux token discovery completeness', () => {
     const discovery = discoverWorkerProcessesForTokens([TOKEN], scope, undefined, {
       platform: 'linux',
       excludedLinuxProcessIdentities: baseline,
+      readLinuxEffectiveUid: () => 1_000,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: (pid) => pid === PROCESS.pid ? candidate : leaders.get(pid),
+      readLinuxProcessOwner: () => 1_000,
       readLinuxProcessEnvironment: () => {
         environmentReads++;
         return [
@@ -594,11 +944,13 @@ describe('Linux token discovery completeness', () => {
     let identityReads = 0;
     const discovery = discoverWorkerProcessesForTokens([TOKEN], scope, undefined, {
       platform: 'linux',
+      readLinuxEffectiveUid: () => 1_000,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: () => ({
         pgrp: PROCESS.pgrp,
         starttime: identityReads++ === 0 ? 'before' : 'replacement',
       }),
+      readLinuxProcessOwner: () => 1_000,
       readLinuxProcessEnvironment: () => [
         `ULTRACODE_WORKER_TOKEN=${TOKEN}`,
         `ULTRACODE_WORKER_SCOPE=${workerScopeValue(scope)}`,
@@ -612,6 +964,7 @@ describe('Linux token discovery completeness', () => {
   it('does not let an unreadable zombie invalidate live-process absence', () => {
     const discovery = discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, {
       platform: 'linux',
+      readLinuxEffectiveUid: () => 0,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: () => ({ state: 'Z', pgrp: PROCESS.pgrp, starttime: '300' }),
       readLinuxProcessOwner: () => process.getuid!(),
@@ -646,10 +999,12 @@ describe('Linux token discovery completeness', () => {
     let environmentReads = 0;
     const discovery = discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, {
       platform: 'linux',
+      readLinuxEffectiveUid: () => 1_000,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: () => identityReads++ === 0
         ? before
         : { state: 'S', pgrp: PROCESS.pgrp, starttime: 'replacement' },
+      readLinuxProcessOwner: () => 1_000,
       readLinuxProcessEnvironment: () => {
         environmentReads++;
         return '';
@@ -671,6 +1026,7 @@ describe('Linux token discovery completeness', () => {
     const inspection = (leaderStarttime: string): ProcessInspectionOptions => ({
       platform: 'linux',
       excludedLinuxProcessIdentities: baseline,
+      readLinuxEffectiveUid: () => 0,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: (pid) => pid === PROCESS.pid
         ? candidate
@@ -704,6 +1060,7 @@ describe('Linux token discovery completeness', () => {
     const inspection = (sessionStarttime: string): ProcessInspectionOptions => ({
       platform: 'linux',
       excludedLinuxProcessIdentities: baseline,
+      readLinuxEffectiveUid: () => 0,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: (pid) => pid === PROCESS.pid
         ? candidate
@@ -730,6 +1087,7 @@ describe('Linux token discovery completeness', () => {
     const inspection: ProcessInspectionOptions = {
       platform: 'linux',
       excludedLinuxProcessIdentities: new Set([parentKey]),
+      readLinuxEffectiveUid: () => 0,
       listLinuxProcessIds: () => [String(PROCESS.pid)],
       readLinuxProcessIdentity: (pid) => pid === PROCESS.pid ? child : pid === parentPid ? parent : undefined,
       readLinuxProcessOwner: () => process.getuid!(),
@@ -756,6 +1114,7 @@ describe('Linux token discovery completeness', () => {
     const inspection: ProcessInspectionOptions = {
       platform: 'linux',
       excludedLinuxProcessIdentities: new Set([key(daemonPid), key(commonPid)]),
+      readLinuxEffectiveUid: () => 1_000,
       listLinuxProcessIds: () => [String(PROCESS.pid), String(daemonPid)],
       readLinuxProcessIdentity: (pid) => identities.get(pid),
       readLinuxProcessOwner: () => 1_000,
@@ -776,6 +1135,74 @@ describe('Linux token discovery completeness', () => {
 });
 
 describe('Linux live process settlement', () => {
+  it('retries a child that survives an authenticated group signal', async () => {
+    const groupLeader = {
+      pid: 301,
+      pgrp: 301,
+      starttime: 'leader-start',
+      token: TOKEN,
+    };
+    const groupChild = {
+      pid: 302,
+      pgrp: 301,
+      starttime: 'child-start',
+      token: 'c'.repeat(32),
+    };
+    let leaderLive = true;
+    let childLive = true;
+    let clock = 0;
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const result = await signalWorkerProcessTokensUntilGone(
+      [groupLeader.token, groupChild.token],
+      'SIGTERM',
+      '/worker-scope',
+      50,
+      {
+        platform: 'linux',
+        discoverWorkerProcesses: () => ({
+          processes: [
+            ...(leaderLive ? [groupLeader] : []),
+            ...(childLive ? [groupChild] : []),
+          ],
+          complete: true,
+        }),
+        readIdentitySnapshot: (pids) => ({
+          identities: new Map(pids.flatMap((pid) => {
+            if (pid === groupLeader.pid && leaderLive) {
+              return [[pid, {
+                pgrp: groupLeader.pgrp,
+                starttime: groupLeader.starttime,
+              }]];
+            }
+            if (pid === groupChild.pid && childLive) {
+              return [[pid, {
+                pgrp: groupChild.pgrp,
+                starttime: groupChild.starttime,
+              }]];
+            }
+            return [];
+          })),
+          complete: true,
+        }),
+        signalProcess: (pid, signal) => {
+          if (signal === 0) throw noSuchProcess();
+          signals.push([pid, signal]);
+          if (pid === -groupLeader.pid) leaderLive = false;
+          if (pid === groupChild.pid) childLive = false;
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    );
+
+    expect(result.settled).toBe(true);
+    expect(result.processes).toBe(2);
+    expect(signals).toEqual([
+      [-groupLeader.pid, 'SIGTERM'],
+      [groupChild.pid, 'SIGTERM'],
+    ]);
+  });
+
   it('does not count an incomplete empty observation and signals a later live process', async () => {
     let clock = 0;
     let observations = 0;
@@ -922,6 +1349,7 @@ describe('Linux benchmark process settlement', () => {
     let observations = 0;
     const signals: Array<[number, NodeJS.Signals]> = [];
     let recovered = false;
+    let processLive = true;
     const result = await runBenchProcess(process.execPath, ['-e', ''], {
       cwd: process.cwd(),
       terminationGraceMs: 100,
@@ -930,17 +1358,18 @@ describe('Linux benchmark process settlement', () => {
         discoverWorkerProcesses: (tokens) => {
           observations++;
           if (observations === 1) return { processes: [], complete: false };
-          if (observations === 2) {
+          if (observations === 2 || observations === 3) {
             return { processes: [{ ...PROCESS, token: tokens[0]! }], complete: true };
           }
           return { processes: [], complete: true };
         },
-        readLinuxProcessIdentity: (pid) => pid === PROCESS.pid
+        readLinuxProcessIdentity: (pid) => processLive && pid === PROCESS.pid
           ? { pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }
           : undefined,
         signalProcess: (pid, signal) => {
           if (signal === 0) throw noSuchProcess();
           signals.push([pid, signal]);
+          processLive = false;
         },
         observationNow: () => clock,
         observationWait: async (delayMs) => { clock += delayMs; },
@@ -949,7 +1378,7 @@ describe('Linux benchmark process settlement', () => {
     });
 
     expect(result.exitCode).toBe(0);
-    expect(observations).toBe(4);
+    expect(observations).toBe(5);
     expect(signals).toEqual([[-PROCESS.pid, 'SIGTERM']]);
     expect(recovered).toBe(true);
   });
@@ -1067,11 +1496,11 @@ describe('process stop settlement', () => {
     complete = true;
     const recovered = await stopRun(root, runId, inspection);
     expect(recovered).toMatchObject({ ok: true, status: 'stopped' });
-    expect(recovered.message).toContain('worker cleanup verified; marked stopped');
+    expect(recovered.message).toContain('worker cleanup scan settled; marked stopped');
     expect(readManifest(directory)?.status).toBe('stopped');
   });
 
-  it('does not derive a Linux absence floor from a forged future start record', async () => {
+  it('settles a non-root run when only stable same-EUID environments are unreadable', async () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-stop-forged-floor-'));
     roots.push(root);
     const runId = newRunId();
@@ -1083,7 +1512,12 @@ describe('process stop settlement', () => {
       config: { backend: 'mock', cwd: root },
     });
     const run = getRun(root, runId)!;
-    writeManifest(directory, { ...run.manifest, status: 'stopped', endedAt: new Date().toISOString() });
+    writeManifest(directory, {
+      ...run.manifest,
+      status: 'cleanup-failed',
+      endedAt: new Date().toISOString(),
+      error: 'worker cleanup incomplete',
+    });
     mkdirSync(workerRecordDir(directory, 0), { recursive: true });
     writeFileSync(workerRecordPath(directory, 0, 1), `${PROCESS.pid} 999999999999 ${TOKEN}`);
     let clock = 0;
@@ -1099,8 +1533,9 @@ describe('process stop settlement', () => {
       observationNow: () => clock,
       observationWait: async (delayMs) => { clock += delayMs; },
     });
-    expect(result).toMatchObject({ ok: false, status: 'cleanup-failed' });
-    expect(result.message).toMatch(/could not verify stable process absence/);
-    expect(readManifest(directory)?.status).toBe('cleanup-failed');
+    expect(result).toMatchObject({ ok: true, status: 'stopped' });
+    expect(result.message).toContain('worker cleanup scan settled; marked stopped');
+    expect(readManifest(directory)?.status).toBe('stopped');
+    expect(isResumableStatus(readManifest(directory)!.status)).toBe(true);
   });
 });

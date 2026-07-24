@@ -728,7 +728,7 @@ export function headerLines(state: PanelState, opts: FrameOptions, paint: Paint)
   if (opts.runStatus === 'orphaned') {
     lines.push(paint('31', '✗ runner died without finalizing (orphaned) — see runner.log'));
   } else if (opts.runStatus === 'cleanup-failed') {
-    lines.push(paint('31', '✗ worker cleanup is unverified — run ultracode stop before resume'));
+    lines.push(paint('31', '✗ worker cleanup scan is unsettled — run ultracode stop before resume'));
   }
   return lines;
 }

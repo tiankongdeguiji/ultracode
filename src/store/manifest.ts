@@ -70,7 +70,7 @@ export function isTerminal(status: RunStatus): boolean {
     || status === 'cleanup-failed';
 }
 
-/** Terminal runs are replayable only after worker cleanup reached verified absence. */
+/** Terminal runs are replayable only after the worker cleanup scan settled. */
 export function isResumableStatus(status: RunStatus): boolean {
   return isTerminal(status) && status !== 'cleanup-failed' && status !== 'orphaned';
 }

@@ -74,7 +74,7 @@ export async function runnerMain(
   if (config.resumeFromRunId !== undefined) {
     const prior = readManifest(join(dirname(dir), config.resumeFromRunId));
     if (prior === null || !isResumableStatus(prior.status)) {
-      throw new Error(`run ${config.resumeFromRunId} cannot be resumed before verified worker cleanup`);
+      throw new Error(`run ${config.resumeFromRunId} cannot be resumed before the worker cleanup scan settles`);
     }
   }
 
