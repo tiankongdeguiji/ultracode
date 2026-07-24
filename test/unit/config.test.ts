@@ -36,6 +36,18 @@ describe('layered subagent config', () => {
     });
   });
 
+  it('starts a fresh profile when the project switches the user backend', () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-config-'));
+    const home = join(root, 'home');
+    const project = join(root, 'project');
+    put(home, { subagent: { backend: 'qoder', model: 'qwen', effort: 'xhigh', context_window: 200_000 } });
+    put(project, { subagent: { backend: 'codex', model: 'gpt-5.6-sol' } });
+    expect(loadSubagentConfig(project, { userHome: home })).toEqual({
+      backend: 'codex',
+      model: 'gpt-5.6-sol',
+    });
+  });
+
   it.each([
     ['unknown top-level field', { nope: true }],
     ['unknown subagent field', { subagent: { cli: 'qoder' } }],

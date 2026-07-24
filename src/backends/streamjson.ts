@@ -49,6 +49,7 @@ export function createStreamJsonParser(
   const contextRatios = new Map<string, number>();
   let contextRatioSum = 0;
   let lastContextRatio: number | undefined;
+  let terminalUsageEmitted = false;
 
   const observeContextRatio = (
     usage: Record<string, any> | undefined,
@@ -153,6 +154,7 @@ export function createStreamJsonParser(
             kind: 'usage',
             usage: hasTokenUsage(reported) || estimated === undefined ? reported : estimated,
           });
+          terminalUsageEmitted = true;
           const isError = obj.is_error === true || (typeof obj.subtype === 'string' && obj.subtype.startsWith('error'));
           out.push({
             kind: 'result',
@@ -173,7 +175,11 @@ export function createStreamJsonParser(
       return out;
     },
     end(): AgentEvent[] {
-      return [];
+      if (terminalUsageEmitted) return [];
+      const estimated = estimatedContextUsage(contextRatioSum);
+      if (estimated === undefined) return [];
+      terminalUsageEmitted = true;
+      return [{ kind: 'usage', usage: estimated }];
     },
   };
 }

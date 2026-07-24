@@ -156,7 +156,11 @@ function readConfigFile(path: string): SubagentDefaults | undefined {
   };
 }
 
-/** User defaults are overlaid field-by-field by project defaults. */
+/**
+ * User defaults are overlaid by project defaults as backend profiles. A
+ * project-level backend switch drops backend-scoped controls from the user
+ * profile instead of leaking them into the new backend.
+ */
 export function loadSubagentConfig(
   cwd: string,
   opts: LoadSubagentConfigOptions = {},
@@ -165,14 +169,22 @@ export function loadSubagentConfig(
     join(opts.userHome ?? homedir(), '.ultracode', 'config.json'),
     join(resolve(cwd), '.ultracode', 'config.json'),
   ];
-  const defaults: SubagentDefaults = {};
+  let defaults: SubagentDefaults = {};
   const seen = new Set<string>();
   for (const path of paths) {
     const absolute = resolve(path);
     if (seen.has(absolute)) continue;
     seen.add(absolute);
     const config = readConfigFile(absolute);
-    if (config) Object.assign(defaults, config);
+    if (config) {
+      const profile = resolveSubagentProfile(defaults, config).profile;
+      defaults = {
+        ...(profile.backend !== undefined ? { backend: profile.backend as ImplementedBackendId } : {}),
+        ...(profile.model !== undefined ? { model: profile.model } : {}),
+        ...(profile.effort !== undefined ? { effort: profile.effort } : {}),
+        ...(profile.contextWindow !== undefined ? { contextWindow: profile.contextWindow } : {}),
+      };
+    }
   }
   return defaults;
 }

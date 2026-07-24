@@ -6,7 +6,7 @@
  * and the setTimeout-overflow guard for huge per-attempt timeouts.
  */
 import { describe, it, expect } from 'vitest';
-import { AgentCallExecutor, resumableSessionId } from '../../src/engine/agentcall.js';
+import { AgentCallExecutor, resumableSessionId, resumeContinuationPrompt } from '../../src/engine/agentcall.js';
 import { usageFromEvents } from '../../src/backends/usage.js';
 import { parseJsonLine } from '../../src/backends/ndjson.js';
 import type { AgentEvent, AgentRequest, AgentSpec, BackendAdapter, ExitClass, SpawnPlan } from '../../src/backends/types.js';
@@ -219,8 +219,8 @@ describe('task-retry resume', () => {
     ]);
     const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(false);
-    // 1000 real + ceil(4-char prompt / 4) = 1 estimated for the uncovered resume
-    expect(outcome.usage.totalTokens).toBe(1001);
+    const continuationTokens = Math.ceil(resumeContinuationPrompt('exit 1').length / 4);
+    expect(outcome.usage.totalTokens).toBe(1_000 + continuationTokens);
     expect(outcome.usage.estimated).toBe(true);
   });
 

@@ -125,6 +125,7 @@ interface AttemptResult {
   sessionId?: string;
   toolCalls: number;
   declinedActions: number;
+  inputChars: number;
   outputChars: number;
 }
 
@@ -175,15 +176,20 @@ export class AgentCallExecutor implements AgentExecutor {
       // when the failed attempt surfaced no (valid) session id or the
       // adapter cannot resume.
       const resumeSession = last !== undefined ? resumableSessionId(last.sessionId) : undefined;
+      const continuationPrompt = last !== undefined
+        ? resumeContinuationPrompt(last.exit.message)
+        : undefined;
       const resumePlan =
         resumeSession !== undefined
-          ? this.adapter.buildResume(resumeSession, resumeContinuationPrompt(last!.exit.message), req)
+          ? this.adapter.buildResume(resumeSession, continuationPrompt!, req)
           : null;
+      const attemptPrompt = resumePlan !== null ? continuationPrompt! : req.prompt;
       const attemptBudgetMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
       const attemptStartedAt = Date.now();
       last = await this.runAttempt(spec, resumePlan ?? this.adapter.buildSpawn(req), signal, attempt, {
         onStreamEvent: tracker?.onStreamEvent,
         resumedSession: resumePlan !== null,
+        inputChars: attemptPrompt.length,
       });
       // A resume that dies without ever REATTACHING (no session event — e.g.
       // the backend could not load the killed session's rollout, whatever
@@ -211,6 +217,7 @@ export class AgentCallExecutor implements AgentExecutor {
             onStreamEvent: tracker?.onStreamEvent,
             stderrSuffix: '-fresh',
             timeoutOverrideMs: remainingMs,
+            inputChars: req.prompt.length,
           });
         }
       }
@@ -360,17 +367,20 @@ export class AgentCallExecutor implements AgentExecutor {
       // whenever an extra spawn is running.
       tracker?.retry(attemptsUsed + round + 1, attemptsUsed + SCHEMA_REPAIR_LIMIT, 'schema-repair', lastErrors.slice(0, 3).join('; '));
       const sessionId = resumableSessionId(current.sessionId) ?? resumableSessionId(first.sessionId);
+      const resumePrompt = resumeRepairPrompt(lastErrors, schema);
       const resumePlan =
-        sessionId !== undefined ? this.adapter.buildResume(sessionId, resumeRepairPrompt(lastErrors, schema), req) : null;
+        sessionId !== undefined ? this.adapter.buildResume(sessionId, resumePrompt, req) : null;
+      const freshPrompt = freshRepairPrompt(spec.prompt, lastRaw, lastErrors, schema);
       const plan =
         resumePlan ??
         this.adapter.buildSpawn({
           ...req,
-          prompt: freshRepairPrompt(spec.prompt, lastRaw, lastErrors, schema),
+          prompt: freshPrompt,
         });
       current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, {
         onStreamEvent: tracker?.onStreamEvent,
         resumedSession: resumePlan !== null,
+        inputChars: (resumePlan !== null ? resumePrompt : freshPrompt).length,
       });
       usages.push(current);
       tracker?.attemptSettled(usages);
@@ -461,7 +471,7 @@ export class AgentCallExecutor implements AgentExecutor {
         // output) rather than dropping it, so a failed attempt or schema-repair
         // that died before emitting a usage event is still counted. (Previously
         // any attempt with usage suppressed estimation for the ones without.)
-        const est = estimateUsage(spec.prompt.length, a.outputChars);
+        const est = estimateUsage(a.inputChars, a.outputChars);
         input += est.inputTokens;
         output += est.outputTokens;
         estimatedAny = true;
@@ -507,9 +517,12 @@ export class AgentCallExecutor implements AgentExecutor {
       /** remaining budget for a same-attempt rerun — one deadline per logical
        *  attempt, never a second full window */
       timeoutOverrideMs?: number;
+      /** Exact task, continuation, or repair prompt sent by this attempt. */
+      inputChars?: number;
     } = {},
   ): Promise<AttemptResult> {
     const { onStreamEvent, resumedSession = false, stderrSuffix = '', timeoutOverrideMs } = opts;
+    const inputChars = opts.inputChars ?? plan.stdinData?.length ?? spec.prompt.length;
     const artifactDir = this.opts.artifactDir?.(spec);
     if (artifactDir) mkdirSync(artifactDir, { recursive: true });
     const recoveryDir = this.opts.workerScope ? workerRecordDir(this.opts.workerScope, spec.seq) : artifactDir;
@@ -757,7 +770,7 @@ export class AgentCallExecutor implements AgentExecutor {
           };
         }
       }
-      attemptResult = { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, outputChars };
+      attemptResult = { exit, events, finalText, structured, sessionId, toolCalls, declinedActions, inputChars, outputChars };
     } catch (err) {
       attemptResult = {
         exit: {
@@ -772,6 +785,7 @@ export class AgentCallExecutor implements AgentExecutor {
         sessionId,
         toolCalls,
         declinedActions,
+        inputChars,
         outputChars,
       };
     } finally {

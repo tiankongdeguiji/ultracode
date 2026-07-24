@@ -136,6 +136,33 @@ describe('QoderAdapter', () => {
     expect(a.extractUsage(events)).toMatchObject({ totalTokens: 0, estimated: false });
   });
 
+  it('settles observed context usage when the stream ends without a result', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = parser.push(JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'message-1',
+        content: [{ type: 'text', text: 'partial' }],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          request_id: 'request-1',
+          context_usage_ratio: 0.25,
+        },
+      },
+    }));
+    events.push(...parser.end());
+    expect(events.filter((event) => event.kind === 'usage')).toEqual([
+      expect.objectContaining({ interim: true, usage: expect.objectContaining({ inputTokens: 50_000 }) }),
+      expect.objectContaining({ usage: expect.objectContaining({ inputTokens: 50_000, estimated: true }) }),
+    ]);
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 50_000,
+      totalTokens: 50_000,
+      estimated: true,
+    });
+  });
+
   it('prefers authoritative token counters when Qoder supplies them', () => {
     const parser = a.createParser(req({ contextWindow: 200_000 }));
     const events = parser.push(JSON.stringify({
