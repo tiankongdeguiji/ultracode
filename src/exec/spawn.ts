@@ -37,7 +37,7 @@ const LINUX_BASELINES = new Map<object | symbol, {
 }>();
 
 function trackedWorkerKey(worker: TrackedWorkerProcess): string {
-  return `${worker.pid}:${worker.starttime}:${worker.pgrp}:${worker.token}`;
+  return `${worker.pid}:${worker.starttime}:${worker.token}`;
 }
 
 function acquireLinuxBaseline(
@@ -284,7 +284,7 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     );
     const now = opts.processInspection?.observationNow ?? (() => performance.now());
     const wait = opts.processInspection?.observationWait ?? sleep;
-    const pendingEscaped = new Map<string, TrackedWorkerProcess>();
+    const pendingWorkers = new Map<string, TrackedWorkerProcess>();
     const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
       let delayMs = 25;
       let emptyPasses = 0;
@@ -292,39 +292,42 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
       for (;;) {
         const groupSignaled = signalGroup(signal);
         const discovery = observeTokenProcesses();
-        const escaped = groupSignaled && pid
-          ? discovery.processes.filter((candidate) => candidate.pgrp !== pid)
-          : discovery.processes;
-        const previouslyObserved = new Set(pendingEscaped.keys());
-        for (const candidate of escaped) {
-          pendingEscaped.set(trackedWorkerKey(candidate), candidate);
+        const previouslyObserved = new Set(pendingWorkers.keys());
+        for (const candidate of discovery.processes) {
+          pendingWorkers.set(trackedWorkerKey(candidate), candidate);
         }
         const pendingSnapshot = readProcessIdentitySnapshot(
-          [...pendingEscaped.values()].map((candidate) => candidate.pid),
+          [...pendingWorkers.values()].map((candidate) => candidate.pid),
           opts.processInspection,
         );
         const livePending: TrackedWorkerProcess[] = [];
-        for (const [key, candidate] of pendingEscaped) {
+        for (const [key, candidate] of pendingWorkers) {
           const live = pendingSnapshot.identities.get(candidate.pid);
-          if (live?.starttime === candidate.starttime && live.pgrp === candidate.pgrp) {
-            livePending.push(candidate);
+          if (live?.starttime === candidate.starttime) {
+            const refreshed = { pid: candidate.pid, token: candidate.token, ...live };
+            pendingWorkers.set(key, refreshed);
+            livePending.push(refreshed);
           } else if (live !== undefined || pendingSnapshot.complete) {
-            pendingEscaped.delete(key);
+            pendingWorkers.delete(key);
           }
         }
+        const individuallySignalable = groupSignaled && pid
+          ? livePending.filter((candidate) => candidate.pgrp !== pid)
+          : livePending;
         const actionable = signal === 'SIGKILL'
-          ? livePending
-          : livePending.filter((candidate) => previouslyObserved.has(trackedWorkerKey(candidate)));
+          ? individuallySignalable
+          : individuallySignalable.filter((candidate) =>
+              previouslyObserved.has(trackedWorkerKey(candidate)));
         // Same-group workers already received this signal; do not immediately
         // re-signal a fork before it can finish setsid() and install handlers.
-        // Keep authenticated escaped identities latched across scans so an
-        // intervening exec cannot erase the marker and create false absence.
+        // Keep authenticated identities latched and refresh their PGID so an
+        // intervening setsid/exec cannot erase the marker and create absence.
         signalTrackedWorkerProcesses(actionable, signal, opts.processInspection);
         retireGroupIfGone();
         emptyPasses = discovery.complete
           && pendingSnapshot.complete
           && discovery.processes.length === 0
-          && pendingEscaped.size === 0
+          && pendingWorkers.size === 0
           ? emptyPasses + 1
           : 0;
         // One procfs directory snapshot can miss a PID forked after readdir.

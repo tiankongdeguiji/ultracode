@@ -190,6 +190,16 @@ function procMountAllowsScopedEnumeration(raw: string): boolean {
       || fields[separator + 1] !== 'proc'
     ) return false;
     found = true;
+    const options = [
+      ...(fields[5] ?? '').split(','),
+      ...(fields[separator + 3] ?? '').split(','),
+    ];
+    for (const option of options) {
+      if (option === 'hidepid') return false;
+      if (!option.startsWith('hidepid=')) continue;
+      const value = option.slice('hidepid='.length);
+      if (!['0', 'off', '1', 'noaccess', '2', 'invisible'].includes(value)) return false;
+    }
   }
   return found;
 }

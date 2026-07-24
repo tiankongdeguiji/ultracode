@@ -230,6 +230,70 @@ describe('Linux worker-token publication', () => {
     await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
     expect(duplicateSignals).toEqual([]);
   });
+
+  it('retains a same-group identity across a PGID change and marker removal', async () => {
+    let clock = 0;
+    let groupLive = true;
+    let groupPid = 0;
+    let workerEscaped = false;
+    let workerLive = true;
+    let observations = 0;
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const spawned = spawnAgentProcess(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1e9)'],
+      {
+        cwd: process.cwd(),
+        env: {},
+        processInspection: {
+          platform: 'linux',
+          listLinuxProcessIds: () => [],
+          discoverWorkerProcesses: (tokens) => ({
+            processes: observations++ === 0
+              ? [{
+                  pid: PROCESS.pid,
+                  pgrp: groupPid,
+                  starttime: PROCESS.starttime,
+                  token: tokens[0]!,
+                }]
+              : [],
+            complete: true,
+          }),
+          readIdentitySnapshot: (pids) => ({
+            identities: new Map(
+              workerLive && pids.includes(PROCESS.pid)
+                ? [[PROCESS.pid, {
+                    pgrp: workerEscaped ? PROCESS.pid : groupPid,
+                    starttime: PROCESS.starttime,
+                  }]]
+                : [],
+            ),
+            complete: true,
+          }),
+          signalProcess: (pid, signal) => {
+            if (signal === 0) {
+              if (!groupLive) throw noSuchProcess();
+              return;
+            }
+            signals.push([pid, signal]);
+            workerLive = false;
+          },
+          observationNow: () => clock,
+          observationWait: async (delayMs) => {
+            clock += delayMs;
+            groupLive = false;
+            workerEscaped = true;
+          },
+        },
+      },
+    );
+    groupPid = spawned.child.pid!;
+    const closed = once(spawned.child, 'close');
+
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+    await closed;
+    expect(signals).toEqual([[-PROCESS.pid, 'SIGTERM']]);
+  });
 });
 
 describe('Linux benchmark lifecycle recovery', () => {
@@ -516,6 +580,15 @@ describe('Linux token discovery completeness', () => {
       .toEqual({ processes: [], complete: true });
     expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, inspection(0)))
       .toEqual({ processes: [], complete: true });
+  });
+
+  it.each(['4', 'ptraceable'])('rejects hidepid=%s as an incomplete process listing', (mode) => {
+    expect(discoverWorkerProcessesForTokens([TOKEN], '/worker-scope', undefined, {
+      platform: 'linux',
+      readLinuxEffectiveUid: () => 1_000,
+      listLinuxProcessIds: () => [],
+      readLinuxProcMountInfo: () => procMountInfo(`rw,hidepid=${mode}`),
+    })).toEqual({ processes: [], complete: false });
   });
 
   it('fails closed when non-root procfs visibility cannot be identified', () => {
