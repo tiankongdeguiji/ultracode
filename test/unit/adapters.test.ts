@@ -93,6 +93,14 @@ describe('ClaudeAdapter', () => {
 describe('QoderAdapter', () => {
   const a = new QoderAdapter();
 
+  it('emulates structured output without unsupported schema flags', () => {
+    expect(a.structuredOutput).toBe('emulated');
+    const spawn = a.buildSpawn(req({ schema: { type: 'object' } }));
+    const resume = a.buildResume('sid', 'fix it', req({ schema: { type: 'object' } }))!;
+    expect(spawn.argv).not.toContain('--json-schema');
+    expect(resume.argv).not.toContain('--json-schema');
+  });
+
   it('parses structured_output from the terminal result line', () => {
     const events = replay(a, 'qoder/success-structured.jsonl');
     const result = events.find((e) => e.kind === 'result');
@@ -109,7 +117,7 @@ describe('QoderAdapter', () => {
     expect(a.classifyExit(41, null, [], 'auth failed')).toMatchObject({ ok: false, errorKind: 'auth', retryable: false });
   });
 
-  it('builds --print --json-schema, agent routing, model controls, and -w cwd', () => {
+  it('builds --print, agent routing, model controls, and -w cwd', () => {
     const plan = a.buildSpawn(req({
       schema: { type: 'object' },
       agentType: 'uc-xhigh',
@@ -118,7 +126,6 @@ describe('QoderAdapter', () => {
       contextWindow: 200_000,
     }));
     expect(plan.argv).toContain('--print');
-    expect(plan.argv).toContain('--json-schema');
     expect(plan.argv).toEqual(expect.arrayContaining(['--agent', 'uc-xhigh', '-w', '/w']));
     expect(plan.argv).toEqual(expect.arrayContaining([
       '--model', 'coder',
@@ -150,6 +157,15 @@ describe('QoderAdapter', () => {
     expect(argv).not.toContain('--model');
     expect(argv).not.toContain('--reasoning-effort');
     expect(argv).not.toContain('--context-window');
+  });
+
+  it('does not retry unsupported CLI options', () => {
+    expect(a.classifyExit(1, null, [], "error: unknown option '--future-flag'")).toMatchObject({
+      ok: false,
+      errorKind: 'infra',
+      retryable: false,
+      message: expect.stringContaining("unknown option '--future-flag'"),
+    });
   });
 });
 

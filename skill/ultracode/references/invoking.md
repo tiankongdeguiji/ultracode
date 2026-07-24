@@ -33,7 +33,7 @@ behalf.
 | backend | worker CLI | structured output | parallel-safe auth |
 |---|---|---|---|
 | codex | `codex exec --json` (+ rollout sidecar for live tokens/model) | native `--output-schema` (strict subset) | `CODEX_API_KEY` |
-| qoder | `qodercli --print` (`--reasoning-effort` / `--context-window` on ≥1.1.1) | native `--json-schema` (+ engine revalidation) | `QODER_PERSONAL_ACCESS_TOKEN` (beware stored /login creds) |
+| qoder | `qodercli --print` (`--reasoning-effort` / `--context-window` on ≥1.1.1) | emulated prompt contract + engine validation/repair | `QODER_PERSONAL_ACCESS_TOKEN` (beware stored /login creds) |
 | claude | `claude -p` | native `--json-schema` | CLI-managed |
 | gemini | `gemini -p` | emulated (prompt contract + validate/retry) | `GEMINI_API_KEY` — no headless resume: task retries always respawn fresh |
 | mock | built-in | schema-aware stubs | n/a — free, use for --dry-run |
