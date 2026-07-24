@@ -245,7 +245,7 @@ return agent('MOCK:ok configured', { label: 'one' })`;
     try {
       await expect(resumeCommand(runId, { home: root, detach: true })).resolves.toBe(1);
       await expect(startDetachedRun({ resumeFromRunId: runId, home: root }))
-        .rejects.toThrow(/before verified worker cleanup/u);
+        .rejects.toThrow(/before the worker cleanup scan settles/u);
     } finally {
       stderr.mockRestore();
     }

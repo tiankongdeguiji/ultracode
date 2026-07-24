@@ -477,7 +477,7 @@ function persistCleanupOutcome(
       status: 'stopped',
       heartbeatAt: new Date().toISOString(),
     });
-    return cleanupStopResult('stopped', 'worker cleanup verified; marked stopped', report);
+    return cleanupStopResult('stopped', 'worker cleanup scan settled; marked stopped', report);
   }
   return cleanupStopResult(settledStatus, message, report);
 }

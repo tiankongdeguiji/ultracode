@@ -131,7 +131,7 @@ describe('panel frame', () => {
     expect(orphaned.split('\n')[1]).toBe('✗ runner died without finalizing (orphaned) — see runner.log');
     const cleanupFailed = renderFrame(richState(), { ...FRAME_OPTS, runStatus: 'cleanup-failed' });
     expect(cleanupFailed.split('\n')[1]).toBe(
-      '✗ worker cleanup is unverified — run ultracode stop before resume',
+      '✗ worker cleanup scan is unsettled — run ultracode stop before resume',
     );
     const s = richState();
     foldEvent(s, ev('stop_requested', {}));
