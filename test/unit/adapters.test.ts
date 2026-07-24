@@ -187,6 +187,56 @@ describe('QoderAdapter', () => {
     });
   });
 
+  it('combines per-request counters and ratio estimates when terminal counters are zero', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = [
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-1',
+          content: [{ type: 'text', text: 'first' }],
+          usage: {
+            input_tokens: 800,
+            output_tokens: 20,
+            request_id: 'request-1',
+            context_usage_ratio: 0.1,
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-2',
+          content: [{ type: 'text', text: 'second' }],
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            request_id: 'request-2',
+            context_usage_ratio: 0.25,
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'done',
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          request_id: 'request-2',
+          context_usage_ratio: 0.25,
+        },
+      })),
+    ];
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 50_800,
+      outputTokens: 20,
+      totalTokens: 50_820,
+      estimated: true,
+    });
+  });
+
   it('prefers authoritative token counters when Qoder supplies them', () => {
     const parser = a.createParser(req({ contextWindow: 200_000 }));
     const events = parser.push(JSON.stringify({
@@ -213,6 +263,13 @@ describe('QoderAdapter', () => {
     const events = replay(a, 'qoder/error-max-turns.jsonl');
     expect(a.classifyExit(0, null, events, '')).toMatchObject({ ok: false, errorKind: 'max-turns' });
     expect(a.classifyExit(41, null, [], 'auth failed')).toMatchObject({ ok: false, errorKind: 'auth', retryable: false });
+  });
+
+  it('keeps a successful terminal result authoritative over incidental stderr', () => {
+    const events = replay(a, 'qoder/success-structured.jsonl');
+    expect(a.classifyExit(0, null, events, 'warning: unknown option mentioned in tool output')).toMatchObject({
+      ok: true,
+    });
   });
 
   it('builds --print, agent routing, model controls, and -w cwd', () => {

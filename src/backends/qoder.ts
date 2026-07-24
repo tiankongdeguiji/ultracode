@@ -100,6 +100,12 @@ export class QoderAdapter implements BackendAdapter {
     if (code === QODER_AUTH_EXIT) {
       return { ok: false, errorKind: 'auth', retryable: false, message: `qodercli auth error (exit 41): ${stderrTail.slice(-300)}` };
     }
+    // Terminal result is authoritative (see claude.ts): an earlier assistant-level
+    // result{isError:true} would otherwise mask a successful terminal result.
+    const result = events.filter((e): e is Extract<AgentEvent, { kind: 'result' }> => e.kind === 'result').pop();
+    if (code === 0 && result && result.kind === 'result' && !result.isError) {
+      return { ok: true, retryable: false, message: 'ok' };
+    }
     if (/\bunknown option\b/i.test(stderrTail)) {
       return {
         ok: false,
@@ -107,12 +113,6 @@ export class QoderAdapter implements BackendAdapter {
         retryable: false,
         message: `qodercli rejected an unsupported CLI option: ${stderrTail.slice(-300)}`,
       };
-    }
-    // Terminal result is authoritative (see claude.ts): an earlier assistant-level
-    // result{isError:true} would otherwise mask a successful terminal result.
-    const result = events.filter((e): e is Extract<AgentEvent, { kind: 'result' }> => e.kind === 'result').pop();
-    if (code === 0 && result && result.kind === 'result' && !result.isError) {
-      return { ok: true, retryable: false, message: 'ok' };
     }
     if (result && result.kind === 'result' && result.isError) {
       const kind = result.errorKind ?? 'infra';

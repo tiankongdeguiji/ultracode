@@ -47,10 +47,22 @@ export function createStreamJsonParser(
   const reportedUsageMessages = new Set<string>();
   let contextWindow = positiveContextWindow(options.contextWindow);
   const contextRatios = new Map<string, number>();
-  let contextRatioSum = 0;
+  const reportedUsageKeys = new Set<string>();
+  const requestKeysByMessage = new Map<string, Set<string>>();
+  let unkeyedContextRatioSum = 0;
   let lastContextRatio: number | undefined;
   let terminalUsageEmitted = false;
   let assistantReportedUsage: Partial<NormalizedUsage> | undefined;
+
+  const contextRequestKey = (
+    usage: Record<string, any>,
+    fallbackKey: string | undefined,
+  ): string | undefined =>
+    typeof usage.request_id === 'string'
+      ? `request:${usage.request_id}`
+      : fallbackKey !== undefined
+        ? `message:${fallbackKey}`
+        : undefined;
 
   const observeContextRatio = (
     usage: Record<string, any> | undefined,
@@ -60,17 +72,12 @@ export function createStreamJsonParser(
     if (!options.estimateContextUsage || !usage) return 0;
     const ratio = usage.context_usage_ratio;
     if (typeof ratio !== 'number' || !Number.isFinite(ratio) || ratio <= 0 || ratio > 1) return 0;
-    const requestKey =
-      typeof usage.request_id === 'string'
-        ? `request:${usage.request_id}`
-        : fallbackKey !== undefined
-          ? `message:${fallbackKey}`
-          : undefined;
+    const requestKey = contextRequestKey(usage, fallbackKey);
     // A terminal result repeats the final assistant request. Older streams may
     // omit request_id, so identical adjacent ratios are the only safe fallback.
     if (requestKey === undefined) {
       if (terminal && lastContextRatio === ratio) return 0;
-      contextRatioSum += ratio;
+      unkeyedContextRatioSum += ratio;
       lastContextRatio = ratio;
       return ratio;
     }
@@ -78,7 +85,6 @@ export function createStreamJsonParser(
     if (previous !== undefined && ratio <= previous) return 0;
     contextRatios.set(requestKey, ratio);
     const delta = ratio - (previous ?? 0);
-    contextRatioSum += delta;
     lastContextRatio = ratio;
     return delta;
   };
@@ -93,6 +99,26 @@ export function createStreamJsonParser(
       outputTokens: 0,
       cachedInputTokens: 0,
       reasoningTokens: 0,
+      estimated: true,
+    };
+  };
+
+  const settledObservedUsage = (): Partial<NormalizedUsage> | undefined => {
+    const uncoveredRatio =
+      unkeyedContextRatioSum +
+      [...contextRatios.entries()]
+        .filter(([key]) => !reportedUsageKeys.has(key))
+        .reduce((sum, [, ratio]) => sum + ratio, 0);
+    const estimated = estimatedContextUsage(uncoveredRatio);
+    if (assistantReportedUsage === undefined) return estimated;
+    if (estimated === undefined) return assistantReportedUsage;
+    return {
+      inputTokens: (assistantReportedUsage.inputTokens ?? 0) + (estimated.inputTokens ?? 0),
+      outputTokens: (assistantReportedUsage.outputTokens ?? 0) + (estimated.outputTokens ?? 0),
+      cachedInputTokens:
+        (assistantReportedUsage.cachedInputTokens ?? 0) + (estimated.cachedInputTokens ?? 0),
+      reasoningTokens:
+        (assistantReportedUsage.reasoningTokens ?? 0) + (estimated.reasoningTokens ?? 0),
       estimated: true,
     };
   };
@@ -125,10 +151,20 @@ export function createStreamJsonParser(
           // surfaced as interim ticks for live progress, never for accounting.
           if (obj.message?.usage && typeof obj.message.usage === 'object') {
             const messageId = typeof obj.message.id === 'string' ? obj.message.id : undefined;
-            const reported = usageFromResult({ usage: obj.message.usage });
-            const ratioDelta = observeContextRatio(obj.message.usage, messageId, false);
+            const messageUsage = obj.message.usage as Record<string, any>;
+            const requestKey = contextRequestKey(messageUsage, messageId);
+            if (messageId !== undefined && requestKey !== undefined) {
+              const keys = requestKeysByMessage.get(messageId) ?? new Set<string>();
+              keys.add(requestKey);
+              requestKeysByMessage.set(messageId, keys);
+              if (reportedUsageMessages.has(messageId)) reportedUsageKeys.add(requestKey);
+            }
+            const reported = usageFromResult({ usage: messageUsage });
+            const ratioDelta = observeContextRatio(messageUsage, messageId, false);
             if (hasTokenUsage(reported)) {
-              if (messageId === undefined || !reportedUsageMessages.has(messageId)) {
+              const duplicateMessage = messageId !== undefined && reportedUsageMessages.has(messageId);
+              const duplicateRequest = requestKey !== undefined && reportedUsageKeys.has(requestKey);
+              if (!duplicateMessage && !duplicateRequest) {
                 if (messageId !== undefined) reportedUsageMessages.add(messageId);
                 assistantReportedUsage = {
                   inputTokens: (assistantReportedUsage?.inputTokens ?? 0) + (reported.inputTokens ?? 0),
@@ -140,11 +176,19 @@ export function createStreamJsonParser(
                 };
                 out.push({ kind: 'usage', usage: reported, interim: true });
               }
+              if (requestKey !== undefined) reportedUsageKeys.add(requestKey);
+              if (messageId !== undefined) {
+                reportedUsageKeys.add(`message:${messageId}`);
+                for (const key of requestKeysByMessage.get(messageId) ?? []) reportedUsageKeys.add(key);
+              }
             } else {
               // Unlike Claude's byte-identical blocks, Qoder 1.1.4 adds the
               // ratio only on the final tool/end block of the same message.
               const estimated = estimatedContextUsage(ratioDelta);
-              if (estimated) out.push({ kind: 'usage', usage: estimated, interim: true });
+              const covered =
+                (requestKey !== undefined && reportedUsageKeys.has(requestKey)) ||
+                (messageId !== undefined && reportedUsageMessages.has(messageId));
+              if (estimated && !covered) out.push({ kind: 'usage', usage: estimated, interim: true });
             }
           }
           if (typeof obj.error === 'string') {
@@ -158,10 +202,10 @@ export function createStreamJsonParser(
           if (reportedWindow !== undefined) contextWindow = reportedWindow;
           observeContextRatio(obj.usage, undefined, true);
           const reported = usageFromResult(obj);
-          const estimated = estimatedContextUsage(contextRatioSum);
+          const observed = settledObservedUsage();
           out.push({
             kind: 'usage',
-            usage: hasTokenUsage(reported) || estimated === undefined ? reported : estimated,
+            usage: hasTokenUsage(reported) || observed === undefined ? reported : observed,
           });
           terminalUsageEmitted = true;
           const isError = obj.is_error === true || (typeof obj.subtype === 'string' && obj.subtype.startsWith('error'));
@@ -185,14 +229,10 @@ export function createStreamJsonParser(
     },
     end(): AgentEvent[] {
       if (terminalUsageEmitted) return [];
-      if (assistantReportedUsage !== undefined) {
-        terminalUsageEmitted = true;
-        return [{ kind: 'usage', usage: assistantReportedUsage }];
-      }
-      const estimated = estimatedContextUsage(contextRatioSum);
-      if (estimated === undefined) return [];
+      const observed = settledObservedUsage();
+      if (observed === undefined) return [];
       terminalUsageEmitted = true;
-      return [{ kind: 'usage', usage: estimated }];
+      return [{ kind: 'usage', usage: observed }];
     },
   };
 }
