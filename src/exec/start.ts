@@ -14,7 +14,7 @@ import { launchRunner } from './daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../backends/ids.js';
 import {
   backendOverrideWarning,
-  loadSubagentConfig,
+  loadSubagentConfigWithWarnings,
   resolveSubagentProfile,
   validateSubagentProfile,
   type SubagentDefaults,
@@ -67,7 +67,13 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
   const cwd = input.cwd ?? process.cwd();
   const root = ultracodeRoot(cwd, input.home);
 
-  const defaults: SubagentDefaults = input.resumeFromRunId ? {} : loadSubagentConfig(cwd);
+  let defaults: SubagentDefaults = {};
+  let warnings: string[] = [];
+  if (!input.resumeFromRunId) {
+    const loaded = loadSubagentConfigWithWarnings(cwd);
+    defaults = loaded.defaults;
+    warnings = loaded.warnings;
+  }
   if (!input.resumeFromRunId && input.requireBackend && input.backend === undefined && defaults.backend === undefined) {
     throw new Error(
       'workflow_start requires an explicit backend or subagent.backend in ultracode config ' +
@@ -77,7 +83,6 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
 
   let source = input.script;
   let args = input.args ?? null;
-  let warnings: string[] = [];
   const freshProfile = resolveSubagentProfile(defaults, {
     backend: input.backend,
     model: input.model,
@@ -85,7 +90,7 @@ export async function startDetachedRun(input: StartRunInput): Promise<StartRunRe
     contextWindow: input.contextWindow,
   });
   const freshWarning = backendOverrideWarning(defaults, freshProfile);
-  if (freshWarning) warnings.push(freshWarning);
+  if (freshWarning && !warnings.includes(freshWarning)) warnings.push(freshWarning);
   let config = {
     backend: freshProfile.profile.backend ?? 'mock',
     model: freshProfile.profile.model,

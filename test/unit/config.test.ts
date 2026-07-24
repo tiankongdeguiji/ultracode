@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   backendOverrideWarning,
   loadSubagentConfig,
+  loadSubagentConfigWithWarnings,
   MAX_CONFIG_BYTES,
   resolveSubagentProfile,
   validateSubagentProfile,
@@ -45,6 +46,16 @@ describe('layered subagent config', () => {
     expect(loadSubagentConfig(project, { userHome: home })).toEqual({
       backend: 'codex',
       model: 'gpt-5.6-sol',
+    });
+    expect(loadSubagentConfigWithWarnings(project, { userHome: home })).toEqual({
+      defaults: {
+        backend: 'codex',
+        model: 'gpt-5.6-sol',
+      },
+      warnings: [
+        "backend override 'codex' differs from configured backend 'qoder'; " +
+        'not inheriting configured effort, contextWindow',
+      ],
     });
   });
 
@@ -154,6 +165,22 @@ describe('subagent profile resolution', () => {
       },
       ignoredDefaults: ['contextWindow'],
     });
+  });
+
+  it('escapes and bounds backend values rendered in override diagnostics', () => {
+    const configured = {
+      backend: `qoder\u001b]8;;https://example.test\u0007${'x'.repeat(300)}`,
+      model: 'qwen',
+    };
+    const warning = backendOverrideWarning(
+      configured,
+      resolveSubagentProfile(configured, { backend: "codex'\nforged" }),
+    )!;
+    expect(warning).not.toContain('\u001b');
+    expect(warning).not.toContain('\n');
+    expect(warning).toContain("\\u001b");
+    expect(warning).toContain("codex\\'\\nforged");
+    expect(warning.length).toBeLessThan(400);
   });
 
   it('rejects controls known to be incompatible with the selected backend', () => {

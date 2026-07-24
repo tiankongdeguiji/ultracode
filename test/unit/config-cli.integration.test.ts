@@ -105,6 +105,52 @@ return agent('MOCK:ok done', { label: 'worker' })`,
     await waitTerminal(overrideDir);
   }, 40_000);
 
+  it('warns when a project backend discards user-profile controls', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-config-cli-layers-'));
+    const project = join(root, 'project');
+    const home = join(root, 'home');
+    const store = join(root, 'store');
+    mkdirSync(join(project, '.ultracode'), { recursive: true });
+    mkdirSync(join(home, '.ultracode'), { recursive: true });
+    writeFileSync(
+      join(home, '.ultracode', 'config.json'),
+      JSON.stringify({
+        subagent: {
+          backend: 'qoder',
+          model: 'Qwen3.8-Max-Preview',
+          effort: 'xhigh',
+          context_window: 1_000_000,
+        },
+      }),
+    );
+    writeFileSync(
+      join(project, '.ultracode', 'config.json'),
+      JSON.stringify({ subagent: { backend: 'mock' } }),
+    );
+    writeFileSync(
+      join(project, 'test.workflow.js'),
+      `export const meta = { name: 'layer-switch-warning', description: 'd' }
+return agent('MOCK:ok done', { label: 'worker' })`,
+    );
+
+    const { stdout, stderr } = await exec(
+      process.execPath,
+      ['--import', tsxLoader, mainTs, 'run', 'test.workflow.js', '--yes', '--detach', '--home', store],
+      { cwd: project, env: { ...process.env, HOME: home } },
+    );
+    const runId = stdout.trim().split('\n')[0]!;
+    const dir = join(store, 'runs', runId);
+    expect(stderr).toContain(
+      "backend override 'mock' differs from configured backend 'qoder'; " +
+      'not inheriting configured model, effort, contextWindow',
+    );
+    expect(JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'))).toMatchObject({
+      backend: 'mock',
+    });
+    expect(JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'))).not.toHaveProperty('model');
+    await waitTerminal(dir);
+  }, 40_000);
+
   it('starts a fresh profile when an explicit CLI backend differs from config', async () => {
     const root = mkdtempSync(join(tmpdir(), 'uc-config-cli-switch-'));
     const project = join(root, 'project');

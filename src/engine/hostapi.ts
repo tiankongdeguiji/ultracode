@@ -88,7 +88,7 @@ type RunEventBody =
       /** resolved from a prior run's journal (prefix replay) — consumed zero tokens */
       cached?: boolean;
       totalTokens: number;
-      /** the total contains inferred usage because authoritative backend telemetry was unavailable */
+      /** the total includes an inferred portion whose authoritative telemetry was unavailable */
       estimated?: boolean;
       /** authoritative tool-call count (started ticks); absent on skip/cached */
       toolCalls?: number;

@@ -13,7 +13,7 @@ import { launchRunner } from '../exec/daemonize.js';
 import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
 import {
   backendOverrideWarning,
-  loadSubagentConfig,
+  loadSubagentConfigWithWarnings,
   resolveSubagentProfile,
   validateSubagentProfile,
   type SubagentDefaults,
@@ -55,8 +55,9 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
   if (!opts.dryRun && refuseInsideWorker('start a run', opts.allowNested)) return 1;
 
   let defaults: SubagentDefaults;
+  let configWarnings: string[];
   try {
-    defaults = loadSubagentConfig(process.cwd());
+    ({ defaults, warnings: configWarnings } = loadSubagentConfigWithWarnings(process.cwd()));
   } catch (err) {
     process.stderr.write(`ultracode: ${(err as Error).message}\n`);
     return 1;
@@ -93,7 +94,9 @@ export async function runCommand(file: string, opts: RunCliOptions): Promise<num
     return 1;
   }
   const warning = backendOverrideWarning(defaults, resolvedProfile);
-  if (warning) process.stderr.write(`ultracode: warning: ${warning}\n`);
+  for (const message of new Set([...configWarnings, ...(warning ? [warning] : [])])) {
+    process.stderr.write(`ultracode: warning: ${message}\n`);
+  }
   const { model, effort, contextWindow } = profile;
 
   let source: string;

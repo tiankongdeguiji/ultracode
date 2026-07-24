@@ -48,6 +48,12 @@ export interface LoadSubagentConfigOptions {
   userHome?: string;
 }
 
+export interface LoadedSubagentConfig {
+  defaults: SubagentDefaults;
+  /** Backend-profile controls discarded while overlaying config layers. */
+  warnings: string[];
+}
+
 /**
  * Resolves launch or per-agent overrides without leaking one backend's controls
  * into another backend. An explicit backend switch starts a fresh profile;
@@ -87,9 +93,16 @@ export function backendOverrideWarning(
 ): string | undefined {
   if (resolved.ignoredDefaults.length === 0) return undefined;
   return (
-    `backend override '${resolved.profile.backend}' differs from configured backend '${defaults.backend}'; ` +
+    `backend override ${diagnosticValue(resolved.profile.backend)} differs from configured backend ` +
+    `${diagnosticValue(defaults.backend)}; ` +
     `not inheriting configured ${resolved.ignoredDefaults.join(', ')}`
   );
+}
+
+function diagnosticValue(value: unknown): string {
+  const escaped = JSON.stringify(String(value)).slice(1, -1).replaceAll("'", "\\'");
+  const bounded = escaped.length > 160 ? `${escaped.slice(0, 157)}...` : escaped;
+  return `'${bounded}'`;
 }
 
 /** Rejects controls that the selected backend is known not to support. */
@@ -165,11 +178,23 @@ export function loadSubagentConfig(
   cwd: string,
   opts: LoadSubagentConfigOptions = {},
 ): SubagentDefaults {
+  return loadSubagentConfigWithWarnings(cwd, opts).defaults;
+}
+
+/**
+ * Loads the layered profile together with diagnostics for controls discarded
+ * by a backend switch between the user and project configuration files.
+ */
+export function loadSubagentConfigWithWarnings(
+  cwd: string,
+  opts: LoadSubagentConfigOptions = {},
+): LoadedSubagentConfig {
   const paths = [
     join(opts.userHome ?? homedir(), '.ultracode', 'config.json'),
     join(resolve(cwd), '.ultracode', 'config.json'),
   ];
   let defaults: SubagentDefaults = {};
+  const warnings: string[] = [];
   const seen = new Set<string>();
   for (const path of paths) {
     const absolute = resolve(path);
@@ -177,7 +202,10 @@ export function loadSubagentConfig(
     seen.add(absolute);
     const config = readConfigFile(absolute);
     if (config) {
-      const profile = resolveSubagentProfile(defaults, config).profile;
+      const resolved = resolveSubagentProfile(defaults, config);
+      const warning = backendOverrideWarning(defaults, resolved);
+      if (warning) warnings.push(warning);
+      const { profile } = resolved;
       defaults = {
         ...(profile.backend !== undefined ? { backend: profile.backend as ImplementedBackendId } : {}),
         ...(profile.model !== undefined ? { model: profile.model } : {}),
@@ -186,5 +214,5 @@ export function loadSubagentConfig(
       };
     }
   }
-  return defaults;
+  return { defaults, warnings };
 }

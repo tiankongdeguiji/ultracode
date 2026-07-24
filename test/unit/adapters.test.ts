@@ -237,6 +237,55 @@ describe('QoderAdapter', () => {
     });
   });
 
+  it('adds request-scoped terminal counters without dropping earlier requests', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = [
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-1',
+          content: [{ type: 'text', text: 'first' }],
+          usage: {
+            input_tokens: 800,
+            output_tokens: 20,
+            request_id: 'request-1',
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          id: 'message-2',
+          content: [{ type: 'text', text: 'second' }],
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            request_id: 'request-2',
+            context_usage_ratio: 0.25,
+          },
+        },
+      })),
+      ...parser.push(JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'done',
+        usage: {
+          input_tokens: 900,
+          output_tokens: 30,
+          request_id: 'request-2',
+          context_usage_ratio: 0.25,
+        },
+      })),
+    ];
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 1_700,
+      outputTokens: 50,
+      totalTokens: 1_750,
+      estimated: false,
+    });
+  });
+
   it('prefers authoritative token counters when Qoder supplies them', () => {
     const parser = a.createParser(req({ contextWindow: 200_000 }));
     const events = parser.push(JSON.stringify({

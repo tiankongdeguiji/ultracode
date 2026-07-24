@@ -33,7 +33,7 @@ export interface NormalizedUsage {
   /** input + output + reasoning + round(0.1 × cached) — see usage.ts */
   totalTokens: number;
   costUSD?: number;
-  /** true when the backend omitted authoritative usage and the value was inferred */
+  /** true when any portion was inferred because authoritative telemetry was unavailable for it */
   estimated: boolean;
 }
 

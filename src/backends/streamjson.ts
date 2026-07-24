@@ -53,6 +53,18 @@ export function createStreamJsonParser(
   let lastContextRatio: number | undefined;
   let terminalUsageEmitted = false;
   let assistantReportedUsage: Partial<NormalizedUsage> | undefined;
+  let lastAssistantMessageId: string | undefined;
+
+  const accumulateReportedUsage = (usage: Partial<NormalizedUsage>): void => {
+    assistantReportedUsage = {
+      inputTokens: (assistantReportedUsage?.inputTokens ?? 0) + (usage.inputTokens ?? 0),
+      outputTokens: (assistantReportedUsage?.outputTokens ?? 0) + (usage.outputTokens ?? 0),
+      cachedInputTokens:
+        (assistantReportedUsage?.cachedInputTokens ?? 0) + (usage.cachedInputTokens ?? 0),
+      reasoningTokens:
+        (assistantReportedUsage?.reasoningTokens ?? 0) + (usage.reasoningTokens ?? 0),
+    };
+  };
 
   const contextRequestKey = (
     usage: Record<string, any>,
@@ -151,6 +163,7 @@ export function createStreamJsonParser(
           // surfaced as interim ticks for live progress, never for accounting.
           if (obj.message?.usage && typeof obj.message.usage === 'object') {
             const messageId = typeof obj.message.id === 'string' ? obj.message.id : undefined;
+            lastAssistantMessageId = messageId;
             const messageUsage = obj.message.usage as Record<string, any>;
             const requestKey = contextRequestKey(messageUsage, messageId);
             if (messageId !== undefined && requestKey !== undefined) {
@@ -166,14 +179,7 @@ export function createStreamJsonParser(
               const duplicateRequest = requestKey !== undefined && reportedUsageKeys.has(requestKey);
               if (!duplicateMessage && !duplicateRequest) {
                 if (messageId !== undefined) reportedUsageMessages.add(messageId);
-                assistantReportedUsage = {
-                  inputTokens: (assistantReportedUsage?.inputTokens ?? 0) + (reported.inputTokens ?? 0),
-                  outputTokens: (assistantReportedUsage?.outputTokens ?? 0) + (reported.outputTokens ?? 0),
-                  cachedInputTokens:
-                    (assistantReportedUsage?.cachedInputTokens ?? 0) + (reported.cachedInputTokens ?? 0),
-                  reasoningTokens:
-                    (assistantReportedUsage?.reasoningTokens ?? 0) + (reported.reasoningTokens ?? 0),
-                };
+                accumulateReportedUsage(reported);
                 out.push({ kind: 'usage', usage: reported, interim: true });
               }
               if (requestKey !== undefined) reportedUsageKeys.add(requestKey);
@@ -202,10 +208,43 @@ export function createStreamJsonParser(
           if (reportedWindow !== undefined) contextWindow = reportedWindow;
           observeContextRatio(obj.usage, undefined, true);
           const reported = usageFromResult(obj);
-          const observed = settledObservedUsage();
+          let usage: Partial<NormalizedUsage>;
+          if (options.estimateContextUsage) {
+            const terminalUsage =
+              obj.usage && typeof obj.usage === 'object'
+                ? obj.usage as Record<string, any>
+                : undefined;
+            const requestKey =
+              terminalUsage === undefined ? undefined : contextRequestKey(terminalUsage, undefined);
+            if (hasTokenUsage(reported)) {
+              const lastMessageUsedFallback =
+                lastAssistantMessageId !== undefined &&
+                reportedUsageMessages.has(lastAssistantMessageId) &&
+                requestKeysByMessage
+                  .get(lastAssistantMessageId)
+                  ?.has(`message:${lastAssistantMessageId}`) === true;
+              const alreadyReported =
+                (requestKey !== undefined && reportedUsageKeys.has(requestKey)) ||
+                (requestKey === undefined &&
+                  lastAssistantMessageId !== undefined &&
+                  reportedUsageMessages.has(lastAssistantMessageId)) ||
+                (requestKey !== undefined && lastMessageUsedFallback);
+              if (!alreadyReported) accumulateReportedUsage(reported);
+              if (requestKey !== undefined) reportedUsageKeys.add(requestKey);
+            }
+            const observed = settledObservedUsage();
+            usage = observed ?? reported;
+            if (reported.costUSD !== undefined) usage = { ...usage, costUSD: reported.costUSD };
+          } else {
+            // Claude's terminal envelope is aggregate; unlike Qoder's
+            // request-scoped result usage it authoritatively replaces interim
+            // per-request counters.
+            const observed = settledObservedUsage();
+            usage = hasTokenUsage(reported) || observed === undefined ? reported : observed;
+          }
           out.push({
             kind: 'usage',
-            usage: hasTokenUsage(reported) || observed === undefined ? reported : observed,
+            usage,
           });
           terminalUsageEmitted = true;
           const isError = obj.is_error === true || (typeof obj.subtype === 'string' && obj.subtype.startsWith('error'));

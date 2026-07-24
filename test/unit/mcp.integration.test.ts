@@ -292,6 +292,73 @@ describe('MCP triad', () => {
     }
   }, 60_000);
 
+  it('returns warnings when project config switches the user backend profile', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'uc-mcp-config-layers-'));
+    const home = join(root, 'home');
+    const project = join(root, 'project');
+    mkdirSync(join(home, '.ultracode'), { recursive: true });
+    mkdirSync(join(project, '.ultracode'), { recursive: true });
+    writeFileSync(join(home, '.ultracode', 'config.json'), JSON.stringify({
+      subagent: {
+        backend: 'qoder',
+        model: 'Qwen3.8-Max-Preview',
+        effort: 'xhigh',
+        context_window: 1_000_000,
+      },
+    }));
+    writeFileSync(join(project, '.ultracode', 'config.json'), JSON.stringify({
+      subagent: { backend: 'mock' },
+    }));
+
+    const layeredClient = new Client({ name: 'layered-config-client', version: '0.0.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', tsxLoader, mainTs, 'mcp'],
+      cwd: project,
+      env: childEnv(home),
+    });
+    let runId: string | undefined;
+    try {
+      await layeredClient.connect(transport);
+      const start = (await layeredClient.callTool({
+        name: 'workflow_start',
+        arguments: { script: HELLO },
+      })) as {
+        structuredContent?: {
+          runId?: string;
+          runDir?: string;
+          backend?: string;
+          warnings?: string[];
+        };
+        isError?: boolean;
+      };
+      expect(start.isError).toBeFalsy();
+      runId = start.structuredContent!.runId!;
+      expect(start.structuredContent).toMatchObject({
+        backend: 'mock',
+        warnings: [
+          "backend override 'mock' differs from configured backend 'qoder'; " +
+          'not inheriting configured model, effort, contextWindow',
+        ],
+      });
+      expect(start.structuredContent).not.toHaveProperty('model');
+      expect(start.structuredContent).not.toHaveProperty('effort');
+      expect(start.structuredContent).not.toHaveProperty('contextWindow');
+      const stored = JSON.parse(readFileSync(join(start.structuredContent!.runDir!, 'config.json'), 'utf8'));
+      expect(stored.backend).toBe('mock');
+      expect(stored).not.toHaveProperty('model');
+    } finally {
+      if (runId !== undefined) {
+        try {
+          await layeredClient.callTool({ name: 'workflow_stop', arguments: { runId } });
+        } catch {
+          /* cleanup is best-effort after a failed assertion */
+        }
+      }
+      await layeredClient.close();
+    }
+  }, 45_000);
+
   it('workflow_start passes wallClockMs/attemptTimeoutMs through unclamped; omitting them leaves config bare', async () => {
     const start = (await client.callTool({
       name: 'workflow_start',
