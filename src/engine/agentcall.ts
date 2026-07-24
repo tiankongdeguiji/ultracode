@@ -125,6 +125,7 @@ interface AttemptResult {
   sessionId?: string;
   toolCalls: number;
   declinedActions: number;
+  /** Estimated model-input characters for this physical attempt. */
   inputChars: number;
   outputChars: number;
 }
@@ -184,12 +185,16 @@ export class AgentCallExecutor implements AgentExecutor {
           ? this.adapter.buildResume(resumeSession, continuationPrompt!, req)
           : null;
       const attemptPrompt = resumePlan !== null ? continuationPrompt! : req.prompt;
+      const attemptInputChars =
+        resumePlan !== null && last !== undefined
+          ? last.inputChars + last.outputChars + attemptPrompt.length
+          : attemptPrompt.length;
       const attemptBudgetMs = spec.timeoutMs ?? this.opts.attemptTimeoutMs;
       const attemptStartedAt = Date.now();
       last = await this.runAttempt(spec, resumePlan ?? this.adapter.buildSpawn(req), signal, attempt, {
         onStreamEvent: tracker?.onStreamEvent,
         resumedSession: resumePlan !== null,
-        inputChars: attemptPrompt.length,
+        inputChars: attemptInputChars,
       });
       // A resume that dies without ever REATTACHING (no session event — e.g.
       // the backend could not load the killed session's rollout, whatever
@@ -380,7 +385,10 @@ export class AgentCallExecutor implements AgentExecutor {
       current = await this.runAttempt(spec, plan, signal, attemptsUsed + round + 1, {
         onStreamEvent: tracker?.onStreamEvent,
         resumedSession: resumePlan !== null,
-        inputChars: (resumePlan !== null ? resumePrompt : freshPrompt).length,
+        inputChars:
+          resumePlan !== null
+            ? current.inputChars + current.outputChars + resumePrompt.length
+            : freshPrompt.length,
       });
       usages.push(current);
       tracker?.attemptSettled(usages);
@@ -456,12 +464,27 @@ export class AgentCallExecutor implements AgentExecutor {
     for (const { a, at } of counted) {
       const u = this.adapter.extractUsage(a.events);
       if (u.totalTokens > 0) {
+        const telemetryIncomplete = a.events.some(
+          (event) =>
+            event.kind === 'usage' &&
+            !event.interim &&
+            event.telemetryIncomplete === true,
+        );
         if (u.estimated) estimatedAny = true;
         else realAny = true;
         input += u.inputTokens;
         output += u.outputTokens;
         cached += u.cachedInputTokens;
         reasoning += u.reasoningTokens;
+        if (telemetryIncomplete) {
+          // Some requests exposed occupancy without a usable denominator.
+          // Preserve their known counters, then conservatively add this
+          // attempt's prompt/output fallback for the unquantified portion.
+          const est = estimateUsage(a.inputChars, a.outputChars);
+          input += est.inputTokens;
+          output += est.outputTokens;
+          estimatedAny = true;
+        }
       } else if (a.sessionId !== undefined && (lastCumulativeAt.get(a.sessionId) ?? -1) > at) {
         // Reported nothing (killed before turn.completed), but a LATER resume
         // on the same session reported the thread total — already counted.

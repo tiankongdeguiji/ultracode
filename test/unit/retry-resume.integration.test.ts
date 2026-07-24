@@ -211,16 +211,19 @@ describe('task-retry resume', () => {
   });
 
   it('a zero-usage attempt AFTER the session\'s last cumulative report is still estimated (ordering-aware subsumption)', async () => {
+    const originalPrompt = 'task';
     const adapter = new ScriptedAdapter([
       // attempt 1 reports the session's (only) cumulative total, then fails retryably
       { lines: [{ session: 's1' }, { usage: { inputTokens: 900, outputTokens: 100 }, cumulative: true }], exit: 1 },
       // the resume does further work but is killed before reporting — NOT covered by attempt 1's figure
       { lines: [{ session: 's1' }], exit: 1 },
     ]);
-    const outcome = await scriptedExecutor(adapter).execute(spec({ retries: 1 }), SIGNAL);
+    const outcome = await scriptedExecutor(adapter).execute(spec({ prompt: originalPrompt, retries: 1 }), SIGNAL);
     expect(outcome.ok).toBe(false);
-    const continuationTokens = Math.ceil(resumeContinuationPrompt('exit 1').length / 4);
-    expect(outcome.usage.totalTokens).toBe(1_000 + continuationTokens);
+    const resumedContextTokens = Math.ceil(
+      (originalPrompt.length + resumeContinuationPrompt('exit 1').length) / 4,
+    );
+    expect(outcome.usage.totalTokens).toBe(1_000 + resumedContextTokens);
     expect(outcome.usage.estimated).toBe(true);
   });
 

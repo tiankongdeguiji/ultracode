@@ -134,8 +134,16 @@ export type AgentEvent =
   | { kind: 'tool'; name: string; status: 'started' | 'completed' | 'failed' | 'declined' }
   /** interim: a mid-run snapshot (per API call) — excluded from usage accounting.
    *  threadCumulative: the figure is the session's running total, not this
-   *  attempt's own (codex turn.completed) — resumed attempts repeat the prefix. */
-  | { kind: 'usage'; usage: Partial<NormalizedUsage>; interim?: boolean; threadCumulative?: boolean }
+   *  attempt's own (codex turn.completed) — resumed attempts repeat the prefix.
+   *  telemetryIncomplete: the reported counters cover only part of this
+   *  attempt, and the adapter could not quantify the uncovered portion. */
+  | {
+      kind: 'usage';
+      usage: Partial<NormalizedUsage>;
+      interim?: boolean;
+      threadCumulative?: boolean;
+      telemetryIncomplete?: boolean;
+    }
   | {
       kind: 'result';
       text?: string;

@@ -115,12 +115,16 @@ export function createStreamJsonParser(
     };
   };
 
-  const settledObservedUsage = (): Partial<NormalizedUsage> | undefined => {
-    const uncoveredRatio =
+  const uncoveredContextRatio = (): number =>
+    (
       unkeyedContextRatioSum +
       [...contextRatios.entries()]
         .filter(([key]) => !reportedUsageKeys.has(key))
-        .reduce((sum, [, ratio]) => sum + ratio, 0);
+        .reduce((sum, [, ratio]) => sum + ratio, 0)
+    );
+
+  const settledObservedUsage = (): Partial<NormalizedUsage> | undefined => {
+    const uncoveredRatio = uncoveredContextRatio();
     const estimated = estimatedContextUsage(uncoveredRatio);
     if (assistantReportedUsage === undefined) return estimated;
     if (estimated === undefined) return assistantReportedUsage;
@@ -134,6 +138,11 @@ export function createStreamJsonParser(
       estimated: true,
     };
   };
+
+  const contextTelemetryIncomplete = (): boolean =>
+    options.estimateContextUsage === true &&
+    contextWindow === undefined &&
+    uncoveredContextRatio() > 0;
 
   return {
     push(line: string): AgentEvent[] {
@@ -217,12 +226,14 @@ export function createStreamJsonParser(
             const requestKey =
               terminalUsage === undefined ? undefined : contextRequestKey(terminalUsage, undefined);
             if (hasTokenUsage(reported)) {
+              const lastMessageAliases =
+                lastAssistantMessageId === undefined
+                  ? undefined
+                  : requestKeysByMessage.get(lastAssistantMessageId);
               const lastMessageUsedFallback =
                 lastAssistantMessageId !== undefined &&
                 reportedUsageMessages.has(lastAssistantMessageId) &&
-                requestKeysByMessage
-                  .get(lastAssistantMessageId)
-                  ?.has(`message:${lastAssistantMessageId}`) === true;
+                lastMessageAliases?.has(`message:${lastAssistantMessageId}`) === true;
               const alreadyReported =
                 (requestKey !== undefined && reportedUsageKeys.has(requestKey)) ||
                 (requestKey === undefined &&
@@ -231,6 +242,15 @@ export function createStreamJsonParser(
                 (requestKey !== undefined && lastMessageUsedFallback);
               if (!alreadyReported) accumulateReportedUsage(reported);
               if (requestKey !== undefined) reportedUsageKeys.add(requestKey);
+              if (lastAssistantMessageId !== undefined) {
+                const fallbackAlias = `message:${lastAssistantMessageId}`;
+                if (requestKey === undefined) {
+                  reportedUsageKeys.add(fallbackAlias);
+                  for (const alias of lastMessageAliases ?? []) reportedUsageKeys.add(alias);
+                } else if (lastMessageAliases?.has(fallbackAlias)) {
+                  reportedUsageKeys.add(fallbackAlias);
+                }
+              }
             }
             const observed = settledObservedUsage();
             usage = observed ?? reported;
@@ -245,6 +265,7 @@ export function createStreamJsonParser(
           out.push({
             kind: 'usage',
             usage,
+            ...(contextTelemetryIncomplete() ? { telemetryIncomplete: true } : {}),
           });
           terminalUsageEmitted = true;
           const isError = obj.is_error === true || (typeof obj.subtype === 'string' && obj.subtype.startsWith('error'));
@@ -271,7 +292,11 @@ export function createStreamJsonParser(
       const observed = settledObservedUsage();
       if (observed === undefined) return [];
       terminalUsageEmitted = true;
-      return [{ kind: 'usage', usage: observed }];
+      return [{
+        kind: 'usage',
+        usage: observed,
+        ...(contextTelemetryIncomplete() ? { telemetryIncomplete: true } : {}),
+      }];
     },
   };
 }

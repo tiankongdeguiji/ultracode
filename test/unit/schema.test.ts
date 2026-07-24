@@ -210,8 +210,9 @@ describe('AgentCallExecutor structured-output pipeline', () => {
   });
 
   it('invalid answer repaired via resume: buildResume used once, validated object returned', async () => {
+    const firstOutput = '{"count": "three"}';
     const adapter = new FakeAdapter('native', [
-      [JSON.stringify({ session: 's1' }), JSON.stringify({ text: '{"count": "three"}' }), JSON.stringify({ done: 1 })],
+      [JSON.stringify({ session: 's1' }), JSON.stringify({ text: firstOutput }), JSON.stringify({ done: 1 })],
       [JSON.stringify({ text: '{"count": 3}' }), JSON.stringify({ done: 1 })],
     ]);
     const ex = new AgentCallExecutor(adapter);
@@ -220,6 +221,10 @@ describe('AgentCallExecutor structured-output pipeline', () => {
     expect(outcome.value).toEqual({ count: 3 });
     expect(adapter.resumeCount).toBe(1);
     expect(adapter.spawnCount).toBe(2);
+    expect(outcome.usage.inputTokens).toBe(
+      Math.ceil('task'.length / 4) +
+      Math.ceil(('task'.length + firstOutput.length + adapter.inputPrompts[1]!.length) / 4),
+    );
   });
 
   it('persistently invalid: fails after exactly 2 repairs with structured-output-retries', async () => {
