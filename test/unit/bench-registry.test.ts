@@ -39,17 +39,20 @@ describe('suite registry contracts', () => {
       adapter('featurebench'),
       adapter('swebench-pro'),
       adapter('swe-marathon'),
+      adapter('workflow-authoring'),
     ]);
     expect(registry.list().map((entry) => entry.suite)).toEqual([
       'swebench-pro',
       'swe-marathon',
       'featurebench',
+      'workflow-authoring',
     ]);
     expect(Object.keys(registry.get('swebench-pro').commands)).toEqual([...SUITE_COMMANDS['swebench-pro']]);
     expect(suiteRegistry.list().map(({ suite }) => suite)).toEqual([
       'swebench-pro',
       'swe-marathon',
       'featurebench',
+      'workflow-authoring',
     ]);
     for (const suite of suiteRegistry.list()) {
       expect(Object.keys(suite.commands)).toEqual([...SUITE_COMMANDS[suite.suite]]);
@@ -82,7 +85,7 @@ describe('suite registry contracts', () => {
     const registry = readFileSync(join(root, 'bench/src/registry.ts'), 'utf8');
     expect(contracts).not.toMatch(/from ['"].*(?:registry|suites)\//);
     expect(registry).toContain("from './shared/contracts.js'");
-    for (const suite of ['swebench-pro', 'swe-marathon', 'featurebench']) {
+    for (const suite of ['swebench-pro', 'swe-marathon', 'featurebench', 'workflow-authoring']) {
       expect(registry).toContain(`from './suites/${suite}/adapter.js'`);
       const adapterSource = readFileSync(join(root, 'bench/src/suites', suite, 'adapter.ts'), 'utf8');
       expect(adapterSource, suite).not.toMatch(/from ['"].*registry\.js/);

@@ -49,6 +49,13 @@ bench/src/suites/swebench-pro/telemetry.ts
 bench/src/suites/swebench-pro/toolchain.ts
 bench/src/suites/swebench-pro/types.ts
 bench/src/suites/swebench-pro/verifier.ts
+bench/src/suites/workflow-authoring/adapter.ts
+bench/src/suites/workflow-authoring/analyzer.ts
+bench/src/suites/workflow-authoring/inputs.ts
+bench/src/suites/workflow-authoring/prepare.ts
+bench/src/suites/workflow-authoring/prompt.ts
+bench/src/suites/workflow-authoring/runner.ts
+bench/src/suites/workflow-authoring/types.ts
 bench/suites/featurebench/.gitattributes
 bench/suites/featurebench/codex-chatgpt.patch
 bench/suites/featurebench/dataset-pin.json
@@ -68,3 +75,4 @@ bench/suites/swebench-pro/evaluator-requirements.lock
 bench/suites/swebench-pro/evaluator-requirements.provenance.json
 bench/suites/swebench-pro/sanitize-git.sh
 bench/suites/swebench-pro/session-gate.sh
+bench/suites/workflow-authoring/cohort.json

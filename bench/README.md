@@ -38,6 +38,7 @@ npm run bench -- --suite swebench-pro --help
 npm run bench -- --suite swebench-pro <fetch|prep|run|eval|report|status|clean> [options]
 npm run bench -- --suite swe-marathon <prep|run|report> [options]
 npm run bench -- --suite featurebench <prep|run|report> [options]
+npm run bench -- --suite workflow-authoring <prepare|generate|report> [options]
 ```
 
 A typical pilot is:
@@ -74,6 +75,28 @@ npm run bench -- --suite featurebench run --run-id feature-b1 \
 npm run bench -- --suite featurebench report --run-id feature-b1
 ```
 
+The static workflow-authoring suite compares authored scripts without running
+them or assigning a benchmark score:
+
+```bash
+npm run bench -- --suite workflow-authoring prepare
+npm run bench -- --suite workflow-authoring generate \
+  --run-id authoring-xhigh --host both --model gpt-5.6-sol --effort xhigh \
+  --concurrency 4
+npm run bench -- --suite workflow-authoring report --run-id authoring-xhigh
+```
+
+The tracked cohort contains 50 repository-stratified SWE-bench Pro tasks, 10
+FeatureBench tasks from distinct repositories, and five distinct SWE-Marathon
+workload archetypes. Lightweight preparation downloads only pinned dataset
+parquet and Marathon instruction text; it does not prepare task repositories,
+images, runtimes, or verifiers. Generation happens in empty temporary
+directories under read-only/plan host policies. Any observed tool-use event
+invalidates the artifact and terminates the authoring process; generated
+workflows are only parsed statically and are never runtime-validated, dry-run,
+mocked, or executed. See
+[the workflow-authoring guide](docs/workflow-authoring.md).
+
 The native evaluator is the sole score authority. Agent success, a captured
 patch, or an output file without a matching host-owned receipt never becomes a
 verified result.
@@ -91,6 +114,19 @@ bench/results/<suite>/<runId>/
   report.json
   report.md
   native/
+```
+
+Workflow-authoring runs use a deliberately separate, non-scoring layout:
+
+```text
+bench/results/workflow-authoring/<runId>/
+  manifest.json
+  tasks/<artifact-key>/<codex|claude>/
+    transcript.jsonl
+    workflow.js
+    artifact.json
+  report.json
+  report.md
 ```
 
 ### SWE-bench Pro persistence

@@ -463,12 +463,15 @@ describe.skipIf(SUBPROCESS_BLOCKED)('benchmark executable boundary', () => {
     if (root.error) throw root.error;
     expect(root.status).toBe(0);
     expect(root.stderr).toBe('');
-    expect(root.stdout).toContain('npm run bench -- --suite <swebench-pro|swe-marathon|featurebench>');
+    expect(root.stdout).toContain(
+      'npm run bench -- --suite <swebench-pro|swe-marathon|featurebench|workflow-authoring>',
+    );
 
     for (const argv of [
       ['--suite', 'swebench-pro', '--help'],
       ['--suite=swebench-pro', 'run', '--help'],
       ['--suite', 'swebench-pro', 'report', '--help'],
+      ['--suite', 'workflow-authoring', 'generate', '--help'],
     ]) {
       const selected = await invokeCli(argv);
       if (selected.error) throw selected.error;

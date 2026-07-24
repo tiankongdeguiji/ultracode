@@ -8,6 +8,7 @@ export const BENCH_SUITES = [
   'swebench-pro',
   'swe-marathon',
   'featurebench',
+  'workflow-authoring',
 ] as const;
 
 export type BenchSuite = typeof BENCH_SUITES[number];
@@ -18,6 +19,7 @@ export interface CommandNames {
   'swebench-pro': 'fetch' | 'prep' | 'run' | 'eval' | 'report' | 'status' | 'clean';
   'swe-marathon': 'prep' | 'run' | 'report';
   featurebench: 'prep' | 'run' | 'report';
+  'workflow-authoring': 'prepare' | 'generate' | 'report';
 }
 
 export type CommandBySuite<S extends BenchSuite> = CommandNames[S];
@@ -26,6 +28,7 @@ export const SUITE_COMMANDS = {
   'swebench-pro': ['fetch', 'prep', 'run', 'eval', 'report', 'status', 'clean'],
   'swe-marathon': ['prep', 'run', 'report'],
   featurebench: ['prep', 'run', 'report'],
+  'workflow-authoring': ['prepare', 'generate', 'report'],
 } as const satisfies { [S in BenchSuite]: readonly CommandBySuite<S>[] };
 
 export interface BenchClock {
