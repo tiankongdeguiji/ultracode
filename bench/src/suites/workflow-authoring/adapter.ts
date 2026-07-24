@@ -1,6 +1,6 @@
 /** Static workflow-authoring command declarations; model CLIs stay lazy. */
 import type { SuiteAdapter, SuiteCommandSpec } from '../../shared/contracts.js';
-import { parseStrictOptions, type OptionDefinition } from '../../shared/options.js';
+import { parseIntegerOption, parseStrictOptions, type OptionDefinition } from '../../shared/options.js';
 
 export type AuthoringHost = 'codex' | 'claude';
 export type AuthoringHostSelection = AuthoringHost | 'both';
@@ -10,6 +10,7 @@ export interface GenerateOptions {
   host: AuthoringHostSelection;
   model: string;
   requestedEffort: string;
+  concurrency: number;
   resume: boolean;
   taskIds?: readonly string[];
 }
@@ -44,6 +45,7 @@ const GENERATE_OPTIONS = [
   string('host', 'codex|claude|both', 'authoring host'),
   string('model', 'model', 'requested model'),
   string('effort', 'effort', 'requested reasoning effort'),
+  string('concurrency', 'n', 'maximum concurrent authoring processes'),
   string('task-id', 'suite:id', 'fixed authoring-cohort task', true),
   boolean('resume', 'resume the exact immutable authoring run'),
 ] as const;
@@ -64,6 +66,9 @@ const generateSpec: SuiteCommandSpec<unknown> = {
       host: host as AuthoringHostSelection,
       model: scalar(parsed.values, 'model') ?? 'gpt-5.6-sol',
       requestedEffort: scalar(parsed.values, 'effort') ?? 'xhigh',
+      concurrency: scalar(parsed.values, 'concurrency') === undefined
+        ? 4
+        : parseIntegerOption('concurrency', scalar(parsed.values, 'concurrency')!, 1),
       resume: parsed.values.resume === true,
       ...(taskIds.length === 0 ? {} : { taskIds }),
     };
@@ -71,6 +76,20 @@ const generateSpec: SuiteCommandSpec<unknown> = {
   async run(options, context) {
     const runner = await import('./runner.js');
     await runner.generateCommand(options as GenerateOptions, context);
+  },
+};
+
+const prepareSpec: SuiteCommandSpec<unknown> = {
+  summary: 'prepare pinned task text only, without repositories, images, or verifiers',
+  usage: '',
+  options: [],
+  parse(argv): Record<string, never> {
+    parseStrictOptions(argv, []);
+    return {};
+  },
+  async run(_options, context) {
+    const prepare = await import('./prepare.js');
+    await prepare.prepareCommand(context);
   },
 };
 
@@ -97,5 +116,5 @@ export const workflowAuthoringAdapter: SuiteAdapter<'workflow-authoring'> = {
     const runner = await import('./runner.js');
     await runner.cleanupWorkflowAuthoringRuntime();
   },
-  commands: { generate: generateSpec, report: reportSpec },
+  commands: { prepare: prepareSpec, generate: generateSpec, report: reportSpec },
 };

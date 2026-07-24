@@ -52,6 +52,7 @@ bench/src/suites/swebench-pro/verifier.ts
 bench/src/suites/workflow-authoring/adapter.ts
 bench/src/suites/workflow-authoring/analyzer.ts
 bench/src/suites/workflow-authoring/inputs.ts
+bench/src/suites/workflow-authoring/prepare.ts
 bench/src/suites/workflow-authoring/prompt.ts
 bench/src/suites/workflow-authoring/runner.ts
 bench/src/suites/workflow-authoring/types.ts

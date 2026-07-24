@@ -7,11 +7,11 @@ import { validateArtifactKey, validateRunId, validateTaskId } from '../../shared
 
 export const AUTHORING_HOSTS = ['codex', 'claude'] as const;
 export type AuthoringHost = typeof AUTHORING_HOSTS[number];
-export type AuthoringSourceSuite = 'swebench-pro' | 'swe-marathon';
+export type AuthoringSourceSuite = 'swebench-pro' | 'featurebench' | 'swe-marathon';
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
 const hostSchema = z.enum(AUTHORING_HOSTS);
-const sourceSuiteSchema = z.enum(['swebench-pro', 'swe-marathon']);
+const sourceSuiteSchema = z.enum(['swebench-pro', 'featurebench', 'swe-marathon']);
 const taskIdSchema = z.string().transform(validateTaskId);
 const artifactKeySchema = z.string().transform(validateArtifactKey);
 
@@ -41,6 +41,7 @@ export const authoringManifestSchema = z.strictObject({
   requestedEffort: z.string().min(1).max(64),
   hosts: z.array(hostSchema).min(1).max(2),
   cohortSha256: sha256Schema,
+  inputsSha256: sha256Schema,
   codexDoctrineSha256: sha256Schema,
   tasks: z.array(z.strictObject({
     sourceSuite: sourceSuiteSchema,
@@ -245,5 +246,9 @@ export interface WorkflowAuthoringReport {
     toolUseViolations: number;
   };
   aggregates: Record<AuthoringHost, HostStaticAggregate>;
+  aggregatesBySourceSuite: Record<
+    AuthoringSourceSuite,
+    Record<AuthoringHost, HostStaticAggregate>
+  >;
   comparisons: PairedComparison[];
 }

@@ -48,6 +48,7 @@ import {
   generatedWorkflowArtifactSchema,
   type AuthoringHost,
   type AuthoringManifest,
+  type AuthoringSourceSuite,
   type AuthoringTask,
   type GeneratedWorkflowArtifact,
   type HostStaticAggregate,
@@ -61,12 +62,18 @@ const TRANSCRIPT_FILE = 'transcript.jsonl';
 const WORKFLOW_FILE = 'workflow.js';
 const ARTIFACT_FILE = 'artifact.json';
 const MAX_TRANSCRIPT_BYTES = 64 * 1_024 * 1_024;
+const SOURCE_SUITES: readonly AuthoringSourceSuite[] = [
+  'swebench-pro',
+  'featurebench',
+  'swe-marathon',
+];
 
 interface GenerateOptions {
   runId: string;
   host: AuthoringHost | 'both';
   model: string;
   requestedEffort: string;
+  concurrency?: number;
   resume: boolean;
   taskIds?: readonly string[];
 }
@@ -84,6 +91,7 @@ interface BinaryIdentity {
 
 interface LoadedInputs {
   cohort: AuthoringCohort;
+  inputsSha256: string;
   tasks: AuthoringTask[];
 }
 
@@ -161,6 +169,7 @@ function requestedManifest(
     requestedEffort: options.requestedEffort,
     hosts,
     cohortSha256: inputs.cohort.sha256,
+    inputsSha256: inputs.inputsSha256,
     codexDoctrineSha256: doctrine.sha256,
     tasks: inputs.tasks.map((task) => ({
       sourceSuite: task.sourceSuite,
@@ -233,6 +242,7 @@ function hostArguments(
   }
   return [
     '--print',
+    '--verbose',
     '--model', model,
     '--effort', requestedEffort,
     '--tools', 'Workflow',
@@ -241,7 +251,7 @@ function hostArguments(
     '--output-format', 'stream-json',
     '--input-format', 'text',
     '--strict-mcp-config',
-    '--mcp-config', '{}',
+    '--mcp-config', '{"mcpServers":{}}',
     '--setting-sources', 'user',
   ];
 }
@@ -401,6 +411,7 @@ async function generateArtifact(
         cwd: workspace,
         stdinData: prompt,
         tailBytes: MAX_TRANSCRIPT_BYTES,
+        terminationGraceMs: 10_000,
         observeStdout: inspectChunk,
       },
     );
@@ -491,6 +502,7 @@ export async function generateCommand(
   let generated = 0;
   let skipped = 0;
   let invalid = 0;
+  const pending: Array<{ task: AuthoringTask; host: AuthoringHost; binary: BinaryIdentity }> = [];
   for (const task of inputs.tasks) {
     for (const host of hosts) {
       const existing = loadArtifact(opened.directory, task.key, host);
@@ -500,22 +512,33 @@ export async function generateCommand(
       }
       const binary = binaries.find((candidate) => candidate.host === host);
       if (binary === undefined) throw new Error(`missing frozen binary identity for ${host}`);
+      pending.push({ task, host, binary });
+    }
+  }
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < pending.length) {
+      const index = cursor;
+      cursor += 1;
+      const item = pending[index]!;
       const artifact = await generateArtifact(
         opened.directory,
         opened.manifest,
-        task,
-        host,
-        binary,
+        item.task,
+        item.host,
+        item.binary,
         doctrine,
         context,
       );
       generated += 1;
       if (artifact.status === 'invalid') invalid += 1;
       context.stdout.write(
-        `${artifact.status} ${task.qualifiedTaskId}/${host} agents=${artifact.metrics?.agentCalls.min ?? '?'}-${artifact.metrics?.agentCalls.max ?? '?'}\n`,
+        `${artifact.status} ${item.task.qualifiedTaskId}/${item.host} agents=${artifact.metrics?.agentCalls.min ?? '?'}-${artifact.metrics?.agentCalls.max ?? '?'}\n`,
       );
     }
-  }
+  };
+  const concurrency = Math.min(options.concurrency ?? 4, pending.length);
+  await Promise.all(Array.from({ length: concurrency }, worker));
   context.stdout.write(`workflow-authoring: generated=${generated} skipped=${skipped} invalid=${invalid}\n`);
 }
 
@@ -626,6 +649,14 @@ function renderReport(report: WorkflowAuthoringReport): string {
       return `| ${host} | ${value.validArtifacts}/${value.storedArtifacts} | ${summaryCell(value.agentMinimum)} | ${summaryCell(value.agentMaximum)} | ${summaryCell(value.phaseCalls)} | ${summaryCell(value.parallelCalls)} | ${summaryCell(value.pipelineCalls)} |`;
     }),
     '',
+    '| Source suite | Host | Valid | Dynamic upper | Agent min mean/median | Agent max mean/median | Phases | Parallel | Pipeline |',
+    '|---|---|---:|---:|---:|---:|---:|---:|---:|',
+    ...SOURCE_SUITES.flatMap((suite) =>
+      (['codex', 'claude'] as const).map((host) => {
+        const value = report.aggregatesBySourceSuite[suite][host];
+        return `| ${suite} | ${host} | ${value.validArtifacts}/${value.storedArtifacts} | ${value.dynamicAgentUpperBounds} | ${summaryCell(value.agentMinimum)} | ${summaryCell(value.agentMaximum)} | ${summaryCell(value.phaseCalls)} | ${summaryCell(value.parallelCalls)} | ${summaryCell(value.pipelineCalls)} |`;
+      })),
+    '',
     '| Host | Branches | Bounded loops | Retries | Conditional repair | Unconditional repair | Triage/judge | Unsafe parallel mutation |',
     '|---|---:|---:|---:|---:|---:|---:|---:|',
     ...(['codex', 'claude'] as const).map((host) => {
@@ -675,6 +706,13 @@ export async function reportCommand(options: ReportOptions, context: CommandCont
       codex: aggregate(artifacts, 'codex'),
       claude: aggregate(artifacts, 'claude'),
     },
+    aggregatesBySourceSuite: Object.fromEntries(SOURCE_SUITES.map((sourceSuite) => {
+      const selected = artifacts.filter((artifact) => artifact.sourceSuite === sourceSuite);
+      return [sourceSuite, {
+        codex: aggregate(selected, 'codex'),
+        claude: aggregate(selected, 'claude'),
+      }];
+    })) as WorkflowAuthoringReport['aggregatesBySourceSuite'],
     comparisons,
   };
   writePrivateJsonAtomic(directory, reportJsonFile(context.paths, SUITE, manifest.runId), report);

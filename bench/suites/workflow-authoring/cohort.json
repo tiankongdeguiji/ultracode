@@ -1,50 +1,128 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "ultracode-workflow-authoring-cohort",
+  "selection": {
+    "seed": "workflow-authoring-v2",
+    "swebenchPro": "proportional-by-repository",
+    "featureBench": "one-task-from-each-of-ten-diverse-repositories",
+    "sweMarathon": "five-distinct-workload-archetypes"
+  },
+  "sources": {
+    "swebenchPro": {
+      "dataset": "ScaleAI/SWE-bench_Pro",
+      "revision": "7ab5114912baf22bb098818e604c02fe7ad2c11f",
+      "parquetSha256": "c8cd7115496ad4e9a8b21d088cef576a65bf821bb542b24336f13f714cef13f8"
+    },
+    "featureBench": {
+      "dataset": "LiberCoders/FeatureBench",
+      "revision": "e99d6efdfe511ea832c1b5735c536129561ec96a",
+      "parquetSha256": "e8a704f83d673e1cc78086eefb76bd56461ead8a65ca06fd6972f7363be8a775"
+    },
+    "sweMarathon": {
+      "repository": "https://github.com/abundant-ai/swe-marathon.git",
+      "revision": "6d6855af390226f6eca607d63818fe076e57ea8c"
+    }
+  },
   "tasks": [
     {
       "suite": "swebench-pro",
-      "taskId": "instance_ansible__ansible-1c06c46cc14324df35ac4f39a45fb3ccd602195d-v0f01c69f1e2528b935359cfe578530722bca2c59"
+      "taskId": "instance_NodeBB__NodeBB-05f2236193f407cf8e2072757fbd6bb170bc13f0-vf2cf3cbd463b7ad942381f1c6d077626485a1e9e"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_ansible__ansible-622a493ae03bd5e5cf517d336fc426e9d12208c7-v906c969b551b346ef54a2c0b41e04f632b7b73c2"
+      "taskId": "instance_NodeBB__NodeBB-4327a09d76f10a79109da9d91c22120428d3bdb9-vnan"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_ansible__ansible-6cc97447aac5816745278f3735af128afb255c81-v0f01c69f1e2528b935359cfe578530722bca2c59"
+      "taskId": "instance_NodeBB__NodeBB-f2082d7de85eb62a70819f4f3396dd85626a0c0a-vd59a5728dfc977f44533186ace531248c2917516"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_ansible__ansible-d9f1866249756efc264b00ff7497e92c11a9885f-v0f01c69f1e2528b935359cfe578530722bca2c59"
+      "taskId": "instance_ansible__ansible-0ea40e09d1b35bcb69ff4d9cecf3d0defa4b36e8-v30a923fb5c164d6cd18280c02422f75e611e8fb2"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_ansible__ansible-f8ef34672b961a95ec7282643679492862c688ec-vba6da65a0f3baefda7a058ebbd0a8dcafb8512f5"
+      "taskId": "instance_ansible__ansible-12734fa21c08a0ce8c84e533abdc560db2eb1955-v7eee2454f617569fd6889f2211f75bc02a35f9f8"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_element-hq__element-web-4c6b0d35add7ae8d58f71ea1711587e31081444b-vnan"
+      "taskId": "instance_ansible__ansible-1bd7dcf339dd8b6c50bc16670be2448a206f4fdb-vba6da65a0f3baefda7a058ebbd0a8dcafb8512f5"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_flipt-io__flipt-36e62baffae2132f78f9d34dc300a9baa2d7ae0e"
+      "taskId": "instance_ansible__ansible-395e5e20fab9cad517243372fa3c3c5d9e09ab2a-v7eee2454f617569fd6889f2211f75bc02a35f9f8"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_future-architect__vuls-139f3a81b66c47e6d8f70ce6c4afe7a9196a6ea8"
+      "taskId": "instance_ansible__ansible-39bd8b99ec8c6624207bf3556ac7f9626dad9173-v1055803c3a812189a1133297f7f5468579283f86"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_future-architect__vuls-4a72295de7b91faa59d90a5bee91535bbe76755d"
+      "taskId": "instance_ansible__ansible-5c225dc0f5bfa677addeac100a8018df3f3a9db1-v173091e2e36d38c978002990795f66cfc0af30ad"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_gravitational__teleport-2b15263e49da5625922581569834eec4838a9257-vee9b09fb20c43af7e520f57e9239bbcf46b7113d"
+      "taskId": "instance_ansible__ansible-f86c58e2d235d8b96029d102c71ee2dfafd57997-v0f01c69f1e2528b935359cfe578530722bca2c59"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_gravitational__teleport-37c3724d0d6637e959e39408ee351565d73afe71-vee9b09fb20c43af7e520f57e9239bbcf46b7113d"
+      "taskId": "instance_element-hq__element-web-41dfec20bfe9b62cddbbbf621bef2e9aa9685157-vnan"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_element-hq__element-web-b7fea97bb68c6628a644580076f840109132f074-vnan"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_element-hq__element-web-d405160080bbe804f7e9294067d004a7d4dad9d6-vnan"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_element-hq__element-web-e15ef9f3de36df7f318c083e485f44e1de8aad17"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_flipt-io__flipt-292fdaca9be39e6a921aaa8874c011d0fdd3e874"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_flipt-io__flipt-6fd0f9e2587f14ac1fdd1c229f0bcae0468c8daa"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_flipt-io__flipt-6fe76d024ee0c50ddb09c86f4ae0bd4c208fd65f"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_flipt-io__flipt-c154dd1a3590954dfd3b901555fc6267f646a289"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_flipt-io__flipt-c6a7b1fd933e763b1675281b30077e161fa115a1"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_flipt-io__flipt-e2bd19dafa7166c96b082fb2a59eb54b4be0d778"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_future-architect__vuls-2c84be80b65d022c262956cd26fc79d8bb2f7010"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_future-architect__vuls-61c39637f2f3809e1b5dad05f0c57c799dce1587"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_future-architect__vuls-aaea15e516ece43978cf98e09e52080478b1d39f"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_future-architect__vuls-d576b6c6c15e56c47cc3e26f5878867677d4a9ea"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_gravitational__teleport-53814a2d600ccd74c1e9810a567563432b98386e-vce94f93ad1030e3136852817f2423c1b3ac37bc4"
     },
     {
       "suite": "swebench-pro",
@@ -52,39 +130,159 @@
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_gravitational__teleport-65438e6e44b6ce51458d09b7bb028a2797cfb0ea-vce94f93ad1030e3136852817f2423c1b3ac37bc4"
+      "taskId": "instance_gravitational__teleport-78b0d8c72637df1129fb6ff84fc49ef4b5ab1288"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_gravitational__teleport-cb712e3f0b06dadc679f895daef8072cae400c26-vee9b09fb20c43af7e520f57e9239bbcf46b7113d"
+      "taskId": "instance_gravitational__teleport-d6ffe82aaf2af1057b69c61bf9df777f5ab5635a-vee9b09fb20c43af7e520f57e9239bbcf46b7113d"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_protonmail__webclients-09fcf0dbdb87fa4f4a27700800ee4a3caed8b413"
+      "taskId": "instance_gravitational__teleport-eefac60a350930e5f295f94a2d55b94c1988c04e-vee9b09fb20c43af7e520f57e9239bbcf46b7113d"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_protonmail__webclients-0d0267c4438cf378bda90bc85eed3a3615871ac4"
+      "taskId": "instance_internetarchive__openlibrary-0a90f9f0256e4f933523e9842799e39f95ae29ce-v76304ecdb3a5954fcf13feb710e8c40fcf24b73c"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_protonmail__webclients-cfd7571485186049c10c822f214d474f1edde8d1"
+      "taskId": "instance_internetarchive__openlibrary-308a35d6999427c02b1dbf5211c033ad3b352556-ve8c8d62a2b60610a3c4631f5f23ed866bada9818"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_qutebrowser__qutebrowser-1af602b258b97aaba69d2585ed499d95e2303ac2-v2ef375ac784985212b1805e1d0431dc8f1b3c171"
+      "taskId": "instance_internetarchive__openlibrary-7edd1ef09d91fe0b435707633c5cc9af41dedddf-v76304ecdb3a5954fcf13feb710e8c40fcf24b73c"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_qutebrowser__qutebrowser-8d05f0282a271bfd45e614238bd1b555c58b3fc1-v35616345bb8052ea303186706cec663146f0f184"
+      "taskId": "instance_internetarchive__openlibrary-7f7e53aa4cf74a4f8549a5bcd4810c527e2f6d7e-v13642507b4fc1f8d234172bf8129942da2c2ca26"
     },
     {
       "suite": "swebench-pro",
-      "taskId": "instance_tutao__tutanota-b4934a0f3c34d9d7649e944b183137e8fad3e859-vbc0d9ba8f0071fbe982809910959a6ff8884dbbf"
+      "taskId": "instance_internetarchive__openlibrary-c05ccf2cd8baa81609434e0e35c4a63bc0da5a25-v0f5aece3601a5b4419f7ccec1dbda2071be28ee4"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_internetarchive__openlibrary-fad4a40acf5ff5f06cd7441a5c7baf41a7d81fe4-vfa6ff903cb27f336e17654595dd900fa943dcd91"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_navidrome__navidrome-69e0a266f48bae24a11312e9efbe495a337e4c84"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_navidrome__navidrome-8383527aaba1ae8fa9765e995a71a86c129ef626"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_navidrome__navidrome-de90152a7173039677ac808f5bfb1e644d761336"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_navidrome__navidrome-eebfbc5381a1e506ff17b5f1371d1ad83d5fd642"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_protonmail__webclients-0ec14e36ceb01ba45602a563e12352af8171ed39"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_protonmail__webclients-2f66db85455f4b22a47ffd853738f679b439593c"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_protonmail__webclients-5f0745dd6993bb1430a951c62a49807c6635cd77"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_protonmail__webclients-8be4f6cb9380fcd2e67bcb18cef931ae0d4b869c"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_protonmail__webclients-c5a2089ca2bfe9aa1d85a664b8ad87ef843a1c9c"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_qutebrowser__qutebrowser-54bcdc1eefa86cc20790973d6997b60c3bba884c-v2ef375ac784985212b1805e1d0431dc8f1b3c171"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_qutebrowser__qutebrowser-66cfa15c372fa9e613ea5a82d3b03e4609399fb6-v363c8a7e5ccdf6968fc7ab84a2053ac78036691d"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_qutebrowser__qutebrowser-85b867fe8d4378c8e371f055c70452f546055854-v2ef375ac784985212b1805e1d0431dc8f1b3c171"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_qutebrowser__qutebrowser-e34dfc68647d087ca3175d9ad3f023c30d8c9746-v363c8a7e5ccdf6968fc7ab84a2053ac78036691d"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_qutebrowser__qutebrowser-e57b6e0eeeb656eb2c84d6547d5a0a7333ecee85-v2ef375ac784985212b1805e1d0431dc8f1b3c171"
+    },
+    {
+      "suite": "swebench-pro",
+      "taskId": "instance_tutao__tutanota-8513a9e8114a8b42e64f4348335e0f23efa054c4-vee878bb72091875e912c52fc32bc60ec3760227b"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "pypa__packaging.013f3b03.test_metadata.e00b5801.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "fastapi__fastapi.02e108d1.test_compat.71e8518f.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "mlflow__mlflow.93dab383.test_client_webhooks.75e39b52.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "pandas-dev__pandas.82fa2715.test_sample.5d2ba03e.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "astropy__astropy.b0db0daa.test_tiled_compression.a4fe298a.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "sphinx-doc__sphinx.e347e59c.test_ext_intersphinx.04901873.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "pydantic__pydantic.e1dcaf9e.test_titles.e806bda8.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "pydata__xarray.97f3a746.test_backends_chunks.fa55f68a.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "scikit-learn__scikit-learn.5741bac9.test_public_functions.28421aef.lv1"
+    },
+    {
+      "suite": "featurebench",
+      "taskId": "python__mypy.8e2ce962.testconstraints.db380fe7.lv1"
+    },
+    {
+      "suite": "swe-marathon",
+      "taskId": "embedding-eval"
     },
     {
       "suite": "swe-marathon",
       "taskId": "kubernetes-rust-rewrite"
+    },
+    {
+      "suite": "swe-marathon",
+      "taskId": "rust-c-compiler"
+    },
+    {
+      "suite": "swe-marathon",
+      "taskId": "stripe-clone"
+    },
+    {
+      "suite": "swe-marathon",
+      "taskId": "trimul-cuda"
     }
   ]
 }

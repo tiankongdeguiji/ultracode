@@ -89,9 +89,26 @@ function fixture(taskBody = 'Requirements:\n- Keep public interfaces stable.'): 
   const key = artifactKey(qualifiedTaskId);
   const dependencies: WorkflowAuthoringDependencies = {
     loadInputs: () => ({
+      inputsSha256: 'c'.repeat(64),
       cohort: {
         bytes: Buffer.from('fixture cohort'),
         sha256: createHash('sha256').update('fixture cohort').digest('hex'),
+        sources: {
+          swebenchPro: {
+            dataset: 'ScaleAI/SWE-bench_Pro',
+            revision: '7ab5114912baf22bb098818e604c02fe7ad2c11f',
+            parquetSha256: 'c8cd7115496ad4e9a8b21d088cef576a65bf821bb542b24336f13f714cef13f8',
+          },
+          featureBench: {
+            dataset: 'LiberCoders/FeatureBench',
+            revision: 'e99d6efdfe511ea832c1b5735c536129561ec96a',
+            parquetSha256: 'e8a704f83d673e1cc78086eefb76bd56461ead8a65ca06fd6972f7363be8a775',
+          },
+          sweMarathon: {
+            repository: 'https://github.com/abundant-ai/swe-marathon.git',
+            revision: '6d6855af390226f6eca607d63818fe076e57ea8c',
+          },
+        },
         tasks: [{ suite: 'swebench-pro', taskId: 'fixture-task' }],
       },
       tasks: [{
@@ -142,6 +159,7 @@ describe('workflow-authoring runner', () => {
       model: 'gpt-5.6-sol',
       requestedEffort: 'xhigh',
       hosts: ['codex', 'claude'],
+      inputsSha256: 'c'.repeat(64),
       codexDoctrineSha256: 'b'.repeat(64),
     });
     expect(manifest.binaries.map((entry: { host: string }) => entry.host)).toEqual(['codex', 'claude']);
@@ -176,8 +194,16 @@ describe('workflow-authoring runner', () => {
       dynamicAgentUpperBounds: 0,
     });
     expect(report.aggregates.claude.agentMinimum).toEqual(report.aggregates.codex.agentMinimum);
+    expect(report.aggregatesBySourceSuite['swebench-pro'].codex).toMatchObject({
+      storedArtifacts: 1,
+      validArtifacts: 1,
+    });
+    expect(report.aggregatesBySourceSuite.featurebench.codex.storedArtifacts).toBe(0);
     expect(readFileSync(join(test.runRoot, 'report.md'), 'utf8')).toContain(
       'No workflow was executed and no benchmark score was produced.',
+    );
+    expect(readFileSync(join(test.runRoot, 'report.md'), 'utf8')).toContain(
+      '| swebench-pro | codex | 1/1 |',
     );
     expect(readFileSync(join(test.runRoot, 'report.md'), 'utf8')).not.toContain('Scale match');
   });
@@ -229,6 +255,7 @@ describe('workflow-authoring runner', () => {
       host: 'both',
       model: 'gpt-5.6-sol',
       requestedEffort: 'xhigh',
+      concurrency: 4,
       taskIds: ['swebench-pro:a', 'swe-marathon:kubernetes-rust-rewrite'],
       resume: true,
     });

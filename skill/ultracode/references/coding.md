@@ -1,34 +1,43 @@
 # Coding workflow guidance
 
-This guidance is deliberately not a template or an acceptance checklist. Do not
-target an agent count, phase count, or another host's workflow shape. Start from
-the task's work graph: unresolved questions, dependency order, mutation
-ownership, and the evidence needed to accept the result. Add an agent only when
-it contributes independent evidence, owns genuinely disjoint work, or validates
-a meaningfully different failure mode.
+These are decision principles, not a workflow template or acceptance checklist.
+Do not target an agent count, phase count, task-category shape, or another
+host's workflow. Derive the workflow from the task's unknowns, dependency edges,
+mutation domains, and acceptance evidence. Add an agent only when it contributes
+independent information, owns genuinely disjoint work, or validates a distinct
+failure mode.
 
-1. **Follow the task's topology.** Explore only genuinely different unknowns,
-   synthesize only when findings or requirements interact, and place barriers
-   where dependencies require them. A coherent local change may need only
-   focused investigation, one mutation owner, and targeted verification; a
-   partitionable rewrite may benefit from a shared foundation, component
-   pipelines, and explicit integration.
-2. **Make ownership and data flow explicit.** Give overlapping files or
-   behavior to one mutation owner. Parallelize disjoint components when their
-   ownership is clear, or isolate patches when reconciliation is deliberate.
-   Keep the integration step visible whenever independent mutations must meet.
-3. **Spend redundancy on independent evidence.** Use distinct search or review
-   lenses for credible failure modes instead of repeating interchangeable
-   roles. Let findings trigger scoped repair and revalidation. Keep semantic
-   recovery evidence-driven and bounded; reserve engine retries for identified
-   transient backend failures and fail closed on unresolved critical evidence.
-4. **Preserve constraints without bloating handoffs.** Pass requirements and
-   source-of-truth locations to the agents responsible for them, use strict
-   schemas only when control flow consumes a result, and forward concise
-   findings rather than full repeated reports. Surface coverage cuts, failures,
-   and unresolved validation in the final result.
+1. **Map work before assigning roles.** Separate genuinely different unknowns,
+   mutation domains, shared prerequisites, integration points, and acceptance
+   risks. A coherent local change may need only focused investigation, one
+   mutation owner, and targeted verification. A partitionable rewrite may grow
+   lanes with its components and dependencies. Task labels and prompt length
+   alone do not justify either shape.
+2. **Parallelize independence, not activity.** Read-only investigations may
+   overlap freely when they seek different evidence. Give overlapping files or
+   behavior one mutation owner; disjoint mutation lanes must name their paths
+   and shared contracts, or use isolated worktrees when patches will be
+   reconciled deliberately. Add barriers only for real dependencies. Use a
+   pipeline only when several independent items share a repeated lifecycle and
+   benefit from advancing at different rates. Make integration explicit when
+   independent mutations must meet.
+3. **Adapt from evidence within a finite frontier.** Review lenses should test
+   credible, distinct failure hypotheses. Merge compatible findings directly;
+   add adjudication only when evidence conflicts, crosses ownership boundaries,
+   or controls a consequential decision. Dispatch repair only for confirmed
+   blockers, scope it to an owner, and revalidate the affected contracts. Every
+   data-dependent dispatch cycle needs a statically visible bound or finite
+   worklist. Reserve engine retries for identified transient backend failures
+   and fail closed on unresolved critical evidence.
+4. **Keep constraints and handoffs decision-sized.** Pass requirements,
+   protected boundaries, and source-of-truth locations to the agents that act
+   on them. Use strict schemas for results consumed by control flow, not as
+   ceremony for forwarded prose. Carry concise findings, evidence locations,
+   coverage gaps, and unresolved failures forward instead of repeatedly
+   serializing full reports. Preserve those gaps in the final result.
 
 Static authoring comparisons can reveal recurring structures, but they do not
-establish which structure solves tasks better. Promote a pattern into this
-guidance only when it recurs across diverse task shapes and has a clear
-correctness rationale; use execution outcomes when they are available.
+establish which structure solves tasks better. Treat another authored workflow
+as a hypothesis, not a target. Promote a pattern into this guidance only when it
+recurs across diverse task shapes, has a clear correctness rationale, and is
+consistent with execution outcomes when they are available.

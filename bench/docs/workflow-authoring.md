@@ -6,11 +6,24 @@ task repositories, tests, or native verifiers, and its report has no score.
 
 ## Inputs
 
-The tracked cohort contains the 20 SWE-bench Pro tasks spanning eight
-repositories from the original `gpt-5.6-sol` / `xhigh` pilot plus the SWE-Marathon
-`kubernetes-rust-rewrite` task. Run the normal Pro `fetch` and Marathon `prep`
-commands first; authoring reads only their pinned task statements. Gold patches
-never enter model prompts. Pro gold patch line/file counts are retained only as
+The tracked cohort contains 50 SWE-bench Pro tasks selected proportionally
+across all 11 repositories, 10 FeatureBench tasks from 10 distinct
+repositories, and five SWE-Marathon tasks covering model evaluation,
+multi-component rewrite, compiler construction, service emulation, and GPU
+kernel work. The deterministic selection seed and exact source revisions are
+stored with the task IDs in `cohort.json`.
+
+Prepare the prompt-only inputs without pulling task repositories, Docker
+images, execution environments, or verifiers:
+
+```bash
+npm run bench -- --suite workflow-authoring prepare
+```
+
+Preparation verifies the exact Pro and FeatureBench parquet bytes and downloads
+only the five Marathon instruction files from the pinned source commit. It
+requires `python3` with `pyarrow` only to extract selected parquet rows. Gold
+patches never enter model prompts; patch line/file counts are retained only as
 report-side complexity context.
 
 By default both hosts author every task once:
@@ -20,13 +33,15 @@ npm run bench -- --suite workflow-authoring generate \
   --run-id authoring-xhigh \
   --host both \
   --model gpt-5.6-sol \
-  --effort xhigh
+  --effort xhigh \
+  --concurrency 4
 ```
 
 Use repeatable `--task-id <suite:id>` for a cohort subset. `--resume` accepts
 only the exact frozen model, effort, host set, task order, cohort bytes,
-Codex-doctrine bytes, and host binary identities; already completed artifacts
-are skipped.
+prepared input bytes, Codex-guidance bytes, and host binary identities; already
+completed artifacts are skipped. `--concurrency` controls only simultaneous
+source-authoring processes and may change on resume.
 
 ## Non-execution boundary
 
@@ -56,9 +71,10 @@ The Acorn-based analysis reports:
   isolation.
 
 Unknown dynamic cardinality is represented as a null upper bound, never as a
-guessed number. The paired report preserves raw per-task deltas and cohort-level
-distributions rather than declaring agent or phase parity. Agent count, stage
-count, and resemblance to one host are observations, not acceptance criteria.
+guessed number. The paired report preserves raw per-task deltas plus whole-cohort
+and per-source-suite distributions rather than declaring agent or phase parity.
+Agent count, stage count, and resemblance to one host are observations, not
+acceptance criteria.
 
 Interpretation should use the full multi-repository cohort, look for recurrent
 patterns across different task shapes, and keep one-off structures as examples

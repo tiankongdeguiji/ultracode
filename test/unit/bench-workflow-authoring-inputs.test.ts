@@ -8,13 +8,15 @@ import {
 import { DEFAULT_BENCH_PATH_ROOTS, artifactKey } from '../../bench/src/shared/paths.js';
 
 describe('workflow-authoring inputs', () => {
-  it('pins the exact 20 Pro plus one Marathon cohort', () => {
+  it('pins the exact 50 Pro, 10 FeatureBench, and 5 Marathon cohort', () => {
     const cohort = loadAuthoringCohort(DEFAULT_BENCH_PATH_ROOTS);
-    expect(cohort.tasks).toHaveLength(21);
-    expect(cohort.tasks.filter((task) => task.suite === 'swebench-pro')).toHaveLength(20);
-    expect(cohort.tasks.filter((task) => task.suite === 'swe-marathon')).toEqual([
-      { suite: 'swe-marathon', taskId: 'kubernetes-rust-rewrite' },
-    ]);
+    expect(cohort.tasks).toHaveLength(65);
+    expect(cohort.tasks.filter((task) => task.suite === 'swebench-pro')).toHaveLength(50);
+    expect(cohort.tasks.filter((task) => task.suite === 'featurebench')).toHaveLength(10);
+    expect(cohort.tasks.filter((task) => task.suite === 'swe-marathon')).toHaveLength(5);
+    expect(cohort.sources.featureBench.parquetSha256).toBe(
+      'e8a704f83d673e1cc78086eefb76bd56461ead8a65ca06fd6972f7363be8a775',
+    );
     expect(cohort.sha256).toMatch(/^[a-f0-9]{64}$/u);
   });
 
@@ -36,8 +38,8 @@ describe('workflow-authoring inputs', () => {
     expect(claude.startsWith('ultracode\n')).toBe(true);
     expect(codex).toContain(task.taskBody.trim());
     expect(claude).toContain(task.taskBody.trim());
-    expect(codex).toContain('This guidance is deliberately not a template');
-    expect(claude).not.toContain('This guidance is deliberately not a template');
+    expect(codex).toContain('These are decision principles, not a workflow template');
+    expect(claude).not.toContain('These are decision principles, not a workflow template');
     expect(codex).not.toContain('999');
     expect(claude).not.toContain('999');
     expect(doctrine.sha256).toMatch(/^[a-f0-9]{64}$/u);
