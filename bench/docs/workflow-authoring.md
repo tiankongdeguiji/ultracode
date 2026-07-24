@@ -6,8 +6,8 @@ task repositories, tests, or native verifiers, and its report has no score.
 
 ## Inputs
 
-The tracked cohort contains the 20 SWE-bench Pro tasks used by the original
-`gpt-5.6-sol` / `xhigh` pilot plus the SWE-Marathon
+The tracked cohort contains the 20 SWE-bench Pro tasks spanning eight
+repositories from the original `gpt-5.6-sol` / `xhigh` pilot plus the SWE-Marathon
 `kubernetes-rust-rewrite` task. Run the normal Pro `fetch` and Marathon `prep`
 commands first; authoring reads only their pinned task statements. Gold patches
 never enter model prompts. Pro gold patch line/file counts are retained only as
@@ -56,10 +56,16 @@ The Acorn-based analysis reports:
   isolation.
 
 Unknown dynamic cardinality is represented as a null upper bound, never as a
-guessed number. The paired report considers minimum and maximum agent counts
-matched when Codex is within `max(2, 20%)` of Claude, and phase calls matched
-within one. These are descriptive structural proxies, not quality or success
-claims.
+guessed number. The paired report preserves raw per-task deltas and cohort-level
+distributions rather than declaring agent or phase parity. Agent count, stage
+count, and resemblance to one host are observations, not acceptance criteria.
+
+Interpretation should use the full multi-repository cohort, look for recurrent
+patterns across different task shapes, and keep one-off structures as examples
+rather than doctrine. Static authoring can identify control-flow and ownership
+properties, but cannot establish that a workflow solves tasks better; promoting
+a pattern into guidance requires a correctness rationale and, when available,
+execution-outcome evidence.
 
 ```bash
 npm run bench -- --suite workflow-authoring report --run-id authoring-xhigh

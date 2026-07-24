@@ -523,11 +523,6 @@ function delta(left: number | null | undefined, right: number | null | undefined
   return left === null || left === undefined || right === null || right === undefined ? null : left - right;
 }
 
-function withinAgentTolerance(codex: number | null, claude: number | null): boolean | null {
-  if (codex === null || claude === null) return null;
-  return Math.abs(codex - claude) <= Math.max(2, Math.ceil(Math.abs(claude) * 0.2));
-}
-
 function comparison(
   manifest: AuthoringManifest,
   runDirectory: string,
@@ -541,10 +536,7 @@ function comparison(
   const claudeMinimum = claudeMetrics?.agentCalls.min ?? null;
   const codexMaximum = codexMetrics?.agentCalls.max ?? null;
   const claudeMaximum = claudeMetrics?.agentCalls.max ?? null;
-  const minimumMatched = withinAgentTolerance(codexMinimum, claudeMinimum);
-  const maximumMatched = withinAgentTolerance(codexMaximum, claudeMaximum);
   const phaseDelta = delta(codexMetrics?.phaseCalls, claudeMetrics?.phaseCalls);
-  const localizedProbe = task.sourceSuite === 'swebench-pro' && task.taskId.includes('qutebrowser');
   return {
     sourceSuite: task.sourceSuite,
     taskId: task.taskId,
@@ -555,15 +547,6 @@ function comparison(
     agentMinimumDelta: delta(codexMinimum, claudeMinimum),
     agentMaximumDelta: delta(codexMaximum, claudeMaximum),
     phaseDelta,
-    agentScaleMatched: minimumMatched === null || maximumMatched === null
-      ? null
-      : minimumMatched && maximumMatched,
-    phaseCountMatched: phaseDelta === null ? null : Math.abs(phaseDelta) <= 1,
-    codexLocalizedScaleMatched: !localizedProbe
-      ? null
-      : codexMinimum === null || codexMaximum === null
-        ? false
-        : codexMinimum === 12 && codexMaximum >= 12 && codexMaximum <= 18,
   };
 }
 
@@ -606,12 +589,18 @@ function aggregate(
     phaseCalls: distribution(values((entry) => entry.phaseCalls)),
     parallelCalls: distribution(values((entry) => entry.parallelCalls)),
     pipelineCalls: distribution(values((entry) => entry.pipelineCalls)),
+    conditionalBranches: distribution(values((entry) => entry.conditionalBranches)),
+    boundedLoops: distribution(values((entry) => entry.boundedLoops)),
+    unboundedLoops: distribution(values((entry) => entry.unboundedLoops)),
     retryDeclarations: distribution(values((entry) => entry.retryDeclarations)),
     schemaAgentCallSites: distribution(values((entry) => entry.schemaAgentCallSites)),
     jsonStringifyCalls: distribution(values((entry) => entry.jsonStringifyCalls)),
+    worktreeIsolations: distribution(values((entry) => entry.worktreeIsolations)),
     unsafeParallelMutators: distribution(values((entry) => entry.unsafeParallelMutators)),
     conditionalRepairCalls: distribution(values((entry) => entry.conditionalRepairCalls)),
     unconditionalRepairCalls: distribution(values((entry) => entry.unconditionalRepairCalls)),
+    triageOrAdjudicationCalls: distribution(values((entry) => entry.triageOrAdjudicationCalls)),
+    failClosedSignals: distribution(values((entry) => entry.failClosedSignals)),
   };
 }
 
@@ -629,26 +618,31 @@ function renderReport(report: WorkflowAuthoringReport): string {
     `- Model/effort: \`${report.model}\` / \`${report.requestedEffort}\``,
     `- Stored: ${report.summary.storedArtifacts}/${report.summary.requestedArtifacts}; valid ${report.summary.validArtifacts}; invalid ${report.summary.invalidArtifacts}`,
     `- Tool-use violations: ${report.summary.toolUseViolations}`,
-    `- Localized Codex 12–18 matches: ${report.summary.localizedCodexScaleMatches}/${report.summary.localizedCodexTasks}`,
     '',
-    '| Host | Valid | Agent min mean/median | Agent max mean/median | Parallel | Pipeline | Retries | JSON handoffs |',
+    '| Host | Valid | Agent min mean/median | Agent max mean/median | Phases | Parallel | Pipeline |',
+    '|---|---:|---:|---:|---:|---:|---:|',
+    ...(['codex', 'claude'] as const).map((host) => {
+      const value = report.aggregates[host];
+      return `| ${host} | ${value.validArtifacts}/${value.storedArtifacts} | ${summaryCell(value.agentMinimum)} | ${summaryCell(value.agentMaximum)} | ${summaryCell(value.phaseCalls)} | ${summaryCell(value.parallelCalls)} | ${summaryCell(value.pipelineCalls)} |`;
+    }),
+    '',
+    '| Host | Branches | Bounded loops | Retries | Conditional repair | Unconditional repair | Triage/judge | Unsafe parallel mutation |',
     '|---|---:|---:|---:|---:|---:|---:|---:|',
     ...(['codex', 'claude'] as const).map((host) => {
       const value = report.aggregates[host];
-      return `| ${host} | ${value.validArtifacts}/${value.storedArtifacts} | ${summaryCell(value.agentMinimum)} | ${summaryCell(value.agentMaximum)} | ${summaryCell(value.parallelCalls)} | ${summaryCell(value.pipelineCalls)} | ${summaryCell(value.retryDeclarations)} | ${summaryCell(value.jsonStringifyCalls)} |`;
+      return `| ${host} | ${summaryCell(value.conditionalBranches)} | ${summaryCell(value.boundedLoops)} | ${summaryCell(value.retryDeclarations)} | ${summaryCell(value.conditionalRepairCalls)} | ${summaryCell(value.unconditionalRepairCalls)} | ${summaryCell(value.triageOrAdjudicationCalls)} | ${summaryCell(value.unsafeParallelMutators)} |`;
     }),
     '',
-    '| Task | Gold patch | Codex agents | Claude agents | Scale match | Phase Δ |',
-    '|---|---:|---:|---:|:---:|---:|',
+    '| Task | Gold patch | Codex agents | Claude agents | Min Δ | Max Δ | Phase Δ |',
+    '|---|---:|---:|---:|---:|---:|---:|',
     ...report.comparisons.map((entry) => {
       const gold = entry.goldPatchStats === null
         ? '—'
         : `${entry.goldPatchStats.files}f +${entry.goldPatchStats.additions}/-${entry.goldPatchStats.deletions}`;
-      const scale = entry.agentScaleMatched === null ? '—' : entry.agentScaleMatched ? 'yes' : 'no';
-      return `| ${entry.qualifiedTaskId} | ${gold} | ${bounds(entry.codex)} | ${bounds(entry.claude)} | ${scale} | ${entry.phaseDelta ?? '—'} |`;
+      return `| ${entry.qualifiedTaskId} | ${gold} | ${bounds(entry.codex)} | ${bounds(entry.claude)} | ${entry.agentMinimumDelta ?? '—'} | ${entry.agentMaximumDelta ?? '—'} | ${entry.phaseDelta ?? '—'} |`;
     }),
     '',
-    '> These are static structural proxies. No workflow was executed and no benchmark score was produced.',
+    '> These are descriptive static proxies, not parity targets or quality claims. No workflow was executed and no benchmark score was produced.',
     '',
   ];
   return lines.join('\n');
@@ -675,10 +669,6 @@ export async function reportCommand(options: ReportOptions, context: CommandCont
       validArtifacts: artifacts.filter((artifact) => artifact.status === 'valid').length,
       invalidArtifacts: artifacts.filter((artifact) => artifact.status === 'invalid').length,
       pairedTasks: comparisons.filter((entry) => entry.codex !== null && entry.claude !== null).length,
-      agentScaleMatches: comparisons.filter((entry) => entry.agentScaleMatched === true).length,
-      phaseCountMatches: comparisons.filter((entry) => entry.phaseCountMatched === true).length,
-      localizedCodexTasks: comparisons.filter((entry) => entry.codexLocalizedScaleMatched !== null).length,
-      localizedCodexScaleMatches: comparisons.filter((entry) => entry.codexLocalizedScaleMatched === true).length,
       toolUseViolations: artifacts.filter((artifact) => artifact.toolUseDetected).length,
     },
     aggregates: {

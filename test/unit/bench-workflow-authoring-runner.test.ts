@@ -179,6 +179,7 @@ describe('workflow-authoring runner', () => {
     expect(readFileSync(join(test.runRoot, 'report.md'), 'utf8')).toContain(
       'No workflow was executed and no benchmark score was produced.',
     );
+    expect(readFileSync(join(test.runRoot, 'report.md'), 'utf8')).not.toContain('Scale match');
   });
 
   it('terminates and invalidates a Claude Workflow tool-use event', async () => {

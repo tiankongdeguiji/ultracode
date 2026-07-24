@@ -65,5 +65,5 @@ If the workflow bounds coverage (top-N, sampling, early exit), `log()` what was 
 | "review this change" | dimension-split finders → adversarial verify per finding |
 | "thoroughly audit / be comprehensive" | large finder pool, loop-until-dry, 3–5-vote adversarial pass, synthesis + completeness critic |
 | "+500k" etc. | loop-until-budget; fleet-size = budget / ~100k per agent |
-| localized substantive code change | 12–18 agent gated coding backbone from `coding.md` |
+| localized substantive code change | focused investigation → one mutation owner → verification aimed at credible risks |
 | partitionable rewrite | foundation owner → disjoint component pipelines → integration → conformance + completeness |

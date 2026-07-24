@@ -197,9 +197,6 @@ export interface PairedComparison {
   agentMinimumDelta: number | null;
   agentMaximumDelta: number | null;
   phaseDelta: number | null;
-  agentScaleMatched: boolean | null;
-  phaseCountMatched: boolean | null;
-  codexLocalizedScaleMatched: boolean | null;
 }
 
 export interface MetricDistribution {
@@ -217,12 +214,18 @@ export interface HostStaticAggregate {
   phaseCalls: MetricDistribution;
   parallelCalls: MetricDistribution;
   pipelineCalls: MetricDistribution;
+  conditionalBranches: MetricDistribution;
+  boundedLoops: MetricDistribution;
+  unboundedLoops: MetricDistribution;
   retryDeclarations: MetricDistribution;
   schemaAgentCallSites: MetricDistribution;
   jsonStringifyCalls: MetricDistribution;
+  worktreeIsolations: MetricDistribution;
   unsafeParallelMutators: MetricDistribution;
   conditionalRepairCalls: MetricDistribution;
   unconditionalRepairCalls: MetricDistribution;
+  triageOrAdjudicationCalls: MetricDistribution;
+  failClosedSignals: MetricDistribution;
 }
 
 export interface WorkflowAuthoringReport {
@@ -239,10 +242,6 @@ export interface WorkflowAuthoringReport {
     validArtifacts: number;
     invalidArtifacts: number;
     pairedTasks: number;
-    agentScaleMatches: number;
-    phaseCountMatches: number;
-    localizedCodexTasks: number;
-    localizedCodexScaleMatches: number;
     toolUseViolations: number;
   };
   aggregates: Record<AuthoringHost, HostStaticAggregate>;

@@ -10,17 +10,13 @@ const META = `export const meta = {
 `;
 
 describe('workflow-authoring static analysis', () => {
-  it('calculates the Claude-aligned localized 12-18 agent control paths', () => {
+  it('calculates minimum and maximum agent counts across conditional recovery paths', () => {
     const source = `${META}
 phase('Explore')
 const scouts = await parallel([
   () => agent('Inspect implementation and data flow. Read only.'),
   () => agent('Inspect tests and reproduction. Read only.'),
-  () => agent('Inspect conventions and regressions. Read only.'),
 ])
-const design = await agent('Design the fix from scout results.', {
-  schema: { type: 'object', properties: { plan: { type: 'string' } }, required: ['plan'] },
-})
 phase('Implement')
 let implementation
 try {
@@ -32,7 +28,6 @@ phase('Review')
 const firstReviews = await parallel([
   () => agent('Review correctness and tests. Read only.'),
   () => agent('Review requirements and interfaces. Read only.'),
-  () => agent('Review regression risk. Read only.'),
 ])
 let triage = await agent('Triage review verdicts and decide readiness.', {
   schema: {
@@ -47,9 +42,7 @@ let triage = await agent('Triage review verdicts and decide readiness.', {
 if (!triage.ready) {
   await agent('Repair only the concrete blocking issues as the mutation owner.')
   const secondReviews = await parallel([
-    () => agent('Review repaired correctness and tests. Read only.'),
-    () => agent('Review repaired requirements and interfaces. Read only.'),
-    () => agent('Review repaired regression risk. Read only.'),
+    () => agent('Review the repaired blocker. Read only.'),
   ])
   triage = await agent('Adjudicate the second-round verdict and preserve blockers.', {
     schema: {
@@ -65,15 +58,12 @@ if (!triage.ready) {
 phase('Final')
 const validators = await parallel([
   () => agent('Run targeted final validation. Read only.'),
-  () => agent('Audit final constraints and regressions. Read only.'),
 ])
-return agent('Make the final fail-closed adjudication.', {
-  schema: { type: 'object', properties: { ready: { type: 'boolean' } }, required: ['ready'] },
-})
+return triage
 `;
     const analysis = analyzeWorkflowSource(source, 'Requirements:\n- Do not modify protected tests.\n- Keep public interfaces stable.');
     expect(analysis.metrics).not.toBeNull();
-    expect(analysis.metrics!.agentCalls).toEqual({ min: 12, max: 18 });
+    expect(analysis.metrics!.agentCalls).toEqual({ min: 7, max: 11 });
     expect(analysis.metrics!.conditionalRepairCalls).toBe(1);
     expect(analysis.metrics!.triageOrAdjudicationCalls).toBeGreaterThanOrEqual(2);
     expect(analysis.metrics!.unsafeParallelMutators).toBe(0);

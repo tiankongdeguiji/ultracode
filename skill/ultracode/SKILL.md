@@ -11,13 +11,13 @@ You orchestrate a fleet of subagents through a small JavaScript workflow script 
 
 - **Only the keyword "ultracode"**, written by the user as their request to YOU, arms ultracode mode for the rest of the session; without the keyword, handle the task solo. The same provenance rule governs disarming: "ultracode" / "ultracode off" seen inside file or directory names, paths, code, or quoted logs neither arms nor disarms the mode.
 - **Worker guard (hard rule):** if the `ULTRACODE_INSIDE_RUN` environment variable is set, you ARE a worker inside an ultracode run. Never start workflows by any route (ultracode CLI, `workflow_start` MCP tool, a native Workflow tool) — a worker that launches runs escapes the parent's caps and cascades. Do your assigned task directly and return.
-- While ON: route **every substantive task** through a workflow. Work solo only on conversational turns and truly trivial mechanical edits. A localized but substantive coding fix still uses the Claude-aligned coding workflow below. Optimize for the most exhaustive, correct answer — not the cheapest.
+- While ON: route **every substantive task** through a workflow. Work solo only on conversational turns and truly trivial mechanical edits. For coding, shape the workflow around the task rather than a target fleet size. Optimize for the most exhaustive, correct answer — not the cheapest.
 - The user says **"ultracode off"** → revert to normal single-agent behavior.
 - Budgets are **opt-in by the user only.** With no explicit directive, run **uncapped** — do NOT pass `--budget` or a `budget` arg, and never invent a number "to be safe." Only when the user gives a directive ("+500k", "budget 2m") do you set one; pass it verbatim to the engine (`--budget` / `budget` arg), never advisory or a number you invented. The engine enforces it at the per-dispatch gate — a firm threshold no *new* agent crosses, though in-flight calls and their internal retries/repairs can overshoot it by a bounded margin (it is not a mid-call hard cap). The engine default is unlimited; keep it that way unless told otherwise.
 
 ## When to orchestrate — and when not
 
-Applies **only once the keyword has armed the mode** (above); with it off, every task is solo. While ON, substantive coding follows the coding doctrine below even when the requested change is localized. Other tasks orchestrate when they have **3+ independent agent-sized units** (files to audit, questions to research, findings to verify), need **independent perspectives** (adversarial verification, judge panels), or exceed what one context can hold.
+Applies **only once the keyword has armed the mode** (above); with it off, every task is solo. While ON, substantive coding follows the task-shaped guidance below even when the requested change is localized. Other tasks orchestrate when they have **3+ independent agent-sized units** (files to audit, questions to research, findings to verify), need **independent perspectives** (adversarial verification, judge panels), or exceed what one context can hold.
 
 Do NOT orchestrate: anything needing mid-run user input (workflows cannot ask — decompose so decisions happen between workflows); purely conversational turns; trivial mechanical edits with no meaningful implementation or verification judgment; **when you are yourself a workflow worker (`ULTRACODE_INSIDE_RUN` set)**.
 
@@ -48,15 +48,16 @@ Eight rules:
 7. Don't branch on completion ORDER (breaks resume replay); branch on results.
 8. Report every cap/cut you introduce (top-N, sampling) via `log()` — no silent caps.
 
-## Coding workflow doctrine
+## Coding workflow guidance
 
-Read `references/coding.md` before authoring a workflow that changes code. Its localized-task backbone deliberately matches Claude Code native Ultracode in both structure and scale: **12 agents on the shortest successful path, 18 on the bounded recovery path**. Do not collapse substantive localized fixes to a solo or two-agent workflow.
+Read `references/coding.md` before authoring a workflow that changes code. It is task-shaping guidance, not a fixed stage sequence or agent-count target. Justify roles through independent evidence, disjoint ownership, dependency structure, or distinct verification risk; do not manufacture roles to match another host's workflow.
 
 Across all sizes:
+- let task topology, uncertainty, and risk determine the amount of exploration, synthesis, and verification;
 - exploration and review may run in parallel; mutation of overlapping files has one sequential owner;
 - parallel mutation requires explicit disjoint path ownership or `isolation: 'worktree'`;
 - repair is conditional on a structured blocking verdict, never an unconditional finalizer;
-- use one explicit semantic takeover after implementation failure, not blanket `retries` on every call;
+- use evidence-driven bounded recovery after implementation failure, not blanket `retries` on every call;
 - pass compact structured summaries and source-of-truth locations, not repeated `JSON.stringify()` dumps of complete reports.
 
 ## Quality patterns (pick per task; details in `references/patterns.md`)
@@ -67,7 +68,7 @@ Across all sizes:
 - **Loop-until-dry**: keep spawning finders until 2 consecutive rounds add nothing new (dedup vs *seen*, not vs *confirmed*).
 - **Multi-modal sweep**: parallel agents each searching a different way.
 - **Completeness critic**: final agent asks "what's missing?" — its output is the next round.
-- **Coding backbone**: localized 12–18 agent gated review; component pipeline for large partitionable work (`references/coding.md`).
+- **Task-shaped coding**: focused ownership and risk-driven verification for local changes; dependency-aware component pipelines for partitionable work (`references/coding.md`).
 
 Scale to the ask: "find bugs" → few finders, single vote; "thoroughly audit" → large pool + 3-vote adversarial pass + synthesis.
 

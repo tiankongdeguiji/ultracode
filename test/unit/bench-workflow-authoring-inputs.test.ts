@@ -36,8 +36,8 @@ describe('workflow-authoring inputs', () => {
     expect(claude.startsWith('ultracode\n')).toBe(true);
     expect(codex).toContain(task.taskBody.trim());
     expect(claude).toContain(task.taskBody.trim());
-    expect(codex).toContain('Localized change: 12–18 agents');
-    expect(claude).not.toContain('Localized change: 12–18 agents');
+    expect(codex).toContain('This guidance is deliberately not a template');
+    expect(claude).not.toContain('This guidance is deliberately not a template');
     expect(codex).not.toContain('999');
     expect(claude).not.toContain('999');
     expect(doctrine.sha256).toMatch(/^[a-f0-9]{64}$/u);

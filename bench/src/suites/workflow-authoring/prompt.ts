@@ -47,7 +47,7 @@ export function composeAuthoringPrompt(
   doctrine: CodexDoctrineSnapshot,
 ): string {
   const doctrineSection = host === 'codex'
-    ? `\n\nThe following tracked Codex Ultracode doctrine is authoritative for this authoring run:${doctrine.text}`
+    ? `\n\nThe following tracked Codex Ultracode snapshot defines the portable dialect and offers task-shaping guidance. Do not infer a target structure or agent count from its examples:${doctrine.text}`
     : '';
   return `ultracode
 
