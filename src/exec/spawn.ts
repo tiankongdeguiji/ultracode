@@ -201,18 +201,47 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     }
   };
 
+  const authenticatedWorkers = new Map<string, TrackedWorkerProcess>();
+  const observeTokenProcesses = () => discoverWorkerProcessesForTokens(
+    [workerToken],
+    opts.workerScope,
+    undefined,
+    tokenInspection,
+  );
+  const latchWorkers = (workers: Iterable<TrackedWorkerProcess>): void => {
+    for (const worker of workers) authenticatedWorkers.set(trackedWorkerKey(worker), worker);
+  };
+  const refreshAuthenticatedWorkers = (): {
+    complete: boolean;
+    processes: TrackedWorkerProcess[];
+  } => {
+    const snapshot = readProcessIdentitySnapshot(
+      [...authenticatedWorkers.values()].map((candidate) => candidate.pid),
+      opts.processInspection,
+    );
+    const processes: TrackedWorkerProcess[] = [];
+    for (const [key, candidate] of authenticatedWorkers) {
+      const live = snapshot.identities.get(candidate.pid);
+      if (live?.starttime === candidate.starttime) {
+        const refreshed = { pid: candidate.pid, token: candidate.token, ...live };
+        authenticatedWorkers.set(key, refreshed);
+        processes.push(refreshed);
+      } else if (live !== undefined || snapshot.complete) {
+        authenticatedWorkers.delete(key);
+      }
+    }
+    return { complete: snapshot.complete, processes };
+  };
+
   const signalLiveWorker = (signal: NodeJS.Signals): number => {
     if (platform === 'darwin') return Number(signalGroup(signal));
+    const discovery = observeTokenProcesses();
+    latchWorkers(discovery.processes);
     const groupSignaled = signalGroup(signal);
-    const discovery = discoverWorkerProcessesForTokens(
-      [workerToken],
-      opts.workerScope,
-      undefined,
-      tokenInspection,
-    );
+    const authenticated = refreshAuthenticatedWorkers().processes;
     const escaped = groupSignaled && pid
-      ? discovery.processes.filter((candidate) => candidate.pgrp !== pid)
-      : discovery.processes;
+      ? authenticated.filter((candidate) => candidate.pgrp !== pid)
+      : authenticated;
     return Number(groupSignaled)
       + signalTrackedWorkerProcesses(escaped, signal, opts.processInspection).processes;
   };
@@ -276,44 +305,21 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
       retireGroupIfGone();
       return Number(!groupTargetRetired) + 1;
     }
-    const observeTokenProcesses = () => discoverWorkerProcessesForTokens(
-      [workerToken],
-      opts.workerScope,
-      undefined,
-      tokenInspection,
-    );
     const now = opts.processInspection?.observationNow ?? (() => performance.now());
     const wait = opts.processInspection?.observationWait ?? sleep;
-    const pendingWorkers = new Map<string, TrackedWorkerProcess>();
     const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
       let delayMs = 25;
       let emptyPasses = 0;
       let finalProofUsed = false;
       for (;;) {
-        const groupSignaled = signalGroup(signal);
+        const previouslyObserved = new Set(authenticatedWorkers.keys());
         const discovery = observeTokenProcesses();
-        const previouslyObserved = new Set(pendingWorkers.keys());
-        for (const candidate of discovery.processes) {
-          pendingWorkers.set(trackedWorkerKey(candidate), candidate);
-        }
-        const pendingSnapshot = readProcessIdentitySnapshot(
-          [...pendingWorkers.values()].map((candidate) => candidate.pid),
-          opts.processInspection,
-        );
-        const livePending: TrackedWorkerProcess[] = [];
-        for (const [key, candidate] of pendingWorkers) {
-          const live = pendingSnapshot.identities.get(candidate.pid);
-          if (live?.starttime === candidate.starttime) {
-            const refreshed = { pid: candidate.pid, token: candidate.token, ...live };
-            pendingWorkers.set(key, refreshed);
-            livePending.push(refreshed);
-          } else if (live !== undefined || pendingSnapshot.complete) {
-            pendingWorkers.delete(key);
-          }
-        }
+        latchWorkers(discovery.processes);
+        const groupSignaled = signalGroup(signal);
+        const authenticated = refreshAuthenticatedWorkers();
         const individuallySignalable = groupSignaled && pid
-          ? livePending.filter((candidate) => candidate.pgrp !== pid)
-          : livePending;
+          ? authenticated.processes.filter((candidate) => candidate.pgrp !== pid)
+          : authenticated.processes;
         const actionable = signal === 'SIGKILL'
           ? individuallySignalable
           : individuallySignalable.filter((candidate) =>
@@ -325,9 +331,9 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
         signalTrackedWorkerProcesses(actionable, signal, opts.processInspection);
         retireGroupIfGone();
         emptyPasses = discovery.complete
-          && pendingSnapshot.complete
+          && authenticated.complete
           && discovery.processes.length === 0
-          && pendingWorkers.size === 0
+          && authenticatedWorkers.size === 0
           ? emptyPasses + 1
           : 0;
         // One procfs directory snapshot can miss a PID forked after readdir.

@@ -186,6 +186,7 @@ describe('Linux worker-token publication', () => {
     let exposeTokenMatch = true;
     let groupLive = true;
     let groupPid = 0;
+    let tokenMatchLive = true;
     let clock = 0;
     const duplicateSignals: Array<[number, NodeJS.Signals]> = [];
     const spawned = spawnAgentProcess(
@@ -204,7 +205,7 @@ describe('Linux worker-token publication', () => {
             complete: true,
           }),
           readIdentitySnapshot: (pids) => ({
-            identities: new Map(pids.includes(groupPid)
+            identities: new Map(tokenMatchLive && pids.includes(groupPid)
               ? [[groupPid, { pgrp: groupPid, starttime: 'worker-start' }]]
               : []),
             complete: true,
@@ -227,17 +228,18 @@ describe('Linux worker-token publication', () => {
     exposeTokenMatch = false;
     await once(spawned.child, 'close');
     groupLive = false;
+    tokenMatchLive = false;
     await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
     expect(duplicateSignals).toEqual([]);
   });
 
-  it('retains a same-group identity across a PGID change and marker removal', async () => {
+  it('retains a pre-signal identity from killTree across a PGID change and marker removal', async () => {
     let clock = 0;
     let groupLive = true;
     let groupPid = 0;
     let workerEscaped = false;
     let workerLive = true;
-    let observations = 0;
+    let exposeTokenMatch = true;
     const signals: Array<[number, NodeJS.Signals]> = [];
     const spawned = spawnAgentProcess(
       process.execPath,
@@ -249,7 +251,7 @@ describe('Linux worker-token publication', () => {
           platform: 'linux',
           listLinuxProcessIds: () => [],
           discoverWorkerProcesses: (tokens) => ({
-            processes: observations++ === 0
+            processes: exposeTokenMatch
               ? [{
                   pid: PROCESS.pid,
                   pgrp: groupPid,
@@ -279,20 +281,65 @@ describe('Linux worker-token publication', () => {
             workerLive = false;
           },
           observationNow: () => clock,
-          observationWait: async (delayMs) => {
-            clock += delayMs;
-            groupLive = false;
-            workerEscaped = true;
-          },
+          observationWait: async (delayMs) => { clock += delayMs; },
         },
       },
     );
     groupPid = spawned.child.pid!;
     const closed = once(spawned.child, 'close');
 
+    spawned.killTree('SIGTERM');
+    exposeTokenMatch = false;
+    groupLive = false;
+    workerEscaped = true;
     await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
     await closed;
     expect(signals).toEqual([[-PROCESS.pid, 'SIGTERM']]);
+  });
+
+  it('retains an authenticated identity across a failed cleanup retry', async () => {
+    let clock = 0;
+    let exposeTokenMatch = true;
+    let workerLive = true;
+    let allowSignal = false;
+    const signals: NodeJS.Signals[] = [];
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      processInspection: {
+        platform: 'linux',
+        listLinuxProcessIds: () => [],
+        discoverWorkerProcesses: (tokens) => ({
+          processes: exposeTokenMatch
+            ? [{ ...PROCESS, token: tokens[0]! }]
+            : [],
+          complete: true,
+        }),
+        readIdentitySnapshot: (pids) => ({
+          identities: new Map(
+            workerLive && pids.includes(PROCESS.pid)
+              ? [[PROCESS.pid, { pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }]]
+              : [],
+          ),
+          complete: true,
+        }),
+        signalProcess: (_pid, signal) => {
+          if (signal === 0) throw noSuchProcess();
+          signals.push(signal);
+          if (!allowSignal) throw new Error('survivor');
+          workerLive = false;
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    });
+
+    await once(spawned.child, 'close');
+    await expect(spawned.cleanupEscaped(0)).resolves.toBeGreaterThan(0);
+    exposeTokenMatch = false;
+    allowSignal = true;
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+    expect(signals).toEqual(['SIGKILL', 'SIGTERM']);
   });
 });
 
