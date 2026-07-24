@@ -29,7 +29,7 @@ export const meta = {
 | `phase` | progress group; use inside pipeline/parallel stages to avoid races on the global `phase()` pointer |
 | `schema` | JSON Schema → subagent forced through structured output; `agent()` returns the **validated object** |
 | `model` | per-call model override (omit to inherit — usually correct) |
-| `effort` | reasoning effort override for Codex/Qoder/Claude (ultracode engine; Gemini logs and uses its default; NOT portable to Qoder native — use agentType there) |
+| `effort` | reasoning effort override for Codex/Qoder/Claude (ultracode engine; rejected for Gemini before dispatch; NOT portable to Qoder native — use agentType there) |
 | `contextWindow` | positive-integer Qoder CLI context window; ultracode engine only, and rejected on non-Qoder agents |
 | `agentType` | subagent type from the host's registry |
 | `isolation: 'worktree'` | fresh git worktree — ONLY for parallel file mutation that would conflict |

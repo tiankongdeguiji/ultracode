@@ -163,6 +163,30 @@ describe('QoderAdapter', () => {
     });
   });
 
+  it('settles authoritative assistant usage ahead of a ratio estimate at EOF', () => {
+    const parser = a.createParser(req({ contextWindow: 200_000 }));
+    const events = parser.push(JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'message-1',
+        content: [{ type: 'text', text: 'partial' }],
+        usage: {
+          input_tokens: 800,
+          output_tokens: 20,
+          request_id: 'request-1',
+          context_usage_ratio: 0.25,
+        },
+      },
+    }));
+    events.push(...parser.end());
+    expect(a.extractUsage(events)).toMatchObject({
+      inputTokens: 800,
+      outputTokens: 20,
+      totalTokens: 820,
+      estimated: false,
+    });
+  });
+
   it('prefers authoritative token counters when Qoder supplies them', () => {
     const parser = a.createParser(req({ contextWindow: 200_000 }));
     const events = parser.push(JSON.stringify({

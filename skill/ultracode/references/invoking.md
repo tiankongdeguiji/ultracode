@@ -20,7 +20,7 @@ behalf.
    ultracode validate my.workflow.js          # meta + dialect + compile check
    ultracode run my.workflow.js --dry-run     # free rehearsal on the mock backend
    ultracode run my.workflow.js --yes [--budget <ONLY if the user specified one>] [--detach]
-   ultracode run my.workflow.js --backend <USER-SELECTED> [--model M] [--effort E] --yes
+   ultracode run my.workflow.js --backend <USER-SELECTED> [--model M] [--effort E] [--context-window N] --yes
    ultracode watch <runId>                    # live panel; status <runId> --watch for script-friendly output
    ultracode logs <runId> --follow | stop <runId>
    ultracode resume <runId> [--script edited.js]

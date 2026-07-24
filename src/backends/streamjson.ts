@@ -50,6 +50,7 @@ export function createStreamJsonParser(
   let contextRatioSum = 0;
   let lastContextRatio: number | undefined;
   let terminalUsageEmitted = false;
+  let assistantReportedUsage: Partial<NormalizedUsage> | undefined;
 
   const observeContextRatio = (
     usage: Record<string, any> | undefined,
@@ -129,6 +130,14 @@ export function createStreamJsonParser(
             if (hasTokenUsage(reported)) {
               if (messageId === undefined || !reportedUsageMessages.has(messageId)) {
                 if (messageId !== undefined) reportedUsageMessages.add(messageId);
+                assistantReportedUsage = {
+                  inputTokens: (assistantReportedUsage?.inputTokens ?? 0) + (reported.inputTokens ?? 0),
+                  outputTokens: (assistantReportedUsage?.outputTokens ?? 0) + (reported.outputTokens ?? 0),
+                  cachedInputTokens:
+                    (assistantReportedUsage?.cachedInputTokens ?? 0) + (reported.cachedInputTokens ?? 0),
+                  reasoningTokens:
+                    (assistantReportedUsage?.reasoningTokens ?? 0) + (reported.reasoningTokens ?? 0),
+                };
                 out.push({ kind: 'usage', usage: reported, interim: true });
               }
             } else {
@@ -176,6 +185,10 @@ export function createStreamJsonParser(
     },
     end(): AgentEvent[] {
       if (terminalUsageEmitted) return [];
+      if (assistantReportedUsage !== undefined) {
+        terminalUsageEmitted = true;
+        return [{ kind: 'usage', usage: assistantReportedUsage }];
+      }
       const estimated = estimatedContextUsage(contextRatioSum);
       if (estimated === undefined) return [];
       terminalUsageEmitted = true;
