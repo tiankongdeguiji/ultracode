@@ -9,12 +9,13 @@ import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   discoverWorkerProcessesForTokens,
+  readProcessIdentitySnapshot,
   snapshotLinuxProcessIdentities,
   signalTrackedWorkerProcesses,
   signal0Status,
   signalWorkerProcessTokens,
-  signalWorkerProcesses,
   type ProcessInspectionOptions,
+  type TrackedWorkerProcess,
   WORKER_SCOPE_ENV,
   WORKER_TOKEN_ENV,
   workerScopeValue,
@@ -34,6 +35,10 @@ const LINUX_BASELINES = new Map<object | symbol, {
   identities: ReadonlySet<string>;
   workers: Set<string>;
 }>();
+
+function trackedWorkerKey(worker: TrackedWorkerProcess): string {
+  return `${worker.pid}:${worker.starttime}:${worker.pgrp}:${worker.token}`;
+}
 
 function acquireLinuxBaseline(
   workerToken: string,
@@ -198,8 +203,18 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
 
   const signalLiveWorker = (signal: NodeJS.Signals): number => {
     if (platform === 'darwin') return Number(signalGroup(signal));
-    return Number(signalGroup(signal))
-      + signalWorkerProcesses(workerToken, signal, opts.workerScope, tokenInspection);
+    const groupSignaled = signalGroup(signal);
+    const discovery = discoverWorkerProcessesForTokens(
+      [workerToken],
+      opts.workerScope,
+      undefined,
+      tokenInspection,
+    );
+    const escaped = groupSignaled && pid
+      ? discovery.processes.filter((candidate) => candidate.pgrp !== pid)
+      : discovery.processes;
+    return Number(groupSignaled)
+      + signalTrackedWorkerProcesses(escaped, signal, opts.processInspection).processes;
   };
 
   if (pid) {
@@ -269,30 +284,47 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
     );
     const now = opts.processInspection?.observationNow ?? (() => performance.now());
     const wait = opts.processInspection?.observationWait ?? sleep;
+    const pendingEscaped = new Map<string, TrackedWorkerProcess>();
     const sweepUntil = async (signal: NodeJS.Signals, deadline: number): Promise<boolean> => {
       let delayMs = 25;
       let emptyPasses = 0;
       let finalProofUsed = false;
-      let observedEscaped = new Set<string>();
       for (;;) {
         const groupSignaled = signalGroup(signal);
         const discovery = observeTokenProcesses();
         const escaped = groupSignaled && pid
           ? discovery.processes.filter((candidate) => candidate.pgrp !== pid)
           : discovery.processes;
+        const previouslyObserved = new Set(pendingEscaped.keys());
+        for (const candidate of escaped) {
+          pendingEscaped.set(trackedWorkerKey(candidate), candidate);
+        }
+        const pendingSnapshot = readProcessIdentitySnapshot(
+          [...pendingEscaped.values()].map((candidate) => candidate.pid),
+          opts.processInspection,
+        );
+        const livePending: TrackedWorkerProcess[] = [];
+        for (const [key, candidate] of pendingEscaped) {
+          const live = pendingSnapshot.identities.get(candidate.pid);
+          if (live?.starttime === candidate.starttime && live.pgrp === candidate.pgrp) {
+            livePending.push(candidate);
+          } else if (live !== undefined || pendingSnapshot.complete) {
+            pendingEscaped.delete(key);
+          }
+        }
         const actionable = signal === 'SIGKILL'
-          ? escaped
-          : escaped.filter((candidate) =>
-              observedEscaped.has(
-                `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}:${candidate.token}`,
-              ));
-        observedEscaped = new Set(escaped.map((candidate) =>
-          `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}:${candidate.token}`));
+          ? livePending
+          : livePending.filter((candidate) => previouslyObserved.has(trackedWorkerKey(candidate)));
         // Same-group workers already received this signal; do not immediately
         // re-signal a fork before it can finish setsid() and install handlers.
+        // Keep authenticated escaped identities latched across scans so an
+        // intervening exec cannot erase the marker and create false absence.
         signalTrackedWorkerProcesses(actionable, signal, opts.processInspection);
         retireGroupIfGone();
-        emptyPasses = discovery.complete && discovery.processes.length === 0
+        emptyPasses = discovery.complete
+          && pendingSnapshot.complete
+          && discovery.processes.length === 0
+          && pendingEscaped.size === 0
           ? emptyPasses + 1
           : 0;
         // One procfs directory snapshot can miss a PID forked after readdir.

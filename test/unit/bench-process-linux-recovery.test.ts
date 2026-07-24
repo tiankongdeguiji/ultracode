@@ -139,6 +139,97 @@ describe('Linux worker-token publication', () => {
     await once(spawned.child, 'close');
     await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
   });
+
+  it('signals a latched escaped identity after its marker disappears', async () => {
+    let clock = 0;
+    let discoveries = 0;
+    let escapedLive = true;
+    let workerToken = '';
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    const spawned = spawnAgentProcess(process.execPath, ['-e', ''], {
+      cwd: process.cwd(),
+      env: {},
+      onWorkerToken: (token) => { workerToken = token; },
+      processInspection: {
+        platform: 'linux',
+        listLinuxProcessIds: () => [],
+        discoverWorkerProcesses: () => ({
+          processes: discoveries++ === 0
+            ? [{ ...PROCESS, token: workerToken }]
+            : [],
+          complete: true,
+        }),
+        readIdentitySnapshot: (pids) => ({
+          identities: new Map(
+            escapedLive && pids.includes(PROCESS.pid)
+              ? [[PROCESS.pid, { pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }]]
+              : [],
+          ),
+          complete: true,
+        }),
+        signalProcess: (pid, signal) => {
+          if (signal === 0) throw noSuchProcess();
+          signals.push([pid, signal]);
+          escapedLive = false;
+        },
+        observationNow: () => clock,
+        observationWait: async (delayMs) => { clock += delayMs; },
+      },
+    });
+
+    await once(spawned.child, 'close');
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+    expect(signals).toEqual([[-PROCESS.pid, 'SIGTERM']]);
+  });
+
+  it('does not duplicate SIGTERM for a token match in the worker group', async () => {
+    let exposeTokenMatch = true;
+    let groupLive = true;
+    let groupPid = 0;
+    let clock = 0;
+    const duplicateSignals: Array<[number, NodeJS.Signals]> = [];
+    const spawned = spawnAgentProcess(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1e9)'],
+      {
+        cwd: process.cwd(),
+        env: {},
+        processInspection: {
+          platform: 'linux',
+          listLinuxProcessIds: () => [],
+          discoverWorkerProcesses: (tokens) => ({
+            processes: exposeTokenMatch
+              ? [{ pid: groupPid, pgrp: groupPid, starttime: 'worker-start', token: tokens[0]! }]
+              : [],
+            complete: true,
+          }),
+          readIdentitySnapshot: (pids) => ({
+            identities: new Map(pids.includes(groupPid)
+              ? [[groupPid, { pgrp: groupPid, starttime: 'worker-start' }]]
+              : []),
+            complete: true,
+          }),
+          signalProcess: (pid, signal) => {
+            if (signal === 0) {
+              if (!groupLive) throw noSuchProcess();
+              return;
+            }
+            duplicateSignals.push([pid, signal]);
+          },
+          observationNow: () => clock,
+          observationWait: async (delayMs) => { clock += delayMs; },
+        },
+      },
+    );
+    groupPid = spawned.child.pid!;
+
+    spawned.killTree('SIGTERM');
+    exposeTokenMatch = false;
+    await once(spawned.child, 'close');
+    groupLive = false;
+    await expect(spawned.cleanupEscaped(50)).resolves.toBe(0);
+    expect(duplicateSignals).toEqual([]);
+  });
 });
 
 describe('Linux benchmark lifecycle recovery', () => {
@@ -951,6 +1042,7 @@ describe('Linux benchmark process settlement', () => {
     let observations = 0;
     const signals: Array<[number, NodeJS.Signals]> = [];
     let recovered = false;
+    let processLive = true;
     const result = await runBenchProcess(process.execPath, ['-e', ''], {
       cwd: process.cwd(),
       terminationGraceMs: 100,
@@ -964,12 +1056,13 @@ describe('Linux benchmark process settlement', () => {
           }
           return { processes: [], complete: true };
         },
-        readLinuxProcessIdentity: (pid) => pid === PROCESS.pid
+        readLinuxProcessIdentity: (pid) => processLive && pid === PROCESS.pid
           ? { pgrp: PROCESS.pgrp, starttime: PROCESS.starttime }
           : undefined,
         signalProcess: (pid, signal) => {
           if (signal === 0) throw noSuchProcess();
           signals.push([pid, signal]);
+          processLive = false;
         },
         observationNow: () => clock,
         observationWait: async (delayMs) => { clock += delayMs; },
@@ -1096,7 +1189,7 @@ describe('process stop settlement', () => {
     complete = true;
     const recovered = await stopRun(root, runId, inspection);
     expect(recovered).toMatchObject({ ok: true, status: 'stopped' });
-    expect(recovered.message).toContain('worker cleanup complete; marked stopped');
+    expect(recovered.message).toContain('worker cleanup scan settled; marked stopped');
     expect(readManifest(directory)?.status).toBe('stopped');
   });
 
@@ -1134,7 +1227,7 @@ describe('process stop settlement', () => {
       observationWait: async (delayMs) => { clock += delayMs; },
     });
     expect(result).toMatchObject({ ok: true, status: 'stopped' });
-    expect(result.message).toContain('worker cleanup complete; marked stopped');
+    expect(result.message).toContain('worker cleanup scan settled; marked stopped');
     expect(readManifest(directory)?.status).toBe('stopped');
     expect(isResumableStatus(readManifest(directory)!.status)).toBe(true);
   });
