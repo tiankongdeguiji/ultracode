@@ -273,10 +273,24 @@ export function spawnAgentProcess(bin: string, argv: string[], opts: SpawnAgentO
       let delayMs = 25;
       let emptyPasses = 0;
       let finalProofUsed = false;
+      let observedEscaped = new Set<string>();
       for (;;) {
-        signalGroup(signal);
+        const groupSignaled = signalGroup(signal);
         const discovery = observeTokenProcesses();
-        signalTrackedWorkerProcesses(discovery.processes, signal, opts.processInspection);
+        const escaped = groupSignaled && pid
+          ? discovery.processes.filter((candidate) => candidate.pgrp !== pid)
+          : discovery.processes;
+        const actionable = signal === 'SIGKILL'
+          ? escaped
+          : escaped.filter((candidate) =>
+              observedEscaped.has(
+                `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}:${candidate.token}`,
+              ));
+        observedEscaped = new Set(escaped.map((candidate) =>
+          `${candidate.pid}:${candidate.starttime}:${candidate.pgrp}:${candidate.token}`));
+        // Same-group workers already received this signal; do not immediately
+        // re-signal a fork before it can finish setsid() and install handlers.
+        signalTrackedWorkerProcesses(actionable, signal, opts.processInspection);
         retireGroupIfGone();
         emptyPasses = discovery.complete && discovery.processes.length === 0
           ? emptyPasses + 1

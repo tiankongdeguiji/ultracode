@@ -41,7 +41,7 @@ export interface ProcessInspectionOptions {
   readLinuxProcessIdentity?: (pid: number) => ProcStat | undefined;
   /** Linux environment seam; errors retain their normal unreadable meaning. */
   readLinuxProcessEnvironment?: (pid: number) => string;
-  /** Linux procfs owner seam; ownership never proves lifecycle-token absence. */
+  /** Linux procfs owner seam used to scope non-root token sweeps to the caller's EUID. */
   readLinuxProcessOwner?: (pid: number) => number | undefined;
   /** Effective-UID seam; Linux permission checks use `geteuid`, not the real UID. */
   readLinuxEffectiveUid?: () => number | undefined;
@@ -136,6 +136,17 @@ function linuxProcessIdentity(pid: number, options: ProcessInspectionOptions): P
     : options.readLinuxProcessIdentity(pid);
 }
 
+function linuxProcessOwner(pid: number, options: ProcessInspectionOptions): number | undefined {
+  if (!isSafeProcessId(pid)) return undefined;
+  try {
+    return options.readLinuxProcessOwner === undefined
+      ? statSync(`/proc/${pid}`).uid
+      : options.readLinuxProcessOwner(pid);
+  } catch {
+    return undefined;
+  }
+}
+
 function linuxIdentityKey(pid: number, identity: ProcStat): string {
   return `${pid}:${identity.starttime}:${identity.pgrp}`;
 }
@@ -165,10 +176,7 @@ function isExcludedUnreadableLinuxProcess(
     || (identity.session !== undefined && hasExactPreSpawnLeader(identity.session, options));
 }
 
-function procMountAllowsFullEnumeration(
-  raw: string,
-  effectiveUid: number | undefined,
-): boolean {
+function procMountAllowsScopedEnumeration(raw: string): boolean {
   let found = false;
   for (const line of raw.split('\n')) {
     if (line.trim() === '') continue;
@@ -182,22 +190,11 @@ function procMountAllowsFullEnumeration(
       || fields[separator + 1] !== 'proc'
     ) return false;
     found = true;
-    const options = [
-      ...(fields[5] ?? '').split(','),
-      ...(fields[separator + 3] ?? '').split(','),
-    ];
-    for (const option of options) {
-      if (option === 'hidepid' || option.startsWith('hidepid=')) {
-        const value = option.slice('hidepid='.length);
-        if (effectiveUid !== 0 && value !== '0' && value !== 'off') return false;
-      }
-    }
   }
   return found;
 }
 
 function linuxProcessEnumerationIsAuthoritative(
-  effectiveUid: number | undefined,
   options: ProcessInspectionOptions,
 ): boolean {
   if (
@@ -212,7 +209,7 @@ function linuxProcessEnumerationIsAuthoritative(
   } catch {
     return false;
   }
-  return procMountAllowsFullEnumeration(mountInfo, effectiveUid);
+  return procMountAllowsScopedEnumeration(mountInfo);
 }
 
 /** Snapshot readable Linux identities before spawn so unrelated peers cannot
@@ -599,8 +596,8 @@ export function discoverWorkerProcessesForTokens(
   const scopeMarker = scopeValue === undefined ? undefined : `${WORKER_SCOPE_ENV}=${scopeValue}`;
   const found: TrackedWorkerProcess[] = [];
   let complete = true;
+  let effectiveUid: number | undefined;
   if (candidates === undefined) {
-    let effectiveUid: number | undefined;
     try {
       effectiveUid = options.readLinuxEffectiveUid === undefined
         ? (typeof process.geteuid === 'function' ? process.geteuid() : undefined)
@@ -608,12 +605,23 @@ export function discoverWorkerProcessesForTokens(
     } catch {
       effectiveUid = undefined;
     }
-    complete = linuxProcessEnumerationIsAuthoritative(effectiveUid, options);
+    complete = effectiveUid !== undefined && linuxProcessEnumerationIsAuthoritative(options);
   }
+  const scopeToEffectiveUid =
+    candidates === undefined && effectiveUid !== undefined && effectiveUid !== 0;
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
     if (!isSafeProcessId(pid) || pid === process.pid) continue;
+    let owner: number | undefined;
+    if (scopeToEffectiveUid) {
+      owner = linuxProcessOwner(pid, options);
+      if (owner === undefined) {
+        if (signal0Status(pid, options) !== 'absent') complete = false;
+        continue;
+      }
+      if (owner !== effectiveUid) continue;
+    }
     let before: ProcStat | undefined;
     try {
       before = linuxProcessIdentity(pid, options);
@@ -659,10 +667,14 @@ export function discoverWorkerProcessesForTokens(
         complete = false;
         continue;
       }
-      // A readable environment always gets authenticated first. These exact
-      // pre-spawn relationships prove unrelatedness only when environ cannot
-      // be inspected and the candidate identity remained stable around the read.
-      if (!isExcludedUnreadableLinuxProcess(pid, afterFailure, options)) {
+      // Non-root fallback containment is scoped to the caller's EUID. Some
+      // stable same-user processes (for example sshd or PAM helpers) still
+      // deny environ reads; best-effort cleanup treats those as unrelated.
+      const bestEffortSameUser = scopeToEffectiveUid && owner === effectiveUid;
+      if (
+        !bestEffortSameUser
+        && !isExcludedUnreadableLinuxProcess(pid, afterFailure, options)
+      ) {
         complete = false;
         continue;
       }

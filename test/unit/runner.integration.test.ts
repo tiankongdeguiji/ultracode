@@ -378,7 +378,7 @@ describe('detached runner', () => {
           })
         : await stopRun(root, runId);
       expect(retry).toMatchObject({ ok: true, status: 'stopped' });
-      expect(retry.message).toContain('worker cleanup verified; marked stopped');
+      expect(retry.message).toContain('worker cleanup complete; marked stopped');
       expect(readManifest(dir)?.status).toBe('stopped');
       if (exerciseWorkerRetry) {
         expect(retry.message).toContain('worker record(s)');
