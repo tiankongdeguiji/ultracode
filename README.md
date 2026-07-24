@@ -123,8 +123,7 @@ That's most of the surface — the rest is `parallel()`, `log()`, `args`, `budge
 ```bash
 ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
-ultracode run my.workflow.js                    # configured backend; foreground live panel
-ultracode run my.workflow.js --backend codex    # explicit backend override; --detach to background
+ultracode run my.workflow.js --backend codex    # foreground live panel; --detach to background
 ultracode resume <runId> [--script edited.js]   # unchanged journal prefix replays free
 ```
 

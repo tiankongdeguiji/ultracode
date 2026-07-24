@@ -142,7 +142,7 @@ ultracode resume <runId> [--script edited.js]   # 直接重放未变化的 journ
 }
 ```
 
-workflow 中的 `agent()` 单次参数会覆盖 CLI/MCP、项目级、用户级参数。CLI/MCP 必须通过参数或配置指定 backend；`--dry-run` 会使用 `mock` backend。
+workflow 中的 `agent()` 单次参数会覆盖 CLI/MCP、项目级、用户级参数。CLI/MCP 必须通过参数或配置指定 backend；`--dry-run` 会使用 `mock` backend。显式指定的 backend 与配置中的 backend 不同时，将从一套全新的 backend profile 开始：不会继承为原 backend 配置的 model、effort 和 context window 默认值。
 
 ### 从源码构建
 
