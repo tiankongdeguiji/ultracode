@@ -97,7 +97,7 @@ export function createServer(baseCwd: string): McpServer {
       description:
         'Launch a workflow (fire-and-forget; returns runId in <1s). Provide script (inline dialect text) ' +
         'or scriptPath, or resumeFromRunId to resume a terminal run (completed agents replay free). ' +
-        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend is one of mock|codex|qoder|claude|gemini and may come from layered ultracode config; without either source a fresh start is rejected. mock returns fabricated stubs (rehearsal only), so use a real backend for real work. model/effort set run defaults; Gemini ignores effort with a warning. contextWindow is a positive-integer Qoder-only default; Qoder effort/contextWindow require qodercli 1.1.1+. ' +
+        'budget is a token ceiling like "500k", enforced at the dispatch gate (new agents stop; in-flight calls may overshoot by a bounded margin). backend is one of mock|codex|qoder|claude|gemini and may come from layered ultracode config; without either source a fresh start is rejected. Omit backend/model/effort/contextWindow unless the user explicitly requested overrides: never infer a worker backend from the current host. An explicit backend switch does not inherit the configured model, effort, or contextWindow. mock returns fabricated stubs (rehearsal only), so use a real backend for real work. model/effort set run defaults; Gemini rejects effort. contextWindow is a positive-integer Qoder-only default; Qoder effort/contextWindow require qodercli 1.1.1+. Known incompatible controls fail before launch; stop and ask the user instead of rewriting or retrying them. ' +
         'wallClockMs (run wall-clock cap) and attemptTimeoutMs (per-attempt agent timeout; per-call opts.timeoutMs still wins) are unclamped and default to UNLIMITED — pass them ONLY when the user explicitly asked for a time limit, and never invent one. On resume an omitted cap inherits the prior run\'s value; pass 0 to clear an inherited cap back to unlimited.',
       inputSchema: {
         script: z.string().optional(),
@@ -158,6 +158,7 @@ export function createServer(baseCwd: string): McpServer {
           ...(result.model !== undefined ? { model: result.model } : {}),
           ...(result.effort !== undefined ? { effort: result.effort } : {}),
           ...(result.contextWindow !== undefined ? { contextWindow: result.contextWindow } : {}),
+          ...(result.warnings.length > 0 ? { warnings: result.warnings } : {}),
           monitor: `call workflow_status {runId: '${result.runId}', until: 'terminal', waitSeconds: 3300}; 3300 assumes \`ultracode install codex\` pinned a 3600s tool timeout — else use your MCP tool timeout − 60; re-issue until terminal and park silently between wakes ('phase' wakes per milestone if commentary is wanted)`,
         });
       } catch (err) {

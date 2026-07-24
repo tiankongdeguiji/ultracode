@@ -55,6 +55,18 @@ describe('plugin bundles', () => {
     expect(readFileSync(join(root, 'dist-qoder/LICENSE'), 'utf8')).toBe(readFileSync(join(root, 'LICENSE'), 'utf8'));
   });
 
+  it('bundled skill preserves configured backend choices', () => {
+    const canonical = readFileSync(join(root, 'skill/ultracode/SKILL.md'), 'utf8');
+    expect(canonical).toContain('Never infer the worker backend from the current Codex/Qoder/Gemini host');
+    expect(canonical).not.toContain('ultracode run script.workflow.js --backend codex --yes');
+    for (const path of [
+      'dist-codex/skills/ultracode/SKILL.md',
+      'dist-qoder/skills/ultracode/SKILL.md',
+    ]) {
+      expect(readFileSync(join(root, path), 'utf8')).toBe(canonical);
+    }
+  });
+
   it('root LICENSE is the canonical Apache-2.0 text', () => {
     // The bundle assertions compare byte-identity against the root file, so pin
     // the root itself: sha256 of https://www.apache.org/licenses/LICENSE-2.0.txt.

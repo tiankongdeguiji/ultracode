@@ -23,17 +23,83 @@ const configSchema = z.object({
 /** Maximum size of either layered configuration file. */
 export const MAX_CONFIG_BYTES = 64 * 1024;
 
-export interface SubagentDefaults {
-  backend?: ImplementedBackendId;
+export interface SubagentProfile {
+  backend?: string;
   model?: string;
   effort?: string;
   /** Qoder-only context window, in tokens. */
   contextWindow?: number;
 }
 
+export interface SubagentDefaults extends SubagentProfile {
+  backend?: ImplementedBackendId;
+}
+
+export type BackendScopedDefault = 'model' | 'effort' | 'contextWindow';
+
+export interface ResolvedSubagentProfile {
+  profile: SubagentProfile;
+  /** Configured controls intentionally dropped after switching backends. */
+  ignoredDefaults: BackendScopedDefault[];
+}
+
 export interface LoadSubagentConfigOptions {
   /** Test seam; production defaults to the operating-system home directory. */
   userHome?: string;
+}
+
+/**
+ * Resolves launch or per-agent overrides without leaking one backend's controls
+ * into another backend. An explicit backend switch starts a fresh profile;
+ * otherwise unspecified controls continue to inherit normally.
+ */
+export function resolveSubagentProfile(
+  defaults: SubagentProfile,
+  overrides: SubagentProfile,
+): ResolvedSubagentProfile {
+  const switchesBackend =
+    overrides.backend !== undefined &&
+    defaults.backend !== undefined &&
+    overrides.backend !== defaults.backend;
+  const ignoredDefaults: BackendScopedDefault[] = [];
+  const inherited = <K extends BackendScopedDefault>(key: K): SubagentProfile[K] => {
+    if (!switchesBackend) return overrides[key] ?? defaults[key];
+    if (overrides[key] !== undefined) return overrides[key];
+    if (defaults[key] !== undefined) ignoredDefaults.push(key);
+    return undefined;
+  };
+
+  return {
+    profile: {
+      backend: overrides.backend ?? defaults.backend,
+      model: inherited('model'),
+      effort: inherited('effort'),
+      contextWindow: inherited('contextWindow'),
+    },
+    ignoredDefaults,
+  };
+}
+
+/** Human-readable warning for controls dropped by an explicit backend switch. */
+export function backendOverrideWarning(
+  defaults: SubagentProfile,
+  resolved: ResolvedSubagentProfile,
+): string | undefined {
+  if (resolved.ignoredDefaults.length === 0) return undefined;
+  return (
+    `backend override '${resolved.profile.backend}' differs from configured backend '${defaults.backend}'; ` +
+    `not inheriting configured ${resolved.ignoredDefaults.join(', ')}`
+  );
+}
+
+/** Rejects controls that the selected backend is known not to support. */
+export function validateSubagentProfile(profile: SubagentProfile, subject = 'subagent profile'): void {
+  if (profile.contextWindow !== undefined && profile.backend !== 'qoder') {
+    throw new Error(`${subject}: contextWindow is supported only by the qoder backend, got ${JSON.stringify(profile.backend)}`);
+  }
+  if (profile.effort !== undefined && profile.backend === 'gemini') {
+    throw new Error(`${subject}: effort is unsupported by the gemini backend; omit it to use the backend default`);
+  }
 }
 
 function readConfigSource(path: string): string | undefined {

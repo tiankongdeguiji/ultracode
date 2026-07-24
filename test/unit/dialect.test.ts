@@ -104,6 +104,7 @@ return [a, b, c]`,
       `await agent('MOCK:ok one', { label: 'defaults' })
 await agent('MOCK:ok two', { label: 'override', model: 'm2', effort: 'low', contextWindow: 100000 })
 await agent('MOCK:ok three', { label: 'mixed', backend: 'codex' })
+await agent('MOCK:ok four', { label: 'switched', backend: 'codex', model: 'm3', effort: 'ultra' })
 return 1`,
       {
         executor,
@@ -117,8 +118,13 @@ return 1`,
     expect(executor.specs.map(({ backend, model, effort, contextWindow }) => ({ backend, model, effort, contextWindow }))).toEqual([
       { backend: 'qoder', model: 'm1', effort: 'high', contextWindow: 200_000 },
       { backend: 'qoder', model: 'm2', effort: 'low', contextWindow: 100_000 },
-      { backend: 'codex', model: 'm1', effort: 'high', contextWindow: undefined },
+      { backend: 'codex', model: undefined, effort: undefined, contextWindow: undefined },
+      { backend: 'codex', model: 'm3', effort: 'ultra', contextWindow: undefined },
     ]);
+    expect(output.logs).toContain(
+      "agent[2] mixed: backend override 'codex' differs from configured backend 'qoder'; " +
+      'not inheriting configured model, effort, contextWindow',
+    );
   });
 
   it('rejects invalid or explicitly non-Qoder contextWindow values', async () => {
@@ -133,7 +139,7 @@ return 1`,
     );
   });
 
-  it('warns and removes effort from Gemini execution identity', async () => {
+  it('rejects effort for the Gemini backend before dispatch', async () => {
     class SpecCapture extends MockExecutor {
       specs: AgentSpec[] = [];
       override execute(spec: AgentSpec, signal: AbortSignal, onProgress?: (progress: AgentProgress) => void) {
@@ -147,11 +153,8 @@ return 1`,
       defaultBackend: 'gemini',
       defaultEffort: 'high',
     });
-    expect(output.result).toBe('done');
-    expect(executor.specs[0]!.effort).toBeUndefined();
-    expect(output.logs).toContain(
-      'agent[0] gem: effort is unsupported by the gemini backend — using the backend default',
-    );
+    expect(output.error).toContain('effort is unsupported by the gemini backend');
+    expect(executor.specs).toEqual([]);
   });
 });
 

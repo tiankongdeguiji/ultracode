@@ -123,7 +123,8 @@ That's most of the surface — the rest is `parallel()`, `log()`, `args`, `budge
 ```bash
 ultracode validate my.workflow.js
 ultracode run my.workflow.js --dry-run          # free rehearsal (mock backend)
-ultracode run my.workflow.js --backend codex    # foreground live panel; --detach to background
+ultracode run my.workflow.js                    # configured backend; foreground live panel
+ultracode run my.workflow.js --backend codex    # explicit backend override; --detach to background
 ultracode resume <runId> [--script edited.js]   # unchanged journal prefix replays free
 ```
 
@@ -142,7 +143,7 @@ Set user-wide defaults in `~/.ultracode/config.json`, then override individual f
 }
 ```
 
-Per-call parameters on workflow `agent()` override CLI/MCP, project-level, and user-level parameters. CLI/MCP must specify a backend through an argument or configuration; `--dry-run` uses the `mock` backend.
+Per-call parameters on workflow `agent()` override CLI/MCP, project-level, and user-level parameters. CLI/MCP must specify a backend through an argument or configuration; `--dry-run` uses the `mock` backend. An explicit backend override starts a fresh backend profile: model, effort, and context-window defaults configured for a different backend are not inherited.
 
 ### Build from source
 

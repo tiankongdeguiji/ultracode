@@ -10,6 +10,7 @@ import { looksNamespaceLocal } from '../exec/procinfo.js';
 import { attachForeground, printOutput } from './lifecycle.js';
 import { readContextWindowOpt, readMaxConcurrencyOpt, readNonEmptyOpt, refuseInsideWorker } from './options.js';
 import { IMPLEMENTED_BACKENDS } from '../exec/start.js';
+import { backendOverrideWarning, resolveSubagentProfile, validateSubagentProfile } from '../config.js';
 
 export interface ResumeCliOptions {
   script?: string;
@@ -109,12 +110,23 @@ export async function resumeCommand(runId: string, opts: ResumeCliOptions): Prom
     return 1;
   }
 
-  const config = readRunConfig(prior.dir);
+  const storedConfig = readRunConfig(prior.dir);
+  const resolvedProfile = resolveSubagentProfile(storedConfig, {
+    backend: opts.backend,
+    model: modelOpt.value,
+    effort: effortOpt.value,
+    contextWindow: contextWindowOpt.value,
+  });
+  const warning = backendOverrideWarning(storedConfig, resolvedProfile);
+  const config = { ...storedConfig, ...resolvedProfile.profile };
   config.resumeFromRunId = runId;
-  if (opts.backend !== undefined) config.backend = opts.backend;
-  if (modelOpt.value !== undefined) config.model = modelOpt.value;
-  if (effortOpt.value !== undefined) config.effort = effortOpt.value;
-  if (contextWindowOpt.value !== undefined) config.contextWindow = contextWindowOpt.value;
+  try {
+    validateSubagentProfile(config, 'workflow defaults');
+  } catch (err) {
+    process.stderr.write(`ultracode: ${(err as Error).message}\n`);
+    return 1;
+  }
+  if (warning) process.stderr.write(`ultracode: warning: ${warning}\n`);
 
   // The stored maxConcurrency is frozen at run creation; this is the explicit
   // way to change it for a resume (ULTRACODE_MAX_CONCURRENCY only seeds new runs).

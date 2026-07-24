@@ -3,7 +3,13 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadSubagentConfig, MAX_CONFIG_BYTES } from '../../src/config.js';
+import {
+  backendOverrideWarning,
+  loadSubagentConfig,
+  MAX_CONFIG_BYTES,
+  resolveSubagentProfile,
+  validateSubagentProfile,
+} from '../../src/config.js';
 
 function put(path: string, value: unknown): void {
   mkdirSync(join(path, '.ultracode'), { recursive: true });
@@ -80,5 +86,70 @@ describe('layered subagent config', () => {
     if (mk.status === 0) {
       expect(() => loadSubagentConfig(fifoProject, { userHome: home })).toThrow(/must be a regular file/);
     }
+  });
+});
+
+describe('subagent profile resolution', () => {
+  const configured = {
+    backend: 'qoder',
+    model: 'Qwen3.8-Max-Preview',
+    effort: 'xhigh',
+    contextWindow: 1_000_000,
+  };
+
+  it('inherits the complete configured profile when backend is omitted', () => {
+    expect(resolveSubagentProfile(configured, {})).toEqual({
+      profile: configured,
+      ignoredDefaults: [],
+    });
+  });
+
+  it('inherits unspecified controls when the explicit backend is unchanged', () => {
+    expect(resolveSubagentProfile(configured, { backend: 'qoder', model: 'coder' })).toEqual({
+      profile: { ...configured, model: 'coder' },
+      ignoredDefaults: [],
+    });
+  });
+
+  it('starts a fresh profile and warns when the explicit backend changes', () => {
+    const resolved = resolveSubagentProfile(configured, { backend: 'codex' });
+    expect(resolved).toEqual({
+      profile: {
+        backend: 'codex',
+        model: undefined,
+        effort: undefined,
+        contextWindow: undefined,
+      },
+      ignoredDefaults: ['model', 'effort', 'contextWindow'],
+    });
+    expect(backendOverrideWarning(configured, resolved)).toBe(
+      "backend override 'codex' differs from configured backend 'qoder'; " +
+      'not inheriting configured model, effort, contextWindow',
+    );
+  });
+
+  it('keeps only explicitly supplied controls after a backend switch', () => {
+    expect(resolveSubagentProfile(configured, {
+      backend: 'codex',
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+    })).toEqual({
+      profile: {
+        backend: 'codex',
+        model: 'gpt-5.6-sol',
+        effort: 'ultra',
+        contextWindow: undefined,
+      },
+      ignoredDefaults: ['contextWindow'],
+    });
+  });
+
+  it('rejects controls known to be incompatible with the selected backend', () => {
+    expect(() => validateSubagentProfile({ backend: 'codex', contextWindow: 200_000 })).toThrow(
+      'contextWindow is supported only by the qoder backend',
+    );
+    expect(() => validateSubagentProfile({ backend: 'gemini', effort: 'high' })).toThrow(
+      'effort is unsupported by the gemini backend',
+    );
   });
 });
